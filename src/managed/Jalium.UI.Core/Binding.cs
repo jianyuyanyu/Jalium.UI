@@ -216,6 +216,18 @@ public class Binding : BindingBase
     public IValueConverter? Converter { get; set; }
 
     /// <summary>
+    /// Resource key for an <see cref="IValueConverter"/> that should be resolved lazily
+    /// against the binding target's resource lookup chain. Used when the binding declares
+    /// <c>Converter="{StaticResource X}"</c> inside a template (DataTemplate /
+    /// ControlTemplate) where the resource cannot be resolved at parse time — the element
+    /// hasn't been attached to its templated parent yet, so neither the ambient parser
+    /// stack nor the visual tree contains the resource. <see cref="BindingExpression.Activate"/>
+    /// resolves this through <c>ResourceLookup.FindResource</c> before the first evaluation,
+    /// at which point the target FE is already in the live visual tree.
+    /// </summary>
+    internal string? PendingConverterKey { get; set; }
+
+    /// <summary>
     /// Gets or sets the parameter to pass to the converter.
     /// </summary>
     public object? ConverterParameter { get; set; }
@@ -434,6 +446,13 @@ public sealed class BindingExpression : BindingExpressionBase
     private DependencyObject? _converterParamDepObj;
 
     /// <summary>
+    /// True once we've subscribed to <see cref="FrameworkElement.Loaded"/> for the
+    /// deferred-Converter retry path; prevents duplicate handler registration when
+    /// <see cref="Activate"/> runs multiple times before the element finally loads.
+    /// </summary>
+    private bool _deferredConverterLoadedHooked;
+
+    /// <summary>
     /// Gets the parent binding.
     /// </summary>
     public Binding ParentBinding => _binding;
@@ -457,6 +476,20 @@ public sealed class BindingExpression : BindingExpressionBase
     {
         if (IsActive)
             return;
+
+        // Lazy-resolve a deferred Converter resource reference. SG-emitted template
+        // SetVisualTree lambdas execute SetProperty(string) before the target element
+        // has been parented (lambda runs first, parent assignment happens after the
+        // lambda returns). At that moment ResourceLookup.FindResource walks zero
+        // ancestors and never reaches the UserControl that owns the Converter resource.
+        // We resolve through three windows of opportunity, in order:
+        //   1. Right now — works when the binding is set on an already-attached element
+        //      (e.g. a non-template usage).
+        //   2. Target.Loaded — fires once the visual tree wires up; FindResource then
+        //      walks the live ancestor chain and finds the resource.
+        //   3. Subsequent Activate calls — keep the key set on failure so reactivations
+        //      (DataContextChanged, ItemsControl re-virtualisation) get another shot.
+        TryResolveDeferredConverter();
 
         // Resolve the data source
         ResolveDataSource();
@@ -486,8 +519,90 @@ public sealed class BindingExpression : BindingExpressionBase
         // Subscribe to source changes
         SubscribeToSource();
 
-        // Initial update
-        UpdateTarget();
+        // Initial update — but skip when we have a deferred Converter that hasn't
+        // resolved yet. Running UpdateTarget without the Converter pushes the raw
+        // source value through BindingValueCoercion, and a Boolean → Brush coerce
+        // (typical for IsSelected → Background bindings on selection cards) throws
+        // InvalidCastException as a first-chance exception even though the catch
+        // swallows it. The Loaded handler re-runs UpdateTarget once the Converter
+        // is bound, which yields the correct typed value on first visible paint.
+        if (string.IsNullOrEmpty(_binding.PendingConverterKey))
+        {
+            UpdateTarget();
+        }
+    }
+
+    /// <summary>
+    /// Try to bind the deferred Converter through the target's resource lookup chain.
+    /// Called from <see cref="Activate"/> and again from the target FE's Loaded handler.
+    /// On success the Converter is set and the pending key cleared; on failure the key
+    /// stays set and we hook into <see cref="FrameworkElement.Loaded"/> for one more
+    /// attempt once the element joins the live visual tree.
+    /// </summary>
+    private void TryResolveDeferredConverter()
+    {
+        if (_binding.Converter != null || string.IsNullOrEmpty(_binding.PendingConverterKey))
+            return;
+
+        if (Target is not FrameworkElement targetFe)
+        {
+            // Non-FE targets (rare for binding, e.g. Freezable) cannot resolve resources
+            // through visual ancestors. Leave the key set; if the binding ever attaches
+            // to an FE later, we'll try again.
+            return;
+        }
+
+        var key = _binding.PendingConverterKey!;
+        var resolved = ResourceLookup.FindResource(targetFe, key);
+        if (resolved is IValueConverter converter)
+        {
+            _binding.Converter = converter;
+            _binding.PendingConverterKey = null;
+            return;
+        }
+
+        // Resource not reachable yet — typically because the target was constructed
+        // inside a SG SetVisualTree lambda and hasn't been parented yet. Hook Loaded
+        // exactly once so the next round-trip through the visual tree wires it up.
+        if (!_deferredConverterLoadedHooked)
+        {
+            targetFe.Loaded += OnTargetLoadedForDeferredConverter;
+            _deferredConverterLoadedHooked = true;
+        }
+    }
+
+    private void OnTargetLoadedForDeferredConverter(object? sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe)
+        {
+            // One-shot — Loaded can fire multiple times for templated elements when
+            // the visual tree is recreated, but we only need the converter resolved
+            // once. Detach immediately to keep the handler list clean.
+            fe.Loaded -= OnTargetLoadedForDeferredConverter;
+        }
+        _deferredConverterLoadedHooked = false;
+
+        if (_binding.Converter != null || string.IsNullOrEmpty(_binding.PendingConverterKey))
+            return;
+
+        if (Target is FrameworkElement targetFe)
+        {
+            var resolved = ResourceLookup.FindResource(targetFe, _binding.PendingConverterKey!);
+            if (resolved is IValueConverter converter)
+            {
+                _binding.Converter = converter;
+                _binding.PendingConverterKey = null;
+
+                // Re-evaluate the binding so the freshly-installed Converter is
+                // applied to the current source value — without this the Border's
+                // Background stays at whatever the missing-Converter coercion path
+                // produced (typically the unconverted Boolean → Brush exception).
+                if (IsActive)
+                {
+                    UpdateTarget();
+                }
+            }
+        }
     }
 
     /// <inheritdoc />
@@ -719,6 +834,29 @@ public sealed class BindingExpression : BindingExpressionBase
             return;
 
         BindingDiagnostics.NotifyUpdateTarget(this);
+
+        // Late-bind a deferred Converter resource if it's still pending. Activate's
+        // initial attempt happens before the SG-emitted SetVisualTree lambda parents
+        // the element, so FindResource reaches no ancestors. By the time UpdateTarget
+        // fires (typically driven by DataContextChanged once the ItemsControl pushes
+        // DataContext into the container), the element has been added to the visual
+        // tree and FindResource walks the live ancestor chain — exactly when the
+        // resource becomes resolvable. Doing this on every UpdateTarget call is cheap
+        // (TryResolveDeferredConverter exits in two field reads when nothing's pending)
+        // and removes the dependency on FrameworkElement.Loaded firing reliably for
+        // every templated element.
+        TryResolveDeferredConverter();
+
+        // If the Converter is still unresolved, bail without touching the target. A
+        // bare Boolean source value can't sensibly coerce into a Brush DP, and pushing
+        // the unconverted value through SetValue would either land in the DP at the
+        // wrong type or no-op silently. Leaving the target on its metadata default
+        // until the deferred resolution succeeds matches WPF's behaviour for a
+        // binding whose Converter resource is genuinely missing.
+        if (!string.IsNullOrEmpty(_binding.PendingConverterKey))
+        {
+            return;
+        }
 
         try
         {

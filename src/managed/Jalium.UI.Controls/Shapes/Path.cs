@@ -103,53 +103,54 @@ public class Path : Shape
         }
 
         var stretch = Stretch;
-        Size newSize;
 
         if (stretch == Stretch.None)
         {
             _hasStretchMatrix = false;
             _stretchMatrix = Matrix.Identity;
             _renderedGeometry = null;
-            newSize = finalSize;
-        }
-        else
-        {
-            var strokeThickness = GetStrokeThickness();
-            var geomBounds = _definingGeometry.Bounds;
-            GetStretchMetrics(stretch, strokeThickness, finalSize, geomBounds,
-                out var xScale, out var yScale, out var dX, out var dY, out newSize);
-
-            if (stretch is Stretch.Uniform or Stretch.UniformToFill)
-            {
-                // Center aspect-ratio-preserving content within the allocated path box.
-                // Without this, tall/narrow chevrons stay top-left aligned and appear to
-                // change size once rotated between collapsed/expanded states.
-                var contentWidth = geomBounds.Width * xScale;
-                var contentHeight = geomBounds.Height * yScale;
-                dX += (finalSize.Width - strokeThickness - contentWidth) / 2;
-                dY += (finalSize.Height - strokeThickness - contentHeight) / 2;
-            }
-
-            // Build the stretch matrix: ScaleAt(sx, sy, bounds.X, bounds.Y) then Translate(dX, dY)
-            var cx = geomBounds.X;
-            var cy = geomBounds.Y;
-            _stretchMatrix = new Matrix(
-                xScale, 0,
-                0, yScale,
-                cx - cx * xScale + dX,
-                cy - cy * yScale + dY);
-            _hasStretchMatrix = true;
-            _renderedGeometry = null; // Force re-creation on next render
+            return finalSize;
         }
 
-        if (SizeIsInvalidOrEmpty(newSize))
+        var strokeThickness = GetStrokeThickness();
+        var geomBounds = _definingGeometry.Bounds;
+        GetStretchMetrics(stretch, strokeThickness, finalSize, geomBounds,
+            out var xScale, out var yScale, out var dX, out var dY, out var stretchedSize);
+
+        if (SizeIsInvalidOrEmpty(stretchedSize))
         {
-            newSize = new Size(0, 0);
             _renderedGeometry = null;
             _definingGeometry = null;
+            return new Size(0, 0);
         }
 
-        return newSize;
+        if (stretch is Stretch.Uniform or Stretch.UniformToFill)
+        {
+            // Center aspect-ratio-preserving content within the allocated path box.
+            // Without this, tall/narrow chevrons stay top-left aligned and appear to
+            // change size once rotated between collapsed/expanded states.
+            var contentWidth = geomBounds.Width * xScale;
+            var contentHeight = geomBounds.Height * yScale;
+            dX += (finalSize.Width - strokeThickness - contentWidth) / 2;
+            dY += (finalSize.Height - strokeThickness - contentHeight) / 2;
+        }
+
+        var cx = geomBounds.X;
+        var cy = geomBounds.Y;
+        _stretchMatrix = new Matrix(
+            xScale, 0,
+            0, yScale,
+            cx - cx * xScale + dX,
+            cy - cy * yScale + dY);
+        _hasStretchMatrix = true;
+        _renderedGeometry = null;
+
+        // Return finalSize (WPF-aligned). The stretch matrix above already centers the
+        // geometry inside the finalSize box, so RenderSize must match that box for
+        // RenderTransformOrigin (e.g. (0.5, 0.5) on RotateTransform) to land on the
+        // geometry's visual center. Returning the smaller stretched size shifts the
+        // rotation pivot off-center and makes the rotated shape drift outside the slot.
+        return finalSize;
     }
 
     #endregion

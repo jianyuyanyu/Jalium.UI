@@ -73,6 +73,91 @@ public abstract class GradientBrush : Brush
     /// Gets or sets the mapping mode for the gradient.
     /// </summary>
     public BrushMappingMode MappingMode { get; set; } = BrushMappingMode.RelativeToBoundingBox;
+
+    // 缓存的 content hash —— 第一次 ComputeContentHash 计算后存到 _cachedContentHash，
+    // 后续直接读，把每帧 O(stops 数) 的 FNV 折叠压成 O(1)。GradientStops 用 List 暴露
+    // 给 user 写入，框架无法订阅 List 变化通知；变更检测的触发点是 user 调用 setter
+    // (StartPoint/EndPoint/Center/Radius/SpreadMethod/MappingMode/Opacity)，那些
+    // 写入路径里调用 InvalidateContentHash() 让 cache 失效。Stops List 直接 Add/Clear
+    // 不会自动失效——这是与 SolidColorBrush 一致的"用户负责通知 mutation"约定。
+    private long _cachedContentHash;
+    private bool _hasCachedContentHash;
+
+    /// <summary>
+    /// Forces the next <see cref="ComputeContentHash"/> call to re-evaluate from
+    /// scratch. Subclasses must call this from any setter that mutates a field
+    /// folded into the hash, otherwise the cached value would diverge from the
+    /// brush's observable state.
+    /// </summary>
+    protected void InvalidateContentHash()
+    {
+        _hasCachedContentHash = false;
+    }
+
+    /// <summary>
+    /// Computes a 64-bit content hash of the brush — every observable field that
+    /// changes the rendered result, including each <see cref="GradientStop"/>'s
+    /// color and offset. Lets the rendering backend detect when a managed brush
+    /// instance has been mutated since the last native upload (e.g. a stop was
+    /// added, a start point moved) and rebuild the native resource without
+    /// having to dispose+create on every frame.
+    ///
+    /// Result is memoised in <c>_cachedContentHash</c>; subclasses' hash bodies
+    /// run at most once per logical mutation generation.
+    ///
+    /// Subclasses fold their endpoint / center / radius fields into the base
+    /// hash via <see cref="ComputeBaseContentHash"/>.
+    /// </summary>
+    internal long ComputeContentHash()
+    {
+        if (_hasCachedContentHash) return _cachedContentHash;
+        long h = ComputeContentHashCore();
+        _cachedContentHash = h;
+        _hasCachedContentHash = true;
+        return h;
+    }
+
+    /// <summary>
+    /// Subclass hook that does the actual O(n) hash fold. Called once per
+    /// mutation generation by <see cref="ComputeContentHash"/>.
+    /// </summary>
+    internal abstract long ComputeContentHashCore();
+
+    /// <summary>
+    /// Folds the fields shared by all gradient brushes — spread method, mapping
+    /// mode, opacity, and every gradient stop — into a 64-bit hash. Subclasses
+    /// XOR their own variant fields on top.
+    /// </summary>
+    protected long ComputeBaseContentHash()
+    {
+        // FNV-1a 64-bit accumulator. Cheap, allocation-free, and stable across
+        // runs (Random/string-keyed HashCode is not, which would let the hash
+        // drift between processes — an unwanted property for a render cache key
+        // that may be persisted alongside the recorded drawing list).
+        const long FnvOffsetBasis = unchecked((long)0xcbf29ce484222325UL);
+        const long FnvPrime = unchecked((long)0x100000001b3UL);
+
+        long hash = FnvOffsetBasis;
+        hash = unchecked((hash ^ (long)SpreadMethod) * FnvPrime);
+        hash = unchecked((hash ^ (long)MappingMode) * FnvPrime);
+        hash = unchecked((hash ^ BitConverter.DoubleToInt64Bits(Opacity)) * FnvPrime);
+
+        var stops = GradientStops;
+        int count = stops.Count;
+        hash = unchecked((hash ^ count) * FnvPrime);
+        for (int i = 0; i < count; i++)
+        {
+            var s = stops[i];
+            // Pack ARGB as 32 bits and offset as 64 bits, fold each separately —
+            // alternates dominate the dispersion for typical 2-3 stop gradients.
+            uint argb = ((uint)s.Color.A << 24) | ((uint)s.Color.R << 16) |
+                        ((uint)s.Color.G << 8) | s.Color.B;
+            hash = unchecked((hash ^ argb) * FnvPrime);
+            hash = unchecked((hash ^ BitConverter.DoubleToInt64Bits(s.Offset)) * FnvPrime);
+        }
+
+        return hash;
+    }
 }
 
 /// <summary>
@@ -116,6 +201,18 @@ public sealed class LinearGradientBrush : GradientBrush
         StartPoint = new Point(0.5 - cos * 0.5, 0.5 - sin * 0.5);
         EndPoint = new Point(0.5 + cos * 0.5, 0.5 + sin * 0.5);
     }
+
+    /// <inheritdoc />
+    internal override long ComputeContentHashCore()
+    {
+        const long FnvPrime = unchecked((long)0x100000001b3UL);
+        long hash = ComputeBaseContentHash();
+        hash = unchecked((hash ^ BitConverter.DoubleToInt64Bits(StartPoint.X)) * FnvPrime);
+        hash = unchecked((hash ^ BitConverter.DoubleToInt64Bits(StartPoint.Y)) * FnvPrime);
+        hash = unchecked((hash ^ BitConverter.DoubleToInt64Bits(EndPoint.X)) * FnvPrime);
+        hash = unchecked((hash ^ BitConverter.DoubleToInt64Bits(EndPoint.Y)) * FnvPrime);
+        return hash;
+    }
 }
 
 /// <summary>
@@ -152,6 +249,20 @@ public sealed class RadialGradientBrush : GradientBrush
     {
         get => _radiusY;
         set => _radiusY = Math.Max(0, value);
+    }
+
+    /// <inheritdoc />
+    internal override long ComputeContentHashCore()
+    {
+        const long FnvPrime = unchecked((long)0x100000001b3UL);
+        long hash = ComputeBaseContentHash();
+        hash = unchecked((hash ^ BitConverter.DoubleToInt64Bits(Center.X)) * FnvPrime);
+        hash = unchecked((hash ^ BitConverter.DoubleToInt64Bits(Center.Y)) * FnvPrime);
+        hash = unchecked((hash ^ BitConverter.DoubleToInt64Bits(GradientOrigin.X)) * FnvPrime);
+        hash = unchecked((hash ^ BitConverter.DoubleToInt64Bits(GradientOrigin.Y)) * FnvPrime);
+        hash = unchecked((hash ^ BitConverter.DoubleToInt64Bits(_radiusX)) * FnvPrime);
+        hash = unchecked((hash ^ BitConverter.DoubleToInt64Bits(_radiusY)) * FnvPrime);
+        return hash;
     }
 }
 

@@ -13,7 +13,7 @@ public sealed class RowDefinition : DefinitionBase
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
     public static readonly DependencyProperty HeightProperty =
         DependencyProperty.Register(nameof(Height), typeof(GridLength), typeof(RowDefinition),
-            new PropertyMetadata(new GridLength(1.0, GridUnitType.Star)));
+            new PropertyMetadata(new GridLength(1.0, GridUnitType.Star), DefinitionBase.OnLayoutPropertyChanged));
 
     /// <summary>
     /// Identifies the MinHeight dependency property.
@@ -21,7 +21,7 @@ public sealed class RowDefinition : DefinitionBase
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
     public static readonly DependencyProperty MinHeightProperty =
         DependencyProperty.Register(nameof(MinHeight), typeof(double), typeof(RowDefinition),
-            new PropertyMetadata(0.0));
+            new PropertyMetadata(0.0, DefinitionBase.OnLayoutPropertyChanged));
 
     /// <summary>
     /// Identifies the MaxHeight dependency property.
@@ -29,7 +29,7 @@ public sealed class RowDefinition : DefinitionBase
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
     public static readonly DependencyProperty MaxHeightProperty =
         DependencyProperty.Register(nameof(MaxHeight), typeof(double), typeof(RowDefinition),
-            new PropertyMetadata(double.PositiveInfinity));
+            new PropertyMetadata(double.PositiveInfinity, DefinitionBase.OnLayoutPropertyChanged));
 
     /// <summary>
     /// Gets or sets the height of the row.
@@ -83,7 +83,7 @@ public sealed class ColumnDefinition : DefinitionBase
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
     public static readonly DependencyProperty WidthProperty =
         DependencyProperty.Register(nameof(Width), typeof(GridLength), typeof(ColumnDefinition),
-            new PropertyMetadata(new GridLength(1.0, GridUnitType.Star)));
+            new PropertyMetadata(new GridLength(1.0, GridUnitType.Star), DefinitionBase.OnLayoutPropertyChanged));
 
     /// <summary>
     /// Identifies the MinWidth dependency property.
@@ -91,7 +91,7 @@ public sealed class ColumnDefinition : DefinitionBase
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
     public static readonly DependencyProperty MinWidthProperty =
         DependencyProperty.Register(nameof(MinWidth), typeof(double), typeof(ColumnDefinition),
-            new PropertyMetadata(0.0));
+            new PropertyMetadata(0.0, DefinitionBase.OnLayoutPropertyChanged));
 
     /// <summary>
     /// Identifies the MaxWidth dependency property.
@@ -99,7 +99,7 @@ public sealed class ColumnDefinition : DefinitionBase
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
     public static readonly DependencyProperty MaxWidthProperty =
         DependencyProperty.Register(nameof(MaxWidth), typeof(double), typeof(ColumnDefinition),
-            new PropertyMetadata(double.PositiveInfinity));
+            new PropertyMetadata(double.PositiveInfinity, DefinitionBase.OnLayoutPropertyChanged));
 
     /// <summary>
     /// Gets or sets the width of the column.

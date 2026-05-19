@@ -76,8 +76,12 @@ public static class PropertyAccessorRegistry
             return true;
         }
 
+        // CanRead 守卫与 TryWriteProperty 的 CanWrite 对称:set-only 属性、或 trim 后
+        // PropertyInfo 元数据保留但 getter 方法被剥离的情形,GetValue 会抛
+        // ArgumentException("Property Get method was not found");这里直接 fall through
+        // 让 BindingExpression 用 FallbackValue,避免把绑定异常传播到 ctor/ visual tree。
         var prop = type.GetProperty(propertyName);
-        if (prop != null)
+        if (prop != null && prop.CanRead)
         {
             value = prop.GetValue(source);
             return true;

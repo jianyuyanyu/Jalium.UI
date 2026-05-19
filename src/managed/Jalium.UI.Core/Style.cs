@@ -560,6 +560,7 @@ public abstract class TriggerBase
             if (setter.Value is IDynamicResourceReference dynamicReference)
             {
                 DynamicResourceBindingOperations.SetDynamicResource(target, actualProperty, dynamicReference.ResourceKey, layerSource);
+                EnsureSetterInvalidation(target, actualProperty);
                 continue;
             }
 
@@ -571,6 +572,7 @@ public abstract class TriggerBase
             if (setter.Value is BindingBase binding)
             {
                 target.SetBinding(actualProperty, binding);
+                EnsureSetterInvalidation(target, actualProperty);
                 continue;
             }
 
@@ -587,13 +589,36 @@ public abstract class TriggerBase
                 continue;
             }
 
-            // Convert value to the correct type if needed and apply
+            // Trigger 走动态状态切换路径，必须参与自动过渡 — 这是 hover/pressed
+            // 反馈动画的入口；Style.Setter (baseline) 走 allowAutoTransition=false。
             var valueToSet = ConvertValueIfNeeded(setter.Value, actualProperty.PropertyType);
-            target.SetLayerValue(actualProperty, valueToSet, layerSource);
+            target.SetLayerValue(actualProperty, valueToSet, layerSource, allowAutoTransition: true);
+            EnsureSetterInvalidation(target, actualProperty);
         }
+    }
 
-        // Invalidate visual to ensure re-render
-        element.InvalidateVisual();
+    /// <summary>
+    /// 当 setter 改的 DP 没有 metadata-level invalidation callback 时（例如纯数据 DP），
+    /// 显式给 target 安排一次 visual 失效，否则改完没人通知 window 重绘。
+    /// 已注册 callback 的 DP（OpacityProperty / RenderTransformProperty / Border.Background
+    /// 等）由 SetLayerValue → MutateValue → OnPropertyChanged → metadata callback
+    /// 链路自然 invalidate，**不**走这条兜底——避免对每个 setter 都 paranoid
+    /// 整体 InvalidateVisual。compositionOnly DP 路由到 InvalidateComposition。
+    /// </summary>
+    private static void EnsureSetterInvalidation(FrameworkElement target, DependencyProperty dp)
+    {
+        var metadata = dp.GetMetadata(target.GetType());
+        if (metadata.PropertyChangedCallback != null)
+            return; // metadata callback 已经处理了 invalidation
+
+        if (metadata is FrameworkPropertyMetadata fpm && fpm.AffectsCompositionOnly)
+        {
+            target.InvalidateComposition();
+        }
+        else
+        {
+            target.InvalidateVisual();
+        }
     }
 
     /// <summary>
@@ -777,7 +802,10 @@ public abstract class TriggerBase
             }
 
             _activeSetters.Remove(key);
-            target.ClearLayerValue(actualProperty, layerSource);
+            // Trigger 失活也是动态状态切换，反向恢复同样要参与自动过渡 —
+            // 否则 hover 退出时值瞬间跳回 baseline，没有缓动。
+            target.ClearLayerValue(actualProperty, layerSource, allowAutoTransition: true);
+            EnsureSetterInvalidation(target, actualProperty);
             needsReapply.Add(key);
 
         }
@@ -829,18 +857,17 @@ public abstract class TriggerBase
                             }
                             else
                             {
-                                // This property needs another trigger's value re-applied
+                                // This property needs another trigger's value re-applied —
+                                // 仍属于 trigger 动态切换路径，保持过渡参与。
                                 var valueToSet = ConvertValueIfNeeded(setter.Value, actualProperty.PropertyType);
-                                target.SetLayerValue(actualProperty, valueToSet, layerSource);
+                                target.SetLayerValue(actualProperty, valueToSet, layerSource, allowAutoTransition: true);
                             }
+                            EnsureSetterInvalidation(target, actualProperty);
                         }
                     }
                 }
             }
         }
-
-        // Invalidate visual to ensure re-render
-        element.InvalidateVisual();
     }
 
     /// <summary>

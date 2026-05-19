@@ -19,71 +19,91 @@ public class Control : FrameworkElement
     /// Identifies the PreviewMouseDoubleClick routed event.
     /// </summary>
     public static readonly RoutedEvent PreviewMouseDoubleClickEvent =
-        EventManager.RegisterRoutedEvent(nameof(PreviewMouseDoubleClick), RoutingStrategy.Direct, typeof(MouseButtonEventHandler), typeof(Control));
+        EventManager.RegisterRoutedEvent(nameof(PreviewMouseDoubleClick), RoutingStrategy.Tunnel, typeof(MouseButtonEventHandler), typeof(Control));
 
     /// <summary>
     /// Identifies the MouseDoubleClick routed event.
     /// </summary>
     public static readonly RoutedEvent MouseDoubleClickEvent =
-        EventManager.RegisterRoutedEvent(nameof(MouseDoubleClick), RoutingStrategy.Direct, typeof(MouseButtonEventHandler), typeof(Control));
+        EventManager.RegisterRoutedEvent(nameof(MouseDoubleClick), RoutingStrategy.Bubble, typeof(MouseButtonEventHandler), typeof(Control));
 
     static Control()
     {
-        // Register class handler for MouseDown to detect double-clicks
-        EventManager.RegisterClassHandler(typeof(Control), MouseLeftButtonDownEvent,
+        // 类处理器订阅 UIElement.MouseDownEvent / PreviewMouseDownEvent — 这两个才是
+        // WindowInputDispatcher 真正 raise 的路由事件。MouseLeftButtonDownEvent /
+        // PreviewMouseLeftButtonDownEvent 仅作为 OnMouseDownThunk 内部派发到虚方法
+        // OnMouseLeftButtonDown 的标记，不会被任何 dispatcher raise，订阅它们等于死代码。
+        //
+        // 不传 handledEventsToo（默认 false）：MouseDownEvent 是 Bubble，命中 element 沿
+        // Bubble 链经过多层 Control（如嵌套 TreeViewItem）。如果允许 Handled 后还触发，
+        // 每层 Control 都会再 raise 一次 MouseDoubleClickEvent，业务侧 ItemDoubleClicked
+        // 在祖先节点上被重复触发。例如双击叶子 TreeViewItem 会同时打开父项目 .csproj。
+        //
+        // 默认 handledEventsToo:false 让最深层 Control（命中点的 source）独占双击事件 —
+        // 它的 RaiseItemDoubleClicked 把 args.Handled 回填到 source.Handled (= MouseDownEvent.Handled)，
+        // 后续 ancestor 的 class handler 不再触发，防止重复。
+        EventManager.RegisterClassHandler(typeof(Control), UIElement.MouseDownEvent,
             new MouseButtonEventHandler(OnMouseDoubleClickThunk));
 
-        // Register class handler for PreviewMouseDown to detect preview double-clicks
-        EventManager.RegisterClassHandler(typeof(Control), PreviewMouseLeftButtonDownEvent,
+        EventManager.RegisterClassHandler(typeof(Control), UIElement.PreviewMouseDownEvent,
             new MouseButtonEventHandler(OnPreviewMouseDoubleClickThunk));
+
+        // 让派生类 override OnMouseDoubleClick / OnPreviewMouseDoubleClick 仍然生效 —
+        // thunk 现在用 RaiseEvent 走完整路由链，所以虚方法回调必须通过类处理器机制串联回来。
+        EventManager.RegisterClassHandler(typeof(Control), MouseDoubleClickEvent,
+            new MouseButtonEventHandler((s, e) => ((Control)s).OnMouseDoubleClick(e)));
+
+        EventManager.RegisterClassHandler(typeof(Control), PreviewMouseDoubleClickEvent,
+            new MouseButtonEventHandler((s, e) => ((Control)s).OnPreviewMouseDoubleClick(e)));
     }
 
     private static void OnMouseDoubleClickThunk(object sender, MouseButtonEventArgs e)
     {
-        if (e.ClickCount == 2)
-        {
-            var control = (Control)sender;
-            var args = new MouseButtonEventArgs(
-                MouseDoubleClickEvent,
-                e.Position,
-                e.ChangedButton,
-                e.ButtonState,
-                e.ClickCount,
-                e.LeftButton,
-                e.MiddleButton,
-                e.RightButton,
-                e.XButton1,
-                e.XButton2,
-                e.KeyboardModifiers,
-                e.Timestamp);
-            control.OnMouseDoubleClick(args);
-            if (args.Handled)
-                e.Handled = true;
-        }
+        // 仅左键双击触发 MouseDoubleClick（与 WPF 行为一致）。
+        if (e.ClickCount != 2 || e.ChangedButton != MouseButton.Left) return;
+
+        var control = (Control)sender;
+        var args = new MouseButtonEventArgs(
+            MouseDoubleClickEvent,
+            e.Position,
+            e.ChangedButton,
+            e.ButtonState,
+            e.ClickCount,
+            e.LeftButton,
+            e.MiddleButton,
+            e.RightButton,
+            e.XButton1,
+            e.XButton2,
+            e.KeyboardModifiers,
+            e.Timestamp);
+        // RaiseEvent 让 Bubble 路由生效；OnMouseDoubleClick 虚方法由 static Control()
+        // 注册的 MouseDoubleClickEvent 类处理器自动调用，避免 inline 调用绕过路由。
+        control.RaiseEvent(args);
+        if (args.Handled)
+            e.Handled = true;
     }
 
     private static void OnPreviewMouseDoubleClickThunk(object sender, MouseButtonEventArgs e)
     {
-        if (e.ClickCount == 2)
-        {
-            var control = (Control)sender;
-            var args = new MouseButtonEventArgs(
-                PreviewMouseDoubleClickEvent,
-                e.Position,
-                e.ChangedButton,
-                e.ButtonState,
-                e.ClickCount,
-                e.LeftButton,
-                e.MiddleButton,
-                e.RightButton,
-                e.XButton1,
-                e.XButton2,
-                e.KeyboardModifiers,
-                e.Timestamp);
-            control.OnPreviewMouseDoubleClick(args);
-            if (args.Handled)
-                e.Handled = true;
-        }
+        if (e.ClickCount != 2 || e.ChangedButton != MouseButton.Left) return;
+
+        var control = (Control)sender;
+        var args = new MouseButtonEventArgs(
+            PreviewMouseDoubleClickEvent,
+            e.Position,
+            e.ChangedButton,
+            e.ButtonState,
+            e.ClickCount,
+            e.LeftButton,
+            e.MiddleButton,
+            e.RightButton,
+            e.XButton1,
+            e.XButton2,
+            e.KeyboardModifiers,
+            e.Timestamp);
+        control.RaiseEvent(args);
+        if (args.Handled)
+            e.Handled = true;
     }
 
     /// <summary>

@@ -50,6 +50,19 @@ internal static class BindingValueCoercion
             }
         }
 
+        // Convert.ChangeType requires the target type to implement IConvertible — typically
+        // primitives, decimal, DateTime and string. User reference types (Brush, Visibility
+        // descendants, etc.) do not, and ChangeType raises InvalidCastException for every
+        // call against them. The catch below swallows it, but Visual Studio's
+        // "break on thrown CLR exceptions" flag still stops the debugger every time, which
+        // pollutes the user's debugging session even though the binding is otherwise
+        // healthy. Skip the call entirely when the target can't be Convert.ChangeType'd
+        // and let the property setter's own type check decide whether to drop the value.
+        if (!typeof(IConvertible).IsAssignableFrom(underlyingType))
+        {
+            return value;
+        }
+
         try
         {
             return System.Convert.ChangeType(value, underlyingType, culture);

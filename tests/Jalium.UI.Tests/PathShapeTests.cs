@@ -228,6 +228,29 @@ public class PathShapeTests
         Assert.Equal(0, path.MeasureResult.Height);
     }
 
+    [Fact]
+    public void Path_ArrangeOverride_ShouldReturnFinalSize_WhenStretchUniformAndAspectRatiosDiffer()
+    {
+        // ComboBox chevron geometry is wider than tall (1126x842). Without this
+        // invariant, ArrangeOverride returned the aspect-uniform stretched box
+        // (e.g. 8x6 for an 8x8 slot), so RenderSize was 8x6 and a
+        // RotateTransform with RenderTransformOrigin=(0.5,0.5) rotated around
+        // (4,3) — off the visual center (4,4) — making the rotated arrow drift
+        // outside its slot.
+        var path = new TestPath
+        {
+            Data = "M 0,0 L 1126,0 L 563,842 Z",
+            Width = 8,
+            Height = 8,
+            Stretch = ShapeStretch.Uniform
+        };
+        path.Measure(new Size(8, 8));
+        path.Arrange(new Rect(0, 0, 8, 8));
+
+        Assert.Equal(8, path.RenderSize.Width);
+        Assert.Equal(8, path.RenderSize.Height);
+    }
+
     #endregion
 
     #region Negative scale / FlipSweep tests

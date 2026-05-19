@@ -14,9 +14,9 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
     <!-- Versioning -->
-    <Version>26.10.2</Version>
-    <AssemblyVersion>26.10.2.0</AssemblyVersion>
-    <FileVersion>26.10.2.0</FileVersion>
+    <Version>26.10.3</Version>
+    <AssemblyVersion>26.10.3.0</AssemblyVersion>
+    <FileVersion>26.10.3.0</FileVersion>
 
     <!-- NuGet Package Metadata -->
     <Authors>Jal</Authors>
@@ -58,5 +58,25 @@
   <!-- Include README.md in all packages -->
   <ItemGroup Condition="'$(IsPackable)' == 'true'">
     <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!--
+    Make MSBuildProjectDirectory and RootNamespace visible to Roslyn analyzers so the
+    JALXAML SourceGenerator can compute the canonical manifest resource name for each
+    AdditionalFiles entry. The SDK does not expose these properties to analyzers by
+    default; CompilerVisibleProperty is the supported opt-in.
+  -->
+  <ItemGroup>
+    <CompilerVisibleProperty Include="MSBuildProjectDirectory" />
+    <CompilerVisibleProperty Include="RootNamespace" />
+    <CompilerVisibleProperty Include="AssemblyName" />
+    <!--
+      Surface the JalxamlSourceRelativePath metadata to the SG so it can compute the
+      original (pre-Razor-transform) jalxaml path for each AdditionalFiles entry. The
+      metadata is set inside Jalium.UI.Build.targets:PrepareJalxamlForSourceGenerator.
+      Without this opt-in the SG only sees the intermediate location under obj/, which
+      yields wrong StartupUri / manifest-resource spellings for transformed files.
+    -->
+    <CompilerVisibleItemMetadata Include="AdditionalFiles" MetadataName="JalxamlSourceRelativePath" />
   </ItemGroup>
 </Project>

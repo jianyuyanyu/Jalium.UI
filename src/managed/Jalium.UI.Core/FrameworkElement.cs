@@ -1223,8 +1223,35 @@ public partial class FrameworkElement : UIElement
             var child = GetVisualChild(i);
             if (child is FrameworkElement fe)
             {
-                // Pass the localPoint to children since their bounds are relative to us
-                var childResult = fe.HitTestCore(localPoint);
+                // 若子有 RenderTransform，将 localPoint 反向变换到子的"原始"局部空间，
+                // 与渲染时父对子做 PushTransform(child.RenderTransform, originX, originY)
+                // 对偶。否则缩放/平移过的子（如 ZoomableCanvas 内部的 Canvas）的
+                // _visualBounds.Contains(point) 永远不命中，鼠标位置和可见控件错位。
+                var pointForChild = localPoint;
+                var childTransform = fe.RenderTransform;
+                if (childTransform != null)
+                {
+                    var matrix = childTransform.Value;
+                    if (matrix.TryInvert(out var inv))
+                    {
+                        // Transform 围绕 (child._visualBounds.position + origin*RenderSize) 应用
+                        var origin = fe.RenderTransformOrigin;
+                        var size = fe.RenderSize;
+                        var originAbsX = fe._visualBounds.X + origin.X * size.Width;
+                        var originAbsY = fe._visualBounds.Y + origin.Y * size.Height;
+
+                        var translated = new Point(localPoint.X - originAbsX, localPoint.Y - originAbsY);
+                        var inverted = inv.Transform(translated);
+                        pointForChild = new Point(inverted.X + originAbsX, inverted.Y + originAbsY);
+                    }
+                    else
+                    {
+                        // 非可逆 transform (例如 ScaleTransform 0)，子整体不可见
+                        continue;
+                    }
+                }
+
+                var childResult = fe.HitTestCore(pointForChild);
                 if (childResult != null)
                 {
                     return childResult;

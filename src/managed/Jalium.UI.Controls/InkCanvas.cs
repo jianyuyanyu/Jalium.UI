@@ -86,6 +86,16 @@ public class InkCanvas : FrameworkElement
     /// </summary>
     private const double MinPointDistance = 2.0;
 
+    /// <summary>
+    /// Upper bound on the number of resampled points uploaded to the GPU
+    /// brush polyline buffer. <c>SdfPolyline</c> in the brush HLSL preamble
+    /// is O(N) per pixel (two passes), so an unbounded resample on a
+    /// long stroke would tank fill-rate. 2048 covers a freehand stroke
+    /// that spans the canvas at ~1 px step and still keeps the per-pixel
+    /// shader cost in the GPU's noise floor.
+    /// </summary>
+    private const int MaxResampledStrokePoints = 2048;
+
     #endregion
 
     #region Dependency Properties
@@ -1095,8 +1105,8 @@ public class InkCanvas : FrameworkElement
         if (target is null || !target.IsValid) return;
         if (stroke is null) return;
 
-        int count = stroke.StylusPoints.Count;
-        if (count < 2) return;
+        int rawCount = stroke.StylusPoints.Count;
+        if (rawCount < 2) return;
 
         var attrs = stroke.DrawingAttributes;
         var shader = attrs.BrushShader ?? BrushShaderRegistry.GetBuiltIn(attrs.BrushType);
@@ -1104,14 +1114,54 @@ public class InkCanvas : FrameworkElement
         if (handle is null) return;
 
         // Marshal stylus points into the native-layout array (16 B each).
-        if (_strokePointsScratch is null || _strokePointsScratch.Length < count)
-            _strokePointsScratch = ArrayPool<BrushStrokePoint>.Shared.Rent(Math.Max(count, 64));
-        var scratch = _strokePointsScratch;
-        for (int i = 0; i < count; i++)
+        // The GPU brush HLSL (SdfPolyline) treats consecutive points as a
+        // straight segment with no curve fitting, so raw input — typically
+        // 5–15 px apart at fast drag speeds — would render as a visible
+        // polygon. When FitToCurve is enabled we Catmull-Rom-resample the
+        // polyline at sub-stroke-radius density before upload so the
+        // segment SDFs blend into a smooth curve. Eraser strokes go through
+        // the same pipeline and benefit identically.
+        int count;
+        bool resample = attrs.FitToCurve && rawCount >= 3;
+        if (resample)
         {
-            var sp = stroke.StylusPoints[i];
-            scratch[i] = new BrushStrokePoint((float)sp.X, (float)sp.Y, sp.PressureFactor);
+            // Step ≈ half the brush radius (clamped at 1 px). Below this,
+            // adjacent segment SDFs are within the 1-px AA falloff so the
+            // polyline reads as a continuous curve. Wider brushes get a
+            // larger step — visual tolerance scales with stroke width.
+            double stepSize = Math.Max(1.0, Math.Min(attrs.Width, attrs.Height) * 0.5);
+
+            // EnumerateSmoothedPath emits (steps+1) samples per raw segment
+            // and shares endpoints between segments. Worst case is
+            // ≈ rawCount + arcLength/stepSize, but the absolute ceiling
+            // keeps SdfPolyline's per-pixel loop bounded. Rent the full
+            // ceiling up front so the inner loop never has to grow + copy.
+            if (_strokePointsScratch is null || _strokePointsScratch.Length < MaxResampledStrokePoints)
+                _strokePointsScratch = ArrayPool<BrushStrokePoint>.Shared.Rent(MaxResampledStrokePoints);
+
+            int collected = 0;
+            foreach (var smoothPt in stroke.EnumerateSmoothedPath(stepSize))
+            {
+                if (collected >= MaxResampledStrokePoints) break;
+                _strokePointsScratch[collected++] = new BrushStrokePoint(
+                    (float)smoothPt.X, (float)smoothPt.Y, (float)smoothPt.Pressure);
+            }
+            count = collected;
+            if (count < 2) return;
         }
+        else
+        {
+            if (_strokePointsScratch is null || _strokePointsScratch.Length < rawCount)
+                _strokePointsScratch = ArrayPool<BrushStrokePoint>.Shared.Rent(Math.Max(rawCount, 64));
+            for (int i = 0; i < rawCount; i++)
+            {
+                var sp = stroke.StylusPoints[i];
+                _strokePointsScratch[i] = new BrushStrokePoint(
+                    (float)sp.X, (float)sp.Y, sp.PressureFactor);
+            }
+            count = rawCount;
+        }
+        var scratch = _strokePointsScratch!;
 
         // Build the 80-byte BrushConstants cbuffer. Color is premultiplied
         // here so SourceOver-blend shaders can output `StrokeColor * cov`

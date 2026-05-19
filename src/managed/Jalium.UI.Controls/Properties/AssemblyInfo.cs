@@ -3,6 +3,10 @@ using Jalium.UI.Markup;
 
 [assembly: InternalsVisibleTo("Jalium.UI.Xaml")]
 [assembly: InternalsVisibleTo("Jalium.UI.Tests")]
+// Platform integration packages implement INotificationBackend directly and
+// need access to internal handle/helper members in Notifications/.
+[assembly: InternalsVisibleTo("Jalium.UI.Desktop")]
+[assembly: InternalsVisibleTo("Jalium.UI.Android")]
 
 // Expose CLR namespaces defined in Jalium.UI.Controls under the canonical JALXAML namespace.
 [assembly: XmlnsDefinition(JalxamlNamespaces.Presentation, "Jalium.UI")]

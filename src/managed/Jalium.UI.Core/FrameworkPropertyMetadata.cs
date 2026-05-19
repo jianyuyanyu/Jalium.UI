@@ -34,6 +34,15 @@ public class FrameworkPropertyMetadata : UIPropertyMetadata
     public bool AffectsRender { get; set; }
     public bool AffectsParentMeasure { get; set; }
     public bool AffectsParentArrange { get; set; }
+    /// <summary>
+    /// When set, changes to this property are treated as a composition-only invalidation:
+    /// the parent's child-render loop reads the live property value via PushOpacity /
+    /// PushTransform / PushClip each frame, so the cached drawing of this visual stays
+    /// valid. The framework will trigger <see cref="UIElement.InvalidateComposition"/>
+    /// instead of <see cref="UIElement.InvalidateVisual()"/> for animation ticks and
+    /// fallback paths. Implies <c>AffectsRender</c>.
+    /// </summary>
+    public bool AffectsCompositionOnly { get; set; }
     public bool BindsTwoWayByDefault { get; set; }
     public bool IsNotDataBindable { get; set; }
     public bool SubPropertiesDoNotAffectRender { get; set; }
@@ -48,6 +57,7 @@ public class FrameworkPropertyMetadata : UIPropertyMetadata
         AffectsRender = (flags & FrameworkPropertyMetadataOptions.AffectsRender) != 0;
         AffectsParentMeasure = (flags & FrameworkPropertyMetadataOptions.AffectsParentMeasure) != 0;
         AffectsParentArrange = (flags & FrameworkPropertyMetadataOptions.AffectsParentArrange) != 0;
+        AffectsCompositionOnly = (flags & FrameworkPropertyMetadataOptions.AffectsCompositionOnly) != 0;
         BindsTwoWayByDefault = (flags & FrameworkPropertyMetadataOptions.BindsTwoWayByDefault) != 0;
         IsNotDataBindable = (flags & FrameworkPropertyMetadataOptions.NotDataBindable) != 0;
         Journal = (flags & FrameworkPropertyMetadataOptions.Journal) != 0;
@@ -88,4 +98,12 @@ public enum FrameworkPropertyMetadataOptions
     BindsTwoWayByDefault = 0x100,
     Journal = 0x400,
     SubPropertiesDoNotAffectRender = 0x800,
+    /// <summary>
+    /// Property changes only affect how the parent composites this element
+    /// (Opacity / RenderTransform / RenderTransformOrigin); the element's
+    /// recorded command list is unchanged, so the framework triggers a
+    /// composition-only invalidation that does not flip the retained-mode
+    /// render-dirty flag. See <see cref="UIElement.InvalidateComposition"/>.
+    /// </summary>
+    AffectsCompositionOnly = 0x1000,
 }

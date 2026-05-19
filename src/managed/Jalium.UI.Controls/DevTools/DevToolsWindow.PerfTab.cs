@@ -11,6 +11,7 @@ public partial class DevToolsWindow
     private TextBlock? _perfEngineText;
     private TextBlock? _perfFpsText;
     private TextBlock? _perfGpuText;
+    private TextBlock? _perfApiStatsText;
     private Border? _perfGraphHost;
     private DispatcherTimer? _perfRefreshTimer;
     private Image? _perfGraphImage;
@@ -87,7 +88,12 @@ public partial class DevToolsWindow
         Grid.SetRow(legendRow, 2);
         root.Children.Add(legendRow);
 
-        // ── GPU stats ──
+        // ── Bottom panel: GPU snapshot (left, fixed-ish) +
+        //     per-API call counters / timing (right, fills remainder) ──
+        var bottomGrid = new Grid();
+        bottomGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(280) });
+        bottomGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
         _perfGpuText = new TextBlock
         {
             Text = "GPU: (no snapshot published)",
@@ -102,12 +108,36 @@ public partial class DevToolsWindow
             BorderThickness = DevToolsTheme.ThicknessHairline,
             CornerRadius = DevToolsTheme.RadiusBase,
             Padding = new Thickness(DevToolsTheme.GutterLg, DevToolsTheme.GutterBase, DevToolsTheme.GutterLg, DevToolsTheme.GutterBase),
-            Margin = new Thickness(DevToolsTheme.GutterBase, 0, DevToolsTheme.GutterBase, DevToolsTheme.GutterBase),
+            Margin = new Thickness(DevToolsTheme.GutterBase, 0, DevToolsTheme.GutterSm, DevToolsTheme.GutterBase),
             Child = new ScrollViewer { Content = _perfGpuText, VerticalScrollBarVisibility = ScrollBarVisibility.Auto },
             ClipToBounds = true,
         };
-        Grid.SetRow(gpuCard, 3);
-        root.Children.Add(gpuCard);
+        Grid.SetColumn(gpuCard, 0);
+        bottomGrid.Children.Add(gpuCard);
+
+        _perfApiStatsText = new TextBlock
+        {
+            Text = "Draw API stats: (waiting for first frame)",
+            FontSize = DevToolsTheme.FontSm,
+            FontFamily = DevToolsTheme.MonoFont,
+            Foreground = DevToolsTheme.TextPrimary,
+        };
+        var apiCard = new Border
+        {
+            Background = DevToolsTheme.SurfaceAlt,
+            BorderBrush = DevToolsTheme.BorderSubtle,
+            BorderThickness = DevToolsTheme.ThicknessHairline,
+            CornerRadius = DevToolsTheme.RadiusBase,
+            Padding = new Thickness(DevToolsTheme.GutterLg, DevToolsTheme.GutterBase, DevToolsTheme.GutterLg, DevToolsTheme.GutterBase),
+            Margin = new Thickness(DevToolsTheme.GutterSm, 0, DevToolsTheme.GutterBase, DevToolsTheme.GutterBase),
+            Child = new ScrollViewer { Content = _perfApiStatsText, VerticalScrollBarVisibility = ScrollBarVisibility.Auto },
+            ClipToBounds = true,
+        };
+        Grid.SetColumn(apiCard, 1);
+        bottomGrid.Children.Add(apiCard);
+
+        Grid.SetRow(bottomGrid, 3);
+        root.Children.Add(bottomGrid);
 
         return new Border
         {
@@ -146,6 +176,11 @@ public partial class DevToolsWindow
 
     partial void OnPerfTabActivated()
     {
+        // Turn on per-frame draw-API counters while the Perf tab is visible.
+        // Window.RenderFrame's end-of-frame hook publishes them, RefreshPerfStats
+        // renders the snapshot. The flag is the only thing gating the recording
+        // overhead — outside DevTools we pay nothing.
+        RenderDiagnostics.ApiStatsEnabled = true;
         RefreshPerfStats();
         if (_perfRefreshTimer == null)
         {
@@ -226,14 +261,132 @@ public partial class DevToolsWindow
             }
             else
             {
-                _perfGpuText.Text = string.Join('\n', new[]
+                var cache = RenderDiagnostics.LatestPathCacheStats;
+                var lines = new List<string>();
+
+                // Last-frame breakdown — Layout / Render / Present from FrameHistory
+                // versus Draw API total time. The gap between RenderMs and the
+                // Draw-API sum is "render-but-not-Draw-API" cost: command recording
+                // in RenderTargetDrawingContext, ImageBrush tile placement, brush
+                // marshaling, retained-mode cache lookups, etc. — anything between
+                // BeginDraw and EndDraw that's NOT a single P/Invoke wrapped in
+                // ApiStart/ApiEnd. A large gap means the bottleneck is on the
+                // managed command-recording side, not the native draw calls.
+                if (count > 0)
                 {
-                    $"GPU snapshot  {snap.Timestamp:HH:mm:ss.fff}",
-                    $"  Glyph atlas   {snap.GlyphAtlasSlotsUsed}/{snap.GlyphAtlasSlotsTotal} slots    {(snap.GlyphAtlasBytes / (1024.0 * 1024.0)):F2} MB",
-                    $"  Path cache    {snap.PathCacheEntries} entries           {(snap.PathCacheBytes / (1024.0 * 1024.0)):F2} MB",
-                    $"  Textures      {snap.TextureCount}                        {(snap.TextureBytes / (1024.0 * 1024.0)):F2} MB",
-                });
+                    var last = buffer[count - 1];
+                    var apiSnapForGap = RenderDiagnostics.LatestDrawApiStats;
+                    double apiMs = apiSnapForGap?.TotalMs ?? 0;
+                    double renderGap = last.RenderMs - apiMs;
+                    lines.Add($"Last frame  L {last.LayoutMs,5:F1}  R {last.RenderMs,5:F1}  P {last.PresentMs,5:F1}  total {last.TotalMs,5:F1} ms");
+                    lines.Add($"            Draw API total  {apiMs,5:F1} ms    gap {renderGap,5:F1} ms (managed recording / brush marshaling)");
+                    lines.Add("");
+                }
+
+                lines.Add($"GPU snapshot  {snap.Timestamp:HH:mm:ss.fff}");
+                lines.Add($"  Glyph atlas   {snap.GlyphAtlasSlotsUsed}/{snap.GlyphAtlasSlotsTotal} slots    {(snap.GlyphAtlasBytes / (1024.0 * 1024.0)):F2} MB");
+                lines.Add($"  Path cache    {snap.PathCacheEntries} entries           {(snap.PathCacheBytes / (1024.0 * 1024.0)):F2} MB");
+                lines.Add($"  Textures      {snap.TextureCount}                        {(snap.TextureBytes / (1024.0 * 1024.0)):F2} MB");
+                if (cache != null)
+                {
+                    long strokeTotal = cache.StrokeHits + cache.StrokeMisses;
+                    long fillTotal   = cache.FillHits + cache.FillMisses;
+                    long geomTotal   = cache.GeometryHits + cache.GeometryMisses;
+                    double strokeHitPct = strokeTotal == 0 ? 0 : (double)cache.StrokeHits / strokeTotal * 100;
+                    double fillHitPct   = fillTotal == 0 ? 0 : (double)cache.FillHits / fillTotal * 100;
+                    double geomHitPct   = geomTotal == 0 ? 0 : (double)cache.GeometryHits / geomTotal * 100;
+                    lines.Add("");
+                    lines.Add("Path raster cache (per frame)");
+                    lines.Add($"  Stroke   hit {cache.StrokeHits,4}  miss {cache.StrokeMisses,4}  ({strokeHitPct:F0}%)");
+                    lines.Add($"  Fill     hit {cache.FillHits,4}  miss {cache.FillMisses,4}  ({fillHitPct:F0}%)");
+                    if (geomTotal > 0)
+                        lines.Add($"  Geometry hit {cache.GeometryHits,4}  miss {cache.GeometryMisses,4}  ({geomHitPct:F0}%)  evict {cache.CacheEvictions}");
+                    if (cache.StrokeHits > 0)
+                        lines.Add($"  Stroke rects/hit avg  {(cache.StrokeRectsTotal / (double)cache.StrokeHits):F0}");
+                    if (cache.FillHits > 0)
+                        lines.Add($"  Fill   rects/hit avg  {(cache.FillRectsTotal / (double)cache.FillHits):F0}");
+
+                    long flattenCalls = strokeTotal - cache.StrokeHits + fillTotal - cache.FillHits + cache.GeometryMisses;
+                    if (cache.FlattenNs > 0 || cache.TriangulateNs > 0)
+                    {
+                        lines.Add("");
+                        lines.Add("Path CPU work (per frame)");
+                        double flattenMs  = cache.FlattenNs    / 1_000_000.0;
+                        double triangMs   = cache.TriangulateNs / 1_000_000.0;
+                        double flattenAvgUs = flattenCalls > 0 ? cache.FlattenNs / 1000.0 / flattenCalls : 0;
+                        long triangCalls = cache.TriangulateOk + cache.TriangulateFail;
+                        double triangAvgUs = triangCalls > 0 ? cache.TriangulateNs / 1000.0 / triangCalls : 0;
+                        lines.Add($"  Flatten     {flattenMs,6:F2} ms  avg {flattenAvgUs,5:F0} µs  verts {cache.FlattenOutputVerts}");
+                        lines.Add($"  Triangulate {triangMs,6:F2} ms  avg {triangAvgUs,5:F0} µs  ok {cache.TriangulateOk}  fail {cache.TriangulateFail}");
+                    }
+                }
+                var bmpStats = RenderDiagnostics.LatestBitmapUploadStats;
+                if (bmpStats != null)
+                {
+                    long total = bmpStats.UploadCount + bmpStats.FastPathHits;
+                    double fastPct = total == 0 ? 0 : (double)bmpStats.FastPathHits / total * 100;
+                    lines.Add("");
+                    lines.Add("Bitmap upload (per frame)");
+                    lines.Add($"  Uploads  {bmpStats.UploadCount,4}  ({(bmpStats.UploadBytes / (1024.0 * 1024.0)):F2} MB,  {bmpStats.DynamicReuses} reuses)");
+                    lines.Add($"  FastPath {bmpStats.FastPathHits,4}  ({fastPct:F0}% of DrawBitmap calls)");
+                    lines.Add($"  Memcmp   {bmpStats.MemcmpShortCircuits,4}  short-circuits (Set/Update with same content)");
+                    string residentSign = bmpStats.GpuResidentBytes >= 0 ? "+" : "";
+                    lines.Add($"  GpuRes   {residentSign}{(bmpStats.GpuResidentBytes / (1024.0 * 1024.0)):F2} MB  net delta this frame");
+                    if (bmpStats.CacheEvictions != 0)
+                        lines.Add($"  Cache    {bmpStats.CacheEvictions,4} evictions");
+                }
+                var retCache = RenderDiagnostics.LatestRetainedCacheStats;
+                if (retCache != null)
+                {
+                    long retTotal = retCache.Records + retCache.Replays + retCache.Bypasses;
+                    double replayPct = retTotal == 0 ? 0 : (double)retCache.Replays / retTotal * 100;
+                    lines.Add("");
+                    lines.Add("Retained-mode cache (per frame)");
+                    lines.Add($"  Records  {retCache.Records,5}  (cache miss / dirty / first time)");
+                    lines.Add($"  Replays  {retCache.Replays,5}  ({replayPct:F0}% — the win)");
+                    lines.Add($"  Bypass   {retCache.Bypasses,5}  (host off / opted out / non-cacheable DC)");
+                }
+                _perfGpuText.Text = string.Join('\n', lines);
                 _perfGpuText.Foreground = DevToolsTheme.TextPrimary;
+            }
+        }
+
+        // ── Draw-API per-frame counters ──
+        var apiSnap = RenderDiagnostics.LatestDrawApiStats;
+        if (_perfApiStatsText != null)
+        {
+            if (apiSnap == null || apiSnap.Entries.Count == 0)
+            {
+                _perfApiStatsText.Text = "Draw API stats: (waiting for next frame…)";
+                _perfApiStatsText.Foreground = DevToolsTheme.TextMuted;
+            }
+            else
+            {
+                // Header + sorted entries (hot-first). One row per native draw API,
+                // showing call count and total wall-clock time spent inside the
+                // managed wrapper + native call. Column widths chosen so the
+                // values line up under a fixed-width font in the bottom panel.
+                var sb = new System.Text.StringBuilder(256 + apiSnap.Entries.Count * 80);
+                sb.Append("Draw APIs  ").Append(apiSnap.Timestamp.ToString("HH:mm:ss.fff"))
+                  .Append("    last frame total ")
+                  .AppendFormat(System.Globalization.CultureInfo.InvariantCulture, "{0:F2}", apiSnap.TotalMs)
+                  .Append(" ms\n");
+                sb.Append("  ").Append("API".PadRight(28))
+                  .Append("calls".PadLeft(8))
+                  .Append("total ms".PadLeft(12))
+                  .Append("avg µs".PadLeft(10))
+                  .Append('\n');
+                sb.Append("  ").Append(new string('-', 58)).Append('\n');
+                foreach (var e in apiSnap.Entries)
+                {
+                    sb.Append("  ").Append(e.Name.PadRight(28))
+                      .Append(e.Count.ToString().PadLeft(8))
+                      .AppendFormat(System.Globalization.CultureInfo.InvariantCulture, "{0,12:F2}", e.TotalMs)
+                      .AppendFormat(System.Globalization.CultureInfo.InvariantCulture, "{0,10:F1}", e.AvgUs)
+                      .Append('\n');
+                }
+                _perfApiStatsText.Text = sb.ToString();
+                _perfApiStatsText.Foreground = DevToolsTheme.TextPrimary;
             }
         }
     }

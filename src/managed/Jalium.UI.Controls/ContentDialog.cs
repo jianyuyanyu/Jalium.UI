@@ -943,6 +943,7 @@ public class ContentDialog : ContentControl
 
         _dialogCard.HorizontalAlignment = HorizontalAlignment.Center;
         _dialogCard.VerticalAlignment = VerticalAlignment.Center;
+
         var viewport = ResolveViewportSize();
         var availableCardWidth = viewport.Width > 0
             ? Math.Max(0, viewport.Width - (DefaultDialogMargin * 2))
@@ -955,29 +956,35 @@ public class ContentDialog : ContentControl
         var explicitHeight = NormalizeExplicitLength(Height);
         var hasExplicitWidth = !double.IsNaN(explicitWidth);
         var hasExplicitHeight = !double.IsNaN(explicitHeight);
-        var hasExplicitMinWidth = MinWidth > 0;
-        var hasExplicitMinHeight = MinHeight > 0;
-        var hasExplicitMaxWidth = HasExplicitMaximum(MaxWidth);
-        var hasExplicitMaxHeight = HasExplicitMaximum(MaxHeight);
-
-        var requestedMinWidth = hasExplicitMinWidth
-            ? MinWidth
-            : hasExplicitWidth ? 0.0 : DefaultDialogCardMinWidth;
-        var requestedMinHeight = hasExplicitMinHeight ? MinHeight : 0.0;
-        var requestedMaxWidth = hasExplicitMaxWidth
-            ? MaxWidth
-            : double.PositiveInfinity;
-        var requestedMaxHeight = hasExplicitMaxHeight ? MaxHeight : double.PositiveInfinity;
-
-        var effectiveMaxWidth = ClampMaximumToAvailable(requestedMaxWidth, availableCardWidth);
-        var effectiveMaxHeight = ClampMaximumToAvailable(requestedMaxHeight, availableCardHeight);
 
         _dialogCard.Width = hasExplicitWidth ? explicitWidth : double.NaN;
         _dialogCard.Height = hasExplicitHeight ? explicitHeight : double.NaN;
-        _dialogCard.MinWidth = ClampMinimumToMaximum(requestedMinWidth, effectiveMaxWidth);
-        _dialogCard.MinHeight = ClampMinimumToMaximum(requestedMinHeight, effectiveMaxHeight);
-        _dialogCard.MaxWidth = effectiveMaxWidth;
-        _dialogCard.MaxHeight = effectiveMaxHeight;
+
+        // 关键修复：仅在用户显式在 <ContentDialog> 上设置 Min/Max 尺寸时才下推到 PART_DialogCard，
+        // 否则尊重模板里声明的默认值（Themes/Controls/Dialogs.jalxaml 里 Card 自带 MinWidth=320 /
+        // MaxWidth=560）。早期实现无条件把 MaxWidth/MaxHeight 设为"viewport-48"，导致 Card 被
+        // 无上限拉到接近整个窗口宽，视觉上像撑满 viewport — 这是设计 bug 不是预期行为。
+        //
+        // 当 viewport 比模板上限还小时，Card 的 measure 阶段会自然受 parent availableSize 限制，
+        // 不会真的渲染到 560 宽，所以无需在这里手动 clamp 到 viewport。ClipToBounds=true 仅作为
+        // 兜底防御。
+        if (MinWidth > 0)
+        {
+            _dialogCard.MinWidth = MinWidth;
+        }
+        if (MinHeight > 0)
+        {
+            _dialogCard.MinHeight = MinHeight;
+        }
+        if (HasExplicitMaximum(MaxWidth))
+        {
+            _dialogCard.MaxWidth = ClampMaximumToAvailable(MaxWidth, availableCardWidth);
+        }
+        if (HasExplicitMaximum(MaxHeight))
+        {
+            _dialogCard.MaxHeight = ClampMaximumToAvailable(MaxHeight, availableCardHeight);
+        }
+
         _dialogCard.ClipToBounds = true;
     }
 

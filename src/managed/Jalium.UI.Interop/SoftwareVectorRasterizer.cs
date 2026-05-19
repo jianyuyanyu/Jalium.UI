@@ -12,12 +12,22 @@ internal static class SoftwareVectorRasterizer
     /// Rasterizes a Drawing into a BGRA8 pixel buffer at the specified size.
     /// Returns null if the drawing cannot be rasterized.
     /// </summary>
-    public static byte[]? Rasterize(Drawing drawing, int width, int height)
+    /// <param name="drawing">The drawing tree to rasterize.</param>
+    /// <param name="width">Target pixel width.</param>
+    /// <param name="height">Target pixel height.</param>
+    /// <param name="sourceBounds">
+    /// The source viewport rectangle to map onto the target buffer. For
+    /// <see cref="SvgImage"/> this must be <c>(0, 0, svg.Width, svg.Height)</c>
+    /// so that SVG viewport spacing is preserved. When <see langword="null"/>,
+    /// falls back to <see cref="Drawing.Bounds"/>, which only covers the actual
+    /// geometry and will distort content that relies on viewport whitespace.
+    /// </param>
+    public static byte[]? Rasterize(Drawing drawing, int width, int height, Rect? sourceBounds = null)
     {
         if (drawing == null || width <= 0 || height <= 0)
             return null;
 
-        var bounds = drawing.Bounds;
+        var bounds = sourceBounds ?? drawing.Bounds;
         if (bounds.IsEmpty || bounds.Width <= 0 || bounds.Height <= 0)
             return null;
 

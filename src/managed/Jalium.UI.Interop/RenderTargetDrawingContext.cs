@@ -1950,18 +1950,32 @@ public sealed class RenderTargetDrawingContext : DrawingContext, IOffsetDrawingC
     {
         if (_closed || imageSource == null) return;
 
-        // Handle vector image sources by rendering the Drawing tree directly
-        Drawing? vectorDrawing = imageSource switch
+        // Handle vector image sources by rendering the Drawing tree directly.
+        // Source viewport is used instead of geometry bounds — for SVG, the
+        // viewport is the (0, 0, width, height) rect that determines the
+        // intended whitespace around content. Using geometry bounds would
+        // stretch the visible geometry to fill the target rect, breaking
+        // centering (e.g. settings cog) and clipping content positioned at
+        // the viewport edges (e.g. notification bell decorations).
+        Drawing? vectorDrawing = null;
+        Rect vectorViewport = Rect.Empty;
+        switch (imageSource)
         {
-            SvgImage svg => svg.Drawing,
-            DrawingImage di => di.Drawing,
-            _ => null
-        };
+            case SvgImage svg when svg.Drawing != null:
+                vectorDrawing = svg.Drawing;
+                vectorViewport = (svg.Width > 0 && svg.Height > 0)
+                    ? new Rect(0, 0, svg.Width, svg.Height)
+                    : svg.Drawing.Bounds;
+                break;
+            case DrawingImage di when di.Drawing != null:
+                vectorDrawing = di.Drawing;
+                vectorViewport = di.Drawing.Bounds;
+                break;
+        }
         if (vectorDrawing != null)
         {
             var drawing = vectorDrawing;
-            var bounds = drawing.Bounds;
-            if (bounds.IsEmpty || bounds.Width <= 0 || bounds.Height <= 0) return;
+            if (vectorViewport.IsEmpty || vectorViewport.Width <= 0 || vectorViewport.Height <= 0) return;
 
             // Target pixel size for cache key (round to int to avoid sub-pixel churn)
             var targetW = (int)Math.Ceiling(rectangle.Width);
@@ -2004,7 +2018,7 @@ public sealed class RenderTargetDrawingContext : DrawingContext, IOffsetDrawingC
             _svgBoundsCalcTicks = 0;
 
             // Rasterize via CPU software renderer into a BGRA pixel buffer
-            var pixels = SoftwareVectorRasterizer.Rasterize(drawing, targetW, targetH);
+            var pixels = SoftwareVectorRasterizer.Rasterize(drawing, targetW, targetH, vectorViewport);
             BitmapImage? rasterized = null;
             if (pixels != null)
             {
@@ -2034,11 +2048,11 @@ public sealed class RenderTargetDrawingContext : DrawingContext, IOffsetDrawingC
             else
             {
                 // Fallback: direct rendering (slow path)
-                var scaleX = rectangle.Width / bounds.Width;
-                var scaleY = rectangle.Height / bounds.Height;
+                var scaleX = rectangle.Width / vectorViewport.Width;
+                var scaleY = rectangle.Height / vectorViewport.Height;
 
                 var transform = new TransformGroup();
-                transform.Add(new TranslateTransform { X = -bounds.X, Y = -bounds.Y });
+                transform.Add(new TranslateTransform { X = -vectorViewport.X, Y = -vectorViewport.Y });
                 transform.Add(new ScaleTransform { ScaleX = scaleX, ScaleY = scaleY });
                 transform.Add(new TranslateTransform { X = rectangle.X, Y = rectangle.Y });
 

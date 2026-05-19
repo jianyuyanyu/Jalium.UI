@@ -1715,7 +1715,7 @@ public class TreeSelectorItem : HeaderedItemsControl
         {
             _expanderBorder.Visibility = HasItems ? Visibility.Visible : Visibility.Collapsed;
         }
-        SetExpanderAngle(IsExpanded ? 90 : 0);
+        SetExpanderAngle(IsExpanded ? 0 : -90);
     }
 
     private void UpdateExpandedVisualState()
@@ -1724,7 +1724,7 @@ public class TreeSelectorItem : HeaderedItemsControl
         {
             _itemsHost.Visibility = IsExpanded ? Visibility.Visible : Visibility.Collapsed;
         }
-        SetExpanderAngle(IsExpanded ? 90 : 0);
+        SetExpanderAngle(IsExpanded ? 0 : -90);
     }
 
     private void SetExpanderAngle(double angle)

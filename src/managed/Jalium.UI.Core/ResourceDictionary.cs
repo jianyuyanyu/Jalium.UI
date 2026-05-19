@@ -34,6 +34,7 @@ public class ResourceDictionary : IDictionary<object, object?>, IDictionary
         }
     }
 
+
     private readonly Dictionary<object, object?> _innerDictionary = new();
     private readonly MergedDictionaryCollection _mergedDictionaries;
     private Dictionary<object, ResourceDictionary>? _themeDictionaries;

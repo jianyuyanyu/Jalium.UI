@@ -12,12 +12,34 @@ public abstract class DefinitionBase : DependencyObject
     public string? Name { get; set; }
 
     /// <summary>
+    /// 所属 Grid — 由 <see cref="Grid"/> 在 measure 阶段或集合 Add 时设置。
+    /// 用于 Width/Height/MinWidth/... 等 layout DP 变化时通知 Grid 重新 layout。
+    /// 没有这个引用，Grid 不会知道 RowDefinition.Height 或 ColumnDefinition.Width
+    /// 在运行时被改变，会出现"列宽设置后不更新"的脏渲染问题。
+    /// </summary>
+    internal Grid? OwnerGrid { get; set; }
+
+    /// <summary>
+    /// Layout 相关 DP 共享的 PropertyChangedCallback —
+    /// 通知 OwnerGrid 重新 layout + 重绘。
+    /// </summary>
+    internal static void OnLayoutPropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is DefinitionBase def && def.OwnerGrid is { } grid)
+        {
+            grid.InvalidateMeasure();
+            grid.InvalidateArrange();
+            grid.InvalidateVisual();
+        }
+    }
+
+    /// <summary>
     /// Identifies the SharedSizeGroup dependency property.
     /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
     public static readonly DependencyProperty SharedSizeGroupProperty =
         DependencyProperty.Register(nameof(SharedSizeGroup), typeof(string), typeof(DefinitionBase),
-            new PropertyMetadata(null));
+            new PropertyMetadata(null, OnLayoutPropertyChanged));
 
     /// <summary>
     /// Gets or sets a value that identifies a ColumnDefinition or RowDefinition

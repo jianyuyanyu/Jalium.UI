@@ -192,9 +192,9 @@ public partial class Application
         if (ApplicationCtorEnterTimestamp == 0)
             ApplicationCtorEnterTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
 
-        // Optional startup tracing — set JALIUM_STARTUP_TRACE=1 to print one summary
-        // line per major phase to Console.Error.  Off by default, no production cost.
-        bool trace = Environment.GetEnvironmentVariable("JALIUM_STARTUP_TRACE") == "1";
+        // Startup tracing 默认开启:几次 Stopwatch.GetTimestamp + 一次 Trace.WriteLine
+        // 总开销 < 1ms,production 无感;启动诊断值更大。JALIUM_STARTUP_TRACE=0 显式关闭。
+        bool trace = Environment.GetEnvironmentVariable("JALIUM_STARTUP_TRACE") != "0";
         long t0 = trace ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         long tDpi = 0, tDispatcher = 0, tKeyboard = 0, tTheme = 0, tToolTip = 0, tInitComponent = 0;
 
@@ -292,7 +292,7 @@ public partial class Application
         {
             static long Ms(long start, long end) =>
                 (long)System.Diagnostics.Stopwatch.GetElapsedTime(start, end).TotalMilliseconds;
-            Console.Error.WriteLine(
+            XamlLoadStartupTrace.Emit(
                 $"[Jalium.UI startup] Application ctor: total {Ms(t0, tInitComponent)}ms " +
                 $"(dpi {Ms(t0, tDpi)}ms, dispatcher {Ms(tDpi, tDispatcher)}ms, " +
                 $"keyboard {Ms(tDispatcher, tKeyboard)}ms, theme {Ms(tKeyboard, tTheme)}ms, " +

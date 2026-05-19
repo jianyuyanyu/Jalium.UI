@@ -99,6 +99,21 @@ public abstract class Visual : DependencyObject
     /// </remarks>
     public static IRenderCacheHost? RenderCacheHost { get; set; }
 
+    // Retained-mode cache telemetry — cumulative since process start.
+    // DevTools subtracts last-frame snapshot to expose per-frame deltas via
+    // RenderDiagnostics.RetainedCacheFrameStats. record = had to re-run
+    // OnRender (dirty / first time); replay = served from _cachedDrawing
+    // (the win); bypass = OnRender ran without caching at all (no host /
+    // opted out / non-cacheable DC). When `record` dominates, the visual
+    // tree is being marked dirty every frame — the win is in finding the
+    // invalidation source, not in the cache itself.
+    private static long s_retainedCacheRecords;
+    private static long s_retainedCacheReplays;
+    private static long s_retainedCacheBypasses;
+    public static long RetainedCacheRecordsTotal  => System.Threading.Volatile.Read(ref s_retainedCacheRecords);
+    public static long RetainedCacheReplaysTotal  => System.Threading.Volatile.Read(ref s_retainedCacheReplays);
+    public static long RetainedCacheBypassesTotal => System.Threading.Volatile.Read(ref s_retainedCacheBypasses);
+
     /// <summary>
     /// Whether this Visual participates in the retained-mode drawing cache.
     /// </summary>
@@ -313,6 +328,19 @@ public abstract class Visual : DependencyObject
     }
 
     /// <summary>
+    /// Propagates the subtree-dirty flag up without invalidating this visual's own
+    /// cached drawing. Used by composition-only invalidations (Opacity, RenderTransform,
+    /// RenderTransformOrigin animations) where the parent re-traverses the child loop
+    /// every frame and reads the live property values via PushOpacity / PushTransform,
+    /// so the child's recorded command list remains correct. Skipping the render-dirty
+    /// flip avoids needlessly re-recording OnRender for the animated element.
+    /// </summary>
+    internal void MarkSubtreeDirtyForComposition()
+    {
+        MarkSubtreeDirtyUp();
+    }
+
+    /// <summary>
     /// Propagates the subtree dirty flag to all ancestors.
     /// </summary>
     private void MarkSubtreeDirtyUp()
@@ -489,12 +517,18 @@ public abstract class Visual : DependencyObject
                 var recorder = cacheHost.CreateRecorder(drawingContext);
                 OnRender(recorder);
                 _cachedDrawing = cacheHost.FinishRecord(recorder);
+                System.Threading.Interlocked.Increment(ref s_retainedCacheRecords);
+            }
+            else
+            {
+                System.Threading.Interlocked.Increment(ref s_retainedCacheReplays);
             }
             cacheHost.Replay(_cachedDrawing!, drawingContext);
         }
         else
         {
             OnRender(drawingContext);
+            System.Threading.Interlocked.Increment(ref s_retainedCacheBypasses);
         }
 
         var childCount = VisualChildrenCount;

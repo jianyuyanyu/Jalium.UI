@@ -653,9 +653,13 @@ public sealed class Stroke : INotifyPropertyChanged
     /// <summary>
     /// Iterates smoothed points along the stroke path using Catmull-Rom interpolation.
     /// Yields (x, y, pressure, segmentIndex, segmentT) for each interpolated sample.
-    /// Used by particle brushes to place particles along smooth curves instead of straight lines.
+    /// Used by particle brushes to place particles along smooth curves instead of
+    /// straight lines, and by <see cref="InkCanvas"/> to resample raw input before
+    /// uploading the polyline to the GPU brush pipeline (whose <c>SdfPolyline</c>
+    /// treats consecutive points as line segments — fast-drawn circles need the
+    /// dense, curve-fitted samples to read as smooth instead of polygonal).
     /// </summary>
-    private IEnumerable<(double X, double Y, double Pressure, int SegmentIndex, double SegmentT)>
+    internal IEnumerable<(double X, double Y, double Pressure, int SegmentIndex, double SegmentT)>
         EnumerateSmoothedPath(double stepSize)
     {
         if (_stylusPoints.Count < 2)

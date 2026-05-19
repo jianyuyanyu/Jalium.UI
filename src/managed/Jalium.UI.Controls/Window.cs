@@ -371,6 +371,34 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             new PropertyMetadata(WindowTitleBarStyle.Custom, OnTitleBarStyleChanged));
 
     /// <summary>
+    /// Identifies the <see cref="TitleBarStyleKey"/> dependency property.
+    /// </summary>
+    /// <remarks>
+    /// When set, the value is used as a resource key to look up a <see cref="UI.Style"/>
+    /// from the window's resource tree (via <see cref="FrameworkElement.TryFindResource"/>).
+    /// The resolved style is applied to the custom <see cref="TitleBar"/>. Has no effect
+    /// when <see cref="TitleBarStyle"/> is <see cref="WindowTitleBarStyle.Native"/>.
+    /// If <see cref="CustomTitleBarStyle"/> is also set, that wins over the keyed lookup.
+    /// </remarks>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty TitleBarStyleKeyProperty =
+        DependencyProperty.Register(nameof(TitleBarStyleKey), typeof(object), typeof(Window),
+            new PropertyMetadata(null, OnTitleBarStyleResolutionChanged));
+
+    /// <summary>
+    /// Identifies the <see cref="CustomTitleBarStyle"/> dependency property.
+    /// </summary>
+    /// <remarks>
+    /// Directly assigns a <see cref="UI.Style"/> to the custom <see cref="TitleBar"/>.
+    /// Takes precedence over <see cref="TitleBarStyleKey"/>. Has no effect when
+    /// <see cref="TitleBarStyle"/> is <see cref="WindowTitleBarStyle.Native"/>.
+    /// </remarks>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty CustomTitleBarStyleProperty =
+        DependencyProperty.Register(nameof(CustomTitleBarStyle), typeof(Style), typeof(Window),
+            new PropertyMetadata(null, OnTitleBarStyleResolutionChanged));
+
+    /// <summary>
     /// Identifies the SystemBackdrop dependency property.
     /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
@@ -578,6 +606,32 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     {
         get => (WindowTitleBarStyle)(GetValue(TitleBarStyleProperty) ?? WindowTitleBarStyle.Custom);
         set => SetValue(TitleBarStyleProperty, value);
+    }
+
+    /// <summary>
+    /// Gets or sets a resource key used to look up the <see cref="UI.Style"/> applied to
+    /// the custom <see cref="TitleBar"/>. The key is resolved against this window's
+    /// resource tree; common choices are a string key or <c>typeof(TitleBar)</c>.
+    /// Ignored when <see cref="TitleBarStyle"/> is <see cref="WindowTitleBarStyle.Native"/>,
+    /// and overridden when <see cref="CustomTitleBarStyle"/> is set.
+    /// </summary>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public object? TitleBarStyleKey
+    {
+        get => GetValue(TitleBarStyleKeyProperty);
+        set => SetValue(TitleBarStyleKeyProperty, value);
+    }
+
+    /// <summary>
+    /// Gets or sets the <see cref="UI.Style"/> directly applied to the custom
+    /// <see cref="TitleBar"/>. Takes precedence over <see cref="TitleBarStyleKey"/>.
+    /// Ignored when <see cref="TitleBarStyle"/> is <see cref="WindowTitleBarStyle.Native"/>.
+    /// </summary>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public Style? CustomTitleBarStyle
+    {
+        get => (Style?)GetValue(CustomTitleBarStyleProperty);
+        set => SetValue(CustomTitleBarStyleProperty, value);
     }
 
     /// <summary>
@@ -899,6 +953,30 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     /// </summary>
     public bool AllowsTransparency { get; set; }
 
+    /// <summary>Identifies the AllowTransparentBackground dependency property.</summary>
+    public static readonly DependencyProperty AllowTransparentBackgroundProperty =
+        DependencyProperty.Register(nameof(AllowTransparentBackground), typeof(bool), typeof(Window),
+            new PropertyMetadata(false));
+
+    /// <summary>
+    /// 当 <see cref="SystemBackdrop"/> 为 <see cref="WindowBackdropType.None"/> 时，框架默认会
+    /// 把半透明 <see cref="UIElement.Background"/>（A&lt;255 的 SolidColorBrush 或 null）强制改成
+    /// 不透明，避免 PREMULTIPLIED swap chain 与桌面合成时的"鬼影"伪影（侧边栏文字重影、桌面
+    /// 内容透过控件可见）。设此开关 = <c>true</c> 表示调用方明确接受该风险，框架不再强制不透明：
+    /// <list type="bullet">
+    /// <item><see cref="UIElement.Background"/>=半透明色 → 保留 alpha，DWM 直接合成下方桌面 / 应用</item>
+    /// <item><see cref="UIElement.Background"/>=null → ClearBackground 走 <c>Clear(0,0,0,0)</c> 透明路径</item>
+    /// </list>
+    /// 仅对走 DirectComposition 渲染路径（<see cref="AllowsTransparency"/>=true 触发的
+    /// <c>WS_EX_NOREDIRECTIONBITMAP</c>）的 Window 有意义；非合成路径下设此 flag 不会让 Window 透明。
+    /// </summary>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public bool AllowTransparentBackground
+    {
+        get => (bool)GetValue(AllowTransparentBackgroundProperty)!;
+        set => SetValue(AllowTransparentBackgroundProperty, value);
+    }
+
     /// <summary>
     /// Gets or sets the window that owns this window.
     /// </summary>
@@ -1017,6 +1095,9 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         if (Handle != nint.Zero)
         {
             EnsureImplicitStyles();
+            // Re-resolve TitleBarStyleKey against the (potentially) new resource scope
+            // so theme swaps pick up updated styles even after the explicit assignment.
+            ResolveAndApplyTitleBarStyle();
             InvalidateMeasure();
             RequestFullInvalidation();
         }
@@ -1197,6 +1278,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         }
 
         TitleBar = new TitleBar();
+        ResolveAndApplyTitleBarStyle();
         ApplyTitleBarPresentation();
 
         TitleBar.MinimizeClicked += OnTitleBarMinimizeClicked;
@@ -2164,9 +2246,9 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     /// </summary>
     public virtual void Show()
     {
-        // Optional startup tracing — set JALIUM_STARTUP_TRACE=1 to print one summary
-        // line per major phase to Console.Error.  Off by default, no production cost.
-        bool trace = Environment.GetEnvironmentVariable("JALIUM_STARTUP_TRACE") == "1";
+        // Startup tracing 默认开启:整个 Show 路径加约 9 次 Stopwatch + 几次 Trace.WriteLine,
+        // 总开销 < 1ms,production 无感。JALIUM_STARTUP_TRACE=0 显式关闭。
+        bool trace = Environment.GetEnvironmentVariable("JALIUM_STARTUP_TRACE") != "0";
         long tShowEnter = trace ? Stopwatch.GetTimestamp() : 0;
         long tStyles = 0, tEnsureHandle = 0, tRefreshRate = 0, tStartupLoc = 0;
         long tPrepareSize = 0, tFirstFrame = 0, tShowWindow = 0, tEvents = 0;
@@ -2323,7 +2405,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             }
             catch { /* StartTime can fail under some sandboxes; report only Show-relative timing */ }
 
-            Console.Error.WriteLine(
+            XamlLoadStartupTrace.Emit(
                 $"[Jalium.UI startup] Window.Show: total {Ms(tShowEnter, tEvents)}ms " +
                 $"(styles {Ms(tShowEnter, tStyles)}ms, EnsureHandle {Ms(tStyles, tEnsureHandle)}ms, " +
                 $"refresh-rate {Ms(tEnsureHandle, tRefreshRate)}ms, startup-loc {Ms(tRefreshRate, tStartupLoc)}ms, " +
@@ -2336,7 +2418,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                 ? Ms(appCtorExit, tShowEnter) : 0;
             double frameworkShowMs = Ms(tShowEnter, tShowWindow);
 
-            Console.Error.WriteLine(
+            XamlLoadStartupTrace.Emit(
                 $"[Jalium.UI startup] === PROCESS-START → WINDOW-VISIBLE: {processToVisibleMs:F0}ms === " +
                 $"(process→module {processToModuleLoadMs:F0}ms, " +
                 $"module→app-ctor {moduleLoadToAppCtorMs:F0}ms, " +
@@ -2354,10 +2436,17 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             double xamlTotalMs = xamlTicks > 0
                 ? Stopwatch.GetElapsedTime(0, xamlTicks).TotalMilliseconds
                 : 0;
-            Console.Error.WriteLine(
+            XamlLoadStartupTrace.Emit(
                 $"[Jalium.UI startup]   jalxaml deserialization: {xamlCalls} LoadComponent calls totaling {xamlTotalMs:F0}ms " +
                 $"(avg {(xamlCalls > 0 ? xamlTotalMs / xamlCalls : 0):F1}ms/call)");
         }
+
+        // 详细 Top-N profile — 仅在 JALIUM_XAML_PROFILE=1 或 JALIUM_STARTUP_TRACE=1
+        // 时被启用 (XamlLoadStartupTrace.Enabled),关闭时是一个 ldsfld + brfalse,
+        // 多窗口下用 Interlocked sentinel 保证只输出一次。这里不在 trace 块里
+        // 因为我们想让用户单独通过 JALIUM_XAML_PROFILE=1 也能拿到详细分桶,
+        // 而不必启用整个 startup trace。
+        XamlLoadStartupTrace.DumpTopN();
     }
 
     /// <summary>
@@ -2949,7 +3038,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         }
 
         // ---- Windows code path (Win32) ----
-        bool trace = Environment.GetEnvironmentVariable("JALIUM_STARTUP_TRACE") == "1";
+        bool trace = Environment.GetEnvironmentVariable("JALIUM_STARTUP_TRACE") != "0";
         long tEnter = trace ? Stopwatch.GetTimestamp() : 0;
         long tRegisterClass = 0, tCreateWindow = 0, tSetWindowPos = 0, tEnsureRT = 0, tBackdrop = 0, tOleDrop = 0;
 
@@ -3100,7 +3189,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             static long Ms(long start, long end) =>
                 (long)Stopwatch.GetElapsedTime(start, end).TotalMilliseconds;
             long tExit = Stopwatch.GetTimestamp();
-            Console.Error.WriteLine(
+            XamlLoadStartupTrace.Emit(
                 $"[Jalium.UI startup]   EnsureHandle breakdown: total {Ms(tEnter, tExit)}ms " +
                 $"(register-class {Ms(tEnter, tRegisterClass)}ms, CreateWindowEx {Ms(tRegisterClass, tCreateWindow)}ms, " +
                 $"SetWindowPos {Ms(tCreateWindow, tSetWindowPos)}ms, EnsureRenderTarget {Ms(tSetWindowPos, tEnsureRT)}ms, " +
@@ -4213,7 +4302,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             return;
         }
 
-        bool trace = Environment.GetEnvironmentVariable("JALIUM_STARTUP_TRACE") == "1";
+        bool trace = Environment.GetEnvironmentVariable("JALIUM_STARTUP_TRACE") != "0";
         long tEnter = trace ? Stopwatch.GetTimestamp() : 0;
 
         var requestedBackend = _renderBackendOverride != RenderBackend.Auto
@@ -4268,7 +4357,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             static long Ms(long start, long end) =>
                 (long)Stopwatch.GetElapsedTime(start, end).TotalMilliseconds;
             long tExit = Stopwatch.GetTimestamp();
-            Console.Error.WriteLine(
+            XamlLoadStartupTrace.Emit(
                 $"[Jalium.UI startup]     EnsureRenderTarget: total {Ms(tEnter, tExit)}ms " +
                 $"(GetOrCreateCurrent {Ms(tEnter, tContext)}ms — was the bg prewarm done?, " +
                 $"CreateRenderTarget+swap-chain {Ms(tContext, tExit)}ms)");
@@ -4358,7 +4447,12 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             // this is almost certainly unintentional and causes ghost-image
             // artifacts (sidebar text doubled, desktop bleeding through).
             // Force the background to fully opaque to prevent the bleed-through.
-            if (SystemBackdrop == WindowBackdropType.None &&
+            //
+            // AllowTransparentBackground=true 表示调用方明确想要真透明背景（接受 ghost-image
+            // 风险），跳过强制不透明逻辑——典型场景是浮动 / 拖拽指示器 window 故意要透明
+            // 给用户看到下方内容。
+            if (!AllowTransparentBackground &&
+                SystemBackdrop == WindowBackdropType.None &&
                 Background is Media.SolidColorBrush bgBrush &&
                 bgBrush.Color.A < 255)
             {
@@ -4516,6 +4610,45 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             window.ApplyTitleBarPresentation();
             window.InvalidateMeasure();
             window.UpdateCustomTitleBarFrameMargins();
+        }
+    }
+
+    private static void OnTitleBarStyleResolutionChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is Window window)
+        {
+            window.ResolveAndApplyTitleBarStyle();
+        }
+    }
+
+    /// <summary>
+    /// Resolves the effective <see cref="Style"/> for the custom <see cref="TitleBar"/>
+    /// from <see cref="CustomTitleBarStyle"/> (preferred) or <see cref="TitleBarStyleKey"/>
+    /// (looked up via <see cref="FrameworkElement.TryFindResource"/>), and assigns it to
+    /// <see cref="Controls.TitleBar.Style"/>. Clearing both restores the implicit style.
+    /// </summary>
+    private void ResolveAndApplyTitleBarStyle()
+    {
+        if (TitleBar == null)
+        {
+            return;
+        }
+
+        Style? resolved = CustomTitleBarStyle;
+
+        if (resolved == null)
+        {
+            var key = TitleBarStyleKey;
+            if (key != null)
+            {
+                resolved = TryFindResource(key) as Style;
+            }
+        }
+
+        // Setting Style to null re-engages implicit-style lookup in FrameworkElement.OnStyleChanged.
+        if (!ReferenceEquals(TitleBar.Style, resolved))
+        {
+            TitleBar.Style = resolved;
         }
     }
 
@@ -5976,6 +6109,125 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         return true;
     }
 
+    // Last-frame snapshot of the unified native path-stats struct. We diff
+    // each ulong field against the next frame to publish per-frame deltas
+    // to DevTools. The whole struct is grabbed in one P/Invoke so producers
+    // (D3D12 / Vulkan) and the reader (managed) see a single atomic point.
+    private Interop.NativeMethods.JaliumPathStats _prevPathStats;
+
+    private void PublishPathCacheStatsFromNative()
+    {
+        Interop.NativeMethods.JaliumPathStats cur = default;
+        try
+        {
+            unsafe
+            {
+                Interop.NativeMethods.QueryPathStats(&cur);
+            }
+        }
+        catch
+        {
+            // Backend not loaded / DLL missing — skip stats this frame.
+            return;
+        }
+        var prev = _prevPathStats;
+        _prevPathStats = cur;
+
+        Jalium.UI.Diagnostics.RenderDiagnostics.PublishPathCacheStats(
+            new Jalium.UI.Diagnostics.RenderDiagnostics.PathCacheFrameStats
+            {
+                Timestamp            = DateTime.Now,
+                StrokeHits           = (long)(cur.StrokeHits           - prev.StrokeHits),
+                StrokeMisses         = (long)(cur.StrokeMisses         - prev.StrokeMisses),
+                FillHits             = (long)(cur.FillHits             - prev.FillHits),
+                FillMisses           = (long)(cur.FillMisses           - prev.FillMisses),
+                StrokeRectsTotal     = (long)(cur.StrokeRects          - prev.StrokeRects),
+                FillRectsTotal       = (long)(cur.FillRects            - prev.FillRects),
+                GeometryHits         = (long)(cur.GeometryHits         - prev.GeometryHits),
+                GeometryMisses       = (long)(cur.GeometryMisses       - prev.GeometryMisses),
+                FlattenNs            = (long)(cur.FlattenNs            - prev.FlattenNs),
+                FlattenInputSegments = (long)(cur.FlattenInputSegments - prev.FlattenInputSegments),
+                FlattenOutputVerts   = (long)(cur.FlattenOutputVerts   - prev.FlattenOutputVerts),
+                TriangulateNs        = (long)(cur.TriangulateNs        - prev.TriangulateNs),
+                TriangulateOk        = (long)(cur.TriangulateOk        - prev.TriangulateOk),
+                TriangulateFail      = (long)(cur.TriangulateFail      - prev.TriangulateFail),
+                CacheEvictions       = (long)(cur.CacheEvictions       - prev.CacheEvictions),
+            });
+
+        // Bitmap upload telemetry — same diff-from-last-frame pattern, now
+        // through the unified core ABI (jalium_query_bitmap_stats). Single
+        // struct grab so all 9 counters move in lockstep.
+        Interop.NativeMethods.JaliumBitmapStats curBmp = default;
+        try
+        {
+            unsafe
+            {
+                Interop.NativeMethods.QueryBitmapStats(&curBmp);
+            }
+        }
+        catch
+        {
+            return;
+        }
+        var prevBmp = _prevBitmapStats;
+        _prevBitmapStats = curBmp;
+
+        // Managed-side downscale cache evictions ride alongside native cache
+        // evictions in the unified CacheEvictions field — DevTools doesn't
+        // need to distinguish the source.
+        long managedDownscaleEvictions = Jalium.UI.Diagnostics.RenderDiagnostics.BitmapDownscaleEvictionsTotal;
+        long deltaManagedEvictions = managedDownscaleEvictions - _prevBitmapDownscaleEvictions;
+        _prevBitmapDownscaleEvictions = managedDownscaleEvictions;
+
+        Jalium.UI.Diagnostics.RenderDiagnostics.PublishBitmapUploadStats(
+            new Jalium.UI.Diagnostics.RenderDiagnostics.BitmapUploadFrameStats
+            {
+                Timestamp           = DateTime.Now,
+                UploadCount         = (long)(curBmp.UploadCount         - prevBmp.UploadCount),
+                UploadBytes         = (long)(curBmp.UploadBytes         - prevBmp.UploadBytes),
+                FastPathHits        = (long)(curBmp.FastPathHits        - prevBmp.FastPathHits),
+                DynamicReuses       = (long)(curBmp.DynamicReuses       - prevBmp.DynamicReuses),
+                MemcmpShortCircuits = (long)(curBmp.MemcmpShortCircuits - prevBmp.MemcmpShortCircuits),
+                GpuResidentBytes    = curBmp.GpuResidentBytes - prevBmp.GpuResidentBytes,
+                AtlasHits           = (long)(curBmp.AtlasHits           - prevBmp.AtlasHits),
+                CacheEvictions      = (long)(curBmp.CacheEvictions      - prevBmp.CacheEvictions)
+                                       + deltaManagedEvictions,
+            });
+    }
+
+    // Unified bitmap stats last-frame snapshot — single struct (the C ABI
+    // returns the whole thing in one call so producers and reader observe
+    // a consistent atomic point).
+    private Interop.NativeMethods.JaliumBitmapStats _prevBitmapStats;
+    private long _prevBitmapDownscaleEvictions;
+
+    // Retained-cache last-frame snapshots — Visual.s_retainedCache* are global
+    // counters incremented by every Visual that runs RenderDirect this frame.
+    private long _prevRetainedRecords;
+    private long _prevRetainedReplays;
+    private long _prevRetainedBypasses;
+
+    private void PublishRetainedCacheStatsFromManaged()
+    {
+        long records  = Jalium.UI.Visual.RetainedCacheRecordsTotal;
+        long replays  = Jalium.UI.Visual.RetainedCacheReplaysTotal;
+        long bypasses = Jalium.UI.Visual.RetainedCacheBypassesTotal;
+        long deltaR   = records  - _prevRetainedRecords;
+        long deltaRP  = replays  - _prevRetainedReplays;
+        long deltaB   = bypasses - _prevRetainedBypasses;
+        _prevRetainedRecords  = records;
+        _prevRetainedReplays  = replays;
+        _prevRetainedBypasses = bypasses;
+        Jalium.UI.Diagnostics.RenderDiagnostics.PublishRetainedCacheStats(
+            new Jalium.UI.Diagnostics.RenderDiagnostics.RetainedCacheFrameStats
+            {
+                Timestamp = DateTime.Now,
+                Records  = deltaR,
+                Replays  = deltaRP,
+                Bypasses = deltaB,
+            });
+    }
+
     private bool CompleteEndDrawOrHandleFailure()
     {
         var renderTarget = RenderTarget;
@@ -5997,6 +6249,18 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     gpuStats.GlyphSlotsUsed, gpuStats.GlyphSlotsTotal, gpuStats.GlyphBytes,
                     gpuStats.PathEntries, gpuStats.PathBytes,
                     gpuStats.TextureCount, gpuStats.TextureBytes);
+            }
+            // Per-frame draw-API call counters → DevTools Perf tab. Only
+            // publishes when ApiStatsEnabled (set by the Perf tab while it's
+            // visible) so production frames pay zero overhead.
+            Jalium.UI.Diagnostics.RenderDiagnostics.PublishAndResetApiStats();
+            // Native path-rasterization cache hit/miss counters (D3D12 Impeller).
+            // Cumulative atomics in native — diff against the previous frame's
+            // values to get per-frame deltas.
+            if (Jalium.UI.Diagnostics.RenderDiagnostics.ApiStatsEnabled)
+            {
+                PublishPathCacheStatsFromNative();
+                PublishRetainedCacheStatsFromManaged();
             }
             _lastRenderTicks = Environment.TickCount64;
             ResetRenderRecoveryBackoff();
@@ -6548,15 +6812,18 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         }
 
         // If something requested a render during our rendering
-        // (e.g., UpdateLayout triggered further invalidation),
-        // schedule another render cycle.
+        // (e.g., UpdateLayout triggered further invalidation, or rapid mouse-move
+        // events arrived mid-frame), schedule another render cycle immediately.
+        //
+        // 不再因 CompositionTarget.IsActive 跳过。理由同 InvalidateWindow 的注释：
+        // IsActive 仅表示有任意长寿命订阅者，不代表下一帧一定到。如果跳过，
+        // 中键拖拽/快速 hover 等密集输入产生的 Requested 会被丢弃，表现为
+        // 规律性卡顿——必须等下一次独立输入事件才能 InvalidateWindow。
+        // InvalidateWindow 本身幂等（TrySetRenderFlag），重复调用不会重复渲染。
         if (HasRenderFlag(RenderFlag_Requested))
         {
             ClearRenderFlag(RenderFlag_Requested);
-            if (!CompositionTarget.IsActive)
-            {
-                InvalidateWindow();
-            }
+            InvalidateWindow();
         }
     }
 
@@ -6665,9 +6932,15 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             if (Background is SolidColorBrush solidFull)
             {
                 var c = solidFull.Color;
-                RenderTarget!.Clear(c.R / 255f, c.G / 255f, c.B / 255f, c.A / 255f);
+                // Composition swap chain 用 DXGI_ALPHA_MODE_PREMULTIPLIED：app 必须提供已预乘
+                // alpha 的 RGB（即 RGB *= A）。否则 Colors.Transparent = (R=255, G=255, B=255, A=0)
+                // 这种 WPF 历史习惯的"透明白"会被 DWM 渲染为不透明白色（A=0 被弱化、RGB=255 直接显示）。
+                // 在这里预乘后：(255, 255, 255, 0) → (0, 0, 0, 0)，PREMULTIPLIED 合法值，真透明。
+                // 半透明色如 (255, 0, 0, 128) → (128, 0, 0, 128)，与 swap chain 期望一致。
+                var a = c.A / 255f;
+                RenderTarget!.Clear(c.R / 255f * a, c.G / 255f * a, c.B / 255f * a, a);
             }
-            else if (SystemBackdrop != WindowBackdropType.None)
+            else if (SystemBackdrop != WindowBackdropType.None || AllowTransparentBackground)
             {
                 RenderTarget!.Clear(0.0f, 0.0f, 0.0f, 0.0f);
             }
@@ -6689,6 +6962,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             // overwrite rather than blend.
             if (solidPartial.Color.A == 255)
             {
+                // 不透明色不需要预乘（A=1 时 RGB*A = RGB）
                 var context = RenderContext.GetOrCreateCurrent(RenderBackend.Auto);
                 using var brush = context.CreateSolidBrush(
                     solidPartial.Color.R / 255f,
@@ -6707,12 +6981,16 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     (float)r.Width, (float)r.Height);
                 if (solidPartial.Color.A > 0)
                 {
+                    // 半透明色：RGB 必须预乘 alpha 才符合 PREMULTIPLIED swap chain 期望——
+                    // 否则 Colors.Transparent = (255,255,255,0) 这种 WPF 历史"透明白"被 DWM
+                    // 渲染成不透明白色。同 ClearBackground 全屏路径，跟着预乘。
+                    var a = solidPartial.Color.A / 255f;
                     var context = RenderContext.GetOrCreateCurrent(RenderBackend.Auto);
                     using var brush = context.CreateSolidBrush(
-                        solidPartial.Color.R / 255f,
-                        solidPartial.Color.G / 255f,
-                        solidPartial.Color.B / 255f,
-                        solidPartial.Color.A / 255f);
+                        solidPartial.Color.R / 255f * a,
+                        solidPartial.Color.G / 255f * a,
+                        solidPartial.Color.B / 255f * a,
+                        a);
                     RenderTarget!.FillRectangle(
                         (float)r.X, (float)r.Y,
                         (float)r.Width, (float)r.Height,
@@ -6720,7 +6998,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                 }
             }
         }
-        else if (SystemBackdrop != WindowBackdropType.None)
+        else if (SystemBackdrop != WindowBackdropType.None || AllowTransparentBackground)
         {
             RenderTarget!.PunchTransparentRect(
                 (float)r.X, (float)r.Y,
@@ -6855,28 +7133,26 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     {
         if (Handle == nint.Zero) return;
 
-        // During rendering, don't schedule 鈥?just flag for re-render after current frame
+        // During rendering, don't schedule — just flag for re-render after current frame
         if (HasRenderFlag(RenderFlag_Rendering))
         {
             SetRenderFlag(RenderFlag_Requested);
             return;
         }
 
-        // When the centralized frame timer is active, only allow renders triggered
-        // during CompositionTarget.Rendering (animation handlers). Between frames,
-        // mouse drags / property changes just mark elements dirty via AddDirtyElement 鈥?
-        // they'll be rendered in the next animation frame via FrameStarting.
-        // This ensures exactly ONE render per frame interval, leaving gaps for
-        // the message pump to process input.
-        if (CompositionTarget.IsActive && !CompositionTarget.IsInRenderingPhase)
-        {
-            SetRenderFlag(RenderFlag_DirtyBetween);
-            return;
-        }
-
+        // 注：不再因 CompositionTarget.IsActive 跳过 schedule。
+        // 之前的逻辑是：动画 timer active 期间 InvalidateWindow 仅设 RenderFlag_DirtyBetween
+        // 标志，依赖下一次动画 frame 消费。但 IsActive 仅检查 "有任意 subscriber"
+        // 不代表"下一帧一定会到"——只要有任何长寿命订阅者（状态栏时钟、未结束的滚动
+        // 惯性等），IsActive 就一直为 true。结果 hover / IsSelected / Background 等
+        // 静态状态变化产生的 invalidate 永远不立即重绘，要等到某个无关动画 tick 才
+        // "顺带" 刷新——表现为"hover 不变色 / 只在动画时才看到更新"。
+        //
+        // TrySetRenderFlag(RenderFlag_Scheduled) 本身是幂等的——一帧内多次 invalidate
+        // 只会 schedule 一次 ProcessRender，不会引入重复渲染开销。
         if (TrySetRenderFlag(RenderFlag_Scheduled))
         {
-            // Use stored UI thread Dispatcher 鈥?NOT Dispatcher.CurrentDispatcher,
+            // Use stored UI thread Dispatcher — NOT Dispatcher.CurrentDispatcher,
             // which returns null on thread-pool threads (System.Threading.Timer callbacks,
             // Storyboard ticks, etc.) and would silently drop the render request.
             _dispatcher?.BeginInvokeCritical(ProcessRender);
