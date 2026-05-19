@@ -221,6 +221,35 @@ public class ToastNotificationTests
     }
 
     [Fact]
+    public void ToastNotificationHost_ImplicitTheme_ShouldPassThroughBlankAreaHitTest()
+    {
+        ResetApplicationState();
+        var app = new Application();
+
+        try
+        {
+            var host = new ToastNotificationHost();
+            host.ShowInformation("Info Title", "Info message");
+
+            host.Measure(new Size(800, 600));
+            host.Arrange(new Rect(0, 0, 800, 600));
+
+            Assert.True(app.Resources.TryGetValue(typeof(ToastNotificationHost), out var styleObj));
+            Assert.IsType<Style>(styleObj);
+            Assert.Null(host.Background);
+            Assert.Null(host.HitTest(new Point(10, 10)));
+
+            var toastHit = host.HitTest(new Point(500, 20));
+            Assert.NotNull(toastHit);
+            Assert.NotSame(host, toastHit!.VisualHit);
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Fact]
     public void ToastNotificationHost_ShowInformation_ShouldAddToast()
     {
         var host = new ToastNotificationHost();

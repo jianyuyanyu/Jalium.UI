@@ -1,52 +1,136 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Text;
+using Jalium.UI.Notifications;
 
-namespace Jalium.UI.Notifications;
+namespace Jalium.UI.Desktop.Platforms.Windows;
 
 /// <summary>
 /// Windows notification backend using raw COM vtable calls to the WinRT
 /// <c>Windows.UI.Notifications</c> APIs. No UWP/WinAppSDK/Toolkit dependency.
+/// Lives in <c>Jalium.UI.Desktop</c> so the cross-platform Controls assembly
+/// stays free of Win32 entanglement; <c>DesktopBootstrap</c> registers it
+/// with <see cref="SystemNotificationManager.BackendFactory"/>.
 /// </summary>
-internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
+[SupportedOSPlatform("windows10.0.10240")]
+public sealed unsafe class WindowsNotificationBackend : INotificationBackend
 {
     private string _appId = string.Empty;
     private nint _notifierPtr;
     private bool _disposed;
+    private bool _runtimeAvailable;
+    private Exception? _initializationFailure;
     private readonly Dictionary<uint, NotificationHandle> _activeNotifications = new();
     private uint _nextId;
 
-    public bool IsSupported => OperatingSystem.IsWindows() && Environment.OSVersion.Version >= new Version(10, 0, 10240);
+    private static bool OsVersionSupported =>
+        OperatingSystem.IsWindows() && Environment.OSVersion.Version >= new Version(10, 0, 10240);
+
+    /// <summary>
+    /// True only when the OS is recent enough <em>and</em> the toast notifier
+    /// was successfully created. Returns false on systems where the WinRT
+    /// notification platform refuses to activate (Server Core, GPO-disabled,
+    /// Session 0 services, etc.).
+    /// </summary>
+    public bool IsSupported => OsVersionSupported && _runtimeAvailable;
+
+    /// <summary>
+    /// If <see cref="IsSupported"/> is false because initialization failed
+    /// at runtime, this returns the underlying exception. Otherwise null.
+    /// </summary>
+    public Exception? InitializationFailure => _initializationFailure;
 
     #region INotificationBackend
 
     public void Initialize(string appId, string appName)
     {
+        if (!OsVersionSupported)
+            return;
+
         _appId = appId;
 
-        // Ensure WinRT is initialized on this thread.
-        WinRT.EnsureInitialized();
+        // Whole pipeline is HRESULT-based on purpose: WPN_E_PLATFORM_UNAVAILABLE
+        // is an *expected* environmental outcome (Server Core, GPO-disabled, fresh
+        // install where the AUMID isn't yet associated, etc.). Throwing a
+        // COMException here would (a) tear down the calling page and (b) trip
+        // Visual Studio's "break on thrown" debugger setting. We translate hr
+        // into Exception only for the diagnostics field, never on the live path.
+        int hr = TryInitializeRuntime(appId, appName);
+        if (hr < 0)
+        {
+            _initializationFailure = BuildInitFailureException(hr);
+            ResetNativeState();
+            return;
+        }
 
-        // Create the AUMID shortcut for non-packaged apps if needed.
-        EnsureShortcut(appId, appName);
+        _runtimeAvailable = true;
+    }
 
-        // Obtain IToastNotificationManagerStatics via RoGetActivationFactory.
-        var managerIid = WinRT.IID_IToastNotificationManagerStatics;
-        nint hClassName = WinRT.CreateHString("Windows.UI.Notifications.ToastNotificationManager");
+    private static Exception BuildInitFailureException(int hr)
+    {
+        var inner = Marshal.GetExceptionForHR(hr) ?? new InvalidOperationException($"HRESULT 0x{hr:X8}");
+
+        // Augment 0x803E0105 (WPN_E_PLATFORM_UNAVAILABLE) with the most common
+        // user-fixable cause: the per-user push notifications service is stopped.
+        // wpnapps.dll cannot validate the toast activator CLSID without it and
+        // surfaces it as "platform unavailable" with no further context.
+        if (hr == unchecked((int)0x803E0105))
+        {
+            return new InvalidOperationException(
+                "Windows 推送通知服务 (WpnUserService) 不可用,toast 通知无法发送。" +
+                "请尝试: 1) 在 PowerShell 运行 Start-Service 'WpnUserService_*';" +
+                " 2) 设置 → 系统 → 通知 → 启用应用通知; 3) 重启 Windows。",
+                inner);
+        }
+        return inner;
+    }
+
+    private int TryInitializeRuntime(string appId, string appName)
+    {
+        int hr = WinRT.TryEnsureInitialized();
+        if (hr < 0) return hr;
+
+        // Win10 RS5+ refuses CreateToastNotifierWithId with
+        // WPN_E_PLATFORM_UNAVAILABLE unless **all four** of these are in place:
+        //   1. Start-Menu .lnk with PKEY_AppUserModel_ID
+        //   2. Start-Menu .lnk with PKEY_AppUserModel_ToastActivatorCLSID
+        //   3. HKCU\Software\Classes\CLSID\{clsid}\LocalServer32 pointing at *some* exe
+        //      — wpnapps.dll!util.cpp validates the CLSID is a real COM server,
+        //      and a missing LocalServer32 surfaces as 0x80040154 (REGDB_E_CLASSNOTREG)
+        //      which the platform converts to 0x803E0105.
+        //   4. SetCurrentProcessExplicitAppUserModelID matching (1).
+        Guid activatorClsid = DeriveActivatorClsid(appId);
+        EnsureToastActivatorRegistered(activatorClsid, appName);
+        EnsureShortcut(appId, appName, activatorClsid);
+        TrySetCurrentProcessAumid(appId);
+
+        return TryCreateNotifier(_appId, out _notifierPtr);
+    }
+
+    private static int TryCreateNotifier(string appId, out nint notifierPtr)
+    {
+        notifierPtr = 0;
+
+        int hr = WinRT.TryCreateHString("Windows.UI.Notifications.ToastNotificationManager", out nint hClassName);
+        if (hr < 0) return hr;
+
         try
         {
-            int hr = WinRT.RoGetActivationFactory(hClassName, ref managerIid, out nint managerPtr);
-            Marshal.ThrowExceptionForHR(hr);
+            var managerIid = WinRT.IID_IToastNotificationManagerStatics;
+            hr = WinRT.RoGetActivationFactory(hClassName, ref managerIid, out nint managerPtr);
+            if (hr < 0) return hr;
 
             try
             {
-                // Call CreateToastNotifierWithId(appId)
-                nint hAppId = WinRT.CreateHString(_appId);
+                hr = WinRT.TryCreateHString(appId, out nint hAppId);
+                if (hr < 0) return hr;
+
                 try
                 {
                     hr = WinRT.IToastNotificationManagerStatics_CreateToastNotifierWithId(
-                        managerPtr, hAppId, out _notifierPtr);
-                    Marshal.ThrowExceptionForHR(hr);
+                        managerPtr, hAppId, out notifierPtr);
+                    return hr;
                 }
                 finally
                 {
@@ -64,11 +148,34 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
         }
     }
 
+    private void ResetNativeState()
+    {
+        _runtimeAvailable = false;
+        if (_notifierPtr != 0)
+        {
+            Marshal.Release(_notifierPtr);
+            _notifierPtr = 0;
+        }
+    }
+
+    private static void TrySetCurrentProcessAumid(string appId)
+    {
+        try
+        {
+            // Best-effort. Failure is non-fatal — Windows can still resolve the
+            // AUMID via the Start-Menu shortcut.
+            _ = Shell32.SetCurrentProcessExplicitAppUserModelID(appId);
+        }
+        catch
+        {
+            // shell32.dll missing on Nano Server etc. — ignore.
+        }
+    }
+
     public NotificationHandle Show(NotificationContent content)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_notifierPtr == 0)
-            throw new InvalidOperationException("NotificationBackend not initialized. Call Initialize first.");
+        EnsureRuntimeAvailable();
 
         // Build toast XML
         string xml = BuildToastXml(content);
@@ -120,7 +227,7 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
     public void Hide(NotificationHandle handle)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_notifierPtr == 0 || handle.NativeHandle == 0) return;
+        if (!_runtimeAvailable || _notifierPtr == 0 || handle.NativeHandle == 0) return;
 
         // IToastNotifier::Hide (vtable slot 7)
         WinRT.IToastNotifier_Hide(_notifierPtr, handle.NativeHandle);
@@ -130,6 +237,7 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
     public void ClearAll()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_runtimeAvailable) return;
 
         nint hClassName = WinRT.CreateHString("Windows.UI.Notifications.ToastNotificationManager");
         try
@@ -171,6 +279,7 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
     public void Remove(string tag, string? group = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_runtimeAvailable) return;
 
         nint hClassName = WinRT.CreateHString("Windows.UI.Notifications.ToastNotificationManager");
         try
@@ -238,6 +347,25 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
             Marshal.Release(_notifierPtr);
             _notifierPtr = 0;
         }
+        _runtimeAvailable = false;
+    }
+
+    private void EnsureRuntimeAvailable()
+    {
+        if (_runtimeAvailable && _notifierPtr != 0)
+            return;
+
+        if (!OsVersionSupported)
+            throw new PlatformNotSupportedException(
+                "Windows toast notifications require Windows 10 (10.0.10240) or later.");
+
+        if (_initializationFailure != null)
+            throw new PlatformNotSupportedException(
+                "Windows notification platform is unavailable on this system.",
+                _initializationFailure);
+
+        throw new InvalidOperationException(
+            "WindowsNotificationBackend has not been initialized. Call Initialize first.");
     }
 
     #endregion
@@ -436,10 +564,14 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
 
     #region Shortcut (non-packaged app AUMID registration)
 
-    private static void EnsureShortcut(string appId, string appName)
+    private static void EnsureShortcut(string appId, string appName, Guid activatorClsid)
     {
-        // For non-packaged (Win32) apps, Windows requires a Start Menu shortcut
-        // with System.AppUserModel.ID property set to receive toast notifications.
+        // Non-packaged (Win32) apps need a Start-Menu shortcut whose property
+        // store carries BOTH PKEY_AppUserModel_ID and (Win10 RS5+)
+        // PKEY_AppUserModel_ToastActivatorCLSID. Without the activator CLSID,
+        // CreateToastNotifierWithId returns WPN_E_PLATFORM_UNAVAILABLE.
+        // We always refresh the shortcut so a previous build that wrote it
+        // without the CLSID can be repaired in place.
         try
         {
             string shortcutPath = Path.Combine(
@@ -447,10 +579,13 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
                 "Microsoft", "Windows", "Start Menu", "Programs",
                 $"{appName}.lnk");
 
-            if (File.Exists(shortcutPath))
+            if (File.Exists(shortcutPath) && ShortcutHasMatchingMetadata(shortcutPath, appId, activatorClsid))
                 return;
 
-            // Create shortcut via COM IShellLink
+            string? dir = Path.GetDirectoryName(shortcutPath);
+            if (!string.IsNullOrEmpty(dir))
+                Directory.CreateDirectory(dir);
+
             var shellLinkClsid = new Guid("00021401-0000-0000-C000-000000000046");
             var shellLinkIid = new Guid("000214F9-0000-0000-C000-000000000046");
 
@@ -460,10 +595,9 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
 
             try
             {
-                // IShellLinkW vtable: QI=0, AddRef=1, Release=2, GetPath=3, ...SetPath=20
                 var vtbl = *(nint**)shellLinkPtr;
 
-                // SetPath – slot 20
+                // IShellLinkW::SetPath — slot 20.
                 string exePath = Environment.ProcessPath ?? string.Empty;
                 nint hPath = Marshal.StringToHGlobalUni(exePath);
                 try
@@ -475,7 +609,6 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
                     Marshal.FreeHGlobal(hPath);
                 }
 
-                // QI for IPropertyStore to set AppUserModelID
                 var propStoreIid = new Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99");
                 hr = Marshal.QueryInterface(shellLinkPtr, in propStoreIid, out nint propStorePtr);
                 if (hr >= 0)
@@ -483,6 +616,8 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
                     try
                     {
                         SetAppUserModelId(propStorePtr, appId);
+                        SetToastActivatorClsid(propStorePtr, activatorClsid);
+                        CommitPropertyStore(propStorePtr);
                     }
                     finally
                     {
@@ -490,14 +625,13 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
                     }
                 }
 
-                // QI for IPersistFile and save
                 var persistFileIid = new Guid("0000010b-0000-0000-C000-000000000046");
                 hr = Marshal.QueryInterface(shellLinkPtr, in persistFileIid, out nint persistFilePtr);
                 if (hr >= 0)
                 {
                     try
                     {
-                        // IPersistFile::Save (vtable slot 6 after IUnknown + IPersist)
+                        // IPersistFile::Save — slot 6 (IUnknown 3 + IPersist 1 + reserved 2).
                         var pvtbl = *(nint**)persistFilePtr;
                         nint hFile = Marshal.StringToHGlobalUni(shortcutPath);
                         try
@@ -522,38 +656,206 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
         }
         catch
         {
-            // Best-effort – if shortcut creation fails, toasts may still work for packaged apps.
+            // Best-effort — if the shortcut can't be written we fall through and
+            // CreateToastNotifierWithId will fail with WPN_E_PLATFORM_UNAVAILABLE,
+            // which the caller already handles as a soft failure.
         }
     }
+
+    /// <summary>
+    /// Reads back the AUMID and ToastActivatorCLSID from an existing shortcut.
+    /// Returns true when both match what we would write, so the existing
+    /// shortcut can be reused without a rewrite.
+    /// </summary>
+    private static bool ShortcutHasMatchingMetadata(string shortcutPath, string appId, Guid activatorClsid)
+    {
+        try
+        {
+            var shellLinkClsid = new Guid("00021401-0000-0000-C000-000000000046");
+            var shellLinkIid = new Guid("000214F9-0000-0000-C000-000000000046");
+
+            int hr = Ole32.CoCreateInstance(ref shellLinkClsid, 0, 1, ref shellLinkIid, out nint shellLinkPtr);
+            if (hr < 0) return false;
+
+            try
+            {
+                var persistFileIid = new Guid("0000010b-0000-0000-C000-000000000046");
+                hr = Marshal.QueryInterface(shellLinkPtr, in persistFileIid, out nint persistFilePtr);
+                if (hr < 0) return false;
+
+                try
+                {
+                    var pvtbl = *(nint**)persistFilePtr;
+                    nint hFile = Marshal.StringToHGlobalUni(shortcutPath);
+                    try
+                    {
+                        // IPersistFile::Load — slot 5. dwMode = STGM_READ (0).
+                        hr = ((delegate* unmanaged[Stdcall]<nint, nint, int, int>)pvtbl[5])(persistFilePtr, hFile, 0);
+                        if (hr < 0) return false;
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(hFile);
+                    }
+                }
+                finally
+                {
+                    Marshal.Release(persistFilePtr);
+                }
+
+                var propStoreIid = new Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99");
+                hr = Marshal.QueryInterface(shellLinkPtr, in propStoreIid, out nint propStorePtr);
+                if (hr < 0) return false;
+
+                try
+                {
+                    string? existingAumid = ReadAppUserModelId(propStorePtr);
+                    Guid? existingClsid = ReadToastActivatorClsid(propStorePtr);
+                    return string.Equals(existingAumid, appId, StringComparison.Ordinal)
+                        && existingClsid == activatorClsid;
+                }
+                finally
+                {
+                    Marshal.Release(propStorePtr);
+                }
+            }
+            finally
+            {
+                Marshal.Release(shellLinkPtr);
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static readonly Guid PKEY_AppUserModelId_Fmtid = new("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
 
     private static void SetAppUserModelId(nint propStorePtr, string appId)
     {
         // PKEY_AppUserModel_ID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, 5
-        var pkey = new PropertyKey
-        {
-            fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"),
-            pid = 5
-        };
+        var pkey = new PropertyKey { fmtid = PKEY_AppUserModelId_Fmtid, pid = 5 };
 
-        // Create PROPVARIANT with VT_LPWSTR
-        var propVar = new PropVariant();
-        propVar.vt = 31; // VT_LPWSTR
-        propVar.pwszVal = Marshal.StringToCoTaskMemUni(appId);
+        var propVar = new PropVariant
+        {
+            vt = 31, // VT_LPWSTR
+            payload = Marshal.StringToCoTaskMemUni(appId)
+        };
 
         try
         {
             var vtbl = *(nint**)propStorePtr;
-            // IPropertyStore::SetValue – slot 6 (IUnknown 3 + GetCount + GetAt + GetValue + SetValue)
             ((delegate* unmanaged[Stdcall]<nint, PropertyKey*, PropVariant*, int>)vtbl[6])(
                 propStorePtr, &pkey, &propVar);
-            // IPropertyStore::Commit – slot 7
-            ((delegate* unmanaged[Stdcall]<nint, int>)vtbl[7])(propStorePtr);
         }
         finally
         {
-            if (propVar.pwszVal != 0)
-                Marshal.FreeCoTaskMem(propVar.pwszVal);
+            if (propVar.payload != 0)
+                Marshal.FreeCoTaskMem(propVar.payload);
         }
+    }
+
+    private static void SetToastActivatorClsid(nint propStorePtr, Guid clsid)
+    {
+        // PKEY_AppUserModel_ToastActivatorCLSID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, 26
+        var pkey = new PropertyKey { fmtid = PKEY_AppUserModelId_Fmtid, pid = 26 };
+
+        // VT_CLSID (72) — payload is a pointer to a 16-byte GUID.
+        nint pclsid = Marshal.AllocCoTaskMem(16);
+        try
+        {
+            byte[] bytes = clsid.ToByteArray();
+            Marshal.Copy(bytes, 0, pclsid, 16);
+
+            var propVar = new PropVariant
+            {
+                vt = 72, // VT_CLSID
+                payload = pclsid
+            };
+
+            var vtbl = *(nint**)propStorePtr;
+            ((delegate* unmanaged[Stdcall]<nint, PropertyKey*, PropVariant*, int>)vtbl[6])(
+                propStorePtr, &pkey, &propVar);
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(pclsid);
+        }
+    }
+
+    private static void CommitPropertyStore(nint propStorePtr)
+    {
+        var vtbl = *(nint**)propStorePtr;
+        // IPropertyStore::Commit — slot 7.
+        ((delegate* unmanaged[Stdcall]<nint, int>)vtbl[7])(propStorePtr);
+    }
+
+    private static string? ReadAppUserModelId(nint propStorePtr)
+    {
+        var pkey = new PropertyKey { fmtid = PKEY_AppUserModelId_Fmtid, pid = 5 };
+        var propVar = default(PropVariant);
+        var vtbl = *(nint**)propStorePtr;
+
+        // IPropertyStore::GetValue — slot 5.
+        int hr = ((delegate* unmanaged[Stdcall]<nint, PropertyKey*, PropVariant*, int>)vtbl[5])(
+            propStorePtr, &pkey, &propVar);
+        try
+        {
+            if (hr < 0) return null;
+            if (propVar.vt != 31 /* VT_LPWSTR */) return null;
+            if (propVar.payload == 0) return null;
+            return Marshal.PtrToStringUni(propVar.payload);
+        }
+        finally
+        {
+            PropVariantClear(&propVar);
+        }
+    }
+
+    private static Guid? ReadToastActivatorClsid(nint propStorePtr)
+    {
+        var pkey = new PropertyKey { fmtid = PKEY_AppUserModelId_Fmtid, pid = 26 };
+        var propVar = default(PropVariant);
+        var vtbl = *(nint**)propStorePtr;
+
+        int hr = ((delegate* unmanaged[Stdcall]<nint, PropertyKey*, PropVariant*, int>)vtbl[5])(
+            propStorePtr, &pkey, &propVar);
+        try
+        {
+            if (hr < 0) return null;
+            if (propVar.vt != 72 /* VT_CLSID */) return null;
+            if (propVar.payload == 0) return null;
+
+            byte[] buf = new byte[16];
+            Marshal.Copy(propVar.payload, buf, 0, 16);
+            return new Guid(buf);
+        }
+        finally
+        {
+            PropVariantClear(&propVar);
+        }
+    }
+
+    [DllImport("ole32.dll")]
+    private static extern int PropVariantClear(PropVariant* pvar);
+
+    /// <summary>
+    /// Stable per-AUMID activator CLSID. It does NOT need to be a registered
+    /// COM server (we never receive callbacks); Windows only inspects the
+    /// property to validate that the toast originates from a "modern" app.
+    /// </summary>
+    private static Guid DeriveActivatorClsid(string appId)
+    {
+        Span<byte> hash = stackalloc byte[20];
+        System.Security.Cryptography.SHA1.HashData(
+            Encoding.UTF8.GetBytes("Jalium.UI.ToastActivator:" + appId), hash);
+        Span<byte> guidBytes = stackalloc byte[16];
+        hash[..16].CopyTo(guidBytes);
+        // RFC 4122 §4.3 — UUID v5 layout.
+        guidBytes[6] = (byte)((guidBytes[6] & 0x0F) | 0x50);
+        guidBytes[8] = (byte)((guidBytes[8] & 0x3F) | 0x80);
+        return new Guid(guidBytes);
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -563,6 +865,12 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
         public uint pid;
     }
 
+    /// <summary>
+    /// PROPVARIANT layout sized to match the native struct (24 bytes on x64,
+    /// 16 on x86). We only consume <see cref="payload"/>, but the trailing
+    /// <see cref="payloadHigh"/> field is required so SetValue / GetValue
+    /// don't write past our struct.
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     private struct PropVariant
     {
@@ -570,7 +878,67 @@ internal sealed unsafe class WindowsNotificationBackend : INotificationBackend
         public ushort wReserved1;
         public ushort wReserved2;
         public ushort wReserved3;
-        public nint pwszVal;
+        public nint payload;
+        public nint payloadHigh;
+    }
+
+    #endregion
+
+    #region COM Activator Registration (HKCU)
+
+    /// <summary>
+    /// Registers the per-AUMID toast activator CLSID under
+    /// <c>HKCU\Software\Classes\CLSID\{clsid}</c> with a <c>LocalServer32</c>
+    /// pointing at the running exe.
+    /// <para>
+    /// The Windows Push Notification user-mode service (<c>wpnapps.dll</c>)
+    /// validates that the ToastActivatorCLSID set on the .lnk resolves to a
+    /// real COM server before issuing a notifier — otherwise it fails the
+    /// internal lookup with <c>0x80040154 (REGDB_E_CLASSNOTREG)</c> and
+    /// surfaces it as <c>0x803E0105 (WPN_E_PLATFORM_UNAVAILABLE)</c>.
+    /// We never hook the activation callback ourselves; the registry entry
+    /// only has to <em>exist</em> for the validation to pass.
+    /// </para>
+    /// </summary>
+    private static void EnsureToastActivatorRegistered(Guid clsid, string appName)
+    {
+        try
+        {
+            string clsidStr = "{" + clsid.ToString().ToUpperInvariant() + "}";
+            string clsidKeyPath = $@"Software\Classes\CLSID\{clsidStr}";
+            string exePath = Environment.ProcessPath ?? string.Empty;
+            string serverCommand = "\"" + exePath + "\"";
+
+            if (Advapi32.TryCreateRegKey(Advapi32.HKEY_CURRENT_USER, clsidKeyPath, out nint clsidKey))
+            {
+                try
+                {
+                    Advapi32.TrySetStringValue(clsidKey, null, $"{appName} Toast Activator");
+                }
+                finally
+                {
+                    Advapi32.RegCloseKey(clsidKey);
+                }
+            }
+
+            string localServerPath = clsidKeyPath + @"\LocalServer32";
+            if (Advapi32.TryCreateRegKey(Advapi32.HKEY_CURRENT_USER, localServerPath, out nint serverKey))
+            {
+                try
+                {
+                    Advapi32.TrySetStringValue(serverKey, null, serverCommand);
+                }
+                finally
+                {
+                    Advapi32.RegCloseKey(serverKey);
+                }
+            }
+        }
+        catch
+        {
+            // Best-effort. Failure surfaces later as WPN_E_PLATFORM_UNAVAILABLE
+            // which the caller already translates into a soft state.
+        }
     }
 
     #endregion
@@ -592,21 +960,45 @@ internal static unsafe class WinRT
 
     /// <summary>
     /// Ensures the WinRT runtime is initialized on the current thread.
+    /// Throws on hard failures.
     /// </summary>
     public static void EnsureInitialized()
     {
-        if (s_initialized) return;
-        // RO_INIT_SINGLETHREADED = 0, RO_INIT_MULTITHREADED = 1
-        // Try single-threaded first (STA), then multithreaded.
-        int hr = RoInitialize(0);
+        int hr = TryEnsureInitialized();
         if (hr < 0)
+            Marshal.ThrowExceptionForHR(hr);
+    }
+
+    /// <summary>
+    /// HRESULT-returning variant of <see cref="EnsureInitialized"/>. Used by
+    /// the toast backend's hot init path so callers can decide whether to
+    /// translate a failure into a soft "platform unavailable" state instead
+    /// of throwing.
+    /// </summary>
+    public static int TryEnsureInitialized()
+    {
+        if (s_initialized) return 0;
+
+        int hr;
+        try
         {
-            hr = RoInitialize(1);
-            // RPC_E_CHANGED_MODE = 0x80010106 means already initialized in a different mode – that's OK.
-            if (hr < 0 && hr != unchecked((int)0x80010106))
-                Marshal.ThrowExceptionForHR(hr);
+            // RO_INIT_SINGLETHREADED = 0, RO_INIT_MULTITHREADED = 1
+            hr = RoInitialize(0);
+            if (hr < 0)
+            {
+                hr = RoInitialize(1);
+                // RPC_E_CHANGED_MODE — already initialized differently — is fine.
+                if (hr == unchecked((int)0x80010106)) hr = 0;
+            }
         }
-        s_initialized = true;
+        catch (DllNotFoundException)
+        {
+            // api-ms-win-core-winrt shim missing (Nano Server, etc.)
+            return unchecked((int)0x80040154); // REGDB_E_CLASSNOTREG
+        }
+
+        if (hr >= 0) s_initialized = true;
+        return hr;
     }
 
     // ── IIDs ──────────────────────────────────────────────────────────
@@ -650,9 +1042,26 @@ internal static unsafe class WinRT
 
     public static nint CreateHString(string s)
     {
-        int hr = WindowsCreateString(s, s.Length, out nint h);
-        Marshal.ThrowExceptionForHR(hr);
+        int hr = TryCreateHString(s, out nint h);
+        if (hr < 0) Marshal.ThrowExceptionForHR(hr);
         return h;
+    }
+
+    /// <summary>
+    /// HRESULT-returning variant of <see cref="CreateHString"/> used by paths
+    /// that translate runtime failures into a soft state instead of throwing.
+    /// </summary>
+    public static int TryCreateHString(string s, out nint h)
+    {
+        try
+        {
+            return WindowsCreateString(s, s.Length, out h);
+        }
+        catch (DllNotFoundException)
+        {
+            h = 0;
+            return unchecked((int)0x80040154); // REGDB_E_CLASSNOTREG
+        }
     }
 
     // ── RoGetActivationFactory / RoActivateInstance ──────────────────
@@ -784,6 +1193,67 @@ internal static class Ole32
     public static extern int CoCreateInstance(
         ref Guid rclsid, nint pUnkOuter, uint dwClsContext,
         ref Guid riid, out nint ppv);
+}
+
+/// <summary>
+/// Shell32 helpers for AUMID registration on the running process.
+/// </summary>
+internal static class Shell32
+{
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, PreserveSig = true)]
+    public static extern int SetCurrentProcessExplicitAppUserModelID(
+        [MarshalAs(UnmanagedType.LPWStr)] string AppID);
+}
+
+/// <summary>
+/// Minimal advapi32 wrapper for HKCU registry writes (toast activator CLSID).
+/// </summary>
+internal static class Advapi32
+{
+    public const nint HKEY_CURRENT_USER = unchecked((nint)(int)0x80000001);
+    private const int KEY_WRITE = 0x20006;
+    private const int REG_SZ = 1;
+    private const int REG_OPTION_NON_VOLATILE = 0;
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegCreateKeyExW")]
+    private static extern int RegCreateKeyEx(
+        nint hKey,
+        [MarshalAs(UnmanagedType.LPWStr)] string lpSubKey,
+        int Reserved,
+        [MarshalAs(UnmanagedType.LPWStr)] string? lpClass,
+        int dwOptions,
+        int samDesired,
+        nint lpSecurityAttributes,
+        out nint phkResult,
+        out int lpdwDisposition);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegSetValueExW")]
+    private static extern int RegSetValueEx(
+        nint hKey,
+        [MarshalAs(UnmanagedType.LPWStr)] string? lpValueName,
+        int Reserved,
+        int dwType,
+        [MarshalAs(UnmanagedType.LPWStr)] string lpData,
+        int cbData);
+
+    [DllImport("advapi32.dll")]
+    public static extern int RegCloseKey(nint hKey);
+
+    public static bool TryCreateRegKey(nint root, string subKeyPath, out nint key)
+    {
+        int hr = RegCreateKeyEx(
+            root, subKeyPath, 0, null,
+            REG_OPTION_NON_VOLATILE, KEY_WRITE,
+            0, out key, out _);
+        return hr == 0 && key != 0;
+    }
+
+    public static void TrySetStringValue(nint key, string? valueName, string data)
+    {
+        // cbData is in bytes and must include the trailing null character.
+        int cbData = (data.Length + 1) * sizeof(char);
+        _ = RegSetValueEx(key, valueName, 0, REG_SZ, data, cbData);
+    }
 }
 
 #endregion
