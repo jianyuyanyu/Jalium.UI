@@ -357,6 +357,33 @@ public class RazorLightweightInterpreterTests
         Assert.Contains("C=\"gray\"", result);
     }
 
+    [Fact]
+    public void ExpandCodeBlock_PureCSharp_IsTaggedAsRuntimeCodeBlock()
+    {
+        // Pure C# (no XML markup) must be deferred to the runtime RazorTemplate engine,
+        // and the caller must recognize that via IsRuntimeCodeBlock so it never re-enters
+        // the Jalxaml tokenizer on the result (which would loop forever).
+        var result = RazorCodeBlockPreprocessor.ExpandCodeBlock("d");
+        Assert.True(RazorCodeBlockPreprocessor.IsRuntimeCodeBlock(result));
+    }
+
+    [Fact]
+    public void ExpandCodeBlock_PureCSharp_VarDecl_IsTaggedAsRuntimeCodeBlock()
+    {
+        var result = RazorCodeBlockPreprocessor.ExpandCodeBlock("var x = 1;");
+        Assert.True(RazorCodeBlockPreprocessor.IsRuntimeCodeBlock(result));
+    }
+
+    [Fact]
+    public void IsRuntimeCodeBlock_RejectsExpandedMarkup()
+    {
+        // A fully expanded code block (XAML markup) must not be misclassified as a
+        // runtime block, or HandleCodeBlock would emit it verbatim instead of tokenizing.
+        Assert.False(RazorCodeBlockPreprocessor.IsRuntimeCodeBlock("<Item/>"));
+        Assert.False(RazorCodeBlockPreprocessor.IsRuntimeCodeBlock(""));
+        Assert.False(RazorCodeBlockPreprocessor.IsRuntimeCodeBlock("@x"));
+    }
+
     // ═══════════════════════════════════════════════════════════
     // Tokenizer Tests
     // ═══════════════════════════════════════════════════════════

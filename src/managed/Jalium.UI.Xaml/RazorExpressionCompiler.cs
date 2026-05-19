@@ -99,6 +99,14 @@ internal static class RazorExpressionRuntimeCompiler
             value = null;
             return false;
         }
+        catch (XamlParseException)
+        {
+            // Razor expression contained malformed C# (typical while the user is
+            // mid-edit). TryEvaluate returns false rather than tearing down the
+            // whole XAML load — see the matching catch in RazorTemplateRuntimeCompiler.
+            value = null;
+            return false;
+        }
     }
 
     private static CompiledExpression Compile(RazorExpressionPlan plan)
@@ -195,6 +203,15 @@ internal static class RazorTemplateRuntimeCompiler
         }
         catch (NullReferenceException)
         {
+            value = null;
+            return false;
+        }
+        catch (XamlParseException)
+        {
+            // Razor template body contained malformed C# (typical while the user is
+            // mid-edit, e.g. a lone keyword like "is" inside @{ ... }). TryEvaluate's
+            // contract is to return false on failure rather than tear down the whole
+            // XAML load — propagate the bool, let the caller leave the property unset.
             value = null;
             return false;
         }

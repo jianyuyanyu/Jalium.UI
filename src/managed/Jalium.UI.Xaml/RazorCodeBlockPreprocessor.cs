@@ -854,6 +854,11 @@ internal static class RazorCodeBlockPreprocessor
 
     /// <summary>
     /// Compiles and executes a Razor code block, returning the generated XAML string.
+    /// When the block contains XML markup, it is expanded inline. When the block is pure
+    /// C# (no markup), it is returned verbatim as <c>@{code}</c> so the caller can defer
+    /// execution to runtime — the C# may reference DataContext members that are unbound
+    /// at parse time. Callers must distinguish the two cases (see <see cref="IsRuntimeCodeBlock"/>)
+    /// to avoid feeding the verbatim form back into the parser, which would recurse forever.
     /// </summary>
     internal static string ExpandCodeBlock(string code)
     {
@@ -861,16 +866,21 @@ internal static class RazorCodeBlockPreprocessor
             return string.Empty;
 
         var segments = ParseCodeBlockSegments(code);
-
-        // If the code block has no XML markup segments (only pure C# code with Write()/WriteLiteral()),
-        // it may reference runtime variables (DataContext). Preserve it as @{...} for the runtime
-        // RazorBindingEngine to handle, instead of expanding at preprocess time.
         var hasMarkup = segments.Any(s => s.IsMarkup);
         if (!hasMarkup)
             return "@{" + code + "}";
 
         return RazorLightweightCodeBlockInterpreter.Expand(segments);
     }
+
+    /// <summary>
+    /// Returns <c>true</c> when <paramref name="expanded"/> is the verbatim
+    /// <c>@{code}</c> form that <see cref="ExpandCodeBlock"/> returns for pure-C# blocks.
+    /// Such output must NOT be re-parsed as Jalxaml — it is intended to be emitted as
+    /// text for the runtime RazorTemplate engine to execute against the live DataContext.
+    /// </summary>
+    internal static bool IsRuntimeCodeBlock(string expanded) =>
+        expanded.Length >= 3 && expanded[0] == '@' && expanded[1] == '{' && expanded[^1] == '}';
 
     /// <summary>
     /// Parses a code block that mixes C# code and XML markup (Razor-style) into a

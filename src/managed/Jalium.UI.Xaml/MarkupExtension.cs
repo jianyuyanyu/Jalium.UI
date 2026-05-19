@@ -135,6 +135,15 @@ public sealed class BindingExtension : MarkupExtension
     public IValueConverter? Converter { get; set; }
 
     /// <summary>
+    /// Resource key for a converter that should be resolved lazily against the binding
+    /// target's resource lookup chain. Set by <see cref="SetBindingParameter"/> when
+    /// <c>Converter="{StaticResource X}"</c> appears inside a template body where the
+    /// resource isn't available at parse time. <see cref="ProvideValue"/> propagates this
+    /// to the produced <see cref="Binding.PendingConverterKey"/> for deferred resolution.
+    /// </summary>
+    internal string? PendingConverterKey { get; set; }
+
+    /// <summary>
     /// Gets or sets the converter parameter.
     /// </summary>
     public object? ConverterParameter { get; set; }
@@ -207,6 +216,7 @@ public sealed class BindingExtension : MarkupExtension
             ElementName = ElementName,
             Mode = Mode,
             Converter = Converter,
+            PendingConverterKey = PendingConverterKey,
             ConverterParameter = ConverterParameter,
             UpdateSourceTrigger = UpdateSourceTrigger,
             FallbackValue = FallbackValue,
@@ -302,18 +312,24 @@ public sealed class StaticResourceExtension : MarkupExtension
                 return resolvedAppValue;
         }
 
-        // Resource not found - log and return null to prevent AOT __fastfail crash
+        // Resource not found — log and return null. The streaming parser used to throw in
+        // DEBUG so missing resources surfaced loudly during development, but the SG-emitted
+        // codegen path now invokes the markup-extension runtime inside template
+        // <c>SetVisualTree</c> lambdas. At that moment the lambda's element has not been
+        // attached to its templated parent yet, so an enclosing
+        // <c>{Binding ..., Converter={StaticResource X}}</c> hits this resolver with
+        // <c>targetElement: null</c> and the resource lookup fails by design — the value
+        // would have been resolved later, in the runtime parser's case, via
+        // <c>ResolveMarkupExtensionValueIfNeeded</c> on the deferred reference. Throwing
+        // here breaks the whole template rather than letting the binding fall through.
+        // Match the Release behaviour (silent null) so DEBUG runs do not differ from
+        // Release in failure mode for the SG path.
         var msg = $"[StaticResource FAIL] Cannot find resource named '{ResourceKey}' (type: {ResourceKey?.GetType().Name}). " +
                   $"targetElement: {(targetElement != null ? targetElement.GetType().Name : "null")}, " +
                   $"ambientProvider: {(ambientProvider != null ? "available" : "null")}, " +
                   $"appResources: {(Jalium.UI.Application.Current?.Resources != null ? $"{Jalium.UI.Application.Current.Resources.Count} entries" : "null")}";
         System.Diagnostics.Debug.WriteLine(msg);
-        Console.Error.WriteLine(msg);
-#if DEBUG
-        throw new XamlParseException(msg);
-#else
         return null;
-#endif
     }
 
     private static object? ResolveDeferredResourceReference(
@@ -1049,7 +1065,33 @@ internal static class MarkupExtensionParser
                 extension.StringFormat = fmt;
                 break;
             case "converter":
-                extension.Converter = ResolveNestedValue(value, ambientProvider) as IValueConverter;
+                {
+                    var resolved = ResolveNestedValue(value, ambientProvider);
+                    if (resolved is IValueConverter converter)
+                    {
+                        extension.Converter = converter;
+                    }
+                    else
+                    {
+                        // Resolution failed at parse time. If the spec is the common
+                        // "{StaticResource X}" form, record X for deferred lookup —
+                        // BindingExpression.Activate will resolve it through the target
+                        // FE's resource chain once the visual tree is in place. This is
+                        // the standard recovery path when SG-emitted template lambdas
+                        // run SetProperty(string) before the element has been attached.
+                        if (TryExtractStaticResourceKey(value, out var key))
+                        {
+                            extension.PendingConverterKey = key;
+                        }
+                        else
+                        {
+                            // Spec is a non-StaticResource expression we couldn't resolve
+                            // (e.g. {x:Static}, {Binding}). Leave Converter null so the
+                            // binding exhibits the same diagnostics it would in WPF.
+                            extension.Converter = null;
+                        }
+                    }
+                }
                 break;
             case "converterparameter":
                 extension.ConverterParameter = ResolveNestedValue(value, ambientProvider) ?? value;
@@ -1073,6 +1115,52 @@ internal static class MarkupExtensionParser
                     extension.NotifyOnValidationError = notifyOnValidationError;
                 break;
         }
+    }
+
+    /// <summary>
+    /// Try to extract the resource key from a <c>{StaticResource X}</c> spec string.
+    /// Used to record a deferred Converter lookup when parse-time resolution fails —
+    /// the key is later fed to <see cref="ResourceLookup.FindResource"/> against the
+    /// binding target's FE in <c>BindingExpression.Activate</c>.
+    /// </summary>
+    /// <remarks>
+    /// Only the simple positional form is recognised (no nested extensions, no commas).
+    /// More elaborate specs (<c>{StaticResource Key, ...}</c>) fall through to the
+    /// caller's null-Converter path; covering them would require teaching the deferred
+    /// resolver about every markup-extension shape.
+    /// </remarks>
+    private static bool TryExtractStaticResourceKey(string spec, out string? key)
+    {
+        key = null;
+        if (string.IsNullOrEmpty(spec))
+            return false;
+
+        var trimmed = spec.Trim();
+        if (trimmed.Length < 4 || trimmed[0] != '{' || trimmed[trimmed.Length - 1] != '}')
+            return false;
+
+        var inner = trimmed.Substring(1, trimmed.Length - 2).Trim();
+        const string Prefix = "StaticResource";
+        if (!inner.StartsWith(Prefix, StringComparison.Ordinal))
+            return false;
+        if (inner.Length <= Prefix.Length)
+            return false;
+        if (!char.IsWhiteSpace(inner[Prefix.Length]))
+            return false;
+
+        var rest = inner.Substring(Prefix.Length + 1).Trim();
+        // Reject anything with commas / nested braces — multi-arg specs aren't deferrable
+        // through the simple key channel.
+        for (var i = 0; i < rest.Length; i++)
+        {
+            if (rest[i] == ',' || rest[i] == '{' || rest[i] == '}' || char.IsWhiteSpace(rest[i]))
+                return false;
+        }
+
+        if (rest.Length == 0)
+            return false;
+        key = rest;
+        return true;
     }
 
     /// <summary>
