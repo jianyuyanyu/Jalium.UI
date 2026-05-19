@@ -34,6 +34,30 @@ public sealed class NativeBrush : IDisposable
     internal ImageSource? CachedImageSource { get; set; }
 
     /// <summary>
+    /// For gradient brushes in <see cref="BrushMappingMode.RelativeToBoundingBox"/>
+    /// mode: a hash of the (bx, by, bw, bh) bounds that produced this native
+    /// brush. Lets the cache reuse the upload across frames whenever the same
+    /// brush reference paints the same bounds — the dominant case for static
+    /// backgrounds painted under retained-mode replay.
+    ///
+    /// 0 means "not bound to a specific bbox" (Absolute-mode gradients, solid
+    /// brushes, ImageBrush fallback) — those entries match purely on the brush
+    /// reference.
+    /// </summary>
+    internal long CachedBoundsKey { get; set; }
+
+    /// <summary>
+    /// For gradient brushes: a hash of the gradient stops + endpoint/center/radius
+    /// + spread/mapping configuration captured when the native brush was created.
+    /// Lets the cache detect when the user mutated the managed gradient (e.g. added
+    /// a stop, changed a start point) and rebuild the native upload.
+    ///
+    /// 0 means "no content hash recorded" — solid brushes use <see cref="CachedColor"/>,
+    /// ImageBrush uses <see cref="CachedImageSource"/>.
+    /// </summary>
+    internal long CachedGradientContentHash { get; set; }
+
+    /// <summary>
     /// Gets or sets the access sequence for LRU eviction.
     /// </summary>
     internal long LastAccessSequence { get; set; }

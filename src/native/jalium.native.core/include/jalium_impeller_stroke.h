@@ -203,20 +203,73 @@ inline bool ExpandStrokePath(
         segNormals.push_back({ -dy / len, dx / len });
     }
 
-    // ---- Per-segment quads (CCW: top-right, top-left, bottom-right, bottom-left) ----
+    // ---- Per-segment quads (+ optional outer-skirt vertex feather AA) ----
+    //
+    // Two emit modes:
+    //
+    // collectContours == nullptr (D3D12 binary mesh → GPU triangle raster):
+    //   8 verts / 6 triangles per segment with an outer feather skirt at
+    //   alpha=0. GPU's barycentric interpolation of vertex alpha gives a
+    //   1-px coverage gradient on each long edge — same visual quality as
+    //   analytic per-rect coverage but emits ~2× verts (vs ~30× for full
+    //   RasterizePathToRects). Skia / Flutter Impeller use this extended-
+    //   quad pattern for stroke AA when MSAA isn't available.
+    //
+    // collectContours != nullptr (Vulkan stroke → analytic scanline raster):
+    //   4 verts / 2 triangles, exact pixel-space stroke quad. The Vulkan
+    //   path collects these triangles into a per-stroke contour set and
+    //   feeds them to RasterizePathToRects, which produces per-pixel
+    //   coverage from the exact geometry — emitting an additional feather
+    //   skirt here would just be union'd in by NonZero filling, fattening
+    //   the stroke by 1 px.
+    const bool emitFeather = (collectContours == nullptr);
     for (uint32_t i = 0; i + 1 < pointCount; ++i) {
         float nx = segNormals[i].nx * halfWidth;
         float ny = segNormals[i].ny * halfWidth;
         float x0 = getX(i), y0 = getY(i);
         float x1 = getX(i + 1), y1 = getY(i + 1);
 
+        if (!emitFeather) {
+            uint32_t base = (uint32_t)verts.size();
+            verts.push_back({ x0 + nx, y0 + ny, r, g, b, a });
+            verts.push_back({ x0 - nx, y0 - ny, r, g, b, a });
+            verts.push_back({ x1 + nx, y1 + ny, r, g, b, a });
+            verts.push_back({ x1 - nx, y1 - ny, r, g, b, a });
+            indices.push_back(base);     indices.push_back(base + 1); indices.push_back(base + 2);
+            indices.push_back(base + 1); indices.push_back(base + 3); indices.push_back(base + 2);
+            continue;
+        }
+
+        // Feather extension is exactly 1 pixel in stroke-pixel space.
+        // featherScale = (halfWidth + 1) / halfWidth, applied to the
+        // unit normal vector (segNormals stored without halfWidth scale).
+        float featherScale = (halfWidth + 1.0f) / halfWidth;
+        float fnx = segNormals[i].nx * halfWidth * featherScale;
+        float fny = segNormals[i].ny * halfWidth * featherScale;
+
         uint32_t base = (uint32_t)verts.size();
+        // 0,1: outer top feather (alpha 0)
+        verts.push_back({ x0 + fnx, y0 + fny, r, g, b, 0.0f });
+        verts.push_back({ x1 + fnx, y1 + fny, r, g, b, 0.0f });
+        // 2,3: inner top edge (alpha a)
         verts.push_back({ x0 + nx, y0 + ny, r, g, b, a });
-        verts.push_back({ x0 - nx, y0 - ny, r, g, b, a });
         verts.push_back({ x1 + nx, y1 + ny, r, g, b, a });
+        // 4,5: inner bottom edge (alpha a)
+        verts.push_back({ x0 - nx, y0 - ny, r, g, b, a });
         verts.push_back({ x1 - nx, y1 - ny, r, g, b, a });
-        indices.push_back(base);     indices.push_back(base + 1); indices.push_back(base + 2);
-        indices.push_back(base + 1); indices.push_back(base + 3); indices.push_back(base + 2);
+        // 6,7: outer bottom feather (alpha 0)
+        verts.push_back({ x0 - fnx, y0 - fny, r, g, b, 0.0f });
+        verts.push_back({ x1 - fnx, y1 - fny, r, g, b, 0.0f });
+
+        // Inner solid quad: (2,4,3) and (4,5,3)
+        indices.push_back(base + 2); indices.push_back(base + 4); indices.push_back(base + 3);
+        indices.push_back(base + 4); indices.push_back(base + 5); indices.push_back(base + 3);
+        // Top feather strip: (0,2,1) and (2,3,1)
+        indices.push_back(base + 0); indices.push_back(base + 2); indices.push_back(base + 1);
+        indices.push_back(base + 2); indices.push_back(base + 3); indices.push_back(base + 1);
+        // Bottom feather strip: (4,6,5) and (6,7,5)
+        indices.push_back(base + 4); indices.push_back(base + 6); indices.push_back(base + 5);
+        indices.push_back(base + 6); indices.push_back(base + 7); indices.push_back(base + 5);
     }
 
     // ---- Joins between adjacent segments ----

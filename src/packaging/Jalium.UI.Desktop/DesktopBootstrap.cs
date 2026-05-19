@@ -1,5 +1,6 @@
 using Jalium.UI.Controls.Themes;
 using Jalium.UI.Desktop.Platforms.Windows;
+using Jalium.UI.Notifications;
 
 namespace Jalium.UI.Desktop;
 
@@ -39,5 +40,15 @@ public static class DesktopBootstrap
         // Don't clobber a resolver an integrator may have already supplied —
         // explicit registrations take precedence.
         ThemeManager.SystemAccentResolver ??= WindowsSystemAccent.Resolve;
+
+        // Register the WinRT toast backend. Same precedence rule: an integrator
+        // that wants to inject a custom backend (tests, fakes) can set
+        // BackendFactory before bootstrap runs and we won't overwrite.
+        // The Desktop assembly is already net10.0-windows; the backend itself
+        // returns IsSupported=false on Windows < 10.0.10240, so the unguarded
+        // factory expression is safe.
+#pragma warning disable CA1416 // Validate platform compatibility
+        SystemNotificationManager.BackendFactory ??= () => new WindowsNotificationBackend();
+#pragma warning restore CA1416
     }
 }

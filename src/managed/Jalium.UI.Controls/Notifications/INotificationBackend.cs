@@ -3,10 +3,13 @@ using Jalium.UI.Media;
 namespace Jalium.UI.Notifications;
 
 /// <summary>
-/// Platform-specific notification backend.
-/// Each platform (Windows, Linux, Android) provides its own implementation.
+/// Platform-specific notification backend contract. Implementations live in
+/// the matching platform packages (<c>Jalium.UI.Desktop</c> for Windows,
+/// <c>Jalium.UI.Android</c> for Android, in-tree for Linux/libnotify) and
+/// are wired into <see cref="SystemNotificationManager"/> via
+/// <see cref="SystemNotificationManager.BackendFactory"/>.
 /// </summary>
-internal interface INotificationBackend : IDisposable
+public interface INotificationBackend : IDisposable
 {
     /// <summary>
     /// Initializes the backend. Called once before any notifications are shown.
@@ -73,9 +76,11 @@ public sealed class NotificationHandle
 
 /// <summary>
 /// Utility to materialize an <see cref="ImageSource"/> into a temporary PNG file
-/// that platform notification APIs can reference by path.
+/// that platform notification APIs can reference by path. Public so that
+/// backend implementations in <c>Jalium.UI.Desktop</c> / <c>Jalium.UI.Android</c>
+/// can share the same logic.
 /// </summary>
-internal static class NotificationImageHelper
+public static class NotificationImageHelper
 {
     private static readonly string s_tempDir = Path.Combine(Path.GetTempPath(), "jalium_notifications");
 

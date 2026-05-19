@@ -202,8 +202,8 @@ public:
 // Construction / Initialization
 // ============================================================================
 
-D3D12GlyphAtlas::D3D12GlyphAtlas(ID3D12Device* device, IDWriteFactory* dwriteFactory)
-    : device_(device), dwriteFactory_(dwriteFactory)
+D3D12GlyphAtlas::D3D12GlyphAtlas(ID3D12Device* device, IDWriteFactory* dwriteFactory, D3D12Backend* backend)
+    : device_(device), dwriteFactory_(dwriteFactory), backend_(backend)
 {
     // Atlas bitmap is sized in Initialize() at kInitialAtlasDim and grown by
     // GrowAtlas() — no 64 MB up-front allocation.
@@ -379,6 +379,22 @@ bool D3D12GlyphAtlas::GrowAtlas(uint32_t reqW, uint32_t reqH)
             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
             IID_PPV_ARGS(&newUpload)))) {
         return false;
+    }
+
+    // Hand the old atlas / upload buffers to the backend's fence-tracked
+    // graveyard before swapping in the new ones. The previous-frame GPU
+    // commands (running on the OTHER frame slot) still reference the old
+    // atlas via SRV bindings — letting ComPtr::operator= drop the last ref
+    // here triggers D3D12 ERROR #921 OBJECT_DELETED_WHILE_STILL_IN_USE on
+    // the next command queue execute. The graveyard pins the resource at
+    // refcount ≥ 1 and frees it only after its fence is GPU-complete.
+    //
+    // BeginFrame waits only the CURRENT slot's fence before calling
+    // ApplyPendingGrowthOrReset; the OTHER slot's commands may still be in
+    // flight, which is exactly the window where this race fires.
+    if (backend_) {
+        if (atlasTexture_) backend_->RetireGpuResource(std::move(atlasTexture_));
+        if (uploadBuffer_) backend_->RetireGpuResource(std::move(uploadBuffer_));
     }
 
     atlasTexture_ = newTex;

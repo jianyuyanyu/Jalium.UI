@@ -7,14 +7,23 @@
 #include <unordered_map>
 #include <vector>
 
+#include "jalium_api.h"
+
 namespace jalium {
 
-// Cache for the result of decomposing + triangulating a path.
+// Cross-backend cache for the result of decomposing + triangulating a path.
+//
+// Originally Vulkan-only (path_cache.h in jalium.native.vulkan); hoisted to
+// jalium.native.core in 2026-05 so D3D12 Impeller can layer it underneath
+// its pixel-space rect cache. Both backends now link to the same LRU type;
+// the rect cache (which is pixel-space and partitions by transform) and
+// this geometry cache (which is source-space and ignores transform until
+// scaleBucket lands in a later commit) coexist as two tiers.
 //
 // Why: TriangulateSimplePolygon is O(N³) ear-clipping. SVG icons routinely
 // give 50–200 verts after bezier decomposition, so a single icon costs
 // ~125 K – 8 M float ops to triangulate. Doing that every frame for every
-// icon dominates CPU time on the Vulkan backend's GPU replay path.
+// icon dominates CPU time on backends that hit the per-path tessellator.
 //
 // What we cache: the *local-space* point list (post-bezier-decompose,
 // pre-transform) and, if triangulation succeeded, the local-space triangle
@@ -42,7 +51,7 @@ struct CachedPathGeometry {
 
 // Bounded LRU cache: O(1) lookup + O(1) touch + per-insert single eviction.
 // Same shape as TextLruCache (text_cache.h) — they share the LRU pattern.
-class PathGeometryCache {
+class JALIUM_API PathGeometryCache {
 public:
     struct LookupResult {
         // shared_ptr so cache evictions are safe even if a recorded GPU
@@ -59,7 +68,7 @@ public:
     // Insert a freshly-computed geometry. Evicts the LRU tail if at capacity.
     void Insert(uint64_t key, std::shared_ptr<const CachedPathGeometry> entry);
 
-    void   Clear();
+    void     Clear();
     size_t   Size()       const noexcept { return list_.size(); }
     size_t   Capacity()   const noexcept { return capacity_; }
     uint64_t HitCount()   const noexcept { return hits_; }
@@ -79,17 +88,24 @@ private:
     uint64_t misses_ = 0;
 };
 
-// FNV-1a 64-bit hash over (startX, startY, fillRule, commands as raw bytes).
-// 64 bits is enough that collision rate on the Gallery's path working set
-// (a few hundred unique paths) is below 1 in 4 billion, so we don't bother
-// with a secondary equality check on the cached commands themselves —
-// callers trust the hash. If a future workload could carry millions of
-// distinct paths simultaneously, switch to a 128-bit hash or add a payload-
-// equality check.
-uint64_t HashPathInput(float startX,
-                       float startY,
-                       const float* commands,
-                       uint32_t commandLength,
-                       int32_t fillRule) noexcept;
+// FNV-1a 64-bit hash over (startX, startY, fillRule, scaleBucket, commands
+// as raw bytes). 64 bits is enough that collision rate on the Gallery's
+// path working set (a few hundred unique paths × handful of scale buckets)
+// is below 1 in 4 billion, so we don't bother with a secondary equality
+// check on the cached commands themselves — callers trust the hash. If a
+// future workload could carry millions of distinct paths simultaneously,
+// switch to a 128-bit hash or add a payload-equality check.
+//
+// scaleBucket partitions the cache by transform-scale octave (see
+// ScaleBucketFromMaxScale in jalium_flatten.h). Same source path data
+// rendered at 1.0× and 4.0× scale gets two cache entries so the cached
+// vertex density actually matches the on-screen size; 1.0× and 1.1× share
+// an entry because the per-octave bucket is wider than 10%.
+JALIUM_API uint64_t HashPathInput(float startX,
+                                  float startY,
+                                  const float* commands,
+                                  uint32_t commandLength,
+                                  int32_t fillRule,
+                                  uint32_t scaleBucket) noexcept;
 
 } // namespace jalium

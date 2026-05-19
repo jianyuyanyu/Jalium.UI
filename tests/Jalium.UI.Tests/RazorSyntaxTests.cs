@@ -89,6 +89,94 @@ public class RazorSyntaxTests
     }
 
     [Fact]
+    public void RazorCodeBlock_PartiallyWrittenIdentifier_DoesNotStackOverflow()
+    {
+        // Regression for an editor scenario where the user is mid-edit and the code block
+        // contains only an unresolved identifier. The parser used to feed ExpandCodeBlock's
+        // "@{d}" output back through TokenizeNested, recursing until the stack blew up.
+        const string xaml = """
+            <TextBlock xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+              @{ d }
+            </TextBlock>
+            """;
+
+        var textBlock = (TextBlock)XamlReader.Parse(xaml);
+        Assert.NotNull(textBlock);
+    }
+
+    [Fact]
+    public void RazorCodeBlock_IncompleteIfDirective_DoesNotThrow()
+    {
+        // Regression: while editing the user may type "@{ if }" before adding the
+        // (condition) and { body }. InterpretIfMixed then reads empty strings for
+        // both and passes "" into Evaluate, which used to throw XamlParseException
+        // ("Unexpected token '' (Eof) at position 0"). An empty expression must
+        // evaluate to null so the in-progress edit doesn't break the whole parse.
+        const string xaml = """
+            <Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+              @{ if }
+            </Grid>
+            """;
+
+        var grid = (Grid)XamlReader.Parse(xaml);
+        Assert.NotNull(grid);
+    }
+
+    [Fact]
+    public void RazorCodeBlock_IncompleteWhileDirective_DoesNotThrow()
+    {
+        // Same protection covers @while/@for/@switch with missing condition.
+        const string xaml = """
+            <Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+              @{ while }
+            </Grid>
+            """;
+
+        var grid = (Grid)XamlReader.Parse(xaml);
+        Assert.NotNull(grid);
+    }
+
+    [Fact]
+    public void RazorCodeBlock_StandaloneKeyword_DoesNotThrowXamlParseException()
+    {
+        // Regression: while the user is mid-edit they may type a lone C# keyword like
+        // "is" / "as" / "switch" inside @{ ... }. The lightweight interpreter throws
+        // XamlParseException for the unexpected token. Runtime template evaluation must
+        // catch this and report failure (return false from TryEvaluate) instead of
+        // tearing down the entire XAML parse.
+        const string xaml = """
+            <Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+              @{ is }
+            </Grid>
+            """;
+
+        var grid = (Grid)XamlReader.Parse(xaml);
+        Assert.NotNull(grid);
+    }
+
+    [Fact]
+    public void RazorCodeBlock_InsideReadOnlyCollectionContent_DoesNotThrow()
+    {
+        // Regression: while editing, the user may place @{ i } inside a Grid (or any panel
+        // whose ContentProperty is a read-only IList like Children). The runtime
+        // RazorTemplate engine used to call PropertyInfo.SetValue on Children and crash with
+        // "Property set method not found.". Read-only collection content properties must
+        // route through IList.Add (or silently ignore an incompatible element type) rather
+        // than throwing during a transient edit.
+        const string xaml = """
+            <Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="48" />
+              </Grid.RowDefinitions>
+              @{ i }
+            </Grid>
+            """;
+
+        var grid = (Grid)XamlReader.Parse(xaml);
+        Assert.NotNull(grid);
+    }
+
+    [Fact]
     public void RazorCodeBlock_ShouldSupportWriteInsideLoops()
     {
         const string xaml = """

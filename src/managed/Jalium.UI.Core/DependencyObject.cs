@@ -439,15 +439,31 @@ public class DependencyObject : DispatcherObject
         {
             OnPropertyChanged(new DependencyPropertyChangedEventArgs(dp, oldValue, value));
 
-            // Ensure dirty rect tracking for animated properties.
-            // OnPropertyChanged fires the metadata callback which MAY call InvalidateVisual,
-            // but properties without explicit callbacks (e.g., Opacity) would be missed.
-            // AddDirtyElement deduplicates, so double-calls are harmless.
-            if (this is UIElement uiElement)
+            // The metadata-callback path is the primary invalidation hook (e.g.
+            // OnRenderPropertyChanged → InvalidateVisual, OnCompositionPropertyChanged
+            // → InvalidateComposition). Without an explicit callback nothing would
+            // schedule a present, so animated DPs without a callback need a fallback.
+            // AddDirtyElement deduplicates so double-calls are harmless when both
+            // paths fire.
+            if (this is UIElement uiElement && !DpHasInvalidationCallback(dp))
             {
-                uiElement.InvalidateVisual();
+                if (DpAffectsCompositionOnly(dp))
+                    uiElement.InvalidateComposition();
+                else
+                    uiElement.InvalidateVisual();
             }
         }
+    }
+
+    private bool DpHasInvalidationCallback(DependencyProperty dp)
+    {
+        var metadata = dp.GetMetadata(GetType());
+        return metadata.PropertyChangedCallback != null;
+    }
+
+    private bool DpAffectsCompositionOnly(DependencyProperty dp)
+    {
+        return dp.GetMetadata(GetType()) is FrameworkPropertyMetadata fpm && fpm.AffectsCompositionOnly;
     }
 
     /// <summary>
@@ -477,14 +493,18 @@ public class DependencyObject : DispatcherObject
                 OnPropertyChanged(new DependencyPropertyChangedEventArgs(dp, oldValue, newValue));
             }
 
-            // 保险：动画结束后强制重绘。
-            // 当 oldValue 与 newValue 看似 Equals（例如两个返回相同 Color 的 SolidColorBrush，
-            // 或同 Reference 的资源 Brush），OnPropertyChanged 不会触发，但 visual 系统
-            // 可能仍持有 animated value 时期产生的临时 Brush（每帧 GetCurrentValueCore 创建新实例）
-            // 引用，导致渲染未刷新到 base value。显式 InvalidateVisual 兜住这种竞态。
+            // 动画结束后兜底重绘。当 oldValue 与 newValue 看似 Equals（例如两个返回
+            // 相同 Color 的 SolidColorBrush，或同 Reference 的资源 Brush），
+            // OnPropertyChanged 不会触发，但 visual 系统可能仍持有 animated value
+            // 时期产生的临时 Brush（每帧 GetCurrentValueCore 创建新实例）引用，导致
+            // 渲染未刷新到 base value。显式 schedule 一次 present 兜住这种竞态。
+            // 合成型 DP 不需要让 cached drawing 失效，仅 schedule present 即可。
             if (this is UIElement uiElement)
             {
-                uiElement.InvalidateVisual();
+                if (DpAffectsCompositionOnly(dp))
+                    uiElement.InvalidateComposition();
+                else
+                    uiElement.InvalidateVisual();
             }
         }
     }
@@ -538,6 +558,9 @@ public class DependencyObject : DispatcherObject
     }
 
     internal void SetLayerValue(DependencyProperty dp, object? value, LayerValueSource source)
+        => SetLayerValue(dp, value, source, allowAutoTransition: true);
+
+    internal void SetLayerValue(DependencyProperty dp, object? value, LayerValueSource source, bool allowAutoTransition)
     {
         ArgumentNullException.ThrowIfNull(dp);
         MutateValue(
@@ -548,17 +571,20 @@ public class DependencyObject : DispatcherObject
                 return true;
             },
             notifyBinding: false,
-            allowAutoTransition: true);
+            allowAutoTransition: allowAutoTransition);
     }
 
     internal void ClearLayerValue(DependencyProperty dp, LayerValueSource source)
+        => ClearLayerValue(dp, source, allowAutoTransition: true);
+
+    internal void ClearLayerValue(DependencyProperty dp, LayerValueSource source, bool allowAutoTransition)
     {
         ArgumentNullException.ThrowIfNull(dp);
         MutateValue(
             dp,
             () => ClearLayerValueCore(dp, source),
             notifyBinding: false,
-            allowAutoTransition: true);
+            allowAutoTransition: allowAutoTransition);
     }
 
     private ValueState GetValueState(DependencyProperty dp, bool forceCoerce = false)

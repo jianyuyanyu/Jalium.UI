@@ -54,8 +54,8 @@ public:
 /// D3D12 bitmap wrapper.
 class D3D12Bitmap : public Bitmap {
 public:
-    D3D12Bitmap(uint32_t width, uint32_t height);
-    ~D3D12Bitmap() override = default;
+    D3D12Bitmap(D3D12Backend* backend, uint32_t width, uint32_t height);
+    ~D3D12Bitmap() override;
 
     uint32_t GetWidth() const override { return width_; }
     uint32_t GetHeight() const override { return height_; }
@@ -79,7 +79,21 @@ public:
     uint32_t width_, height_;
     std::vector<uint8_t> pixelData_;
 
+    // Public so the renderer can park the current upload buffer in
+    // bitmapTextures_ to keep it alive at least for the duration of the
+    // command list that referenced it via CopyTextureRegion. Returns a
+    // ref-counted handle; the renderer drops it on the next BeginFrame
+    // after fence-wait, by which point the GPU has finished the copy.
+    ComPtr<ID3D12Resource> GetCurrentUploadBuffer() const { return d3d12UploadBuffer_; }
+    ComPtr<ID3D12Resource> GetCurrentTexture() const { return d3d12Texture_; }
+
 private:
+    // Backend owning this bitmap. Never owned. Used only at destruction time
+    // to forward the underlying GPU resources to the fence-gated graveyard,
+    // since the bitmap may be Disposed from any thread (worker, GC finalizer)
+    // while the GPU is still consuming its texture/upload buffer.
+    D3D12Backend* backend_ = nullptr;
+
     // D3D12 texture for direct renderer path
     ComPtr<ID3D12Resource> d3d12Texture_;
     ComPtr<ID3D12Resource> d3d12UploadBuffer_;
@@ -89,6 +103,10 @@ private:
     bool isDynamic_ = false;
     // Deferred release: old resources kept alive until GPU finishes using them
     std::vector<ComPtr<ID3D12Resource>> pendingRelease_;
+    // Tracks the bytes this bitmap has currently added to the global
+    // bitmap_stats::gpuResidentBytes counter. Destructor subtracts the same
+    // amount so reload / release accounting stays balanced.
+    uint64_t pinnedGpuBytes_ = 0;
 };
 
 /// DirectWrite text format wrapper.

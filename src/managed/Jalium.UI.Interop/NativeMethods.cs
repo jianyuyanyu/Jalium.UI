@@ -464,8 +464,13 @@ internal static partial class NativeMethods
     /// Draws a batch of filled ellipses with per-ellipse color (5 floats each: cx, cy, rx, ry, packedRGBA).
     /// Single P/Invoke call for thousands of ellipses.
     /// </summary>
+    /// <remarks>
+    /// 用 <c>float*</c> 而非 <c>float[]</c>:LibraryImport 对 <c>float[]</c> 的默认
+    /// <c>ArrayMarshaller</c> 即使是 blittable 也会 NativeMemory.Alloc + memcpy 一份新缓冲(每帧每次调用都做),
+    /// 让 IL_STUB_PInvoke 成为 50% 级别的 CPU 热点。改成裸指针后调用方用 <c>fixed</c> pin 数组,零拷贝零分配。
+    /// </remarks>
     [LibraryImport(CoreLib, EntryPoint = "jalium_fill_ellipse_batch")]
-    internal static partial void FillEllipseBatch(nint renderTarget, float[] data, uint count);
+    internal static unsafe partial void FillEllipseBatch(nint renderTarget, float* data, uint count);
 
     /// <summary>
     /// Draws an ellipse outline.
@@ -488,7 +493,7 @@ internal static partial class NativeMethods
     /// <param name="brush">Brush to fill with.</param>
     /// <param name="fillRule">0 = EvenOdd, 1 = NonZero.</param>
     [LibraryImport(CoreLib, EntryPoint = "jalium_fill_polygon")]
-    internal static partial void FillPolygon(nint renderTarget, float[] points, int pointCount, nint brush, int fillRule);
+    internal static unsafe partial void FillPolygon(nint renderTarget, float* points, int pointCount, nint brush, int fillRule);
 
     /// <summary>
     /// Draws a polygon outline.
@@ -500,24 +505,121 @@ internal static partial class NativeMethods
     /// <param name="strokeWidth">Width of stroke.</param>
     /// <param name="closed">Whether to close the polygon (1 = closed, 0 = open).</param>
     [LibraryImport(CoreLib, EntryPoint = "jalium_draw_polygon")]
-    internal static partial void DrawPolygon(nint renderTarget, float[] points, int pointCount, nint brush, float strokeWidth, int closed, int lineJoin, float miterLimit);
+    internal static unsafe partial void DrawPolygon(nint renderTarget, float* points, int pointCount, nint brush, float strokeWidth, int closed, int lineJoin, float miterLimit);
 
     /// <summary>
     /// Fills a path with lines and bezier curves.
     /// Commands: tag 0 = LineTo [0,x,y], tag 1 = CubicBezierTo [1,cp1x,cp1y,cp2x,cp2y,ex,ey],
     ///           tag 2 = MoveTo [2,x,y], tag 3 = QuadBezierTo [3,cpx,cpy,ex,ey],
     ///           tag 4 = ArcTo [4,ex,ey,rx,ry,xRotDeg,largeArc,sweep], tag 5 = ClosePath [5].
+    /// edgeMode: -1 = inherit / backend default, 1 = Aliased, 2 = Antialiased.
     /// </summary>
     [LibraryImport(CoreLib, EntryPoint = "jalium_fill_path")]
-    internal static partial void FillPath(nint renderTarget, float startX, float startY, float[] commands, int commandLength, nint brush, int fillRule);
+    internal static unsafe partial void FillPath(nint renderTarget, float startX, float startY, float* commands, int commandLength, nint brush, int fillRule, int edgeMode);
 
     /// <summary>
     /// Strokes a path with lines and bezier curves.
     /// lineCap: 0 = Butt, 1 = Square, 2 = Round.
+    /// edgeMode: -1 = inherit / backend default, 1 = Aliased, 2 = Antialiased.
     /// </summary>
     [LibraryImport(CoreLib, EntryPoint = "jalium_stroke_path")]
-    internal static partial void StrokePath(nint renderTarget, float startX, float startY, float[] commands, int commandLength, nint brush, float strokeWidth, int closed, int lineJoin, float miterLimit, int lineCap,
-        float[]? dashPattern, int dashCount, float dashOffset);
+    internal static unsafe partial void StrokePath(nint renderTarget, float startX, float startY, float* commands, int commandLength, nint brush, float strokeWidth, int closed, int lineJoin, float miterLimit, int lineCap,
+        float* dashPattern, int dashCount, float dashOffset, int edgeMode);
+
+    /// <summary>
+    /// Fills a path with an additional integer-pixel translation (offsetX, offsetY)
+    /// applied on top of the current transform stack for this single call. Equivalent
+    /// to push_transform([1,0,0,1,ox,oy]) + fill_path + pop_transform but in 1 P/Invoke
+    /// instead of 3 — saves two GC frame transitions per path draw.
+    /// edgeMode: -1 = inherit / backend default, 1 = Aliased, 2 = Antialiased.
+    /// </summary>
+    [LibraryImport(CoreLib, EntryPoint = "jalium_fill_path_at")]
+    internal static unsafe partial void FillPathAt(nint renderTarget, float offsetX, float offsetY, float startX, float startY, float* commands, int commandLength, nint brush, int fillRule, int edgeMode);
+
+    /// <summary>
+    /// Strokes a path with an additional integer-pixel translation applied on top of
+    /// the current transform stack. Single-P/Invoke counterpart to
+    /// push_transform + stroke_path + pop_transform.
+    /// edgeMode: -1 = inherit / backend default, 1 = Aliased, 2 = Antialiased.
+    /// </summary>
+    [LibraryImport(CoreLib, EntryPoint = "jalium_stroke_path_at")]
+    internal static unsafe partial void StrokePathAt(nint renderTarget, float offsetX, float offsetY, float startX, float startY, float* commands, int commandLength, nint brush, float strokeWidth, int closed, int lineJoin, float miterLimit, int lineCap,
+        float* dashPattern, int dashCount, float dashOffset, int edgeMode);
+
+    /// <summary>
+    /// Unified path telemetry from jalium.native.core. Single source of truth
+    /// for stroke/fill rect-cache hit/miss, source-space geometry cache (used
+    /// by Vulkan's PathGeometryCache and D3D12's geometry layer), and
+    /// CPU flatten / triangulate timing. Cumulative atomics since process
+    /// start — DevTools subtracts last-frame snapshot to get per-frame
+    /// deltas.
+    /// Layout MUST stay in sync with JaliumPathStats in
+    /// jalium_path_stats.h. Bumping the version field on the C side is the
+    /// only way to detect mismatches at runtime.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct JaliumPathStats
+    {
+        public ulong Version;
+        public ulong StrokeHits;
+        public ulong StrokeMisses;
+        public ulong StrokeRects;
+        public ulong FillHits;
+        public ulong FillMisses;
+        public ulong FillRects;
+        public ulong GeometryHits;
+        public ulong GeometryMisses;
+        public ulong FlattenNs;
+        public ulong FlattenInputSegments;
+        public ulong FlattenOutputVerts;
+        public ulong TriangulateNs;
+        public ulong TriangulateOk;
+        public ulong TriangulateFail;
+        public ulong CacheEvictions;
+        // Reserve 16 ulong slots to match the C side's ABI cushion. The
+        // backing array is fixed-size so the struct lays out byte-identical.
+        private ulong _r0, _r1, _r2, _r3, _r4, _r5, _r6, _r7;
+        private ulong _r8, _r9, _r10, _r11, _r12, _r13, _r14, _r15;
+    }
+
+    [LibraryImport(CoreLib, EntryPoint = "jalium_query_path_stats")]
+    internal static unsafe partial void QueryPathStats(JaliumPathStats* outStats);
+
+    [LibraryImport(CoreLib, EntryPoint = "jalium_reset_path_stats")]
+    internal static partial void ResetPathStats();
+
+    /// <summary>
+    /// Unified bitmap telemetry from jalium.native.core. Cross-backend
+    /// (D3D12 + Vulkan + software all write into the same atomic state in
+    /// core.dll), cumulative since process start. DevTools subtracts the
+    /// last-frame snapshot to get per-frame deltas.
+    ///
+    /// Layout MUST stay in sync with JaliumBitmapStats in jalium_bitmap_stats.h.
+    /// The version field on the C side detects ABI mismatch.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct JaliumBitmapStats
+    {
+        public ulong Version;
+        public ulong UploadCount;
+        public ulong UploadBytes;
+        public ulong FastPathHits;
+        public ulong DynamicReuses;
+        public ulong MemcmpShortCircuits;
+        public long  GpuResidentBytes;  // signed: producers Add(±bytes); net = live pinned bytes
+        public ulong AtlasHits;
+        public ulong CacheEvictions;
+        // Reserved 16 ulong slots so the struct lays out byte-identical with
+        // the C `reserved[16]` cushion.
+        private ulong _r0, _r1, _r2, _r3, _r4, _r5, _r6, _r7;
+        private ulong _r8, _r9, _r10, _r11, _r12, _r13, _r14, _r15;
+    }
+
+    [LibraryImport(CoreLib, EntryPoint = "jalium_query_bitmap_stats")]
+    internal static unsafe partial void QueryBitmapStats(JaliumBitmapStats* outStats);
+
+    [LibraryImport(CoreLib, EntryPoint = "jalium_reset_bitmap_stats")]
+    internal static partial void ResetBitmapStats();
 
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -809,7 +911,7 @@ internal static partial class NativeMethods
     /// Pushes a transform matrix.
     /// </summary>
     [LibraryImport(CoreLib, EntryPoint = "jalium_push_transform")]
-    internal static partial void PushTransform(nint renderTarget, [In] float[] matrix);
+    internal static unsafe partial void PushTransform(nint renderTarget, float* matrix);
 
     /// <summary>
     /// Pops the current transform.

@@ -79,16 +79,55 @@
              Importance="low" />
   </Target>
 
-  <!-- Register source files for the source generator. -->
+  <!-- Register source files for the source generator.
+       Carry the project-relative path (RazorRelativeLogicalPath when set, otherwise the
+       jalxaml's RelativeDir+Filename) as a metadata item on AdditionalFiles so the SG
+       can compute StartupUri spellings even after the Razor transform has rewritten the
+       file's filesystem location into the intermediate output directory. -->
   <Target Name="PrepareJalxamlForSourceGenerator"
-          BeforeTargets="CoreCompile"
+          BeforeTargets="GenerateMSBuildEditorConfigFileShouldRun;GenerateMSBuildEditorConfigFile;CoreCompile"
           DependsOnTargets="ResolveEffectiveJalxamlSources"
           Condition="'$(EnableJalxamlCodeGeneration)' == 'false' and ('@(JalxamlPage)' != '' or '@(JalxamlApplicationDefinition)' != '')">
+    <!-- Stamp the source-relative path on each effective source as item metadata first.
+         The Razor transform writes its output into $(JalxamlRazorIntermediateOutputPath)
+         while preserving directory structure ("Views/MainWindow.jalxaml" stays at
+         "Views/MainWindow.jalxaml" inside the intermediate root). [MSBuild]::MakeRelative
+         strips the intermediate-root prefix and recovers the project-relative source path
+         the SG needs for StartupUri / manifest-name spellings. For files outside the
+         intermediate root, MakeRelative returns a path containing "..\" — we filter that
+         out with a Contains check and fall back to RelativeDir+Filename, which is already
+         project-relative for in-tree items.
+
+         IMPORTANT (MSBuild batching trap, MSB4096):
+         - Inner item-modify elements share batching state within one <ItemGroup>; a later
+           element cannot observe metadata a sibling just assigned. Split each chained
+           write into its OWN <ItemGroup> — ItemGroups are evaluated sequentially.
+         - Every item in the batch must define JalxamlSourceRelativePath before any
+           Condition or transform references it; otherwise MSB4096 fires on items that
+           "fell through" earlier conditional writes (e.g. App.jalxaml at the project
+           root never enters the Razor intermediate path).
+           Fix: write the fallback unconditionally first, then conditionally OVERWRITE
+           with the Razor-relative path. Every item ends up with a defined value. -->
+    <ItemGroup>
+      <_EffectiveJalxamlSources>
+        <_JalxamlPathRelativeToRazorRoot>$([MSBuild]::MakeRelative($(JalxamlRazorIntermediateOutputPath), %(FullPath)))</_JalxamlPathRelativeToRazorRoot>
+      </_EffectiveJalxamlSources>
+    </ItemGroup>
+    <ItemGroup>
+      <_EffectiveJalxamlSources>
+        <JalxamlSourceRelativePath>%(RelativeDir)%(Filename)%(Extension)</JalxamlSourceRelativePath>
+      </_EffectiveJalxamlSources>
+    </ItemGroup>
+    <ItemGroup>
+      <_EffectiveJalxamlSources>
+        <JalxamlSourceRelativePath Condition="!$([System.String]::Copy('%(_JalxamlPathRelativeToRazorRoot)').Contains('..'))">%(_JalxamlPathRelativeToRazorRoot)</JalxamlSourceRelativePath>
+      </_EffectiveJalxamlSources>
+    </ItemGroup>
     <ItemGroup>
       <AdditionalFiles Include="@(_EffectiveJalxamlSources)" />
       <AdditionalFiles Include="$(JalxamlIntermediateOutputPath)*.uic.base64" />
     </ItemGroup>
-    <Message Text="Added JALXAML files to AdditionalFiles for the source generator." Importance="low" />
+    <Message Text="Added JALXAML files to AdditionalFiles for the source generator: @(_EffectiveJalxamlSources->'%(JalxamlSourceRelativePath)')" Importance="normal" />
   </Target>
 
   <!-- Transform Razor-style JALXAML before compilation and embedding. -->
@@ -120,7 +159,20 @@
              Text="Generated JALXAML Razor metadata code: @(_JalxamlRazorGeneratedCodeFiles)" Importance="normal" />
   </Target>
 
-  <!-- Choose the final source set used by downstream targets. -->
+  <!-- Choose the final source set used by downstream targets.
+
+       Order of preference:
+         1. Task output @(_JalxamlRazorTransformedFiles) — populated only when
+            TransformJalxamlRazor actually ran (not skipped by Inputs/Outputs
+            incremental check).
+         2. Disk-resident intermediate files at $(JalxamlRazorIntermediateOutputPath)
+            — when the Razor transform was skipped this build but produced output on
+            a previous build, those files are still valid and must be preferred over
+            the raw sources (otherwise the SG receives @{ for } / @expr blocks and
+            errors with JALXAML002).
+         3. Raw @(JalxamlPage)/@(JalxamlApplicationDefinition) — last-resort fallback
+            for projects with EnableJalxamlRazorTransform=false or for items whose
+            transform output does not exist on disk. -->
   <Target Name="ResolveEffectiveJalxamlSources"
           DependsOnTargets="TransformJalxamlRazor"
           Condition="'@(JalxamlPage)' != '' or '@(JalxamlApplicationDefinition)' != ''">
@@ -128,6 +180,14 @@
       <_EffectiveJalxamlSources Remove="@(_EffectiveJalxamlSources)" />
       <_EffectiveJalxamlSources Include="@(_JalxamlRazorTransformedFiles)"
                                 Condition="'$(EnableJalxamlRazorTransform)' == 'true' and '@(_JalxamlRazorTransformedFiles)' != ''" />
+    </ItemGroup>
+    <!-- Reconstruct from the intermediate folder when the transform task was skipped
+         (Inputs/Outputs match, so its Output items were not produced this build). -->
+    <ItemGroup Condition="'$(EnableJalxamlRazorTransform)' == 'true' and '@(_EffectiveJalxamlSources)' == ''">
+      <_JalxamlRazorExpectedTransformOutput Include="@(JalxamlPage->'$(JalxamlRazorIntermediateOutputPath)%(RecursiveDir)%(Filename)%(Extension)');@(JalxamlApplicationDefinition->'$(JalxamlRazorIntermediateOutputPath)%(RecursiveDir)%(Filename)%(Extension)')" />
+      <_EffectiveJalxamlSources Include="@(_JalxamlRazorExpectedTransformOutput)" Condition="Exists('%(Identity)')" />
+    </ItemGroup>
+    <ItemGroup>
       <_EffectiveJalxamlSources Include="@(JalxamlPage);@(JalxamlApplicationDefinition)"
                                 Condition="'@(_EffectiveJalxamlSources)' == ''">
         <RazorRelativeLogicalPath></RazorRelativeLogicalPath>
@@ -244,11 +304,21 @@
     <Message Text="Embedded compiled JALXAML resources: @(_UicFilesToEmbed -> '$(RootNamespace).%(Filename).uic')" Importance="normal" />
   </Target>
 
-  <!-- Embed original JALXAML sources for runtime XAML parsing. -->
+  <!--
+    Embed original JALXAML sources for runtime XAML parsing.
+
+    The SourceGenerator now inlines the document content as a verbatim string literal in
+    the codegen fallback path (see XamlBuilder.RunFallbackContentLoad), so manifest
+    resources are no longer required for runtime parsing. Embedding is therefore
+    OFF by default; enable it project-by-project by setting
+    <c>&lt;EmbedJalxamlSources&gt;true&lt;/EmbedJalxamlSources&gt;</c> when external tooling
+    (designer / hot-reload / unit tests that go through the legacy LoadComponent path)
+    still needs to find the file via <c>Assembly.GetManifestResourceStream</c>.
+  -->
   <Target Name="EmbedJalxamlSources"
           BeforeTargets="AssignTargetPaths;CoreCompile"
           DependsOnTargets="ResolveEffectiveJalxamlSources"
-          Condition="'@(JalxamlPage)' != '' or '@(JalxamlApplicationDefinition)' != ''">
+          Condition="'$(EmbedJalxamlSources)' == 'true' and ('@(JalxamlPage)' != '' or '@(JalxamlApplicationDefinition)' != '')">
 
     <ItemGroup>
       <_JalxamlSourcesToEmbed Include="@(_EffectiveJalxamlSources)">

@@ -1,4 +1,5 @@
-﻿using System.Diagnostics.CodeAnalysis;
+﻿using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using Jalium.UI.Media;
 
@@ -132,6 +133,10 @@ public static class ThemeManager
     {
         ArgumentNullException.ThrowIfNull(app);
 
+        bool trace = Environment.GetEnvironmentVariable("JALIUM_STARTUP_TRACE") != "0";
+        long t0 = trace ? Stopwatch.GetTimestamp() : 0;
+        long tEnsureXaml = 0, tPlatform = 0, tGeneric = 0, tAccent = 0, tTypo = 0;
+
         _application = app;
         SyncThemeFromCurrentThemeKey();
         ResourceDictionary.CurrentThemeKey = CurrentTheme.ToString();
@@ -143,6 +148,7 @@ public static class ThemeManager
         }
 
         EnsureXamlLoaderRegistered();
+        if (trace) tEnsureXaml = Stopwatch.GetTimestamp();
 
         // Loading Jalium.UI.Xaml may re-enter ThemeManager.Initialize via ThemeLoader.Initialize().
         // If that already completed initialization, stop here to avoid duplicate dictionary insertion.
@@ -163,6 +169,7 @@ public static class ThemeManager
         // Windows) a chance to register a SystemAccentResolver before we
         // build the accent dictionary.
         EnsurePlatformIntegrationLoaded();
+        if (trace) tPlatform = Stopwatch.GetTimestamp();
 
         var platformAccent = TryGetPlatformAccent();
         if (platformAccent.HasValue)
@@ -175,15 +182,32 @@ public static class ThemeManager
         {
             app.Resources.MergedDictionaries.Add(_genericThemeDictionary);
         }
+        if (trace) tGeneric = Stopwatch.GetTimestamp();
 
         _accentDictionary = BuildAccentDictionary(CurrentAccentColor);
+        if (trace) tAccent = Stopwatch.GetTimestamp();
+
         _typographyDictionary = BuildTypographyDictionary(CurrentDisplayFontFamily, CurrentBodyFontFamily, CurrentMonospaceFontFamily, CurrentBodyFontSize);
+        if (trace) tTypo = Stopwatch.GetTimestamp();
 
         app.Resources.MergedDictionaries.Add(_accentDictionary);
         app.Resources.MergedDictionaries.Add(_typographyDictionary);
 
         _initialized = true;
         ForceThemeRefresh();
+
+        if (trace)
+        {
+            static long Ms(long a, long b) => (long)Stopwatch.GetElapsedTime(a, b).TotalMilliseconds;
+            long tEnd = Stopwatch.GetTimestamp();
+            XamlLoadStartupTrace.Emit(
+                $"[Jalium.UI startup]   ThemeManager.Initialize breakdown: total {Ms(t0, tEnd)}ms " +
+                $"(EnsureXamlLoaderRegistered {Ms(t0, tEnsureXaml)}ms, " +
+                $"EnsurePlatformIntegrationLoaded {Ms(tEnsureXaml, tPlatform)}ms, " +
+                $"LoadGenericTheme[+27 nested dicts] {Ms(tPlatform, tGeneric)}ms, " +
+                $"BuildAccentDictionary {Ms(tGeneric, tAccent)}ms, " +
+                $"BuildTypographyDictionary {Ms(tAccent, tTypo)}ms)");
+        }
     }
 
     /// <summary>
@@ -298,47 +322,71 @@ public static class ThemeManager
     /// <summary>
     /// Loads the Generic theme using the registered XamlLoader callback.
     /// This avoids compile-time dependency on the Xaml project (AOT-safe).
+    ///
+    /// <para>
+    /// Two paths are supported, in order of preference:
+    /// <list type="number">
+    /// <item>The SourceGenerator emitted a prebuilt-dictionary builder for Generic.jalxaml
+    /// — the XamlLoader callback's prebuilt registry lookup hits and the manifest
+    /// resource is irrelevant. This is the default after the no-embed switch.</item>
+    /// <item>Legacy fallback: the .jalxaml file is still embedded as a manifest resource
+    /// (for projects that opted into <c>EmbedJalxamlSources=true</c> for tooling).</item>
+    /// </list>
+    /// When neither is available the caller logs a diagnostic and theming silently
+    /// falls back to default control rendering. We deliberately pass the canonical
+    /// manifest resource name to XamlLoader so its prebuilt-dictionary lookup can match
+    /// what the SG registered — registry keys are the canonical
+    /// <c>{AssemblyName}.{path-with-dots}.jalxaml</c> form.
+    /// </para>
     /// </summary>
+    /// <summary>
+    /// Loads the Generic theme dictionary, populating it with control templates and styles.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// We pass the slash-form path to <see cref="XamlLoader"/>. The Xaml-side
+    /// <c>ThemeLoader</c> turns it into the canonical prebuilt-registry key
+    /// (<c>{AssemblyName}.{dotted-path}</c>) when looking up the SG-emitted builder, but
+    /// uses the slash form as the dictionary's <c>BaseUri</c>. The latter is mandatory:
+    /// <c>&lt;ResourceDictionary Source="Controls/Button.jalxaml" /&gt;</c> children inside
+    /// Generic.jalxaml resolve as path-relative URIs, and only the slash form preserves
+    /// the <c>Themes/</c> segment when relative resolution strips the trailing filename.
+    /// Passing the dotted form here makes the entire dotted name look like a single
+    /// filename to the URI parser, dropping <c>Themes/</c> and breaking every nested
+    /// MergedDictionary lookup.
+    /// </para>
+    /// </remarks>
     private static ResourceDictionary? LoadGenericTheme()
     {
         if (XamlLoader == null)
         {
-            // XamlLoader not registered - Jalium.UI.Xaml assembly not initialized.
             return null;
         }
 
-        using var stream = GetGenericThemeStream();
-        if (stream == null)
-        {
-            return null;
-        }
-
-        return XamlLoader(stream, "Themes/Generic.jalxaml", ControlsAssembly);
+        const string slashPath = "Themes/Generic.jalxaml";
+        using var emptyStream = new MemoryStream();
+        return XamlLoader(emptyStream, slashPath, ControlsAssembly);
     }
 
     /// <summary>
-    /// Gets the embedded resource stream for the Generic theme.
+    /// Returns the embedded-resource stream for the Generic theme, when one exists.
     /// </summary>
-    /// <returns>The stream containing the Generic.jalxaml content, or null if not found.</returns>
+    /// <remarks>
+    /// Jalium.UI.Controls no longer embeds the framework theme dictionaries as manifest
+    /// resources — the SourceGenerator emits compile-time builders that the runtime loads
+    /// via <see cref="XamlPrebuiltDictionaryRegistry"/>. This API is retained for callers
+    /// that may want to consume the (third-party) embedded variant of the framework
+    /// theme; it now always returns <c>null</c> for the in-box assembly. Use
+    /// <see cref="LoadGenericTheme"/> to obtain a fully-built dictionary instead.
+    /// </remarks>
     public static Stream? GetGenericThemeStream()
     {
-        var assembly = typeof(ThemeManager).Assembly;
-        var stream = assembly.GetManifestResourceStream(GenericThemeResourceName);
-
-        if (stream == null)
-        {
-            // Fallback: try to find the resource with different naming
-            var resourceNames = assembly.GetManifestResourceNames();
-            var genericResource = resourceNames.FirstOrDefault(n => n.EndsWith("Generic.jalxaml", StringComparison.OrdinalIgnoreCase));
-
-            if (genericResource != null)
-            {
-                stream = assembly.GetManifestResourceStream(genericResource);
-            }
-
-        }
-
-        return stream;
+        // Kept as a public API for backward compatibility. With the SG-emitted prebuilt
+        // registry replacing the manifest-resource pipeline, the in-box framework
+        // dictionaries are no longer accessible as a stream — callers must go through
+        // LoadGenericTheme / XamlLoader. Returning null here matches the "stream not
+        // present" contract this API has always documented.
+        return null;
     }
 
     /// <summary>

@@ -35,6 +35,30 @@ internal sealed class XmlnsTypeResolver
     private const string XmlnsDefinitionAttributeName = "Jalium.UI.Markup.XmlnsDefinitionAttribute";
     private const string XmlnsCompatibleWithAttributeName = "Jalium.UI.Markup.XmlnsCompatibleWithAttribute";
     private const string ClrNamespacePrefix = "clr-namespace:";
+    private const string XamlLanguageNamespace = "http://schemas.microsoft.com/winfx/2006/xaml";
+
+    /// <summary>
+    /// XAML language built-in element types. <c>&lt;x:String&gt;</c> resolves to
+    /// <see cref="System.String"/>, <c>&lt;x:Int32&gt;</c> to <see cref="System.Int32"/>, etc.
+    /// These are XAML-spec primitives, not assembly-declared mappings, so the resolver
+    /// short-circuits them before the regular <c>_mappings</c> lookup.
+    /// </summary>
+    private static readonly Dictionary<string, string> XamlLanguageBuiltInTypes = new(StringComparer.Ordinal)
+    {
+        { "Object",  "System.Object" },
+        { "String",  "System.String" },
+        { "Boolean", "System.Boolean" },
+        { "Char",    "System.Char" },
+        { "Byte",    "System.Byte" },
+        { "Int16",   "System.Int16" },
+        { "Int32",   "System.Int32" },
+        { "Int64",   "System.Int64" },
+        { "Single",  "System.Single" },
+        { "Double",  "System.Double" },
+        { "Decimal", "System.Decimal" },
+        { "TimeSpan","System.TimeSpan" },
+        { "Uri",     "System.Uri" },
+    };
 
     private readonly Compilation _compilation;
 
@@ -160,6 +184,15 @@ internal sealed class XmlnsTypeResolver
             return ResolveClrNamespace(elementName, namespaceUri);
         }
 
+        // 1b) XAML-language built-in primitive types (<x:String>, <x:Int32> etc.). These are
+        //     spec-mandated aliases for System.* types; no assembly carries an XmlnsDefinition
+        //     for them so the regular mapping path won't see them.
+        if (string.Equals(namespaceUri, XamlLanguageNamespace, StringComparison.Ordinal) &&
+            XamlLanguageBuiltInTypes.TryGetValue(elementName, out var builtIn))
+        {
+            return $"global::{builtIn}";
+        }
+
         // 2) Follow XmlnsCompatibleWith redirect chain (with cycle guard) so legacy URIs
         //    (e.g. http://schemas.jalium.ui/2024) fold into the canonical Presentation URI
         //    where the actual XmlnsDefinition declarations live.
@@ -170,6 +203,17 @@ internal sealed class XmlnsTypeResolver
             return null;
         }
 
+        // Two-pass walk. Pass 1 honours the assembly hint when the same (clrNs, name) pair
+        // resolves in multiple assemblies — without this the SG would arbitrarily pick the
+        // first assembly the symbol table returns (which depends on file enumeration order).
+        // Pass 2 accepts ANY hit when no preferred-assembly candidate matched — the runtime
+        // type registry behaves the same way (XmlnsDefinitionRegistry.AddXmlnsDefinition
+        // records the declaring assembly purely as a tie-breaker; XamlReader still honours
+        // a name found in a different assembly when the declaring assembly doesn't carry
+        // the type). The framework relies on this behaviour heavily: the Media types live
+        // in Jalium.UI.Core but their xmlns mapping is declared on the Jalium.UI.Media
+        // assembly facade.
+        INamedTypeSymbol? firstCandidate = null;
         foreach (var mapping in candidateMappings)
         {
             var fullName = $"{mapping.ClrNamespace}.{elementName}";
@@ -177,18 +221,16 @@ internal sealed class XmlnsTypeResolver
             if (typeSymbol == null)
                 continue;
 
-            // Honour the assembly hint when present — when the same simple name exists in
-            // multiple assemblies, the XmlnsDefinition's preferred assembly wins.
-            if (!string.IsNullOrEmpty(mapping.PreferredAssembly) &&
-                !string.Equals(typeSymbol.ContainingAssembly?.Identity.Name, mapping.PreferredAssembly, StringComparison.Ordinal))
-            {
-                continue;
-            }
+            firstCandidate ??= typeSymbol;
 
-            return ToGlobalDisplayString(typeSymbol);
+            if (string.IsNullOrEmpty(mapping.PreferredAssembly) ||
+                string.Equals(typeSymbol.ContainingAssembly?.Identity.Name, mapping.PreferredAssembly, StringComparison.Ordinal))
+            {
+                return ToGlobalDisplayString(typeSymbol);
+            }
         }
 
-        return null;
+        return firstCandidate != null ? ToGlobalDisplayString(firstCandidate) : null;
     }
 
     private string? ResolveClrNamespace(string elementName, string namespaceUri)

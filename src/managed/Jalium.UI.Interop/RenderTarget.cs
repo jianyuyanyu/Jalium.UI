@@ -1,4 +1,7 @@
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using Jalium.UI;
+using Jalium.UI.Diagnostics;
 
 namespace Jalium.UI.Interop;
 
@@ -188,7 +191,9 @@ public sealed class RenderTarget : IDisposable
         ThrowIfDisposed();
         if (_isDrawing) return;
 
+        long t0 = ApiStart();
         int resultCode = _native.BeginDraw(_handle);
+        ApiEnd("BeginDraw", t0);
         ThrowIfNativeFailure("Begin", resultCode);
         _isDrawing = true;
     }
@@ -203,7 +208,9 @@ public sealed class RenderTarget : IDisposable
         ThrowIfDisposed();
         if (_isDrawing) return true;
 
+        long t0 = ApiStart();
         int resultCode = _native.BeginDraw(_handle);
+        ApiEnd("BeginDraw", t0);
         if (resultCode == (int)JaliumResult.Ok)
         {
             _isDrawing = true;
@@ -229,6 +236,7 @@ public sealed class RenderTarget : IDisposable
         ThrowIfDisposed();
         if (!_isDrawing) return;
 
+        long t0 = ApiStart();
         int resultCode;
         try
         {
@@ -237,6 +245,7 @@ public sealed class RenderTarget : IDisposable
         finally
         {
             _isDrawing = false;
+            ApiEnd("EndDraw", t0);
         }
 
         ThrowIfNativeFailure("End", resultCode);
@@ -250,6 +259,7 @@ public sealed class RenderTarget : IDisposable
     {
         if (_disposed || !_isDrawing) return JaliumResult.Ok;
 
+        long t0 = ApiStart();
         int resultCode;
         try
         {
@@ -258,6 +268,7 @@ public sealed class RenderTarget : IDisposable
         finally
         {
             _isDrawing = false;
+            ApiEnd("EndDraw", t0);
         }
 
         return JaliumResultMapper.FromCode(resultCode);
@@ -294,17 +305,37 @@ public sealed class RenderTarget : IDisposable
     public void Clear(float r, float g, float b, float a = 1.0f)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.RenderTargetClear(_handle, r, g, b, a);
+        ApiEnd("Clear", t0);
     }
 
     /// <summary>
     /// Draws a filled rectangle.
     /// </summary>
+    // ─── DevTools draw-API instrumentation ──────────────────────────────
+    // ApiStart/ApiEnd are no-cost when RenderDiagnostics.ApiStatsEnabled is
+    // false (which is the default outside DevTools). When enabled they record
+    // per-frame call counts + native-side wall-clock time per native draw API
+    // so the Perf tab can show which paths dominate the frame budget.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long ApiStart()
+        => RenderDiagnostics.ApiStatsEnabled ? Stopwatch.GetTimestamp() : 0L;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ApiEnd(string name, long t0)
+    {
+        if (!RenderDiagnostics.ApiStatsEnabled) return;
+        RenderDiagnostics.RecordApi(name, Stopwatch.GetTimestamp() - t0);
+    }
+
     public void FillRectangle(float x, float y, float width, float height, NativeBrush brush)
     {
         ThrowIfDisposed();
         if (brush == null || !brush.IsValid) return;
+        long t0 = ApiStart();
         NativeMethods.DrawFillRectangle(_handle, x, y, width, height, brush.Handle);
+        ApiEnd("FillRectangle", t0);
     }
 
     /// <summary>
@@ -314,7 +345,9 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (brush == null || !brush.IsValid) return;
+        long t0 = ApiStart();
         NativeMethods.DrawRectangle(_handle, x, y, width, height, brush.Handle, strokeWidth);
+        ApiEnd("DrawRectangle", t0);
     }
 
     /// <summary>
@@ -324,7 +357,9 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (brush == null || !brush.IsValid) return;
+        long t0 = ApiStart();
         NativeMethods.DrawFillRoundedRectangle(_handle, x, y, width, height, radiusX, radiusY, brush.Handle);
+        ApiEnd("FillRoundedRectangle", t0);
     }
 
     /// <summary>
@@ -334,7 +369,9 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (brush == null || !brush.IsValid) return;
+        long t0 = ApiStart();
         NativeMethods.DrawRoundedRectangle(_handle, x, y, width, height, radiusX, radiusY, brush.Handle, strokeWidth);
+        ApiEnd("DrawRoundedRectangle", t0);
     }
 
     /// <summary>
@@ -344,7 +381,9 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (brush == null || !brush.IsValid) return;
+        long t0 = ApiStart();
         NativeMethods.FillPerCornerRoundedRectangle(_handle, x, y, width, height, tl, tr, br, bl, brush.Handle);
+        ApiEnd("FillPerCornerRoundedRectangle", t0);
     }
 
     /// <summary>
@@ -354,7 +393,9 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (brush == null || !brush.IsValid) return;
+        long t0 = ApiStart();
         NativeMethods.DrawPerCornerRoundedRectangle(_handle, x, y, width, height, tl, tr, br, bl, brush.Handle, strokeWidth);
+        ApiEnd("DrawPerCornerRoundedRectangle", t0);
     }
 
     /// <summary>
@@ -364,7 +405,9 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (brush == null || !brush.IsValid) return;
+        long t0 = ApiStart();
         NativeMethods.DrawFillEllipse(_handle, centerX, centerY, radiusX, radiusY, brush.Handle);
+        ApiEnd("FillEllipse", t0);
     }
 
     /// <summary>
@@ -376,7 +419,15 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (data == null || count == 0) return;
-        NativeMethods.FillEllipseBatch(_handle, data, count);
+        long t0 = ApiStart();
+        unsafe
+        {
+            fixed (float* p = data)
+            {
+                NativeMethods.FillEllipseBatch(_handle, p, count);
+            }
+        }
+        ApiEnd("FillEllipseBatch", t0);
     }
 
     /// <summary>
@@ -386,7 +437,9 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (brush == null || !brush.IsValid) return;
+        long t0 = ApiStart();
         NativeMethods.DrawEllipse(_handle, centerX, centerY, radiusX, radiusY, brush.Handle, strokeWidth);
+        ApiEnd("DrawEllipse", t0);
     }
 
     /// <summary>
@@ -396,7 +449,9 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (brush == null || !brush.IsValid) return;
+        long t0 = ApiStart();
         NativeMethods.DrawLine(_handle, x1, y1, x2, y2, brush.Handle, strokeWidth);
+        ApiEnd("DrawLine", t0);
     }
 
     /// <summary>
@@ -409,7 +464,15 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (brush == null || !brush.IsValid || points == null || points.Length < 6) return;
-        NativeMethods.FillPolygon(_handle, points, points.Length / 2, brush.Handle, fillRule);
+        long t0 = ApiStart();
+        unsafe
+        {
+            fixed (float* p = points)
+            {
+                NativeMethods.FillPolygon(_handle, p, points.Length / 2, brush.Handle, fillRule);
+            }
+        }
+        ApiEnd("FillPolygon", t0);
     }
 
     /// <summary>
@@ -423,30 +486,154 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (brush == null || !brush.IsValid || points == null || points.Length < 4) return;
-        NativeMethods.DrawPolygon(_handle, points, points.Length / 2, brush.Handle, strokeWidth, closed ? 1 : 0, lineJoin, miterLimit);
+        long t0 = ApiStart();
+        unsafe
+        {
+            fixed (float* p = points)
+            {
+                NativeMethods.DrawPolygon(_handle, p, points.Length / 2, brush.Handle, strokeWidth, closed ? 1 : 0, lineJoin, miterLimit);
+            }
+        }
+        ApiEnd("DrawPolygon", t0);
     }
 
     /// <summary>
     /// Fills a path with native bezier curve support.
     /// </summary>
-    public void FillPath(float startX, float startY, float[] commands, NativeBrush brush, int fillRule = 0)
+    /// <param name="edgeMode">-1 = inherit / backend default, 1 = Aliased, 2 = Antialiased.</param>
+    public void FillPath(float startX, float startY, float[] commands, NativeBrush brush, int fillRule = 0, int edgeMode = -1)
     {
         ThrowIfDisposed();
         if (brush == null || !brush.IsValid || commands == null || commands.Length == 0) return;
-        NativeMethods.FillPath(_handle, startX, startY, commands, commands.Length, brush.Handle, fillRule);
+        long t0 = ApiStart();
+        unsafe
+        {
+            fixed (float* p = commands)
+            {
+                NativeMethods.FillPath(_handle, startX, startY, p, commands.Length, brush.Handle, fillRule, edgeMode);
+            }
+        }
+        ApiEnd("FillPath", t0);
+    }
+
+    /// <summary>
+    /// Fills a path using only the first <paramref name="commandLength"/> floats of
+    /// <paramref name="commands"/>. Used by callers that pool / reuse the buffer
+    /// across calls — the array's <c>Length</c> is the pool capacity, not the
+    /// active command count.
+    /// </summary>
+    /// <param name="edgeMode">-1 = inherit / backend default, 1 = Aliased, 2 = Antialiased.</param>
+    public void FillPath(float startX, float startY, float[] commands, int commandLength, NativeBrush brush, int fillRule = 0, int edgeMode = -1)
+    {
+        ThrowIfDisposed();
+        if (brush == null || !brush.IsValid || commands == null || commandLength <= 0) return;
+        long t0 = ApiStart();
+        unsafe
+        {
+            fixed (float* p = commands)
+            {
+                NativeMethods.FillPath(_handle, startX, startY, p, commandLength, brush.Handle, fillRule, edgeMode);
+            }
+        }
+        ApiEnd("FillPath", t0);
     }
 
     /// <summary>
     /// Strokes a path with native bezier curve support.
     /// lineCap: 0 = Butt, 1 = Square, 2 = Round.
     /// </summary>
+    /// <param name="edgeMode">-1 = inherit / backend default, 1 = Aliased, 2 = Antialiased.</param>
     public void StrokePath(float startX, float startY, float[] commands, NativeBrush brush, float strokeWidth = 1.0f, bool closed = true, int lineJoin = 0, float miterLimit = 10.0f, int lineCap = 0,
-        float[]? dashPattern = null, float dashOffset = 0.0f)
+        float[]? dashPattern = null, float dashOffset = 0.0f, int edgeMode = -1)
     {
         ThrowIfDisposed();
         if (brush == null || !brush.IsValid || commands == null || commands.Length == 0) return;
-        NativeMethods.StrokePath(_handle, startX, startY, commands, commands.Length, brush.Handle, strokeWidth, closed ? 1 : 0, lineJoin, miterLimit, lineCap,
-            dashPattern, dashPattern?.Length ?? 0, dashOffset);
+        int dashCount = dashPattern?.Length ?? 0;
+        long t0 = ApiStart();
+        unsafe
+        {
+            fixed (float* p = commands)
+            fixed (float* dp = dashPattern)
+            {
+                NativeMethods.StrokePath(_handle, startX, startY, p, commands.Length, brush.Handle, strokeWidth, closed ? 1 : 0, lineJoin, miterLimit, lineCap,
+                    dp, dashCount, dashOffset, edgeMode);
+            }
+        }
+        ApiEnd("StrokePath", t0);
+    }
+
+    /// <summary>
+    /// Strokes a path using only the first <paramref name="commandLength"/> floats of
+    /// <paramref name="commands"/>. Used by callers that pool / reuse the buffer
+    /// across calls.
+    /// </summary>
+    /// <param name="edgeMode">-1 = inherit / backend default, 1 = Aliased, 2 = Antialiased.</param>
+    public void StrokePath(float startX, float startY, float[] commands, int commandLength, NativeBrush brush, float strokeWidth = 1.0f, bool closed = true, int lineJoin = 0, float miterLimit = 10.0f, int lineCap = 0,
+        float[]? dashPattern = null, float dashOffset = 0.0f, int edgeMode = -1)
+    {
+        ThrowIfDisposed();
+        if (brush == null || !brush.IsValid || commands == null || commandLength <= 0) return;
+        int dashCount = dashPattern?.Length ?? 0;
+        long t0 = ApiStart();
+        unsafe
+        {
+            fixed (float* p = commands)
+            fixed (float* dp = dashPattern)
+            {
+                NativeMethods.StrokePath(_handle, startX, startY, p, commandLength, brush.Handle, strokeWidth, closed ? 1 : 0, lineJoin, miterLimit, lineCap,
+                    dp, dashCount, dashOffset, edgeMode);
+            }
+        }
+        ApiEnd("StrokePath", t0);
+    }
+
+    /// <summary>
+    /// Fills a path with an additional translation (offsetX, offsetY) applied on top
+    /// of the current transform stack for this single call. Single-P/Invoke replacement
+    /// for the push_transform + fill_path + pop_transform sequence — saves two GC
+    /// frame transitions per draw, which adds up to a meaningful chunk of managed
+    /// overhead when many visuals each emit a few paths per frame.
+    /// </summary>
+    public void FillPathAtOffset(float offsetX, float offsetY, float startX, float startY,
+        float[] commands, int commandLength, NativeBrush brush, int fillRule = 0, int edgeMode = -1)
+    {
+        ThrowIfDisposed();
+        if (brush == null || !brush.IsValid || commands == null || commandLength <= 0) return;
+        long t0 = ApiStart();
+        unsafe
+        {
+            fixed (float* p = commands)
+            {
+                NativeMethods.FillPathAt(_handle, offsetX, offsetY, startX, startY, p, commandLength, brush.Handle, fillRule, edgeMode);
+            }
+        }
+        ApiEnd("FillPathAtOffset", t0);
+    }
+
+    /// <summary>
+    /// Strokes a path with an additional translation applied on top of the current
+    /// transform stack. Single-P/Invoke counterpart to FillPathAtOffset.
+    /// </summary>
+    public void StrokePathAtOffset(float offsetX, float offsetY, float startX, float startY,
+        float[] commands, int commandLength, NativeBrush brush,
+        float strokeWidth = 1.0f, bool closed = true, int lineJoin = 0, float miterLimit = 10.0f, int lineCap = 0,
+        float[]? dashPattern = null, float dashOffset = 0.0f, int edgeMode = -1)
+    {
+        ThrowIfDisposed();
+        if (brush == null || !brush.IsValid || commands == null || commandLength <= 0) return;
+        int dashCount = dashPattern?.Length ?? 0;
+        long t0 = ApiStart();
+        unsafe
+        {
+            fixed (float* p = commands)
+            fixed (float* dp = dashPattern)
+            {
+                NativeMethods.StrokePathAt(_handle, offsetX, offsetY, startX, startY, p, commandLength, brush.Handle,
+                    strokeWidth, closed ? 1 : 0, lineJoin, miterLimit, lineCap,
+                    dp, dashCount, dashOffset, edgeMode);
+            }
+        }
+        ApiEnd("StrokePathAtOffset", t0);
     }
 
 
@@ -462,7 +649,9 @@ public sealed class RenderTarget : IDisposable
         var fillHandle = (fillBrush != null && fillBrush.IsValid) ? fillBrush.Handle : 0;
         var strokeHandle = (strokeBrush != null && strokeBrush.IsValid) ? strokeBrush.Handle : 0;
         if (fillHandle == 0 && strokeHandle == 0) return;
+        long t0 = ApiStart();
         NativeMethods.DrawContentBorder(_handle, x, y, width, height, blRadius, brRadius, fillHandle, strokeHandle, strokeWidth);
+        ApiEnd("DrawContentBorder", t0);
     }
 
     /// <summary>
@@ -481,6 +670,7 @@ public sealed class RenderTarget : IDisposable
         }
 
         _drawTextDepth++;
+        long t0 = ApiStart();
         try
         {
             unsafe
@@ -494,6 +684,7 @@ public sealed class RenderTarget : IDisposable
         finally
         {
             _drawTextDepth--;
+            ApiEnd("DrawText", t0);
         }
     }
 
@@ -504,7 +695,34 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (matrix == null || matrix.Length < 6) return;
-        NativeMethods.PushTransform(_handle, matrix);
+        long t0 = ApiStart();
+        unsafe
+        {
+            fixed (float* p = matrix)
+            {
+                NativeMethods.PushTransform(_handle, p);
+            }
+        }
+        ApiEnd("PushTransform", t0);
+    }
+
+    /// <summary>
+    /// Pushes a pure translation matrix (1, 0, 0, 1, dx, dy) onto the transform
+    /// stack — zero-allocation stackalloc fast path for the common case of
+    /// applying a per-Visual offset around a single Draw call. Equivalent to
+    /// translating every command coordinate by (dx, dy) but lets the native
+    /// path cache treat (dx, dy)-only-different draws as the same path.
+    /// </summary>
+    public unsafe void PushTransformTranslation(float dx, float dy)
+    {
+        ThrowIfDisposed();
+        long t0 = ApiStart();
+        float* mat = stackalloc float[6];
+        mat[0] = 1f; mat[1] = 0f;
+        mat[2] = 0f; mat[3] = 1f;
+        mat[4] = dx; mat[5] = dy;
+        NativeMethods.PushTransform(_handle, mat);
+        ApiEnd("PushTransformTranslation", t0);
     }
 
     /// <summary>
@@ -513,7 +731,9 @@ public sealed class RenderTarget : IDisposable
     public void PopTransform()
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.PopTransform(_handle);
+        ApiEnd("PopTransform", t0);
     }
 
     /// <summary>
@@ -522,7 +742,9 @@ public sealed class RenderTarget : IDisposable
     public void PushClip(float x, float y, float width, float height)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.PushClip(_handle, x, y, width, height);
+        ApiEnd("PushClip", t0);
     }
 
     /// <summary>
@@ -532,7 +754,9 @@ public sealed class RenderTarget : IDisposable
     public void PushClipAliased(float x, float y, float width, float height)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.PushClipAliased(_handle, x, y, width, height);
+        ApiEnd("PushClipAliased", t0);
     }
 
     /// <summary>
@@ -541,7 +765,9 @@ public sealed class RenderTarget : IDisposable
     public void PushRoundedRectClip(float x, float y, float width, float height, float rx, float ry)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.PushRoundedRectClip(_handle, x, y, width, height, rx, ry);
+        ApiEnd("PushRoundedRectClip", t0);
     }
 
     /// <summary>
@@ -551,7 +777,9 @@ public sealed class RenderTarget : IDisposable
         float tl, float tr, float br, float bl)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.PushPerCornerRoundedRectClip(_handle, x, y, width, height, tl, tr, br, bl);
+        ApiEnd("PushPerCornerRoundedRectClip", t0);
     }
 
     /// <summary>
@@ -560,7 +788,9 @@ public sealed class RenderTarget : IDisposable
     public void PopClip()
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.PopClip(_handle);
+        ApiEnd("PopClip", t0);
     }
 
     /// <summary>
@@ -569,7 +799,9 @@ public sealed class RenderTarget : IDisposable
     public void PunchTransparentRect(float x, float y, float width, float height)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.PunchTransparentRect(_handle, x, y, width, height);
+        ApiEnd("PunchTransparentRect", t0);
     }
 
     /// <summary>
@@ -578,7 +810,9 @@ public sealed class RenderTarget : IDisposable
     public void PushOpacity(float opacity)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.PushOpacity(_handle, opacity);
+        ApiEnd("PushOpacity", t0);
     }
 
     /// <summary>
@@ -587,7 +821,9 @@ public sealed class RenderTarget : IDisposable
     public void PopOpacity()
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.PopOpacity(_handle);
+        ApiEnd("PopOpacity", t0);
     }
 
     /// <summary>
@@ -717,7 +953,9 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (bitmap == null || !bitmap.IsValid) return;
+        long t0 = ApiStart();
         NativeMethods.DrawBitmap(_handle, bitmap.Handle, x, y, width, height, opacity);
+        ApiEnd("DrawBitmap", t0);
     }
 
     /// <summary>
@@ -734,7 +972,9 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (bitmap == null || !bitmap.IsValid) return;
+        long t0 = ApiStart();
         NativeMethods.DrawBitmapEx(_handle, bitmap.Handle, x, y, width, height, opacity, (int)scalingMode);
+        ApiEnd("DrawBitmap", t0);
     }
 
     /// <summary>
@@ -766,6 +1006,7 @@ public sealed class RenderTarget : IDisposable
         float cornerRadiusBL)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.DrawBackdropFilter(
             _handle,
             x, y, width, height,
@@ -778,6 +1019,7 @@ public sealed class RenderTarget : IDisposable
             cornerRadiusTR,
             cornerRadiusBR,
             cornerRadiusBL);
+        ApiEnd("DrawBackdropFilter", t0);
     }
 
     /// <summary>
@@ -806,6 +1048,7 @@ public sealed class RenderTarget : IDisposable
         float screenWidth, float screenHeight)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.DrawGlowingBorderHighlight(
             _handle,
             x, y, width, height,
@@ -815,6 +1058,7 @@ public sealed class RenderTarget : IDisposable
             trailLength,
             dimOpacity,
             screenWidth, screenHeight);
+        ApiEnd("DrawGlowingBorderHighlight", t0);
     }
 
     /// <summary>
@@ -832,6 +1076,7 @@ public sealed class RenderTarget : IDisposable
         float screenWidth, float screenHeight)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.DrawGlowingBorderTransition(
             _handle,
             fromX, fromY, fromWidth, fromHeight,
@@ -843,6 +1088,7 @@ public sealed class RenderTarget : IDisposable
             trailLength,
             dimOpacity,
             screenWidth, screenHeight);
+        ApiEnd("DrawGlowingBorderTransition", t0);
     }
 
     /// <summary>
@@ -870,6 +1116,7 @@ public sealed class RenderTarget : IDisposable
         float screenWidth, float screenHeight)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.DrawRippleEffect(
             _handle,
             x, y, width, height,
@@ -878,6 +1125,7 @@ public sealed class RenderTarget : IDisposable
             strokeWidth,
             dimOpacity,
             screenWidth, screenHeight);
+        ApiEnd("DrawRippleEffect", t0);
     }
 
     /// <summary>
@@ -892,7 +1140,9 @@ public sealed class RenderTarget : IDisposable
     {
         ThrowIfDisposed();
         if (width <= 0 || height <= 0) return;
+        long t0 = ApiStart();
         NativeMethods.CaptureDesktopArea(_handle, screenX, screenY, width, height);
+        ApiEnd("CaptureDesktopArea", t0);
     }
 
     /// <summary>
@@ -906,10 +1156,12 @@ public sealed class RenderTarget : IDisposable
         float noiseIntensity = 0f, float saturation = 1f)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.DrawDesktopBackdrop(
             _handle, x, y, width, height,
             blurRadius, tintR, tintG, tintB, tintOpacity,
             noiseIntensity, saturation);
+        ApiEnd("DrawDesktopBackdrop", t0);
     }
 
     /// <summary>
@@ -923,7 +1175,9 @@ public sealed class RenderTarget : IDisposable
     public void BeginTransitionCapture(int slot, float x, float y, float w, float h)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.TransitionBeginCapture(_handle, slot, x, y, w, h);
+        ApiEnd("BeginTransitionCapture", t0);
     }
 
     /// <summary>
@@ -933,7 +1187,9 @@ public sealed class RenderTarget : IDisposable
     public void EndTransitionCapture(int slot)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.TransitionEndCapture(_handle, slot);
+        ApiEnd("EndTransitionCapture", t0);
     }
 
     /// <summary>
@@ -948,7 +1204,9 @@ public sealed class RenderTarget : IDisposable
     public void DrawTransitionShader(float x, float y, float w, float h, float progress, int mode, float cornerRadius = 0f)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.DrawTransitionShader(_handle, x, y, w, h, progress, mode, cornerRadius);
+        ApiEnd("DrawTransitionShader", t0);
     }
 
     /// <summary>
@@ -957,7 +1215,9 @@ public sealed class RenderTarget : IDisposable
     public void DrawCapturedTransition(int slot, float x, float y, float w, float h, float opacity)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.DrawCapturedTransition(_handle, slot, x, y, w, h, opacity);
+        ApiEnd("DrawCapturedTransition", t0);
     }
 
     // ========================================================================
@@ -970,7 +1230,9 @@ public sealed class RenderTarget : IDisposable
     public void BeginEffectCapture(float x, float y, float w, float h)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.EffectBeginCapture(_handle, x, y, w, h);
+        ApiEnd("BeginEffectCapture", t0);
     }
 
     /// <summary>
@@ -979,7 +1241,9 @@ public sealed class RenderTarget : IDisposable
     public void EndEffectCapture()
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.EffectEndCapture(_handle);
+        ApiEnd("EndEffectCapture", t0);
     }
 
     /// <summary>
@@ -989,7 +1253,9 @@ public sealed class RenderTarget : IDisposable
         float uvOffsetX = 0, float uvOffsetY = 0)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.DrawBlurEffect(_handle, x, y, w, h, radius, uvOffsetX, uvOffsetY);
+        ApiEnd("DrawBlurEffect", t0);
     }
 
     /// <summary>
@@ -1002,10 +1268,12 @@ public sealed class RenderTarget : IDisposable
         float cornerTL = 0, float cornerTR = 0, float cornerBR = 0, float cornerBL = 0)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.DrawDropShadowEffect(_handle, x, y, w, h,
             blurRadius, offsetX, offsetY, r, g, b, a,
             uvOffsetX, uvOffsetY,
             cornerTL, cornerTR, cornerBR, cornerBL);
+        ApiEnd("DrawDropShadowEffect", t0);
     }
 
     public void DrawOuterGlowEffect(float x, float y, float w, float h,
@@ -1014,9 +1282,11 @@ public sealed class RenderTarget : IDisposable
         float cornerTL = 0, float cornerTR = 0, float cornerBR = 0, float cornerBL = 0)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.DrawOuterGlowEffect(_handle, x, y, w, h,
             glowSize, r, g, b, a, intensity, uvOffsetX, uvOffsetY,
             cornerTL, cornerTR, cornerBR, cornerBL);
+        ApiEnd("DrawOuterGlowEffect", t0);
     }
 
     public void DrawInnerShadowEffect(float x, float y, float w, float h,
@@ -1026,24 +1296,30 @@ public sealed class RenderTarget : IDisposable
         float cornerTL = 0, float cornerTR = 0, float cornerBR = 0, float cornerBL = 0)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.DrawInnerShadowEffect(_handle, x, y, w, h,
             blurRadius, offsetX, offsetY, r, g, b, a, uvOffsetX, uvOffsetY,
             cornerTL, cornerTR, cornerBR, cornerBL);
+        ApiEnd("DrawInnerShadowEffect", t0);
     }
 
     public void DrawColorMatrixEffect(float x, float y, float w, float h,
         ReadOnlySpan<float> matrix)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.DrawColorMatrixEffect(_handle, x, y, w, h, matrix);
+        ApiEnd("DrawColorMatrixEffect", t0);
     }
 
     public void DrawEmbossEffect(float x, float y, float w, float h,
         float amount, float lightDirX, float lightDirY, float relief)
     {
         ThrowIfDisposed();
+        long t0 = ApiStart();
         NativeMethods.DrawEmbossEffect(_handle, x, y, w, h,
             amount, lightDirX, lightDirY, relief);
+        ApiEnd("DrawEmbossEffect", t0);
     }
 
     /// <summary>
@@ -1056,9 +1332,11 @@ public sealed class RenderTarget : IDisposable
         ArgumentNullException.ThrowIfNull(shaderBytecode);
         ArgumentNullException.ThrowIfNull(constants);
 
+        long t0 = ApiStart();
         NativeMethods.DrawShaderEffect(_handle, x, y, w, h,
             shaderBytecode, (uint)shaderBytecode.Length,
             constants, (uint)constants.Length);
+        ApiEnd("DrawShaderEffect", t0);
     }
 
     /// <summary>
@@ -1083,6 +1361,7 @@ public sealed class RenderTarget : IDisposable
         ThrowIfDisposed();
         if (neighborCount > 0 && neighborData.Length < neighborCount * 5)
             throw new ArgumentException("neighborData too small for neighborCount");
+        long t0 = ApiStart();
         fixed (float* pNeighbor = neighborData)
         {
             NativeMethods.DrawLiquidGlass(
@@ -1094,6 +1373,7 @@ public sealed class RenderTarget : IDisposable
                 shapeType, shapeExponent,
                 neighborCount, fusionRadius, (nint)pNeighbor);
         }
+        ApiEnd("DrawLiquidGlass", t0);
     }
 
     private void ThrowIfDisposed()

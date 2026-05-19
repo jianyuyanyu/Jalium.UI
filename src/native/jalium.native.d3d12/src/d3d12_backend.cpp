@@ -1,6 +1,7 @@
 #include "d3d12_backend.h"
 #include "d3d12_render_target.h"
 #include "d3d12_resources.h"
+#include <algorithm>
 #include <cstdlib>
 #include <cwchar>
 #include <vector>
@@ -109,12 +110,62 @@ bool AdapterDrivesMonitor(IDXGIAdapter1* adapter, HMONITOR monitor)
 D3D12Backend::D3D12Backend() = default;
 
 D3D12Backend::~D3D12Backend() {
+    // Graveyard ComPtrs hold the last refs to retired GPU resources. By the
+    // time the backend itself is being destroyed the command queue is also
+    // about to die, so any GPU work on these is necessarily complete; drop
+    // them before tearing down the queue/device.
+    {
+        std::lock_guard<std::mutex> lock(graveyardMutex_);
+        graveyard_.clear();
+    }
+
     // Release in reverse order of creation
     wicFactory_.Reset();
     dwriteFactory_.Reset();
     commandQueue_.Reset();
     device_.Reset();
     dxgiFactory_.Reset();
+}
+
+void D3D12Backend::RetireGpuResource(ComPtr<ID3D12Resource>&& resource) {
+    if (!resource) return;
+    std::lock_guard<std::mutex> lock(graveyardMutex_);
+    // Pin to (lastSubmittedFenceValue_ + 1): the value that the NEXT Signal will
+    // emit. Any open command list currently being recorded (which may already
+    // reference this resource via DrawBitmap / CopyTextureRegion) will Signal
+    // a value ≥ lastSubmittedFenceValue_ + 1 when submitted.
+    //
+    // Using lastSubmittedFenceValue_ directly is INCORRECT and triggers
+    // D3D12 ERROR #921 OBJECT_DELETED_WHILE_STILL_IN_USE:
+    //   T0: frame N submitted, Signal(V)         → lastSubmitted = V
+    //   T1: frame N+1 BeginFrame, Reclaim(V) ✓
+    //   T2: frame N+1 starts recording; DrawBitmap(X) records X.texture into open cmd list
+    //   T3: worker thread evicts X from LRU → ~D3D12Bitmap → RetireGpuResource(X.tex, fence=V)
+    //   T4: frame N+1 submitted, Signal(V+1)
+    //   T5: frame N+2 BeginFrame, Reclaim(V+1) → X.tex released (fence V ≤ V+1)
+    //   T6: GPU executes frame N+1's commands → references released X.tex → CRASH
+    //
+    // With (lastSubmitted + 1) we guarantee X.tex stays alive until the next
+    // Signal completes, by which time any cmd list that referenced it is done.
+    graveyard_.push_back({ std::move(resource), lastSubmittedFenceValue_ + 1 });
+}
+
+void D3D12Backend::NoteSubmittedFenceValue(uint64_t fenceValue) {
+    std::lock_guard<std::mutex> lock(graveyardMutex_);
+    if (fenceValue > lastSubmittedFenceValue_) {
+        lastSubmittedFenceValue_ = fenceValue;
+    }
+}
+
+void D3D12Backend::ReclaimRetiredGpuResources(uint64_t completedFenceValue) {
+    std::lock_guard<std::mutex> lock(graveyardMutex_);
+    if (graveyard_.empty()) return;
+    auto newEnd = std::remove_if(
+        graveyard_.begin(), graveyard_.end(),
+        [completedFenceValue](const RetiredResource& r) {
+            return r.fenceValue <= completedFenceValue;
+        });
+    graveyard_.erase(newEnd, graveyard_.end());
 }
 
 void D3D12Backend::ReleasePartialInit() {
@@ -506,7 +557,7 @@ Bitmap* D3D12Backend::CreateBitmapFromMemory(const uint8_t* data, uint32_t dataS
     if (FAILED(hr)) return nullptr;
 
     // Create bitmap object
-    auto bitmap = new D3D12Bitmap(width, height);
+    auto bitmap = new D3D12Bitmap(this, width, height);
     bitmap->SetBitmapData(pixels.data(), static_cast<uint32_t>(pixels.size()));
 
     return bitmap;
@@ -533,7 +584,7 @@ Bitmap* D3D12Backend::CreateBitmapFromPixels(const uint8_t* pixels, uint32_t wid
         }
     }
 
-    auto bitmap = new D3D12Bitmap(width, height);
+    auto bitmap = new D3D12Bitmap(this, width, height);
     bitmap->SetBitmapData(packed.data(), static_cast<uint32_t>(packed.size()));
     return bitmap;
 }

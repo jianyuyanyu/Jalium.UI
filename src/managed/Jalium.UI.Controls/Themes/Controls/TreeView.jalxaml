@@ -15,7 +15,8 @@
                     <Border Background="{TemplateBinding Background}"
                             BorderBrush="{TemplateBinding BorderBrush}"
                             BorderThickness="{TemplateBinding BorderThickness}">
-                        <ScrollViewer HorizontalScrollBarVisibility="Auto"
+                        <ScrollViewer Name="PART_ScrollViewer"
+                                      HorizontalScrollBarVisibility="Auto"
                                       VerticalScrollBarVisibility="Auto">
                             <ItemsPresenter />
                         </ScrollViewer>
@@ -181,13 +182,18 @@
                                     Grid.Column="0"
                                     Width="0" />
 
-                            <!-- Expander Arrow -->
+                            <!-- Expander Arrow — 圆角朝下三角形（用户指定 SVG path,
+                                 几何在 ~1160×1012 bbox），Stretch=Uniform 缩放进
+                                 8×8 槽。SetExpanderAngle 用绝对像素 CenterX/CenterY
+                                 锚定旋转中心,避免 RenderTransformOrigin 相对单位 +
+                                 Stretch 缩放共同导致的锚点偏移。自然朝下 = 展开态,
+                                 折叠态由代码旋转 -90° 改为朝右。 -->
                             <Border Name="PART_ExpanderBorder"
                                     Grid.Column="1"
                                     Width="16"
                                     Visibility="Collapsed">
                                 <Path Name="PART_ExpanderArrow"
-                                      Data="M 841.90,426.67 L 273.07,0 A 170.67,170.67,0,0,0,0,136.53 V 989.87 A 170.67,170.67,0,0,0,273.07,1126.40 L 841.90,699.73 A 170.67,170.67,0,0,0,841.90,426.67 Z"
+                                      Data="M 733.87,841.90 L 1160.54,273.07 A 170.67,170.67,0,0,0,1024.00,0 H 170.67 A 170.67,170.67,0,0,0,34.14,273.07 L 460.80,841.90 A 170.67,170.67,0,0,0,733.87,841.90 Z"
                                       Fill="{TemplateBinding Foreground}"
                                       Width="8"
                                       Height="8"
@@ -248,13 +254,15 @@
                                     Grid.Column="0"
                                     Width="0" />
 
-                            <!-- Expander Arrow -->
+                            <!-- Expander Arrow — 圆角朝下三角形（用户指定 SVG path）,
+                                 Stretch=Uniform 缩放进 8×8 槽。自然朝下 = 展开态,
+                                 折叠态由代码旋转 -90° 改为朝右。 -->
                             <Border Name="PART_ExpanderBorder"
                                     Grid.Column="1"
                                     Width="16"
                                     Visibility="Collapsed">
                                 <Path Name="PART_ExpanderArrow"
-                                      Data="M 841.90,426.67 L 273.07,0 A 170.67,170.67,0,0,0,0,136.53 V 989.87 A 170.67,170.67,0,0,0,273.07,1126.40 L 841.90,699.73 A 170.67,170.67,0,0,0,841.90,426.67 Z"
+                                      Data="M 733.87,841.90 L 1160.54,273.07 A 170.67,170.67,0,0,0,1024.00,0 H 170.67 A 170.67,170.67,0,0,0,34.14,273.07 L 460.80,841.90 A 170.67,170.67,0,0,0,733.87,841.90 Z"
                                       Fill="{TemplateBinding Foreground}"
                                       Width="8"
                                       Height="8"

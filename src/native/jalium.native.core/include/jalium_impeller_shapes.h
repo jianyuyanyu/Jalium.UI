@@ -242,7 +242,14 @@ inline bool GenerateFilledEllipseStrip(
     }
 
     float maxScale = impeller_detail::MaxTransformScale(transform);
-    size_t divisions = TrigCache::ComputeDivisions(maxScale * std::max(rx, ry));
+    // Use the maximum radius of curvature (at major-axis tips) so an elongated
+    // ellipse gets enough segments where curvature is highest. The tolerance
+    // formula in ComputeDivisions is derived for a circle (chord deviation
+    // r·(1−cos θ)); applying it with max(rx,ry) under-samples flat ellipses.
+    float aMaj = std::max(rx, ry);
+    float aMin = std::max(std::min(rx, ry), 0.0001f);
+    float curvatureRadius = (aMaj * aMaj) / aMin;
+    size_t divisions = TrigCache::ComputeDivisions(maxScale * curvatureRadius);
     const auto& trigs = trigCache.Get(divisions);
 
     uint32_t base = (uint32_t)outVerts.size();

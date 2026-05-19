@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
 
 namespace Jalium.UI.Diagnostics;
 
@@ -191,5 +193,224 @@ public static class RenderDiagnostics
             }
             return list;
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Per-frame draw-API call counters + cumulative wall-clock time.
+    //
+    // Wraps every native draw entry point in RenderTarget.cs (FillPath,
+    // StrokePath, DrawLine, …) so DevTools can show which APIs dominate the
+    // frame — counts and total managed+native time side-by-side make it easy
+    // to spot, e.g., a viewport that issues 28 StrokePathAtOffset calls
+    // taking 50 ms vs 500 short DrawLine calls taking 0.2 ms.
+    //
+    // Single-threaded by design: the UI thread is the only producer/consumer.
+    // Disabled by default so production apps pay no overhead; DevTools sets
+    // ApiStatsEnabled=true while the Perf tab is visible.
+    // ─────────────────────────────────────────────────────────────────────
+    public sealed class DrawApiEntry
+    {
+        public string Name { get; init; } = "";
+        public long Count { get; init; }
+        public long TotalTicks { get; init; }
+        public double TotalMs => TotalTicks * 1000.0 / Stopwatch.Frequency;
+        public double AvgUs => Count == 0 ? 0 : (TotalTicks * 1_000_000.0 / Stopwatch.Frequency) / Count;
+    }
+
+    public sealed class DrawApiStats
+    {
+        public DateTime Timestamp { get; init; }
+        public IReadOnlyList<DrawApiEntry> Entries { get; init; } = Array.Empty<DrawApiEntry>();
+        public long TotalTicks { get; init; }
+        public double TotalMs => TotalTicks * 1000.0 / Stopwatch.Frequency;
+    }
+
+    public static bool ApiStatsEnabled { get; set; }
+
+    public static DrawApiStats? LatestDrawApiStats => s_latestDrawApiStats;
+
+    /// <summary>
+    /// Per-frame native path telemetry published by the unified core API
+    /// (jalium_query_path_stats). Helps DevTools tell apart "the pipeline is
+    /// fast but called too many times" from "every call is a cache miss
+    /// running the full flatten + triangulate + rasterize pipeline".
+    ///
+    /// Sourced from the cross-backend atomics in jalium.native.core:
+    ///  • Stroke / Fill: pixel-space rect-cache hit/miss (D3D12 Impeller).
+    ///  • Geometry:      source-space PathGeometryCache hit/miss (Vulkan
+    ///                   GPU-replay path; D3D12 second-tier in commit 2).
+    ///  • Flatten / Triangulate: cumulative ns + counts across all backends.
+    /// </summary>
+    public sealed class PathCacheFrameStats
+    {
+        public DateTime Timestamp { get; init; }
+        public long StrokeHits { get; init; }
+        public long StrokeMisses { get; init; }
+        public long FillHits { get; init; }
+        public long FillMisses { get; init; }
+        public long StrokeRectsTotal { get; init; }   // sum of rect count over hits this frame
+        public long FillRectsTotal { get; init; }
+
+        // Source-space geometry cache (PathGeometryCache).
+        public long GeometryHits { get; init; }
+        public long GeometryMisses { get; init; }
+
+        // Per-frame flatten work. FlattenNs is the cumulative wall time spent
+        // inside the bezier-decompose entry points across all paths this
+        // frame; FlattenInputSegments is the total path-command count fed in
+        // (proportional to source complexity); FlattenOutputVerts is the
+        // total polyline vertices produced (proportional to on-screen
+        // complexity). The ratio tells you whether transform-scale-aware
+        // tolerance is doing its job (verts ≈ scale × input).
+        public long FlattenNs { get; init; }
+        public long FlattenInputSegments { get; init; }
+        public long FlattenOutputVerts { get; init; }
+
+        // Per-frame triangulate work (Impeller fallback path: scanline raster
+        // empty → ear-clip recovery, plus Vulkan PathGeometryCache miss).
+        // Fail count is the loud signal: a path that consistently fails
+        // triangulation means the cache stores an empty result and never
+        // helps — see project_vulkan_path_cache memory.
+        public long TriangulateNs { get; init; }
+        public long TriangulateOk { get; init; }
+        public long TriangulateFail { get; init; }
+
+        // Number of PathGeometryCache (and any future LRU using path_stats)
+        // evictions this frame. A nonzero value while geometry-hit rate is
+        // low says the cache capacity is undersized for the current path
+        // working set.
+        public long CacheEvictions { get; init; }
+    }
+
+    public static PathCacheFrameStats? LatestPathCacheStats => s_latestPathCacheStats;
+    private static PathCacheFrameStats? s_latestPathCacheStats;
+
+    public static void PublishPathCacheStats(PathCacheFrameStats s)
+    {
+        s_latestPathCacheStats = s;
+    }
+
+    /// <summary>
+    /// Per-frame native bitmap upload telemetry, sourced from the unified
+    /// core API (jalium_query_bitmap_stats — D3D12 + Vulkan + software all
+    /// feed the same atomic state in core.dll).
+    ///
+    ///  • UploadCount / UploadBytes — full upload pipeline ran
+    ///    (CreateCommittedResource if non-dynamic + Map + memcpy +
+    ///    CopyTextureRegion + barriers).
+    ///  • FastPathHits — cached GPU texture returned immediately.
+    ///  • DynamicReuses — upload reused existing texture + upload buffer
+    ///    (no CreateCommittedResource; video frame / WriteableBitmap path).
+    ///  • MemcmpShortCircuits — SetBitmapData / UpdatePackedPixels saw
+    ///    identical content and bailed.
+    ///  • GpuResidentBytes — net live bytes pinned in GPU heaps across all
+    ///    bitmaps (delta since last frame; signed, can decrease on release).
+    ///  • AtlasHits — reserved for future texture-atlas paths.
+    ///  • CacheEvictions — bitmap-side LRU evictions (e.g. downscale cache).
+    ///
+    /// Use to confirm whether DrawBitmap CPU cost is upload-dominated and
+    /// whether the various caches are doing their job.
+    /// </summary>
+    public sealed class BitmapUploadFrameStats
+    {
+        public DateTime Timestamp { get; init; }
+        public long UploadCount { get; init; }
+        public long UploadBytes { get; init; }
+        public long FastPathHits { get; init; }
+        public long DynamicReuses { get; init; }
+        public long MemcmpShortCircuits { get; init; }
+        public long GpuResidentBytes { get; init; }   // delta (signed) since last frame
+        public long AtlasHits { get; init; }
+        public long CacheEvictions { get; init; }
+    }
+
+    public static BitmapUploadFrameStats? LatestBitmapUploadStats => s_latestBitmapUploadStats;
+    private static BitmapUploadFrameStats? s_latestBitmapUploadStats;
+
+    public static void PublishBitmapUploadStats(BitmapUploadFrameStats s)
+    {
+        s_latestBitmapUploadStats = s;
+    }
+
+    // Managed-side bitmap downscale cache eviction counter. Producer is
+    // BitmapDownscaleCache; consumer is Window.cs's per-frame publish which
+    // folds it into BitmapUploadFrameStats.CacheEvictions so DevTools shows a
+    // single "Cache" line regardless of which side (native LRU / managed
+    // thumbnail LRU) did the eviction.
+    private static long s_bitmapDownscaleEvictionsTotal;
+
+    public static long BitmapDownscaleEvictionsTotal
+        => System.Threading.Interlocked.Read(ref s_bitmapDownscaleEvictionsTotal);
+
+    public static void OnBitmapDownscaleEviction(int count)
+    {
+        if (count > 0)
+            System.Threading.Interlocked.Add(ref s_bitmapDownscaleEvictionsTotal, count);
+    }
+
+    /// <summary>
+    /// Per-frame retained-mode drawing-cache hit rate. Records = visuals
+    /// whose OnRender ran AND emitted into a fresh recorder (cache miss);
+    /// Replays = visuals served straight from the cached Drawing (the win);
+    /// Bypasses = visuals whose OnRender ran without caching at all (host
+    /// not installed / Visual opted out / DC isn't ICacheableDrawingContext).
+    /// When Records dominate, the visual tree is being marked dirty every
+    /// frame — the next optimisation is finding the invalidation source,
+    /// not improving the cache implementation.
+    /// </summary>
+    public sealed class RetainedCacheFrameStats
+    {
+        public DateTime Timestamp { get; init; }
+        public long Records { get; init; }
+        public long Replays { get; init; }
+        public long Bypasses { get; init; }
+    }
+
+    public static RetainedCacheFrameStats? LatestRetainedCacheStats => s_latestRetainedCacheStats;
+    private static RetainedCacheFrameStats? s_latestRetainedCacheStats;
+
+    public static void PublishRetainedCacheStats(RetainedCacheFrameStats s)
+    {
+        s_latestRetainedCacheStats = s;
+    }
+
+    // Map name → (count, ticks). Plain dictionary because all access is on UI thread.
+    private static readonly Dictionary<string, (long count, long ticks)> s_currentApiStats = new();
+    private static DrawApiStats? s_latestDrawApiStats;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void RecordApi(string name, long elapsedTicks)
+    {
+        if (!ApiStatsEnabled) return;
+        ref var entry = ref System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrAddDefault(
+            s_currentApiStats, name, out _);
+        entry.count++;
+        entry.ticks += elapsedTicks;
+    }
+
+    public static void PublishAndResetApiStats()
+    {
+        if (!ApiStatsEnabled || s_currentApiStats.Count == 0) return;
+        long totalTicks = 0;
+        var entries = new List<DrawApiEntry>(s_currentApiStats.Count);
+        foreach (var kv in s_currentApiStats)
+        {
+            entries.Add(new DrawApiEntry
+            {
+                Name = kv.Key,
+                Count = kv.Value.count,
+                TotalTicks = kv.Value.ticks,
+            });
+            totalTicks += kv.Value.ticks;
+        }
+        // Sort hot-first so DevTools renders the worst offenders at the top.
+        entries.Sort((a, b) => b.TotalTicks.CompareTo(a.TotalTicks));
+        s_latestDrawApiStats = new DrawApiStats
+        {
+            Timestamp = DateTime.Now,
+            Entries = entries,
+            TotalTicks = totalTicks,
+        };
+        s_currentApiStats.Clear();
     }
 }

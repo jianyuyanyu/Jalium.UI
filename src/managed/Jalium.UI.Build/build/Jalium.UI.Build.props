@@ -63,6 +63,22 @@
     </HlslShader>
   </ItemDefinitionGroup>
 
+  <!--
+    Expose the project directory and root namespace to the JALXAML source generator so it
+    can compute the canonical manifest resource name for each AdditionalFiles entry. Without
+    these the SG cannot derive the same name the .NET SDK uses for embedded jalxaml
+    resources, which means runtime ResourceDictionary lookups would never match the
+    SG-emitted prebuilt-dictionary registry. Visible only to the compiler — does not change
+    runtime behaviour.
+  -->
+  <ItemGroup>
+    <CompilerVisibleProperty Include="MSBuildProjectDirectory" />
+    <CompilerVisibleProperty Include="RootNamespace" />
+    <CompilerVisibleProperty Include="AssemblyName" />
+    <!-- See Jalium.UI.Build.targets:PrepareJalxamlForSourceGenerator for what this carries. -->
+    <CompilerVisibleItemMetadata Include="AdditionalFiles" MetadataName="JalxamlSourceRelativePath" />
+  </ItemGroup>
+
   <!-- Visual Studio 属性页架构 - 定义 JalxamlPage 在属性窗口的显示 -->
   <ItemGroup>
     <PropertyPageSchema Include="$(MSBuildThisFileDirectory)Jalium.UI.Build.xml" />

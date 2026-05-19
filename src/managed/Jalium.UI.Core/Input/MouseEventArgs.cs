@@ -133,32 +133,62 @@ public class MouseEventArgs : InputEventArgs
     }
 
     /// <summary>
-    /// Gets the position of the mouse relative to the specified element.
+    /// Gets the position of the mouse relative to the specified element,
+    /// correctly accounting for VisualBounds offsets AND any RenderTransform
+    /// on ancestors. Without inverting RenderTransform, hit-tests on
+    /// transformed subtrees (e.g. inside ZoomableCanvas) land in the wrong
+    /// place — cursor changes look correct (the framework's hit-test was
+    /// fixed) but per-element pixel math (TextBox caret/selection, drag
+    /// thresholds, popup placement) reads the raw, untransformed coordinate
+    /// and ends up off by the zoom factor and pan offset.
     /// </summary>
     public Point GetPosition(UIElement? relativeTo)
     {
         if (relativeTo == null)
             return Position;
 
-        double offsetX = 0;
-        double offsetY = 0;
-
+        // Walk up from relativeTo collecting the ancestor chain.
+        // chain[0] = relativeTo, chain[last] = topmost ancestor reached.
+        var chain = new List<Visual>();
         Visual? current = relativeTo;
         while (current != null)
         {
-            if (current.VisualParent == null)
-                break;
-
-            if (current is FrameworkElement fe)
-            {
-                var bounds = fe.VisualBounds;
-                offsetX += bounds.X;
-                offsetY += bounds.Y;
-            }
+            chain.Add(current);
             current = current.VisualParent;
         }
 
-        return new Point(Position.X - offsetX, Position.Y - offsetY);
+        // Start at the topmost visual's parent-local space (which is what
+        // `Position` is expressed in for a window-rooted visual tree) and
+        // descend to relativeTo, undoing each step:
+        //   parent → child:  translate by -child.VisualBounds.position,
+        //                    then apply child.RenderTransform.Inverse around
+        //                    child's RenderTransformOrigin.
+        // This mirrors the render-side `PushTransform(child.RenderTransform,
+        // originX, originY)` in Visual.RenderDirect.
+        var p = Position;
+        for (int i = chain.Count - 2; i >= 0; i--)
+        {
+            var child = chain[i];
+
+            if (child is FrameworkElement fe)
+            {
+                p = new Point(p.X - fe.VisualBounds.X, p.Y - fe.VisualBounds.Y);
+            }
+
+            if (child is UIElement ui && ui.RenderTransform is { } rt
+                && rt.Value.TryInvert(out var inv))
+            {
+                var origin = ui.RenderTransformOrigin;
+                var size = ui.RenderSize;
+                var ox = origin.X * size.Width;
+                var oy = origin.Y * size.Height;
+                var translated = new Point(p.X - ox, p.Y - oy);
+                var inverted = inv.Transform(translated);
+                p = new Point(inverted.X + ox, inverted.Y + oy);
+            }
+        }
+
+        return p;
     }
 
     /// <summary>

@@ -1,24 +1,50 @@
+using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
 using Jalium.UI.Controls.Platform;
 
 namespace Jalium.UI.Notifications;
 
 /// <summary>
 /// Cross-platform system notification manager for Jalium.UI.
-/// Automatically selects the appropriate backend:
+/// <para>
+/// Backends are supplied by platform packages via
+/// <see cref="BackendFactory"/>:
+/// </para>
 /// <list type="bullet">
-///   <item>Windows 10+ – WinRT Toast Notifications via COM vtable</item>
-///   <item>Linux – libnotify (freedesktop)</item>
-///   <item>Android – NotificationManager via JNI (jalium.native.platform)</item>
+///   <item><c>Jalium.UI.Desktop</c> registers the WinRT Toast backend on Windows.</item>
+///   <item><c>Jalium.UI.Android</c> registers the NotificationManager-via-JNI backend on Android.</item>
+///   <item>libnotify (freedesktop) remains in-tree so non-packaged Linux apps work out of the box.</item>
 /// </list>
+/// <para>
+/// On the first access of <see cref="Current"/> the manager reflectively
+/// loads the matching platform package's <c>Bootstrap.Initialize()</c> if
+/// it hasn't been loaded yet — same pattern used by
+/// <c>ThemeManager.EnsurePlatformIntegrationLoaded</c>.
+/// </para>
 /// </summary>
 public sealed class SystemNotificationManager : IDisposable
 {
+    private const string DesktopAssemblyName = "Jalium.UI.Desktop";
+    private const string DesktopBootstrapTypeName = "Jalium.UI.Desktop.DesktopBootstrap";
+    private const string AndroidAssemblyName = "Jalium.UI.Android";
+    private const string AndroidBootstrapTypeName = "Jalium.UI.AndroidBootstrap";
+
     private static SystemNotificationManager? s_current;
     private static readonly object s_lock = new();
 
     private readonly INotificationBackend _backend;
     private bool _initialized;
     private bool _disposed;
+
+    /// <summary>
+    /// Optional platform-supplied factory that constructs the
+    /// <see cref="INotificationBackend"/> used by this manager. Platform
+    /// integration packages (<c>Jalium.UI.Desktop</c>, <c>Jalium.UI.Android</c>)
+    /// set this from their bootstrap so the cross-platform Controls assembly
+    /// never has to reference Win32/JNI APIs directly. If it stays null, the
+    /// manager falls back to libnotify on Linux or to a no-op backend.
+    /// </summary>
+    public static Func<INotificationBackend>? BackendFactory { get; set; }
 
     /// <summary>
     /// Gets the global <see cref="SystemNotificationManager"/> singleton.
@@ -30,7 +56,11 @@ public sealed class SystemNotificationManager : IDisposable
             if (s_current != null) return s_current;
             lock (s_lock)
             {
-                s_current ??= new SystemNotificationManager();
+                if (s_current == null)
+                {
+                    EnsurePlatformBackendLoaded();
+                    s_current = new SystemNotificationManager();
+                }
             }
             return s_current;
         }
@@ -131,16 +161,78 @@ public sealed class SystemNotificationManager : IDisposable
 
     private static INotificationBackend CreateBackend()
     {
-        if (PlatformFactory.IsWindows)
-            return new WindowsNotificationBackend();
+        // Platform-supplied factory wins. This is the path for Windows/Android
+        // once the corresponding bootstrap has run.
+        var factory = BackendFactory;
+        if (factory != null)
+        {
+            try
+            {
+                var fromFactory = factory();
+                if (fromFactory != null) return fromFactory;
+            }
+            catch
+            {
+                // Fall through to defaults below.
+            }
+        }
 
-        if (PlatformFactory.IsAndroid)
-            return new AndroidNotificationBackend();
-
+        // Linux backend stays in-tree for now: libnotify has no native Win32/JNI
+        // entanglement, so there's no architectural win in moving it out.
         if (PlatformFactory.IsLinux)
             return new LinuxNotificationBackend();
 
         return new NullNotificationBackend();
+    }
+
+    /// <summary>
+    /// Reflectively loads the matching platform integration package and runs
+    /// its bootstrap. Best-effort: if the package isn't deployed we silently
+    /// fall back to <see cref="NullNotificationBackend"/>.
+    /// </summary>
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicMethods,
+        DesktopBootstrapTypeName, DesktopAssemblyName)]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicMethods,
+        AndroidBootstrapTypeName, AndroidAssemblyName)]
+    [RequiresUnreferencedCode("Reflectively resolves the desktop/android bootstrap type and its public Initialize() method via Assembly.GetType. The types are preserved by the DynamicDependency attributes.")]
+    private static void EnsurePlatformBackendLoaded()
+    {
+        if (BackendFactory != null) return;
+
+        if (PlatformFactory.IsWindows)
+            TryRunBootstrap(DesktopAssemblyName, DesktopBootstrapTypeName);
+        else if (PlatformFactory.IsAndroid)
+            TryRunBootstrap(AndroidAssemblyName, AndroidBootstrapTypeName);
+    }
+
+    [RequiresUnreferencedCode("Reflectively resolves a bootstrap type and its public Initialize() method via Assembly.GetType.")]
+    private static void TryRunBootstrap(string assemblyName, string bootstrapTypeName)
+    {
+        Assembly? asm = AppDomain.CurrentDomain
+            .GetAssemblies()
+            .FirstOrDefault(a => string.Equals(a.GetName().Name, assemblyName, StringComparison.Ordinal));
+
+        if (asm == null)
+        {
+            try { asm = Assembly.Load(new AssemblyName(assemblyName)); }
+            catch { return; }
+        }
+
+        try
+        {
+            var bootstrapType = asm.GetType(bootstrapTypeName, throwOnError: false);
+            var initialize = bootstrapType?.GetMethod(
+                "Initialize",
+                BindingFlags.Public | BindingFlags.Static,
+                binder: null,
+                types: Type.EmptyTypes,
+                modifiers: null);
+            initialize?.Invoke(null, null);
+        }
+        catch
+        {
+            // Best-effort.
+        }
     }
 }
 

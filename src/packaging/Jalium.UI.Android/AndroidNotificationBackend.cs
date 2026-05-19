@@ -1,12 +1,17 @@
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 
 namespace Jalium.UI.Notifications;
 
 /// <summary>
 /// Android notification backend using JNI calls to <c>android.app.NotificationManager</c>.
 /// Requires a native helper (jalium.native.platform) that exposes the JNI calls.
+/// Lives in <c>Jalium.UI.Android</c> so the cross-platform Controls assembly
+/// stays free of Android.* / JNI entanglement; <c>AndroidBootstrap</c> wires
+/// it into <see cref="SystemNotificationManager.BackendFactory"/>.
 /// </summary>
-internal sealed class AndroidNotificationBackend : INotificationBackend
+[SupportedOSPlatform("android24.0")]
+public sealed class AndroidNotificationBackend : INotificationBackend
 {
     private string _appId = string.Empty;
     private string _appName = string.Empty;

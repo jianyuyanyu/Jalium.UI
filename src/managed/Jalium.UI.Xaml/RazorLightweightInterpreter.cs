@@ -2772,6 +2772,13 @@ internal static class RazorLightweightExpressionEvaluator
 
     public static object? Evaluate(string expression, Func<string, object?> resolver)
     {
+        // An empty expression has no value — treat it as null instead of dispatching
+        // into the parser, which would see a lone EOF token and throw XamlParseException.
+        // This commonly happens when control-flow helpers (InterpretIfMixed, etc.) read a
+        // missing condition during mid-edit input like "@{ if }".
+        if (string.IsNullOrWhiteSpace(expression))
+            return null;
+
         if (!_current.TryGetValue(expression, out var tokens))
         {
             // Check previous generation and promote if found

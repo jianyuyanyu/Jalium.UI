@@ -43,6 +43,13 @@ public static class RenderOptions
     /// <summary>Gets or sets the process-wide rendering mode.</summary>
     public static RenderMode ProcessRenderMode { get; set; } = RenderMode.Default;
 
+    /// <summary>
+    /// Gets or sets the system-wide default edge mode used when an element's
+    /// resolved <see cref="EdgeModeProperty"/> is <see cref="EdgeMode.Unspecified"/>.
+    /// Defaults to <see cref="EdgeMode.Antialiased"/>.
+    /// </summary>
+    public static EdgeMode DefaultEdgeMode { get; set; } = EdgeMode.Antialiased;
+
     /// <summary>Sets the edge mode for the specified element.</summary>
     public static void SetEdgeMode(DependencyObject target, EdgeMode edgeMode) =>
         target.SetValue(EdgeModeProperty, edgeMode);

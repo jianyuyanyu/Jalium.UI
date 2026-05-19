@@ -249,8 +249,27 @@ public abstract partial class UIElement : Visual, IInputElement
         while (current != null)
         {
             current.InvokeHandlers(current, e);
-            current = current.VisualParent as UIElement;
+            // 沿 visual parent 链向上找下一个 UIElement 祖先。如果中间夹了非 UIElement
+            // 的 Visual（比如 ContainerVisual / DrawingVisual / HostVisual），用 `as UIElement`
+            // 直接返回 null 会让 bubble 在那里中断、无法到达真正的 UIElement 祖先（例如
+            // 模板根之上的控件本体）。改为穿透非 UIElement 节点继续向上寻找。
+            current = NextUIElementAncestor(current);
         }
+    }
+
+    /// <summary>
+    /// 沿 <see cref="Visual.VisualParent"/> 链向上找下一个 <see cref="UIElement"/> 祖先；
+    /// 中间夹的纯 <see cref="Visual"/> 节点会被穿透。链尽头返回 null。
+    /// </summary>
+    private static UIElement? NextUIElementAncestor(Visual node)
+    {
+        Visual? cur = node.VisualParent;
+        while (cur != null)
+        {
+            if (cur is UIElement ui) return ui;
+            cur = cur.VisualParent;
+        }
+        return null;
     }
 
     // Reusable list for tunnel event path to avoid allocations on every mouse move.
@@ -277,12 +296,13 @@ public abstract partial class UIElement : Visual, IInputElement
             path = new List<UIElement>(32);
         }
 
-        // Build the path from root to source
+        // Build the path from root to source. 同 RaiseEventBubble：穿透中间的非 UIElement
+        // 节点（ContainerVisual 等），否则 tunnel 会丢失模板控件本体之上的祖先。
         UIElement? current = this;
         while (current != null)
         {
             path.Add(current);
-            current = current.VisualParent as UIElement;
+            current = NextUIElementAncestor(current);
         }
 
         // Tunnel from root to source
@@ -410,7 +430,9 @@ public abstract partial class UIElement : Visual, IInputElement
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
     public static readonly DependencyProperty OpacityProperty =
         DependencyProperty.Register(nameof(Opacity), typeof(double), typeof(UIElement),
-            new PropertyMetadata(1.0, OnRenderPropertyChanged));
+            new FrameworkPropertyMetadata(1.0,
+                FrameworkPropertyMetadataOptions.AffectsRender | FrameworkPropertyMetadataOptions.AffectsCompositionOnly,
+                OnCompositionPropertyChanged));
 
     /// <summary>
     /// Identifies the BackdropEffect dependency property.
@@ -443,7 +465,9 @@ public abstract partial class UIElement : Visual, IInputElement
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
     public static readonly DependencyProperty RenderTransformProperty =
         DependencyProperty.Register(nameof(RenderTransform), typeof(Transform), typeof(UIElement),
-            new PropertyMetadata(null, OnRenderPropertyChanged));
+            new FrameworkPropertyMetadata(null,
+                FrameworkPropertyMetadataOptions.AffectsRender | FrameworkPropertyMetadataOptions.AffectsCompositionOnly,
+                OnRenderTransformChanged));
 
     /// <summary>
     /// Identifies the RenderTransformOrigin dependency property.
@@ -452,7 +476,9 @@ public abstract partial class UIElement : Visual, IInputElement
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
     public static readonly DependencyProperty RenderTransformOriginProperty =
         DependencyProperty.Register(nameof(RenderTransformOrigin), typeof(Point), typeof(UIElement),
-            new PropertyMetadata(new Point(0, 0), OnRenderPropertyChanged));
+            new FrameworkPropertyMetadata(new Point(0, 0),
+                FrameworkPropertyMetadataOptions.AffectsRender | FrameworkPropertyMetadataOptions.AffectsCompositionOnly,
+                OnCompositionPropertyChanged));
 
     /// <summary>
     /// Identifies the Focusable dependency property.
@@ -1136,6 +1162,39 @@ public abstract partial class UIElement : Visual, IInputElement
     }
 
     /// <summary>
+    /// Schedules a repaint without invalidating this element's cached drawing.
+    /// Use for property changes that affect only how the parent composites this
+    /// element (Opacity, RenderTransform, RenderTransformOrigin) — the parent's
+    /// child-render loop reads these values live each frame via PushOpacity /
+    /// PushTransform, so the recorded command list stays correct.
+    /// </summary>
+    /// <remarks>
+    /// Compared with <see cref="InvalidateVisual()"/>:
+    ///   - does not flip <c>_isRenderDirty</c>, so retained-mode replay continues
+    ///     to skip the OnRender re-record on this and ancestor visuals;
+    ///   - still propagates the subtree-dirty flag up so the render walker reaches
+    ///     this element and re-runs the parent's child loop;
+    ///   - still asks the window host for a present.
+    /// Per-frame transitions (180 ms hover Opacity fade across many cards) used
+    /// to flip every animated element render-dirty every frame, blowing the
+    /// retained cache. This path keeps the cache hot.
+    /// </remarks>
+    public void InvalidateComposition()
+    {
+        MarkSubtreeDirtyForComposition();
+
+        var windowHost = GetWindowHost();
+        if (windowHost != null)
+        {
+            windowHost.AddDirtyElement(this);
+            windowHost.InvalidateWindow();
+        }
+
+        if (LayoutDiagnostics.IsRecording)
+            LayoutDiagnostics.NotifyInvalidation(this, LayoutDiagnostics.InvalidationKind.Visual);
+    }
+
+    /// <summary>
     /// Invalidates a specific sub-rectangle (in this element's local coordinate space)
     /// for partial redraw. Enables precise dirty tracking for animations that affect
     /// only a small part of the element — caret blink, focus rings, hover glyphs,
@@ -1382,7 +1441,43 @@ public abstract partial class UIElement : Visual, IInputElement
     {
         if (d is UIElement element)
         {
+            // Visibility 变化必须同时触发整条 layout 链（Measure / Arrange）和渲染链
+            // （Visual）失效，且需要**递归整个子树**：从 Collapsed→Visible 切换时，
+            // 子元素之前没参与 paint，PaintCommand 不存在，仅标父元素脏不够。
+            // 同时父级也要重新 layout（留出/收回空间）。
+            // 这是 framework 关键 bug 的修复 — 之前 Visibility 切换会出现
+            // "脏渲染"（要鼠标移开触发别的失效才会顺带重绘）。
             element.InvalidateMeasure();
+            element.InvalidateArrange();
+            element.InvalidateVisual();
+            InvalidateVisualRecursive(element);
+
+            // 父级也需要重新 layout — 子元素 Collapsed/Visible 切换会改变父级的
+            // 可用空间分配。也要 InvalidateVisual 以擦除/绘制子元素留下的痕迹。
+            if (element.VisualParent is UIElement parent)
+            {
+                parent.InvalidateMeasure();
+                parent.InvalidateArrange();
+                parent.InvalidateVisual();
+            }
+        }
+    }
+
+    /// <summary>
+    /// 递归把整个 visual 子树标记为渲染脏 — Visibility 从 Collapsed 切回 Visible 时
+    /// 子树之前未参与 paint，PaintCommand 链上不存在，所以仅标自己脏不够，
+    /// 必须主动让每个后代都重绘一次。
+    /// </summary>
+    private static void InvalidateVisualRecursive(UIElement element)
+    {
+        var count = element.VisualChildrenCount;
+        for (int i = 0; i < count; i++)
+        {
+            if (element.GetVisualChild(i) is UIElement child)
+            {
+                child.InvalidateVisual();
+                InvalidateVisualRecursive(child);
+            }
         }
     }
 
@@ -1613,6 +1708,50 @@ public abstract partial class UIElement : Visual, IInputElement
         {
             element.InvalidateVisual();
         }
+    }
+
+    /// <summary>
+    /// Property-changed callback for "composition-only" DPs whose values are read
+    /// live by the parent's child-render loop (Opacity, RenderTransform,
+    /// RenderTransformOrigin). Schedules a present without invalidating the
+    /// retained-mode cache — see <see cref="InvalidateComposition"/>.
+    /// </summary>
+    private static void OnCompositionPropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is UIElement element)
+        {
+            element.InvalidateComposition();
+        }
+    }
+
+    /// <summary>
+    /// Property-changed callback for <see cref="RenderTransformProperty"/>. In
+    /// addition to the standard composition invalidation, this manages
+    /// subscription to the <see cref="Transform.Changed"/> event so that
+    /// mutating a sub-property of the assigned Transform (e.g.
+    /// <c>translateTransform.X</c>, <c>scaleTransform.ScaleX</c>) re-invalidates
+    /// composition without requiring callers to reassign the Transform.
+    /// </summary>
+    private static void OnRenderTransformChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is not UIElement element) return;
+
+        if (e.OldValue is Transform oldTransform)
+        {
+            oldTransform.Changed -= element.OnRenderTransformSubPropertyChanged;
+        }
+
+        if (e.NewValue is Transform newTransform)
+        {
+            newTransform.Changed += element.OnRenderTransformSubPropertyChanged;
+        }
+
+        element.InvalidateComposition();
+    }
+
+    private void OnRenderTransformSubPropertyChanged(object? sender, EventArgs e)
+    {
+        InvalidateComposition();
     }
 
     #endregion
@@ -3544,6 +3683,7 @@ public abstract partial class UIElement : Visual, IInputElement
             return;
 
         var hasRunningAnimation = false;
+        var hasNonCompositionAnimation = false;
 
         foreach (var (dp, anim) in _activeAnimations.ToArray())
         {
@@ -3551,6 +3691,7 @@ public abstract partial class UIElement : Visual, IInputElement
             {
                 anim.Clock.Begin();
                 hasRunningAnimation = true;
+                if (!IsCompositionOnlyDp(dp)) hasNonCompositionAnimation = true;
                 continue;
             }
 
@@ -3558,22 +3699,38 @@ public abstract partial class UIElement : Visual, IInputElement
                 continue;
 
             hasRunningAnimation = true;
+            if (!IsCompositionOnlyDp(dp)) hasNonCompositionAnimation = true;
 
             // Update clock progress
             anim.Clock.Tick();
 
-            // Update animated value
+            // Update animated value (which routes through SetAnimatedValue → metadata
+            // callback → InvalidateVisual or InvalidateComposition as appropriate).
             UpdateAnimatedValue(dp);
         }
 
         if (hasRunningAnimation)
         {
-            InvalidateVisual();
+            // Per-frame backup invalidation. Most animations get their schedule-
+            // present hook from SetAnimatedValue's metadata callback; but some
+            // animations may write equal values that don't fire OnPropertyChanged.
+            // Use the lightest-weight path that still covers every active animation:
+            //   - all animations target composition-only DPs   → InvalidateComposition
+            //   - any animation targets a render-affecting DP  → InvalidateVisual
+            if (hasNonCompositionAnimation)
+                InvalidateVisual();
+            else
+                InvalidateComposition();
         }
         else
         {
             UnsubscribeFromRenderingIfNeeded();
         }
+    }
+
+    private bool IsCompositionOnlyDp(DependencyProperty dp)
+    {
+        return dp.GetMetadata(GetType()) is FrameworkPropertyMetadata fpm && fpm.AffectsCompositionOnly;
     }
 
     private void UpdateAnimatedValue(DependencyProperty dp)

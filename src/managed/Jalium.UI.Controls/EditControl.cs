@@ -6422,20 +6422,44 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
 
     private static void DrawWavyUnderline(DrawingContext dc, Pen pen, double x1, double x2, double y)
     {
+        // Single zigzag PolyLineSegment instead of N individual DrawLine calls.
+        // The code editor's diagnostic squiggles can produce hundreds of error
+        // regions at once — each formerly emitted ~25 separate native draws,
+        // turning DrawWavyUnderline into the dominant per-frame CPU cost. With
+        // a single DrawGeometry call the native rasterizer cache also reuses
+        // one entry across same-length error regions.
         const double waveHeight = 2;
         const double waveWidth = 4;
 
+        if (x2 <= x1) return;
+
+        int segCount = (int)Math.Ceiling((x2 - x1) / waveWidth);
+        if (segCount <= 0) return;
+
+        var pts = new List<Point>(segCount);
         double x = x1;
-        bool up = true;
-        while (x < x2)
+        for (int i = 0; i < segCount; i++)
         {
             double nextX = Math.Min(x + waveWidth, x2);
-            double y1 = up ? y - waveHeight : y;
-            double y2 = up ? y : y - waveHeight;
-            dc.DrawLine(pen, new Point(x, y1), new Point(nextX, y2));
+            // Endpoint y alternates: original first segment was (x1, y-h) → (nextX, y),
+            // so iter-i endpoint y is `i%2==0 ? y : y-h`.
+            double yEnd = (i % 2 == 0) ? y : y - waveHeight;
+            pts.Add(new Point(nextX, yEnd));
             x = nextX;
-            up = !up;
         }
+
+        var figure = new PathFigure
+        {
+            StartPoint = new Point(x1, y - waveHeight),
+            IsFilled = false,
+            IsClosed = false,
+        };
+        figure.Segments.Add(new PolyLineSegment(pts, true));
+
+        var geom = new PathGeometry();
+        geom.Figures.Add(figure);
+
+        dc.DrawGeometry(null, pen, geom);
     }
 
     private void DrawLspInlayHints(DrawingContext dc, string fontFamily, double fontSize)

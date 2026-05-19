@@ -1,4 +1,5 @@
-#include "path_cache.h"
+#include "jalium_path_cache.h"
+#include "jalium_path_stats.h"
 
 #include <cstring>
 #include <utility>
@@ -41,12 +42,14 @@ uint64_t HashPathInput(float startX,
                        float startY,
                        const float* commands,
                        uint32_t commandLength,
-                       int32_t fillRule) noexcept
+                       int32_t fillRule,
+                       uint32_t scaleBucket) noexcept
 {
     uint64_t h = kFnvOffset;
     h = FnvMix(h, FloatBits(startX));
     h = FnvMix(h, FloatBits(startY));
     h = FnvMix(h, static_cast<uint64_t>(fillRule));
+    h = FnvMix(h, static_cast<uint64_t>(scaleBucket));
     h = FnvMix(h, static_cast<uint64_t>(commandLength));
     if (commands && commandLength > 0) {
         h = FnvMixBytes(h, commands,
@@ -66,10 +69,12 @@ PathGeometryCache::FindAndTouch(uint64_t key)
     auto it = map_.find(key);
     if (it == map_.end()) {
         ++misses_;
+        path_stats::AddGeometryMiss();
         return std::nullopt;
     }
     list_.splice(list_.begin(), list_, it->second);
     ++hits_;
+    path_stats::AddGeometryHit();
     return LookupResult{ it->second->entry };
 }
 
@@ -87,10 +92,15 @@ void PathGeometryCache::Insert(uint64_t key,
         return;
     }
 
+    uint64_t evicted = 0;
     while (list_.size() >= capacity_ && !list_.empty()) {
         const auto& tail = list_.back();
         map_.erase(tail.key);
         list_.pop_back();
+        ++evicted;
+    }
+    if (evicted != 0) {
+        path_stats::AddCacheEviction(evicted);
     }
 
     list_.push_front(ListNode{ key, std::move(entry) });

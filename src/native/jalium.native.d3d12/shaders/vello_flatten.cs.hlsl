@@ -35,7 +35,17 @@ cbuffer VelloConfig : register(b0)
 #define SEG_QUAD  1u
 #define SEG_CUBIC 2u
 
-// Euler spiral constants
+// Euler spiral constants.
+// TODO(path-perf, follow-up): make these into push-constant root constants so
+// the CPU can scale them per-frame by the surface device-pixel-ratio and the
+// current transform's max scale. Today they are fixed — under-tessellates at
+// hi-DPI / large-scale, over-tessellates at low-DPI / small-scale. See
+// jalium_flatten.h::ComputePixelTolerance for the CPU-side equivalent that
+// already does this for the Impeller-CPU paths. Wiring requires a new root
+// constants slot in the D3D12 vello root signature (and matching push-constant
+// block on the Vulkan side) — held back from the 2026-05 path-perf commits
+// because vello GPU is still preserved-not-default per memory
+// project_vello_cleartype.md.
 #define DERIV_THRESH          1e-6
 #define DERIV_THRESH_SQUARED  1e-12
 #define DERIV_EPS             1e-6

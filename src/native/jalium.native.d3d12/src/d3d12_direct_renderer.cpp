@@ -193,9 +193,10 @@ bool D3D12DirectRenderer::Initialize(IDXGISwapChain3* swapChain, UINT frameCount
     }
 
     // RTV heap
+    // Layout: [0..frameCount_-1] back buffers, [frameCount_..frameCount_+1] offscreen, [frameCount_+2] MSAA color
     {
         D3D12_DESCRIPTOR_HEAP_DESC desc = {};
-        desc.NumDescriptors = frameCount_ + 2;  // +2 for offscreen RT slots
+        desc.NumDescriptors = frameCount_ + 3;
         desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         if (FAILED(device_->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&rtvHeap_))))
             return false;
@@ -250,11 +251,15 @@ bool D3D12DirectRenderer::Initialize(IDXGISwapChain3* swapChain, UINT frameCount
         OutputDebugStringA("[D3D12DirectRenderer] Blur resources init failed (non-fatal)\n");
         // Non-fatal: blur will fall back to semi-transparent overlay
     }
+    if (!CreateStencilPathResources()) {
+        OutputDebugStringA("[D3D12DirectRenderer] Stencil path init failed (non-fatal, falls back to Impeller scanline)\n");
+        // Non-fatal: AddStencilPath returns false → D3D12RenderTarget routes to ImpellerEngine.
+    }
 
     // Initialize glyph atlas for text rendering
     auto dwriteFactory = backend_->GetDWriteFactory();
     if (dwriteFactory) {
-        glyphAtlas_ = std::make_unique<D3D12GlyphAtlas>(device_, dwriteFactory);
+        glyphAtlas_ = std::make_unique<D3D12GlyphAtlas>(device_, dwriteFactory, backend_);
         if (!glyphAtlas_->Initialize()) {
             OutputDebugStringA("[D3D12DirectRenderer] GlyphAtlas init failed\n");
             glyphAtlas_.reset();
@@ -285,10 +290,13 @@ void D3D12DirectRenderer::Shutdown()
         if (queue) {
             uint64_t fv = nextFenceValue_++;
             queue->Signal(fence_.Get(), fv);
+            backend_->NoteSubmittedFenceValue(fv);
             if (fence_->GetCompletedValue() < fv) {
                 fence_->SetEventOnCompletion(fv, fenceEvent_);
                 WaitForSingleObject(fenceEvent_, 5000);
             }
+            // GPU is now idle — flush anything else parked in the graveyard.
+            backend_->ReclaimRetiredGpuResources(fence_->GetCompletedValue());
         }
     }
 
@@ -309,6 +317,7 @@ void D3D12DirectRenderer::Shutdown()
         // GPU is idle (waited above) — buffers retired by mid-frame growth in the
         // last submitted frame are no longer referenced and can be released now.
         frames_[i].retiredInstanceBuffers.clear();
+        frames_[i].retiredDescriptorHeaps.clear();
     }
 
     if (fenceEvent_) {
@@ -333,10 +342,12 @@ void D3D12DirectRenderer::ReleaseBackBufferReferences()
         if (queue) {
             uint64_t fv = nextFenceValue_++;
             queue->Signal(fence_.Get(), fv);
+            backend_->NoteSubmittedFenceValue(fv);
             if (fence_->GetCompletedValue() < fv) {
                 fence_->SetEventOnCompletion(fv, fenceEvent_);
                 WaitForSingleObject(fenceEvent_, 5000);
             }
+            backend_->ReclaimRetiredGpuResources(fence_->GetCompletedValue());
         }
     }
 
@@ -402,6 +413,12 @@ bool D3D12DirectRenderer::OnResize(UINT newWidth, UINT newHeight)
     offscreenResourcesUsedThisFrame_ = false;
 
     blurTempsUsedThisFrame_ = false;
+
+    // Drop the MSAA color buffer; BeginFrame will allocate a new one at the
+    // new size on the next call.
+    msaaColorBuffer_.Reset();
+    msaaWidth_ = 0;
+    msaaHeight_ = 0;
 
     // Update viewport dimensions (will be applied in next BeginFrame)
     viewportWidth_ = newWidth;
@@ -656,6 +673,8 @@ bool D3D12DirectRenderer::CreatePSOs()
     psoDesc.NumRenderTargets = 1;
     // Use SRGB format to match the SRGB RTV — GPU auto-converts linear->sRGB on write
     psoDesc.RTVFormats[0] = swapChainFormat_;
+    // PSOs that target the swap-chain RT must match the MSAA sample count
+    // because we render into a 4× MSAA color buffer and resolve at end of frame.
     psoDesc.SampleDesc.Count = 1;
 
     if (FAILED(device_->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&sdfRectPSO_))))
@@ -780,28 +799,59 @@ bool D3D12DirectRenderer::BeginFrame(UINT frameIndex, UINT width, UINT height,
     // The previous use of this slot is GPU-complete: any instance upload buffers
     // that mid-frame growth retired during that previous frame are no longer
     // referenced by the GPU and can now be released.  Clearing the ComPtr vector
-    // drops the last refcount on each retired resource.
+    // drops the last refcount on each retired resource. Same lifetime applies to
+    // the per-Dispatch Vello descriptor heaps drained onto retiredDescriptorHeaps.
     if (!fr.retiredInstanceBuffers.empty()) {
         fr.retiredInstanceBuffers.clear();
+    }
+    if (!fr.retiredDescriptorHeaps.empty()) {
+        fr.retiredDescriptorHeaps.clear();
+    }
+
+    // Drain the backend's GPU-resource graveyard for everything whose
+    // fence value is now ≤ the completed value. This is where bitmap
+    // textures/upload buffers retired by D3D12Bitmap destruction (worker-
+    // thread LRU eviction, GC finalizer) actually get freed — the
+    // destructor only hands them to the graveyard; freeing happens here
+    // after we've confirmed the GPU is done with them.
+    if (backend_) {
+        backend_->ReclaimRetiredGpuResources(fence_->GetCompletedValue());
     }
 
     // Reset allocator + command list
     fr.commandAllocator->Reset();
     commandList_->Reset(fr.commandAllocator.Get(), nullptr);
 
-    // Transition back buffer: PRESENT → RENDER_TARGET
+    // ── 4× MSAA color target setup ─────────────────────────────────────
+    // We render into a 4-sample MSAA texture and resolve to the swap-chain
+    // back buffer in EndFrame. This restores edge AA after Phase 1 of the
+    // stroke pipeline switched from CPU scanline rasterization to direct
+    // GPU triangle tessellation.
+    //
+    // D3D12 implicit-decay semantics: after ExecuteCommandLists finishes, a
+    // RENDER_TARGET texture without explicit barriers decays back to COMMON.
+    // So even though EndFrame ends the previous frame with MSAA in
+    // RENDER_TARGET state, the GPU sees it as COMMON when we start this
+    // frame's recording. Explicitly promote it back to RENDER_TARGET. Same
+    // applies to the back-buffer transition (PRESENT == COMMON, both 0x0).
+    // Phase 2 MSAA was rolled back: per the DevTools Perf trace, sampling
+    // many bitmaps + DrawBackdropFilter + DrawSnapshotBlurred into a 4× MSAA
+    // color buffer dropped the demo from 137 FPS (Phase 1, no MSAA, aliased
+    // strokes) to 18 FPS — DrawBitmap alone went from sub-ms to ~5 ms/call
+    // when its PSO changed to SampleDesc=4. The MSAA infrastructure stays
+    // in place behind EnsureMsaaColorBuffer / GetMsaaRtvHandle so we can
+    // re-enable it later (e.g. behind a per-element toggle, or once stroke
+    // edges get analytic-AA in the fragment shader instead). For now we
+    // bind the swap-chain back buffer directly so the rest of the pipeline
+    // (effects, snapshot, etc.) keeps its sample-count = 1 fast paths.
     auto barrier = MakeTransitionBarrier(
         renderTargets_[currentFrame_].Get(),
         D3D12_RESOURCE_STATE_PRESENT,
         D3D12_RESOURCE_STATE_RENDER_TARGET);
     commandList_->ResourceBarrier(1, &barrier);
-
-    // Set render target
-    auto rtvHandle = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
-    rtvHandle.ptr += currentFrame_ * rtvDescriptorSize_;
+    auto rtvHandle = GetSwapChainRtvHandle();
     commandList_->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
-    // Clear if requested (full invalidation frames)
     if (clear) {
         float clearColor[4] = { clearR, clearG, clearB, clearA };
         commandList_->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
@@ -830,6 +880,7 @@ bool D3D12DirectRenderer::BeginFrame(UINT frameIndex, UINT width, UINT height,
     bitmapInstances_.clear();
     triangleVertices_.clear();
     bitmapTextures_.clear();
+    stencilPathDraws_.clear();
     batches_.clear();
     drawOrder_ = 0.0f;
     currentOpacity_ = 1.0f;
@@ -897,6 +948,7 @@ void D3D12DirectRenderer::AbortFrame()
     bitmapInstances_.clear();
     triangleVertices_.clear();
     bitmapTextures_.clear();
+    stencilPathDraws_.clear();
     batches_.clear();
 
     // Reset snapshot validity — the snapshot may reference stale back buffer content
@@ -922,7 +974,8 @@ JaliumResult D3D12DirectRenderer::EndFrame(bool useDirtyRects, const std::vector
     UploadInstances();
     RecordDrawCommands();
 
-    // Transition: RENDER_TARGET → PRESENT
+    // Transition back buffer RENDER_TARGET → PRESENT (matching the original
+    // pre-MSAA flow now that we render directly into the swap chain).
     auto barrier = MakeTransitionBarrier(
         renderTargets_[currentFrame_].Get(),
         D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -985,6 +1038,13 @@ JaliumResult D3D12DirectRenderer::EndFrame(bool useDirtyRects, const std::vector
     // Signal fence for this frame
     frames_[currentFrame_].fenceValue = nextFenceValue_++;
     backend_->GetCommandQueue()->Signal(fence_.Get(), frames_[currentFrame_].fenceValue);
+
+    // Tell the backend graveyard that anything retired from now on must
+    // outlive at least this fence value. Resources retired *before* this
+    // call are tagged with an older value and may already be reclaimable;
+    // resources retired *after* this call are tagged with the new value
+    // and will be reclaimed when this frame's Signal completes.
+    backend_->NoteSubmittedFenceValue(frames_[currentFrame_].fenceValue);
 
     if (SUCCEEDED(hr) || hr == DXGI_STATUS_OCCLUDED) {
         return JALIUM_OK;
@@ -1077,9 +1137,14 @@ void D3D12DirectRenderer::AddSdfRect(const SdfRectInstance& inst)
     adjusted.cornerBL *= avgScale;
     adjusted.borderWidth *= avgScale;
 
-    // Apply current shape type (0 = RoundedRect, 1 = SuperEllipse)
-    adjusted.shapeType = currentShapeType_;
-    adjusted.shapeN = currentShapeN_;
+    // Apply current shape type (0 = RoundedRect, 1 = SuperEllipse).
+    // If the caller pre-set inst.shapeType > 0 (e.g. FillEllipse uses
+    // SuperEllipse n=2 for a real ellipse SDF), keep that and don't let the
+    // current global shape type override it.
+    if (adjusted.shapeType <= 0.0f) {
+        adjusted.shapeType = currentShapeType_;
+        adjusted.shapeN = currentShapeN_;
+    }
 
     rectInstances_.push_back(adjusted);
 }
@@ -1159,7 +1224,8 @@ void D3D12DirectRenderer::AddText(IDWriteTextLayout* layout, float x, float y,
 void D3D12DirectRenderer::AddBitmap(float x, float y, float w, float h, float opacity,
                                      ID3D12Resource* textureResource, DXGI_FORMAT format,
                                      float uvMaxX, float uvMaxY,
-                                     int scalingMode)
+                                     int scalingMode,
+                                     ID3D12Resource* uploadBuffer)
 {
     if (!textureResource) return;
     if (bitmapInstances_.size() >= kMaxInstancesPerFrame) {
@@ -1209,9 +1275,56 @@ void D3D12DirectRenderer::AddBitmap(float x, float y, float w, float h, float op
     if (batch.hasScissor) batch.scissor = scissorStack_.top();
     ResolveRoundedClipForBatch(batch);
 
+    // Batch coalescing: when the previous batch is also a bitmap that uses the
+    // SAME texture + SAME state (scissor + rounded clip), append this instance
+    // to it instead of creating a new batch. This is the bitmap analogue of
+    // stroke/fill batch coalescing in ImpellerEngine — N back-to-back DrawBitmap
+    // calls (e.g. ImageBrush.TileMode tiling, sprite sheets, glyph runs through
+    // the bitmap path) collapse to 1 SRV-descriptor-pair creation + 1
+    // SetGraphicsRootDescriptorTable + 1 DrawIndexedInstanced(N) on EndFrame
+    // instead of N of each.
+    //
+    // Coalescing requires:
+    //   1. previous batch is also Bitmap type
+    //   2. previous batch's texture matches (textureResource + format)
+    //   3. scissor state matches (presence + rect)
+    //   4. rounded-clip state matches (presence + rect + corner radii)
+    //   5. instance contiguity: prevBatch.instanceOffset + instanceCount must
+    //      equal bitmapInstances_.size() — guarantees the new instance lands
+    //      directly after the batch's existing slice in the shared buffer.
+    //
+    // samplerIdx + opacity + transform are per-instance (baked into BitmapQuadInstance),
+    // so they do NOT block coalescing.
+    if (!batches_.empty() && !bitmapTextures_.empty()) {
+        DrawBatch& prev = batches_.back();
+        const BitmapBatchTexture& prevTex = bitmapTextures_.back();
+        const bool sameType    = prev.type == DrawBatchType::Bitmap;
+        const bool sameTex     = prevTex.batchIndex == (uint32_t)(batches_.size() - 1) &&
+                                 prevTex.textureResource.Get() == textureResource &&
+                                 prevTex.format == format;
+        const bool sameScissor = prev.hasScissor == batch.hasScissor &&
+                                 (!batch.hasScissor ||
+                                  (prev.scissor.left   == batch.scissor.left   &&
+                                   prev.scissor.top    == batch.scissor.top    &&
+                                   prev.scissor.right  == batch.scissor.right  &&
+                                   prev.scissor.bottom == batch.scissor.bottom));
+        const bool sameRClip   = prev.hasRoundedClip == batch.hasRoundedClip &&
+                                 (!batch.hasRoundedClip ||
+                                  (memcmp(prev.roundedClipRect,        batch.roundedClipRect,        sizeof(float) * 4) == 0 &&
+                                   memcmp(prev.roundedClipCornerRadii, batch.roundedClipCornerRadii, sizeof(float) * 4) == 0));
+        const bool contiguous  = prev.instanceOffset + prev.instanceCount == bitmapInstances_.size();
+
+        if (sameType && sameTex && sameScissor && sameRClip && contiguous) {
+            prev.instanceCount++;
+            bitmapInstances_.push_back(inst);
+            return;
+        }
+    }
+
     BitmapBatchTexture tex;
     tex.batchIndex = (uint32_t)batches_.size();
     tex.textureResource = textureResource;
+    tex.uploadBuffer = uploadBuffer;  // may be nullptr (offscreen RT / desktop dup sources)
     tex.format = format;
     bitmapTextures_.push_back(tex);
 
@@ -1471,15 +1584,41 @@ void D3D12DirectRenderer::FlushVelloPaths()
         velloRenderer_->ClearScissorRect();
     }
 
-    if (velloRenderer_->Dispatch(commandList_.Get(), currentFrame_)) {
+    bool dispatched = velloRenderer_->Dispatch(commandList_.Get(), currentFrame_);
+    if (dispatched) {
         ID3D12Resource* output = velloRenderer_->GetOutputTexture();
         if (output) {
-            // Composite Vello output as a full-viewport bitmap
+            // Composite Vello output as a full-viewport bitmap with the CURRENT
+            // drawOrder. When called mid-frame from FlushVelloIfNeeded, this
+            // composite slots between the rect/text/bitmap batches drawn before
+            // the flush and those drawn afterwards — opaque content drawn after
+            // (e.g. card backgrounds) correctly covers the wave/dot pixels in
+            // the Vello bitmap.
             float w = (float)viewportWidth_ / dpiScale_;
             float h = (float)viewportHeight_ / dpiScale_;
             AddBitmap(0, 0, w, h, 1.0f, output, DXGI_FORMAT_R8G8B8A8_UNORM, 1.0f, 1.0f);
         }
+        // Force the next Dispatch in this frame to allocate a fresh output
+        // texture; the one we just composited is held alive by the
+        // BitmapBatchTexture entry AddBitmap pushed above.
+        velloRenderer_->ForceNewOutputTexture();
+        // Reset Vello's CPU-side scene encoding so subsequent paths in this
+        // frame accumulate into a fresh subscene rather than re-rendering the
+        // content we just flushed.
+        velloRenderer_->BeginFrame(viewportWidth_, viewportHeight_);
     }
+
+    // Drain the resources Dispatch retired (per-frame upload buffers,
+    // descriptor heap, configUpload CBV, any default-heap buffers grown
+    // mid-frame) onto this slot's frame retired list — even on Dispatch
+    // failure paths, because partial command queueing may already have
+    // happened before the failure point. Their lifetime is gated by the
+    // slot's fence — BeginFrame for this slot won't recycle the command
+    // allocator until the GPU has executed the commandList that consumed
+    // them, so the ComPtrs are released only when it's verifiably safe.
+    auto& fr = frames_[currentFrame_];
+    velloRenderer_->DrainRetired(fr.retiredInstanceBuffers);
+    velloRenderer_->DrainRetiredHeaps(fr.retiredDescriptorHeaps);
 }
 
 // ============================================================================
@@ -1514,6 +1653,14 @@ void D3D12DirectRenderer::UploadInstances()
         probe = ((probe + 3) / 4) * 4;
         if (!triangleVertices_.empty()) {
             probe += triangleVertices_.size() * sizeof(TriangleVertex);
+        }
+        // Stencil-path verts are 2×float = 8 bytes/vertex, 8-byte aligned.
+        probe = ((probe + 7) / 8) * 8;
+        for (const auto& d : stencilPathDraws_) {
+            if (d.geom) {
+                probe += d.geom->fillTriangles.size()  * sizeof(StencilPathVertex);
+                probe += d.geom->coverTriangles.size() * sizeof(StencilPathVertex);
+            }
         }
         const size_t requiredBytes = probe + kMidFrameReserveBytes;
         if (!EnsureFrameInstanceCapacity(fr, requiredBytes)) {
@@ -1583,16 +1730,65 @@ void D3D12DirectRenderer::UploadInstances()
         }
     }
 
+    // ── Stencil-path local-space vertices (8-byte stride float2 POSITION).
+    // Each StencilPathDraw owns its own contiguous slice of fillTriangles +
+    // coverTriangles, recorded with two DrawInstanced calls in
+    // RecordDrawCommands. The vertex shader applies the per-draw transform
+    // from b1 root constants, so vertex data is identical across frames
+    // even when the path animates — that's the whole point of the cache.
+    size_t pathBufferOffset = ((offset + 7) / 8) * 8;
+    stencilPathBufferByteOffset_ = pathBufferOffset;
+    if (!stencilPathDraws_.empty()) {
+        size_t stride = sizeof(StencilPathVertex);
+        size_t cursor = pathBufferOffset;
+        bool overflow = false;
+        for (auto& draw : stencilPathDraws_) {
+            const auto& geom = draw.geom;
+            if (!geom) continue;
+            // fill vertex slice
+            size_t fillBytes  = geom->fillTriangles.size()  * stride;
+            size_t coverBytes = geom->coverTriangles.size() * stride;
+            if (cursor + fillBytes + coverBytes > cap) {
+                overflow = true;
+                break;
+            }
+            if (fillBytes) {
+                memcpy(dst + cursor, geom->fillTriangles.data(), fillBytes);
+                draw.fillVbOffsetBytes = cursor;
+                draw.fillVertexCount   = (UINT)geom->fillTriangles.size();
+                cursor += fillBytes;
+            }
+            if (coverBytes) {
+                memcpy(dst + cursor, geom->coverTriangles.data(), coverBytes);
+                draw.coverVbOffsetBytes = cursor;
+                draw.coverVertexCount   = (UINT)geom->coverTriangles.size();
+                cursor += coverBytes;
+            }
+        }
+        if (overflow) {
+            OutputDebugStringA("[D3D12DirectRenderer] WARNING: Stencil path vertex buffer overflow — paths truncated\n");
+        }
+        offset = cursor;
+    }
+
     // ── Descriptor ring buffer ──
     // Save upload buffer write position for next flush
     uploadBufferOffset_ = offset;
     // Each flush allocates descriptor slots from the SRV heap.
     // Base layout: [0-1] rect SRV + atlas, [4-5] text SRV + atlas
     // Per-bitmap/snapshot batch: 2 extra slots (instance SRV + texture)
+    // Per-stencil-path batch: at most one extra resolve SRV slot. Path slots
+    //   live AFTER the bitmap range so the bitmap descriptor pairs stay
+    //   stride-2 aligned no matter how many resolves run between them.
     // This avoids overwriting descriptors that are still referenced by earlier draws
     // on the same command list (GPU hasn't executed them yet).
     UINT numBitmapSlots = (UINT)(bitmapTextures_.size() + CountSnapshotBlitBatches()) * 2;
-    UINT kSlotsPerFlush = 8 + numBitmapSlots;
+    UINT numPathResolveSlots = (UINT)stencilPathDraws_.size();  // upper bound: 1 per path
+    UINT kSlotsPerFlush = 8 + numBitmapSlots + numPathResolveSlots;
+    // Stash path-resolve region size so RecordDrawCommands can place its
+    // ring counter past the bitmap region.
+    lastFlushPathResolveBase_ = 8 + numBitmapSlots;
+    lastFlushPathResolveCount_ = numPathResolveSlots;
     // Check for overflow BEFORE allocation to avoid writing past frame region boundary
     UINT frameSrvBase = currentFrame_ * frameSrvRegionSize_;
     UINT frameSrvEnd = frameSrvBase + frameSrvRegionSize_;
@@ -1608,6 +1804,7 @@ void D3D12DirectRenderer::UploadInstances()
         bitmapInstances_.clear();
         triangleVertices_.clear();
         bitmapTextures_.clear();
+        stencilPathDraws_.clear();
         batches_.clear();
         return;
     }
@@ -1718,9 +1915,226 @@ void D3D12DirectRenderer::RecordDrawCommands()
     DrawBatchType currentPSO = DrawBatchType::SdfRect;
     commandList_->SetPipelineState(sdfRectPSO_.Get());
 
+    // ── Path-pipeline state machine ────────────────────────────────────
+    // Stencil-then-cover paths target an 8× MSAA scratch RT, not the back
+    // buffer. We enter "path mode" lazily on the first path batch (clear
+    // MSAA color + stencil, bind scratch RT/DSV, switch root signature),
+    // stay there for runs of consecutive path batches, and flush back to
+    // the swap-chain RT (resolve → blit) the moment a non-path batch
+    // arrives or the loop ends. This keeps the rest of the renderer
+    // unchanged: bitmap / text / rect still draw 1× directly into the
+    // swap chain.
+    bool pathActiveOnMsaa = false;          // currently rendering paths into MSAA scratch?
+    bool pathScratchClearedThisFrame = false;  // ClearRTV/CDS done this frame on scratch?
+
+    // We collect SRV slots from the per-flush ring for each resolve blit
+    // we have to do. Path resolves live in their own region (placed past
+    // the bitmap descriptors by UploadInstances) so bitmap descriptor
+    // pairs stay stride-2 aligned even when paths interleave.
+    UINT pathResolveCursor = descBase + lastFlushPathResolveBase_;
+    UINT pathResolveBudget = lastFlushPathResolveCount_;
+    auto allocResolveSrvSlot = [&]() -> UINT {
+        if (pathResolveBudget == 0) {
+            // Budget exhausted (UploadInstances under-counted, or extra path
+            // batches were appended after — defensive guard so we don't
+            // collide with a bitmap descriptor). Skip the blit; visual is
+            // wrong only for that path, no descriptor corruption.
+            return UINT_MAX;
+        }
+        UINT slot = pathResolveCursor;
+        pathResolveCursor += 1;
+        pathResolveBudget -= 1;
+        return slot;
+    };
+
+    auto enterPathMode = [&]() {
+        if (pathActiveOnMsaa) return;
+        if (!EnsureStencilDepthBuffer(viewportWidth_, viewportHeight_)) return;
+
+        // Transition MSAA color to RENDER_TARGET if it isn't already.
+        if (pathMsaaColorState_ != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+            auto b = MakeTransitionBarrier(pathMsaaColor_.Get(),
+                pathMsaaColorState_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            commandList_->ResourceBarrier(1, &b);
+            pathMsaaColorState_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        }
+
+        auto rtvHandle = pathMsaaRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        auto dsvHandle = stencilDsvHeap_->GetCPUDescriptorHandleForHeapStart();
+        commandList_->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
+
+        // On the first path batch of the frame, clear MSAA color to
+        // transparent and stencil to 0 so old contents don't leak.
+        if (!pathScratchClearedThisFrame) {
+            float clearColor[4] = { 0, 0, 0, 0 };
+            commandList_->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+            commandList_->ClearDepthStencilView(dsvHandle,
+                D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+            pathScratchClearedThisFrame = true;
+        }
+
+        commandList_->SetGraphicsRootSignature(stencilPathRootSig_.Get());
+        commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        pathActiveOnMsaa = true;
+        currentPSO = DrawBatchType::StencilPath;
+    };
+
+    auto exitPathMode = [&]() {
+        if (!pathActiveOnMsaa) return;
+
+        // Resolve 8× MSAA color → 1× resolve texture.
+        // MSAA color is currently RENDER_TARGET; resolve source must be
+        // RESOLVE_SOURCE. Resolve dest must be RESOLVE_DEST.
+        D3D12_RESOURCE_BARRIER preBarriers[2];
+        preBarriers[0] = MakeTransitionBarrier(pathMsaaColor_.Get(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        preBarriers[1] = MakeTransitionBarrier(pathResolveTexture_.Get(),
+            pathResolveTexState_, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+        commandList_->ResourceBarrier(2, preBarriers);
+
+        commandList_->ResolveSubresource(
+            pathResolveTexture_.Get(), 0,
+            pathMsaaColor_.Get(), 0,
+            DXGI_FORMAT_R16G16B16A16_FLOAT);
+
+        D3D12_RESOURCE_BARRIER postBarriers[2];
+        postBarriers[0] = MakeTransitionBarrier(pathMsaaColor_.Get(),
+            D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        postBarriers[1] = MakeTransitionBarrier(pathResolveTexture_.Get(),
+            D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        commandList_->ResourceBarrier(2, postBarriers);
+        pathMsaaColorState_  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        pathResolveTexState_ = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        // Allocate one SRV slot for the resolve texture and write the SRV.
+        UINT srvSlot = allocResolveSrvSlot();
+        if (srvSlot == UINT_MAX) {
+            // No SRV budget left — skip the blit but still keep state
+            // consistent so the next batch doesn't crash. The path output
+            // is dropped; non-path content remains correct.
+            pathScratchClearedThisFrame = false;
+            pathActiveOnMsaa = false;
+            currentPSO = DrawBatchType::SdfRect;
+            commandList_->SetPipelineState(sdfRectPSO_.Get());
+            return;
+        }
+        auto srvCpu = srvHeap_->GetCPUDescriptorHandleForHeapStart();
+        srvCpu.ptr += srvSlot * srvDescriptorSize_;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        srvDesc.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView(pathResolveTexture_.Get(), &srvDesc, srvCpu);
+        auto srvGpu = srvHeap_->GetGPUDescriptorHandleForHeapStart();
+        srvGpu.ptr += srvSlot * srvDescriptorSize_;
+
+        // Rebind swap-chain RT (no DSV) and run the fullscreen-triangle blit.
+        auto rtvHandle = GetSwapChainRtvHandle();
+        commandList_->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+        D3D12_RECT fullScissor = { 0, 0, (LONG)viewportWidth_, (LONG)viewportHeight_ };
+        commandList_->RSSetScissorRects(1, &fullScissor);
+
+        commandList_->SetGraphicsRootSignature(pathResolveRootSig_.Get());
+        ID3D12DescriptorHeap* heaps[] = { srvHeap_.Get() };
+        commandList_->SetDescriptorHeaps(1, heaps);
+        commandList_->SetGraphicsRootDescriptorTable(0, srvGpu);
+        commandList_->SetPipelineState(psoPathResolve_.Get());
+        commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        commandList_->IASetVertexBuffers(0, 0, nullptr);
+        commandList_->DrawInstanced(3, 1, 0, 0);
+
+        // Restore main root signature + descriptor heap so the next
+        // non-path batch picks up where it left off. Root constants and
+        // descriptor table bindings on root sigs are independent — we
+        // must re-emit them.
+        commandList_->SetGraphicsRootSignature(rootSignature_.Get());
+        commandList_->SetGraphicsRootConstantBufferView(0,
+            fr.constantsBuffer->GetGPUVirtualAddress() + cbOffset);
+        commandList_->SetGraphicsRootDescriptorTable(1, srvGpuBase);
+
+        // Reset state-machine knobs so the next path batch in this frame
+        // re-binds MSAA, but does NOT re-clear (paths from earlier still
+        // live in the resolved texture, already blitted to the back buffer;
+        // subsequent paths get rendered on a fresh MSAA scratch).
+        //
+        // We DO clear MSAA color again before the next run — otherwise the
+        // previously-blitted paths would re-resolve and blit a second time,
+        // overshooting alpha. Tracking that via pathScratchClearedThisFrame
+        // forces the path-mode re-entry path to clear.
+        pathScratchClearedThisFrame = false;
+        pathActiveOnMsaa = false;
+        currentPSO = DrawBatchType::SdfRect;  // force PSO re-select on next batch
+        commandList_->SetPipelineState(sdfRectPSO_.Get());
+    };
+
     for (size_t batchIdx = 0; batchIdx < batches_.size(); batchIdx++) {
         const auto& batch = batches_[batchIdx];
 
+        if (batch.type == DrawBatchType::StencilPath) {
+            if (!stencilPathReady_) continue;
+            enterPathMode();
+            if (!pathActiveOnMsaa) continue;  // EnsureStencilDepthBuffer failed
+
+            // Apply scissor for this path.
+            if (batch.hasScissor) {
+                if (batch.scissor.left >= batch.scissor.right ||
+                    batch.scissor.top >= batch.scissor.bottom)
+                    continue;
+                commandList_->RSSetScissorRects(1, &batch.scissor);
+            } else {
+                D3D12_RECT fullScissor = { 0, 0, (LONG)viewportWidth_, (LONG)viewportHeight_ };
+                commandList_->RSSetScissorRects(1, &fullScissor);
+            }
+
+            uint32_t drawIdx = batch.instanceOffset;
+            if (drawIdx >= stencilPathDraws_.size()) continue;
+            const auto& draw = stencilPathDraws_[drawIdx];
+            if (draw.fillVertexCount == 0 || draw.coverVertexCount == 0) continue;
+
+            // 16 dwords of root constants (transform/color/screen).
+            float rootConsts[16] = {};
+            rootConsts[0] = draw.m11; rootConsts[1] = draw.m12;
+            rootConsts[2] = draw.m21; rootConsts[3] = draw.m22;
+            rootConsts[4] = draw.dx;  rootConsts[5] = draw.dy;
+            rootConsts[8]  = draw.r;
+            rootConsts[9]  = draw.g;
+            rootConsts[10] = draw.b;
+            rootConsts[11] = draw.a;
+            rootConsts[12] = (float)viewportWidth_;
+            rootConsts[13] = (float)viewportHeight_;
+            rootConsts[14] = (viewportWidth_  > 0) ? 1.0f / (float)viewportWidth_  : 0.0f;
+            rootConsts[15] = (viewportHeight_ > 0) ? 1.0f / (float)viewportHeight_ : 0.0f;
+            commandList_->SetGraphicsRoot32BitConstants(0, 16, rootConsts, 0);
+
+            // Pass 1 — stencil fill.
+            commandList_->OMSetStencilRef(0);
+            commandList_->SetPipelineState(
+                draw.fillRule == 1 ? psoStencilFillNonZero_.Get()
+                                   : psoStencilFillEvenOdd_.Get());
+            D3D12_VERTEX_BUFFER_VIEW fillVbv = {};
+            fillVbv.BufferLocation = fr.instanceUploadBuffer->GetGPUVirtualAddress() + draw.fillVbOffsetBytes;
+            fillVbv.SizeInBytes    = draw.fillVertexCount * (UINT)sizeof(StencilPathVertex);
+            fillVbv.StrideInBytes  = sizeof(StencilPathVertex);
+            commandList_->IASetVertexBuffers(0, 1, &fillVbv);
+            commandList_->DrawInstanced(draw.fillVertexCount, 1, 0, 0);
+
+            // Pass 2 — cover.
+            commandList_->SetPipelineState(psoStencilCover_.Get());
+            D3D12_VERTEX_BUFFER_VIEW coverVbv = {};
+            coverVbv.BufferLocation = fr.instanceUploadBuffer->GetGPUVirtualAddress() + draw.coverVbOffsetBytes;
+            coverVbv.SizeInBytes    = draw.coverVertexCount * (UINT)sizeof(StencilPathVertex);
+            coverVbv.StrideInBytes  = sizeof(StencilPathVertex);
+            commandList_->IASetVertexBuffers(0, 1, &coverVbv);
+            commandList_->DrawInstanced(draw.coverVertexCount, 1, 0, 0);
+            continue;
+        }
+
+        // Non-stencil-path batch: if we were rendering paths, resolve + blit
+        // them onto the back buffer first so painter's order is preserved.
+        if (pathActiveOnMsaa) {
+            exitPathMode();
+        }
 
         // Switch PSO if needed
         if (batch.type != currentPSO) {
@@ -1879,6 +2293,12 @@ void D3D12DirectRenderer::RecordDrawCommands()
         // Draw: 6 vertices per instance (2 triangles)
         commandList_->DrawInstanced(6, batch.instanceCount, 0, 0);
     }
+
+    // End-of-flush flush: if the last batch was a path, resolve+blit now
+    // so the back buffer reflects everything we recorded.
+    if (pathActiveOnMsaa) {
+        exitPathMode();
+    }
 }
 
 // ============================================================================
@@ -1983,6 +2403,66 @@ static D3D12_RESOURCE_DESC MakeTexture2DDesc(UINT width, UINT height, DXGI_FORMA
     return desc;
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// EnsureMsaaColorBuffer
+//
+// Lazily creates / re-creates the 4× MSAA color buffer that the frame
+// renders into. The buffer is sized to the current viewport (matching
+// the swap-chain back buffer); on resize OnResize() drops the old one
+// so the next BeginFrame allocates a fresh size-matched buffer. RTV is
+// (re)written into the dedicated MSAA slot in rtvHeap_.
+// ────────────────────────────────────────────────────────────────────────
+bool D3D12DirectRenderer::EnsureMsaaColorBuffer(uint32_t width, uint32_t height)
+{
+    if (width == 0 || height == 0) return false;
+    if (msaaColorBuffer_ && width == msaaWidth_ && height == msaaHeight_) return true;
+
+    msaaColorBuffer_.Reset();
+    msaaWidth_ = 0;
+    msaaHeight_ = 0;
+
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = swapChainFormat_;
+    desc.SampleDesc.Count = kMsaaSampleCount;
+    desc.SampleDesc.Quality = 0;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    auto heapProps = MakeHeapProps(D3D12_HEAP_TYPE_DEFAULT);
+
+    // Pass nullptr for the optimized clear value: the MSAA buffer is cleared
+    // to several different colors over its lifetime (BeginFrame's user color,
+    // partial-redraw's zero, mid-frame D3D12RenderTarget::Clear), so any
+    // single optimized value would mismatch most of them and emit a perf
+    // warning every clear (D3D12 #820 CLEARRENDERTARGETVIEW_MISMATCHINGCLEARVALUE).
+    // The frame-start MSAA clear runs once per frame so giving up the fast-
+    // clear optimization is a fixed sub-microsecond cost.
+    //
+    // Start in COMMON so the per-frame BeginFrame barrier (COMMON →
+    // RENDER_TARGET) is consistent whether this is the first frame or a
+    // post-decay subsequent frame.
+    HRESULT hr = device_->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&msaaColorBuffer_));
+    if (FAILED(hr)) return false;
+
+    msaaWidth_ = width;
+    msaaHeight_ = height;
+
+    D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+    rtvDesc.Format = swapChainFormat_;
+    rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+    device_->CreateRenderTargetView(msaaColorBuffer_.Get(), &rtvDesc, GetMsaaRtvHandle());
+
+    return true;
+}
+
 void D3D12DirectRenderer::WaitForGpuIdle()
 {
     if (!backend_ || !fence_ || !fenceEvent_) {
@@ -1998,6 +2478,7 @@ void D3D12DirectRenderer::WaitForGpuIdle()
     if (FAILED(queue->Signal(fence_.Get(), fenceValue))) {
         return;
     }
+    backend_->NoteSubmittedFenceValue(fenceValue);
 
     if (fence_->GetCompletedValue() < fenceValue) {
         ResetEvent(fenceEvent_);
@@ -2005,6 +2486,7 @@ void D3D12DirectRenderer::WaitForGpuIdle()
             WaitForSingleObject(fenceEvent_, 5000);
         }
     }
+    backend_->ReclaimRetiredGpuResources(fence_->GetCompletedValue());
 }
 
 bool D3D12DirectRenderer::EnsureSnapshotTexture()
@@ -2195,6 +2677,7 @@ void D3D12DirectRenderer::FlushGraphicsForCompute()
     bitmapInstances_.clear();
     triangleVertices_.clear();
     bitmapTextures_.clear();
+    stencilPathDraws_.clear();
     batches_.clear();
 }
 
@@ -2470,8 +2953,7 @@ void D3D12DirectRenderer::BlurRegion(float x, float y, float w, float h, float r
     }
 
     // Re-bind render target and viewport for subsequent graphics draws
-    auto rtvHandle = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
-    rtvHandle.ptr += currentFrame_ * rtvDescriptorSize_;
+    auto rtvHandle = GetSwapChainRtvHandle();
     cl->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     D3D12_VIEWPORT vp = { 0, 0, (float)viewportWidth_, (float)viewportHeight_, 0, 1 };
@@ -2512,8 +2994,7 @@ void D3D12DirectRenderer::PunchTransparentRect(float x, float y, float w, float 
     clearRect.right = (LONG)((newX + sw) * dpiScale_);
     clearRect.bottom = (LONG)((newY + sh) * dpiScale_);
 
-    auto rtvHandle = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
-    rtvHandle.ptr += currentFrame_ * rtvDescriptorSize_;
+    auto rtvHandle = GetSwapChainRtvHandle();
 
     float clearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     cl->ClearRenderTargetView(rtvHandle, clearColor, 1, &clearRect);
@@ -2559,8 +3040,7 @@ bool D3D12DirectRenderer::CaptureSnapshot()
     snapshotState_ = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
     // Re-bind render target
-    auto rtvHandle = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
-    rtvHandle.ptr += currentFrame_ * rtvDescriptorSize_;
+    auto rtvHandle = GetSwapChainRtvHandle();
     cl->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     D3D12_VIEWPORT vp = { 0, 0, (float)viewportWidth_, (float)viewportHeight_, 0, 1 };
@@ -3162,8 +3642,7 @@ void D3D12DirectRenderer::EndOffscreenCapture(int slot)
     offscreenRTState_[slot] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
     // Restore main render target
-    auto rtvHandle = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
-    rtvHandle.ptr += currentFrame_ * rtvDescriptorSize_;
+    auto rtvHandle = GetSwapChainRtvHandle();
     cl->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     // Restore viewport
@@ -3420,8 +3899,7 @@ void D3D12DirectRenderer::DrawCustomShaderEffect(int slot,
     cl->RSSetViewports(1, &vp);
     cl->RSSetScissorRects(1, &scissor);
 
-    auto rtvHandle = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
-    rtvHandle.ptr += currentFrame_ * rtvDescriptorSize_;
+    auto rtvHandle = GetSwapChainRtvHandle();
     cl->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     cl->SetGraphicsRootConstantBufferView(0, cbGpuAddr);
@@ -3640,8 +4118,7 @@ bool D3D12DirectRenderer::BlurOffscreenSlot(int slot, float radius)
 
     // Re-bind render target and viewport for subsequent graphics draws
     // (FlushGraphicsForCompute resets command list state)
-    auto rtvHandle = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
-    rtvHandle.ptr += currentFrame_ * rtvDescriptorSize_;
+    auto rtvHandle = GetSwapChainRtvHandle();
     cl->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     D3D12_VIEWPORT vp = { 0, 0, (float)viewportWidth_, (float)viewportHeight_, 0, 1 };
@@ -4092,8 +4569,7 @@ void D3D12DirectRenderer::DrawLiquidGlass(
     cl->RSSetViewports(1, &vp);
     cl->RSSetScissorRects(1, &scissor);
 
-    auto rtvHandle = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
-    rtvHandle.ptr += currentFrame_ * rtvDescriptorSize_;
+    auto rtvHandle = GetSwapChainRtvHandle();
     cl->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     // Bind frame constants (b0)

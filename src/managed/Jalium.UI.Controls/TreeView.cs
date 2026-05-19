@@ -82,6 +82,37 @@ public class TreeView : ItemsControl
         remove { if (value is not null) RemoveHandler(SelectedItemChangedEvent, value); }
     }
 
+    /// <summary>
+    /// Identifies the <see cref="ItemDoubleClicked"/> routed event.
+    /// </summary>
+    public static readonly RoutedEvent ItemDoubleClickedEvent =
+        EventManager.RegisterRoutedEvent(nameof(ItemDoubleClicked), RoutingStrategy.Bubble,
+            typeof(EventHandler<TreeViewItemDoubleClickedEventArgs>), typeof(TreeView));
+
+    /// <summary>
+    /// 当 <see cref="TreeViewItem"/> 被左键双击时触发。事件参数携带容器和数据上下文，
+    /// 调用方无需再用 <see cref="SelectedItem"/> 取值。
+    /// </summary>
+    public event EventHandler<TreeViewItemDoubleClickedEventArgs>? ItemDoubleClicked
+    {
+        add { if (value is not null) AddHandler(ItemDoubleClickedEvent, value); }
+        remove { if (value is not null) RemoveHandler(ItemDoubleClickedEvent, value); }
+    }
+
+    /// <summary>
+    /// 由 <see cref="TreeViewItem.OnMouseDoubleClick"/> 调用 — 用容器和 DataContext
+    /// 构造高层事件参数并 raise <see cref="ItemDoubleClickedEvent"/>。
+    /// </summary>
+    internal void RaiseItemDoubleClicked(TreeViewItem container, MouseButtonEventArgs source)
+    {
+        if (container == null) return;
+
+        var args = new TreeViewItemDoubleClickedEventArgs(
+            ItemDoubleClickedEvent, this, container, container.DataContext, source);
+        RaiseEvent(args);
+        if (args.Handled) source.Handled = true;
+    }
+
     #endregion
 
     public TreeView()
@@ -97,12 +128,31 @@ public class TreeView : ItemsControl
         AddHandler(KeyDownEvent, new KeyEventHandler(OnTreeViewKeyDown));
     }
 
+    private ScrollViewer? _scrollViewer;
+
+    /// <summary>
+    /// 内部使用 — TreeViewItem 在 wheel 事件触发时调用此方法把事件转发给 TreeView 内部
+    /// 的 ScrollViewer。这是为了绕开 visual tree 在 VirtualizingStackPanel 处断裂的
+    /// 框架 bug —— 正常 wheel event 应该沿 visual tree bubble 到 ScrollViewer，
+    /// 但 VSP._parent = null 让 bubble 链断在 VSP，事件无法到达 ScrollViewer。
+    /// </summary>
+    internal void ForwardMouseWheel(MouseWheelEventArgs e)
+    {
+        if (e.Handled) return;
+        if (_scrollViewer == null) return;
+
+        // 用 RaiseEvent 把事件重新派发到 ScrollViewer。
+        // RoutedEvent 的 OriginalSource 保留指向真实点击源，与正常 bubble 等效。
+        _scrollViewer.RaiseEvent(e);
+    }
+
     #region Template
 
     /// <inheritdoc />
     public override void OnApplyTemplate()
     {
         base.OnApplyTemplate();
+        _scrollViewer = GetTemplateChild("PART_ScrollViewer") as ScrollViewer;
     }
 
     #endregion
@@ -116,7 +166,10 @@ public class TreeView : ItemsControl
     /// <inheritdoc />
     protected override FrameworkElement GetContainerForItem(object item)
     {
-        return WrapItemAsTreeViewItem(item) ?? new TreeViewItem();
+        // 仅创建容器；HierarchicalDataTemplate 的应用统一交给 PrepareContainerForItem，
+        // 避免双重 apply 导致 BridgeDataItemBoolStateToTreeViewItem 重复订阅、
+        // _childrenRealized 状态机被重置以及 EnsureChildrenRealized 跑两遍生成重复子项。
+        return item is TreeViewItem tvi ? tvi : new TreeViewItem();
     }
 
     /// <inheritdoc />
@@ -166,31 +219,6 @@ public class TreeView : ItemsControl
         {
             tvi.HeaderTemplate = ItemTemplate;
         }
-    }
-
-    /// <summary>
-    /// Wraps a data item as a TreeViewItem if it isn't one already.
-    /// Applies HierarchicalDataTemplate to configure child items.
-    /// </summary>
-    private TreeViewItem? WrapItemAsTreeViewItem(object item)
-    {
-        if (item is TreeViewItem tvi)
-            return tvi;
-
-        // Create a container for the data item
-        tvi = new TreeViewItem { Header = item, DataContext = item };
-
-        // Apply ItemTemplate
-        if (ItemTemplate is HierarchicalDataTemplate hdt)
-        {
-            TreeViewItem.ApplyHierarchicalDataTemplate(tvi, item, hdt);
-        }
-        else if (ItemTemplate != null)
-        {
-            tvi.HeaderTemplate = ItemTemplate;
-        }
-
-        return tvi;
     }
 
     private static void OnSelectedItemChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
@@ -357,6 +385,13 @@ public class TreeViewItem : HeaderedItemsControl
     private HierarchicalDataTemplate? _deferredTemplate;
     private bool _childrenRealized;
 
+    // 桥接的 dataItem（HierarchicalDataTemplate 模式下背后的 ViewModel 节点）。
+    // IsExpanded / IsSelected 的双向同步通过 DP PropertyChanged 回调直接写回 dataItem，
+    // 而不再依赖 ExpandedEvent / CollapsedEvent — 因为这两个事件是 Bubble 路由策略，
+    // 父节点的桥接 handler 会被子节点冒泡的事件错误触发，导致整条父链连锁收起。
+    private object? _bridgedDataItem;
+    private System.ComponentModel.PropertyChangedEventHandler? _bridgedINPCHandler;
+
     #region Template Parts
 
     private Border? _headerBorder;
@@ -501,6 +536,17 @@ public class TreeViewItem : HeaderedItemsControl
         Items.CollectionChanged += OnChildItemsChanged;
         ResourcesChanged += OnResourcesChangedHandler;
         AddHandler(KeyDownEvent, new KeyEventHandler(OnKeyDownHandler));
+
+        // 把 wheel 事件转发给 ParentTreeView 内部的 ScrollViewer。
+        // 必须显式转发因为 framework 的 visual tree 在 VirtualizingStackPanel 处断裂
+        // (VSP.VisualParent = null), wheel 事件从 _headerBorder 起 bubble 到 VSP 就停了，
+        // 永远不会自然到达 ScrollViewer.OnMouseWheel。
+        // 订阅 MouseWheelEvent (bubble) 而非 PreviewMouseWheelEvent (tunnel) —
+        // ScrollViewer 注册的 handler 是 MouseWheelEvent，事件类型必须一致才能转发命中。
+        AddHandler(MouseWheelEvent, new Input.MouseWheelEventHandler((s, e) =>
+        {
+            ParentTreeView?.ForwardMouseWheel(e);
+        }), handledEventsToo: true);
     }
 
     /// <summary>
@@ -671,25 +717,17 @@ public class TreeViewItem : HeaderedItemsControl
         }
     }
 
-    protected override HitTestResult? HitTestCore(Point point)
-    {
-        var result = base.HitTestCore(point);
-        if (result == null || result.VisualHit != this)
-        {
-            return result;
-        }
-
-        // TreeViewItem itself is a transparent wrapper around template parts.
-        // Avoid swallowing unrelated clicks when layout stretches the container
-        // beyond the actual header / realized child content.
-        if (IsPointWithinElementBounds(_headerBorder, point) ||
-            IsPointWithinElementBounds(_itemsHost, point))
-        {
-            return result;
-        }
-
-        return null;
-    }
+    // 注：原本这里有一段 HitTestCore override 试图过滤"layout 拉伸到 header / items 之外
+    // 区域内的击中"，但实现有两个 bug：
+    //   1. 坐标系混淆 — HitTestCore 的 point 是当前元素局部坐标，
+    //      element.VisualBounds 却是相对父级坐标，IsPointWithinElementBounds
+    //      Contains 比对得出错误结果。
+    //   2. 过滤过激 — 当 result.VisualHit == this 时把不在两个 PART 区域里的点击
+    //      一律 return null，吞掉了 ScrollBar 拖拽 / Hover Enter-Leave / 子内容空隙
+    //      所有"非精确命中 PART"事件。叠加后整个 TreeView 子树鼠标交互不响应。
+    // 移除该 override 让 TreeViewItem 走默认 HitTestCore：默认 TreeViewItem.Background
+    // 是 Transparent (=不命中)，所以原 override 想防止的"空白处吞 click"问题
+    // 在标准链路下本来就不会发生。
 
     #endregion
 
@@ -784,19 +822,41 @@ public class TreeViewItem : HeaderedItemsControl
         }
     }
 
+    /// <summary>
+    /// TreeViewItem 双击 — 转发为 TreeView 的 <see cref="TreeView.ItemDoubleClicked"/>
+    /// 高层事件，携带数据上下文。注意展开箭头 / 内部交互元素的双击会被
+    /// <see cref="OnMouseDownHandler"/> 提前 Handled，不会进到这里。
+    ///
+    /// 末尾设 <c>e.Handled = true</c>：MouseDoubleClickEvent 是 Bubble，沿 Bubble 链
+    /// 每层 TreeViewItem (祖先) 的 class handler 都会调一次自己的 OnMouseDoubleClick。
+    /// 不 Handled 会让每个祖先都触发 ItemDoubleClicked，业务侧重复打开（如双击叶子节点
+    /// 同时打开父项目 .csproj）。最深层 TVI 处理后 Handled，祖先 class handler 不再调用
+    /// （class handler 默认 handledEventsToo:false）。
+    /// </summary>
+    protected override void OnMouseDoubleClick(MouseButtonEventArgs e)
+    {
+        base.OnMouseDoubleClick(e);
+        if (e.Handled) return;
+
+        ParentTreeView?.RaiseItemDoubleClicked(this, e);
+        e.Handled = true;
+    }
+
     private void OnMouseDownHandler(object sender, MouseButtonEventArgs e)
     {
-        // Check if clicked on expander area
-        if (HasItems && _expanderBorder is { Visibility: Visibility.Visible } expander)
+        // Check if clicked on expander area.
+        // 注：不能用 e.GetPosition(expander) 做坐标范围判断 — Jalium.UI 当前的
+        // MouseEventArgs.GetPosition 实现在嵌套 visual tree 中返回的是窗口绝对坐标
+        // 而非相对元素的局部坐标，导致坐标永远超出 expander 16×24 范围。
+        // 改用 OriginalSource visual tree 关系判断：如果点击命中的元素是 expander
+        // 或其后代（PART_ExpanderArrow），就是点了展开箭头。
+        if (HasItems && _expanderBorder is { Visibility: Visibility.Visible } expander &&
+            e.OriginalSource is DependencyObject originalSrc &&
+            IsVisualDescendantOf(originalSrc, expander))
         {
-            var pos = e.GetPosition(expander);
-            if (pos.X >= 0 && pos.X <= expander.ActualWidth &&
-                pos.Y >= 0 && pos.Y <= expander.ActualHeight)
-            {
-                IsExpanded = !IsExpanded;
-                e.Handled = true;
-                return;
-            }
+            IsExpanded = !IsExpanded;
+            e.Handled = true;
+            return;
         }
 
         // Let focusable controls inside the header (for example buttons or text boxes)
@@ -810,7 +870,27 @@ public class TreeViewItem : HeaderedItemsControl
 
         // Select this item
         ParentTreeView?.SelectItem(this);
-        e.Handled = true;
+
+        // 选中已通过 SelectItem 完成，事件继续 bubble — 不再设 e.Handled = true。
+        // Handled 会截断 Bubble 链，导致 Control 类处理器（订阅 MouseDownEvent
+        // 检测双击）在外层 TreeView 那一层永远不触发，业务侧
+        // SolutionTree.ItemDoubleClicked / MouseDoubleClick 收不到事件。
+        // 上层若需特殊吞 click，自行在外层 handler 设 Handled。
+    }
+
+    /// <summary>
+    /// 沿 visual tree 向上判断 <paramref name="child"/> 是否是 <paramref name="ancestor"/>
+    /// 自身或后代。用于鼠标事件 OriginalSource 检测，避免依赖坐标转换。
+    /// </summary>
+    private static bool IsVisualDescendantOf(DependencyObject child, DependencyObject ancestor)
+    {
+        DependencyObject? current = child;
+        while (current != null)
+        {
+            if (ReferenceEquals(current, ancestor)) return true;
+            current = VisualTreeHelper.GetParent(current);
+        }
+        return false;
     }
 
     private void OnHeaderMouseEnter(object sender, MouseEventArgs e)
@@ -939,7 +1019,7 @@ public class TreeViewItem : HeaderedItemsControl
         // in sync with the current expanded state.
         if (_expanderArrow != null && _expandAnimTimer == null)
         {
-            SetExpanderAngle(IsExpanded ? 90 : 0);
+            SetExpanderAngle(IsExpanded ? 0 : -90);
         }
     }
 
@@ -956,7 +1036,7 @@ public class TreeViewItem : HeaderedItemsControl
 
         if (_expanderArrow != null)
         {
-            SetExpanderAngle(IsExpanded ? 90 : 0);
+            SetExpanderAngle(IsExpanded ? 0 : -90);
         }
     }
 
@@ -975,7 +1055,7 @@ public class TreeViewItem : HeaderedItemsControl
         var startHeight = GetCurrentItemsHostHeight();
         var targetHeight = expanded ? MeasureItemsHostNaturalHeight() : 0.0;
         var startAngle = GetCurrentExpanderAngle();
-        var targetAngle = expanded ? 90.0 : 0.0;
+        var targetAngle = expanded ? 0.0 : -90.0;
 
         if (Math.Abs(startHeight - targetHeight) < 0.5 && Math.Abs(startAngle - targetAngle) < 0.5)
         {
@@ -1069,7 +1149,7 @@ public class TreeViewItem : HeaderedItemsControl
         }
 
         ClearChildOffsets();
-        SetExpanderAngle(_expandAnimationTargetExpanded ? 90 : 0);
+        SetExpanderAngle(_expandAnimationTargetExpanded ? 0 : -90);
         InvalidateMeasure();
         ParentTreeView?.InvalidateMeasure();
     }
@@ -1147,7 +1227,7 @@ public class TreeViewItem : HeaderedItemsControl
             return rotateTransform.Angle;
         }
 
-        return IsExpanded ? 90 : 0;
+        return IsExpanded ? 0 : -90;
     }
 
     private void SetExpanderAngle(double angle)
@@ -1157,9 +1237,15 @@ public class TreeViewItem : HeaderedItemsControl
             return;
         }
 
+        // 用绝对像素 CenterX/CenterY 锁定旋转中心 — 避免 RenderTransformOrigin 相对
+        // 单位在 Stretch 缩放下计算偏差。Path 的 Width/Height = 8，几何中心 = (4, 4)。
+        // 当 ActualWidth/Height 已经布局过则用真实尺寸的一半，更精确。
         var rotateTransform = _expanderArrow.RenderTransform as RotateTransform ?? new RotateTransform();
+        var w = _expanderArrow.ActualWidth > 0 ? _expanderArrow.ActualWidth : _expanderArrow.Width;
+        var h = _expanderArrow.ActualHeight > 0 ? _expanderArrow.ActualHeight : _expanderArrow.Height;
+        rotateTransform.CenterX = (double.IsNaN(w) || w <= 0) ? 4 : w / 2;
+        rotateTransform.CenterY = (double.IsNaN(h) || h <= 0) ? 4 : h / 2;
         rotateTransform.Angle = angle;
-        _expanderArrow.RenderTransformOrigin = new Point(0.5, 0.5);
         _expanderArrow.RenderTransform = rotateTransform;
         _expanderArrow.InvalidateVisual();
     }
@@ -1262,14 +1348,50 @@ public class TreeViewItem : HeaderedItemsControl
         _headerBorder.ClearValue(Border.BackgroundProperty);
     }
 
+    /// <summary>
+    /// 资源查找走 _headerBorder 而非 TreeViewItem 自己 —— template 内部的 part
+    /// 已 attach 到 visual tree, 它的 VisualParent 链直接经过 TreeView.Resources;
+    /// TreeViewItem 在某些时机（比如 ItemContainerGenerator 初次创建容器时）visual tree 可能
+    /// 没完全连通, this.TryFindResource 会跳到 Application.Resources 拿到主题默认 fallback
+    /// (#15FFFFFF 等), 错过用户在 TreeView.Resources 里的覆盖。
+    /// </summary>
+    private Brush ResolveResourceBrush(string key, Brush fallback)
+    {
+        // 优先级 1：直接从 ParentTreeView 的 Resources 拿 — TreeViewItem 持有 ParentTreeView 引用，
+        // 不依赖 visual tree（framework 在 ItemContainerGenerator 创建容器时
+        // 显式设置该字段），因此即使 visual ancestor 链断开也能正确解析用户在
+        // <TreeView.Resources> 里的覆盖。
+        if (ParentTreeView is { } tv)
+        {
+            // 沿 ParentTreeView 链向上 — 处理嵌套 TreeView 场景（虽然现在不嵌套）
+            FrameworkElement? cur = tv;
+            while (cur != null)
+            {
+                if (cur.Resources != null && cur.Resources.TryGetValue(key, out var v) && v is Brush direct)
+                {
+                    return direct;
+                }
+                cur = cur.VisualParent as FrameworkElement;
+            }
+        }
+
+        // 优先级 2：_headerBorder 走 visual tree 查找（保险路径）
+        if (_headerBorder?.TryFindResource(key) is Brush b1) return b1;
+
+        // 优先级 3：TreeViewItem 自身查找
+        if (TryFindResource(key) is Brush b2) return b2;
+
+        return fallback;
+    }
+
     private Brush ResolveHoverBackgroundBrush()
-        => TryFindResource("ControlBackgroundHover") as Brush ?? s_fallbackHoverBackgroundBrush;
+        => ResolveResourceBrush("ControlBackgroundHover", s_fallbackHoverBackgroundBrush);
 
     private Brush ResolveSelectedBackgroundBrush()
-        => TryFindResource("SelectionBackground") as Brush ?? s_fallbackSelectedBackgroundBrush;
+        => ResolveResourceBrush("SelectionBackground", s_fallbackSelectedBackgroundBrush);
 
     private Brush ResolveSelectedHoverBackgroundBrush()
-        => TryFindResource("AccentBrushPressed") as Brush ?? s_fallbackSelectedHoverBackgroundBrush;
+        => ResolveResourceBrush("AccentBrushPressed", s_fallbackSelectedHoverBackgroundBrush);
 
     private void OnResourcesChangedHandler(object? sender, EventArgs e)
     {
@@ -1343,6 +1465,13 @@ public class TreeViewItem : HeaderedItemsControl
         {
             var expanded = (bool)e.NewValue!;
 
+            // 反向同步: tvi -> dataItem。直接通过 DP 回调写回，不依赖 ExpandedEvent / CollapsedEvent
+            // 的冒泡 — 那条路径会让父节点也跟着收起。
+            if (tvi._bridgedDataItem != null)
+            {
+                PropertyAccessorRegistry.TryWriteProperty(tvi._bridgedDataItem, "IsExpanded", expanded);
+            }
+
             // Realize deferred children on first expand
             if (expanded)
             {
@@ -1376,7 +1505,15 @@ public class TreeViewItem : HeaderedItemsControl
     {
         if (d is TreeViewItem tvi)
         {
-            if ((bool)e.NewValue! && tvi.ParentTreeView != null)
+            var selected = (bool)e.NewValue!;
+
+            // 反向同步: tvi -> dataItem
+            if (tvi._bridgedDataItem != null)
+            {
+                PropertyAccessorRegistry.TryWriteProperty(tvi._bridgedDataItem, "IsSelected", selected);
+            }
+
+            if (selected && tvi.ParentTreeView != null)
             {
                 tvi.ParentTreeView.SelectItem(tvi);
             }
@@ -1399,7 +1536,18 @@ public class TreeViewItem : HeaderedItemsControl
     /// <summary>
     /// Applies a HierarchicalDataTemplate to a TreeViewItem, setting up header template.
     /// Child items are deferred until the node is expanded to avoid recursive tree creation.
+    ///
+    /// <para>ItemsSource resolution accepts three shapes — XAML 解析期对 BindingBase 类型属性
+    /// 的处理在不同写法下产物不同，此处显式覆盖三种情形以保证 attribute / property-element /
+    /// 直接代码注入都能工作：</para>
+    /// <list type="bullet">
+    /// <item><c>Binding</c> 实例（属性元素 <c>&lt;Binding Path="X"/&gt;</c> 或代码直接构造）— 反射读 Path。</item>
+    /// <item>string 形如 <c>"{Binding X}"</c>（attribute 语法 <c>ItemsSource="{Binding Children}"</c>
+    /// 在某些 SG/Reader 路径下产物退化成字符串字面量）— 提取路径表达式重新当作 Binding 处理。</item>
+    /// <item><c>IEnumerable</c> 已求值集合 — 当作直接子集合，无需路径反射。</item>
+    /// </list>
     /// </summary>
+    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("HierarchicalDataTemplate ItemsSource may resolve via PropertyAccessorRegistry reflection on data items.")]
     internal static void ApplyHierarchicalDataTemplate(TreeViewItem tvi, object dataItem, HierarchicalDataTemplate hdt)
     {
         // Set the header template
@@ -1414,35 +1562,166 @@ public class TreeViewItem : HeaderedItemsControl
 
         // Defer child creation: only resolve whether children exist (for the expander arrow),
         // but don't create TreeViewItem containers until the node is expanded.
-        if (hdt.ItemsSource is Jalium.UI.Data.Binding binding && !string.IsNullOrEmpty(binding.Path?.Path))
+        var childItems = ResolveHierarchicalChildItems(hdt.ItemsSource, dataItem);
+        if (childItems is IEnumerable enumerable)
         {
-            var childItems = ResolvePropertyPath(dataItem, binding.Path.Path);
-            if (childItems is IEnumerable enumerable)
+            // Check if there are any children without enumerating everything
+            var enumerator = enumerable.GetEnumerator();
+            try
             {
-                // Check if there are any children without enumerating everything
-                var enumerator = enumerable.GetEnumerator();
-                try
+                if (enumerator.MoveNext())
                 {
-                    if (enumerator.MoveNext())
-                    {
-                        // Has children — store for deferred realization
-                        tvi._deferredItemsSource = childItems;
-                        tvi._deferredTemplate = hdt.ItemTemplate as HierarchicalDataTemplate ?? hdt;
-                        tvi._childrenRealized = false;
-                    }
-                }
-                finally
-                {
-                    (enumerator as IDisposable)?.Dispose();
+                    // Has children — store for deferred realization
+                    tvi._deferredItemsSource = childItems;
+                    tvi._deferredTemplate = hdt.ItemTemplate as HierarchicalDataTemplate ?? hdt;
+                    tvi._childrenRealized = false;
                 }
             }
+            finally
+            {
+                (enumerator as IDisposable)?.Dispose();
+            }
         }
+
+        // 把 dataItem.IsExpanded / IsSelected 桥接到 TreeViewItem 的对应 DP 上 —
+        // 这是 HDT 模式里"数据节点 ↔ UI 容器状态"自动双向同步的预期行为。
+        BridgeDataItemBoolStateToTreeViewItem(tvi, dataItem);
 
         // If the item is already expanded, realize children immediately
         if (tvi.IsExpanded)
         {
             tvi.EnsureChildrenRealized();
         }
+    }
+
+    /// <summary>
+    /// 把 <paramref name="dataItem"/> 上常见的 <c>IsExpanded</c> / <c>IsSelected</c> 布尔属性
+    /// 同步到 <see cref="TreeViewItem"/> 的对应 DP 上。如果数据类型实现了 <see cref="INotifyPropertyChanged"/>，
+    /// 还订阅 PropertyChanged 让外部修改 dataItem.IsExpanded 时 UI 自动跟随；
+    /// TreeViewItem.IsExpanded/IsSelected 反向变化时也回写到 dataItem，实现双向桥接。
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("PropertyAccessorRegistry uses reflection fallback for unregistered types.")]
+    private static void BridgeDataItemBoolStateToTreeViewItem(TreeViewItem tvi, object dataItem)
+    {
+        // 容器复用 / dataItem 换绑场景 — 先解绑旧 dataItem 的 INPC，避免泄漏 + 错绑。
+        if (tvi._bridgedDataItem is System.ComponentModel.INotifyPropertyChanged oldInpc &&
+            tvi._bridgedINPCHandler != null)
+        {
+            oldInpc.PropertyChanged -= tvi._bridgedINPCHandler;
+            tvi._bridgedINPCHandler = null;
+        }
+
+        tvi._bridgedDataItem = dataItem;
+
+        // 初始 push：dataItem.IsExpanded / IsSelected → tvi DP
+        if (PropertyAccessorRegistry.TryReadProperty(dataItem, "IsExpanded", out var expandedValue) &&
+            expandedValue is bool expanded && tvi.IsExpanded != expanded)
+        {
+            tvi.IsExpanded = expanded;
+        }
+
+        if (PropertyAccessorRegistry.TryReadProperty(dataItem, "IsSelected", out var selectedValue) &&
+            selectedValue is bool selected && tvi.IsSelected != selected)
+        {
+            tvi.IsSelected = selected;
+        }
+
+        // 单向订阅：dataItem PropertyChanged → tvi DP。
+        // 反向 (tvi DP → dataItem) 在 OnIsExpandedChanged / OnIsSelectedChanged 内直接处理，
+        // 不再依赖 ExpandedEvent / CollapsedEvent — 那两个事件是 Bubble 路由，
+        // 让父节点的桥接 handler 在子节点收起时被错误触发，进而把父 dataItem.IsExpanded 写为 false，
+        // 沿父链连锁塌陷整棵子树（即"收起一个 item 所有 item 都收起"的 bug）。
+        if (dataItem is System.ComponentModel.INotifyPropertyChanged inpc)
+        {
+            tvi._bridgedINPCHandler = (_, args) =>
+            {
+                if (tvi._bridgedDataItem == null) return;
+
+                if (args.PropertyName == "IsExpanded" &&
+                    PropertyAccessorRegistry.TryReadProperty(tvi._bridgedDataItem, "IsExpanded", out var v) &&
+                    v is bool b && tvi.IsExpanded != b)
+                {
+                    tvi.IsExpanded = b;
+                }
+                else if (args.PropertyName == "IsSelected" &&
+                    PropertyAccessorRegistry.TryReadProperty(tvi._bridgedDataItem, "IsSelected", out var vs) &&
+                    vs is bool bs && tvi.IsSelected != bs)
+                {
+                    tvi.IsSelected = bs;
+                }
+            };
+            inpc.PropertyChanged += tvi._bridgedINPCHandler;
+        }
+    }
+
+    /// <summary>
+    /// 把 <see cref="HierarchicalDataTemplate.ItemsSource"/> 在三种 XAML 解析产物形态下
+    /// 统一解析成"当前节点的子集合"对象。返回 null 表示无法解析（节点视为无子项）。
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Resolves PropertyPath against the data item via reflection.")]
+    private static object? ResolveHierarchicalChildItems(object? itemsSource, object dataItem)
+    {
+        if (itemsSource == null)
+            return null;
+
+        // 1) 标准 Binding 实例（属性元素语法 <Binding Path="Children" /> 或代码注入）
+        if (itemsSource is Jalium.UI.Data.Binding binding && !string.IsNullOrEmpty(binding.Path?.Path))
+        {
+            return ResolvePropertyPath(dataItem, binding.Path.Path);
+        }
+
+        // 2) attribute 语法 ItemsSource="{Binding Children}" — XAML SourceGenerator
+        // 把整个表达式当字符串字面量传给 BindingBase setter，反射 SetValue 直接存了
+        // string。这里识别 "{Binding X}" 形态并提取路径作为 fallback。
+        if (itemsSource is string text)
+        {
+            var path = ExtractBindingPathFromMarkup(text);
+            if (!string.IsNullOrEmpty(path))
+            {
+                return ResolvePropertyPath(dataItem, path);
+            }
+        }
+
+        // 3) 已求值的 IEnumerable — 直接当子集合返回。
+        if (itemsSource is IEnumerable directEnumerable)
+        {
+            return directEnumerable;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 从 <c>"{Binding X}"</c> / <c>"{Binding Path=X}"</c> 这类字面量里抠出
+    /// Path 表达式（"X"）。仅识别简单 Binding 形态，复杂场景（StaticResource / 多参数）返回 null。
+    /// </summary>
+    private static string? ExtractBindingPathFromMarkup(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        var trimmed = text.Trim();
+        if (!trimmed.StartsWith('{') || !trimmed.EndsWith('}')) return null;
+
+        var content = trimmed.Substring(1, trimmed.Length - 2).Trim();
+        if (!content.StartsWith("Binding", StringComparison.Ordinal)) return null;
+
+        var rest = content.Substring("Binding".Length).Trim();
+        if (rest.Length == 0) return null;
+
+        // 切换式：可能是 "PathExpr" 也可能是 "Path=PathExpr,Mode=..."。
+        // 取第一个 ',' 之前的部分；如果含 '=' 取等号右侧；否则整段就是 Path。
+        var firstComma = rest.IndexOf(',');
+        var head = (firstComma >= 0 ? rest.Substring(0, firstComma) : rest).Trim();
+        var eq = head.IndexOf('=');
+        if (eq < 0)
+        {
+            return head; // 位置参数即 Path
+        }
+        var key = head.Substring(0, eq).Trim();
+        if (!string.Equals(key, "Path", StringComparison.OrdinalIgnoreCase))
+        {
+            return null; // 不是 Path= 形式（可能是 ElementName=、Source= 等），不在此 fallback 范围
+        }
+        return head.Substring(eq + 1).Trim();
     }
 
     /// <summary>
@@ -1553,6 +1832,46 @@ public class TreeViewItem : HeaderedItemsControl
     }
 
     #endregion
+}
+
+/// <summary>
+/// 提供 <see cref="TreeView.ItemDoubleClicked"/> 事件的数据：携带被双击的容器
+/// （<see cref="TreeViewItem"/>）和它对应的数据 <see cref="DataContext"/>，
+/// 让订阅方不必再 <c>tree.SelectedItem</c> 取值。
+/// </summary>
+public sealed class TreeViewItemDoubleClickedEventArgs : RoutedEventArgs
+{
+    public TreeViewItemDoubleClickedEventArgs(
+        RoutedEvent routedEvent,
+        object? source,
+        TreeViewItem container,
+        object? item,
+        MouseButtonEventArgs sourceArgs)
+        : base(routedEvent, source)
+    {
+        Container = container;
+        Item = item;
+        SourceArgs = sourceArgs;
+    }
+
+    /// <summary>被双击的 <see cref="TreeViewItem"/> 容器。</summary>
+    public TreeViewItem Container { get; }
+
+    /// <summary>容器对应的数据（DataContext）；若 <see cref="ItemsControl.Items"/>
+    /// 直接放 TreeViewItem 实例则与 <see cref="Container"/> 相同。</summary>
+    public object? Item { get; }
+
+    /// <summary>原始 <see cref="MouseButtonEventArgs"/> — 提供修饰键、坐标、点击数等信息。</summary>
+    public MouseButtonEventArgs SourceArgs { get; }
+
+    /// <inheritdoc />
+    internal override void InvokeEventHandler(Delegate handler, object target)
+    {
+        if (handler is EventHandler<TreeViewItemDoubleClickedEventArgs> typed)
+            typed(target, this);
+        else
+            base.InvokeEventHandler(handler, target);
+    }
 }
 
 // Note: HeaderedItemsControl is defined in Menu.cs

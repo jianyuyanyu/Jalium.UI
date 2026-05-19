@@ -387,19 +387,25 @@ JALIUM_API void jalium_draw_polygon(
     }
 }
 
+// ─── EdgeMode signal: trailing int32_t edgeMode parameter on every path
+// draw. -1 = inherit / backend default, 1 = Aliased binary edges,
+// 2 = Antialiased analytic coverage. Each backend decides what its default
+// is; -1 lets callers stay agnostic. The signal flows managed → C API →
+// RenderTarget virtual → engine EncodeFillPath / EncodeStrokePath. ─────
 JALIUM_API void jalium_fill_path(
     JaliumRenderTarget* rt,
     float startX, float startY,
     const float* commands,
     uint32_t commandLength,
     JaliumBrush* brush,
-    int32_t fillRule)
+    int32_t fillRule,
+    int32_t edgeMode)
 {
     if (rt && brush && commands && commandLength > 0) {
         reinterpret_cast<jalium::RenderTarget*>(rt)->FillPath(
             startX, startY, commands, commandLength,
             reinterpret_cast<jalium::Brush*>(brush),
-            fillRule);
+            fillRule, edgeMode);
     }
 }
 
@@ -416,14 +422,83 @@ JALIUM_API void jalium_stroke_path(
     int32_t lineCap,
     const float* dashPattern,
     uint32_t dashCount,
-    float dashOffset)
+    float dashOffset,
+    int32_t edgeMode)
 {
     if (rt && brush && commands && commandLength > 0) {
         reinterpret_cast<jalium::RenderTarget*>(rt)->StrokePath(
             startX, startY, commands, commandLength,
             reinterpret_cast<jalium::Brush*>(brush),
             strokeWidth, closed != 0, lineJoin, miterLimit, lineCap,
-            dashPattern, dashCount, dashOffset);
+            dashPattern, dashCount, dashOffset, edgeMode);
+    }
+}
+
+// ─── fill_path_at / stroke_path_at: applies (offsetX, offsetY) as an
+// additional translation on top of the current transform stack for the
+// duration of this single draw. Equivalent to push_transform [1,0,0,1,ox,oy]
+// + draw + pop_transform but in one P/Invoke instead of three. The transform
+// stack push and pop are pure-CPU stack ops at native level (no managed-to-
+// native transition cost), so combining them here saves 2 P/Invoke trips per
+// path draw — a meaningful chunk of per-stroke managed overhead when the UI
+// emits hundreds of paths per frame. ─────────────────────────────────────
+JALIUM_API void jalium_fill_path_at(
+    JaliumRenderTarget* rt,
+    float offsetX, float offsetY,
+    float startX, float startY,
+    const float* commands,
+    uint32_t commandLength,
+    JaliumBrush* brush,
+    int32_t fillRule,
+    int32_t edgeMode)
+{
+    if (!rt || !brush || !commands || commandLength == 0) return;
+    auto* nrt = reinterpret_cast<jalium::RenderTarget*>(rt);
+    bool hasOffset = (offsetX != 0.0f || offsetY != 0.0f);
+    if (hasOffset) {
+        const float mat[6] = { 1.0f, 0.0f, 0.0f, 1.0f, offsetX, offsetY };
+        nrt->PushTransform(mat);
+    }
+    nrt->FillPath(
+        startX, startY, commands, commandLength,
+        reinterpret_cast<jalium::Brush*>(brush),
+        fillRule, edgeMode);
+    if (hasOffset) {
+        nrt->PopTransform();
+    }
+}
+
+JALIUM_API void jalium_stroke_path_at(
+    JaliumRenderTarget* rt,
+    float offsetX, float offsetY,
+    float startX, float startY,
+    const float* commands,
+    uint32_t commandLength,
+    JaliumBrush* brush,
+    float strokeWidth,
+    int32_t closed,
+    int32_t lineJoin,
+    float miterLimit,
+    int32_t lineCap,
+    const float* dashPattern,
+    uint32_t dashCount,
+    float dashOffset,
+    int32_t edgeMode)
+{
+    if (!rt || !brush || !commands || commandLength == 0) return;
+    auto* nrt = reinterpret_cast<jalium::RenderTarget*>(rt);
+    bool hasOffset = (offsetX != 0.0f || offsetY != 0.0f);
+    if (hasOffset) {
+        const float mat[6] = { 1.0f, 0.0f, 0.0f, 1.0f, offsetX, offsetY };
+        nrt->PushTransform(mat);
+    }
+    nrt->StrokePath(
+        startX, startY, commands, commandLength,
+        reinterpret_cast<jalium::Brush*>(brush),
+        strokeWidth, closed != 0, lineJoin, miterLimit, lineCap,
+        dashPattern, dashCount, dashOffset, edgeMode);
+    if (hasOffset) {
+        nrt->PopTransform();
     }
 }
 

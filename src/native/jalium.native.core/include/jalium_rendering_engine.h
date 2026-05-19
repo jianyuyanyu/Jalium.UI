@@ -100,14 +100,19 @@ public:
     /// @param fillRule        Fill rule (EvenOdd or NonZero).
     /// @param transform       Current transform matrix.
     /// @return true on success, false if path is too complex (caller should fallback).
+    /// @param edgeMode Anti-aliasing mode (-1 = inherit/engine default,
+    ///                 1 = Aliased binary edges, 2 = Antialiased analytic coverage).
     virtual bool EncodeFillPath(
         float startX, float startY,
         const float* commands, uint32_t commandLength,
         const EngineBrushData& brush,
         FillRule fillRule,
-        const EngineTransform& transform) = 0;
+        const EngineTransform& transform,
+        int32_t edgeMode = -1) = 0;
 
     /// Encode a stroked path.
+    /// @param edgeMode Anti-aliasing mode (-1 = inherit/engine default,
+    ///                 1 = Aliased binary edges, 2 = Antialiased analytic coverage).
     virtual bool EncodeStrokePath(
         float startX, float startY,
         const float* commands, uint32_t commandLength,
@@ -120,7 +125,8 @@ public:
         const float* dashPattern,
         uint32_t dashCount,
         float dashOffset,
-        const EngineTransform& transform) = 0;
+        const EngineTransform& transform,
+        int32_t edgeMode = -1) = 0;
 
     /// Encode a filled polygon (triangulated internally by the engine).
     virtual bool EncodeFillPolygon(

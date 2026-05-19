@@ -1535,24 +1535,47 @@ public class TextBox : TextBoxBase, IImeSupport
 
     private void DrawWavyLine(DrawingContext dc, Pen pen, double startX, double endX, double y)
     {
-        // Draw a simple wavy line approximation using short line segments
+        // Wavy underline rendered as a single zigzag PolyLineSegment instead
+        // of N individual dc.DrawLine calls. Each spell-error error region
+        // typically expands to 25–100 short segments — issuing them as
+        // separate DrawLine commands burned an N× P/Invoke + native call
+        // multiplier per frame (the dominant draw-time cost in TextBox).
+        // One DrawGeometry call submits the whole zigzag and lets the native
+        // path cache reuse a single rasterized result for any error region of
+        // the same length.
         const double waveHeight = 2;
         const double waveWidth = 4;
 
-        double x = startX;
-        bool up = true;
+        if (endX <= startX) return;
 
-        while (x < endX)
+        int segCount = (int)Math.Ceiling((endX - startX) / waveWidth);
+        if (segCount <= 0) return;
+
+        var pts = new List<Point>(segCount);
+        double x = startX;
+        for (int i = 0; i < segCount; i++)
         {
             double nextX = Math.Min(x + waveWidth, endX);
-            double y1 = up ? y - waveHeight : y;
-            double y2 = up ? y : y - waveHeight;
-
-            dc.DrawLine(pen, new Point(x, y1), new Point(nextX, y2));
-
+            // Endpoint y alternates: iter 0 ends at y, iter 1 at y-h, ...
+            // (start point is at y-h; original code's first segment was
+            // (x, y-h) → (nextX, y), so endpoint pattern is y, y-h, y, y-h, ...)
+            double yEnd = (i % 2 == 0) ? y : y - waveHeight;
+            pts.Add(new Point(nextX, yEnd));
             x = nextX;
-            up = !up;
         }
+
+        var figure = new PathFigure
+        {
+            StartPoint = new Point(startX, y - waveHeight),
+            IsFilled = false,
+            IsClosed = false,
+        };
+        figure.Segments.Add(new PolyLineSegment(pts, true));
+
+        var geom = new PathGeometry();
+        geom.Figures.Add(figure);
+
+        dc.DrawGeometry(null, pen, geom);
     }
 
     private void DrawSelection(DrawingContext dc, Rect contentRect, double lineHeight)

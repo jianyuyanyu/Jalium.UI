@@ -76,7 +76,7 @@ struct GlyphCacheValue {
 
 class D3D12GlyphAtlas {
 public:
-    explicit D3D12GlyphAtlas(ID3D12Device* device, IDWriteFactory* dwriteFactory);
+    explicit D3D12GlyphAtlas(ID3D12Device* device, IDWriteFactory* dwriteFactory, D3D12Backend* backend = nullptr);
     ~D3D12GlyphAtlas();
 
     bool Initialize();
@@ -180,6 +180,7 @@ private:
 
     ID3D12Device* device_;
     IDWriteFactory* dwriteFactory_;
+    D3D12Backend* backend_;  // optional: when set, GrowAtlas retires old atlas/upload buffers through the backend's fence-tracked graveyard instead of dropping them via ComPtr operator= (which triggers D3D12 ERROR #921).
 
     // Atlas texture — starts at kInitialAtlasDim and grows ×2 up to kMaxAtlasDim
     // on overflow.  Sized lazily so an idle UI keeps a 1 MB atlas instead of 64 MB.

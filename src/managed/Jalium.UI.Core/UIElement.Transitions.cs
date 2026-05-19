@@ -338,19 +338,15 @@ public abstract partial class UIElement
 
     private void ScheduleAutomaticTransitionArm()
     {
-        var armVersion = unchecked(++_transitionArmVersion);
-        _automaticTransitionsArmed = false;
-
-        Dispatcher.BeginInvoke(() =>
-        {
-            if (_transitionArmVersion != armVersion)
-                return;
-
-            if (VisualParent == null)
-                return;
-
-            _automaticTransitionsArmed = true;
-        });
+        // 同步 arm — Style.Setter (baseline) 走 allowAutoTransition=false，
+        // 不会因为这里 arm=true 而误触过渡；只有 Trigger.Setter 等动态状态切换
+        // 才参与过渡。BeginInvoke 异步 arm 的旧实现存在多次 disarm-rearm 循环
+        // 之间的竞态：当用户 navigation 切回页面时，layout pass 中的 ApplyTemplate
+        // 会让模板内元素再次 disarm 并重新调度 BeginInvoke，而最初一次的 callback
+        // 可能因 dispatcher 拥塞被压制，导致用户首次 hover 时 arm 仍是 false。
+        // 同步 arm 彻底消除这一竞态。
+        unchecked { _transitionArmVersion++; }
+        _automaticTransitionsArmed = true;
     }
 
     private static Func<DependencyProperty, object?, object?, TimeSpan, TransitionTimingFunction, IAnimationTimeline?>? GetAutomaticTransitionAnimationFactory()

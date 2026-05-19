@@ -1,5 +1,6 @@
 #include "d3d12_resources.h"
 #include "d3d12_backend.h"
+#include "jalium_bitmap_stats.h"
 #include <algorithm>
 #include <cstring>
 
@@ -52,13 +53,28 @@ void DownsampleBoxBgra(const uint8_t* src, uint32_t srcW, uint32_t srcH,
 
 } // namespace
 
-D3D12Bitmap::D3D12Bitmap(uint32_t width, uint32_t height)
+D3D12Bitmap::D3D12Bitmap(D3D12Backend* backend, uint32_t width, uint32_t height)
     : width_(width)
     , height_(height)
+    , backend_(backend)
 {
 }
 
 void D3D12Bitmap::SetBitmapData(const uint8_t* data, uint32_t dataSize) {
+    // Same content-skip rationale as UpdatePackedPixels: callers (cached
+    // bitmap thumbnails, image sources that re-decode every frame, etc.)
+    // often hand us identical pixels every call. memcmp short-circuits on
+    // the first differing byte so changed images are still cheap; matched
+    // content keeps the cached d3d12Texture_ valid and skips the entire
+    // GPU upload pipeline (5–10 ms/call on the user's profile).
+    if (data != nullptr &&
+        pixelData_.size() == dataSize &&
+        d3d12TextureValid_ && d3d12Texture_ &&
+        std::memcmp(pixelData_.data(), data, dataSize) == 0)
+    {
+        bitmap_stats::AddMemcmpShortCircuit();
+        return;
+    }
     pixelData_.assign(data, data + dataSize);
     d3d12TextureValid_ = false;  // Force re-upload on next use
 }
@@ -73,6 +89,40 @@ bool D3D12Bitmap::UpdatePackedPixels(const uint8_t* pixels, uint32_t width, uint
 
     const size_t rowBytes = static_cast<size_t>(width) * 4u;
     const size_t requiredSize = rowBytes * height;
+
+    // Fast skip when caller pushes the same pixels we already uploaded.
+    // DevTools / live-thumbnail style code often reuses a single
+    // WriteableBitmap and calls UpdatePackedPixels every frame even when
+    // the content didn't actually change — this turns into a 5–10 ms/frame
+    // GPU upload per bitmap on the user's profile. memcmp short-circuits at
+    // the first differing byte, so genuinely-changed bitmaps pay only the
+    // cost of the diverging prefix; identical bitmaps short-circuit fast
+    // and we skip the entire upload pipeline (preserving the
+    // d3d12TextureValid_ flag the cached upload path checks).
+    if (pixelData_.size() == requiredSize && d3d12TextureValid_ && d3d12Texture_) {
+        if (stride == rowBytes) {
+            if (std::memcmp(pixelData_.data(), pixels, requiredSize) == 0) {
+                bitmap_stats::AddMemcmpShortCircuit();
+                return true;  // No-op: caller's pixels match what we already uploaded.
+            }
+        } else {
+            bool same = true;
+            for (uint32_t row = 0; row < height; ++row) {
+                if (std::memcmp(pixelData_.data() + row * rowBytes,
+                                pixels + static_cast<size_t>(row) * stride,
+                                rowBytes) != 0)
+                {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                bitmap_stats::AddMemcmpShortCircuit();
+                return true;
+            }
+        }
+    }
+
     if (pixelData_.size() != requiredSize) {
         pixelData_.resize(requiredSize);
     }
@@ -94,36 +144,36 @@ bool D3D12Bitmap::UpdatePackedPixels(const uint8_t* pixels, uint32_t width, uint
 
 ID3D12Resource* D3D12Bitmap::GetOrCreateD3D12Texture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList) {
     if (!device || !cmdList) return nullptr;
-    if (d3d12TextureValid_ && d3d12Texture_) return d3d12Texture_.Get();
+    if (d3d12TextureValid_ && d3d12Texture_) {
+        bitmap_stats::AddFastPathHit();
+        return d3d12Texture_.Get();
+    }
     if (pixelData_.empty() || width_ == 0 || height_ == 0) return nullptr;
 
-    // Dynamic path (video frame, WriteableBitmap): single mip level, reuse the
-    // existing default-heap texture so GPU memory stays flat across uploads.
-    // Without this the previous code would CreateCommittedResource(8MB) every frame
+    // Dynamic path (video frame, WriteableBitmap): reuse the existing
+    // default-heap texture so GPU memory stays flat across uploads. Without
+    // this the previous code would CreateCommittedResource(8MB) every frame
     // for a 1080p video, which thrashes the D3D12 deferred-release queue and
     // blackouts the swap chain when memory pressure spikes.
     const bool dynamicPath = isDynamic_ && d3d12Texture_ &&
                              d3d12Texture_->GetDesc().Width == width_ &&
                              d3d12Texture_->GetDesc().Height == height_;
 
-    const UINT16 mipLevels = dynamicPath ? UINT16{1} : ComputeMipLevels(width_, height_);
-
-    // Generate per-level pixel buffers. Level 0 references pixelData_ directly;
-    // subsequent levels are CPU-downsampled with a 2x2 box filter.
-    std::vector<std::vector<uint8_t>> mipPixels;
-    mipPixels.reserve(mipLevels);
-    mipPixels.emplace_back();  // level 0 stays empty — we'll alias pixelData_
-
-    for (UINT16 m = 1; m < mipLevels; ++m) {
-        const uint32_t prevW = std::max(1u, width_ >> (m - 1));
-        const uint32_t prevH = std::max(1u, height_ >> (m - 1));
-        const uint32_t curW = std::max(1u, width_ >> m);
-        const uint32_t curH = std::max(1u, height_ >> m);
-        std::vector<uint8_t> level(static_cast<size_t>(curW) * curH * 4);
-        const uint8_t* src = (m == 1) ? pixelData_.data() : mipPixels[m - 1].data();
-        DownsampleBoxBgra(src, prevW, prevH, level.data(), curW, curH);
-        mipPixels.emplace_back(std::move(level));
-    }
+    // Single mip level by default — UI content is 1:1 pixel mapped (icons,
+    // images at native resolution, ImageBrush tiles), and anisotropic
+    // sampling already handles minor minification by sampling multiple
+    // texels per fragment. The previous full mip chain forced a CPU 2×2
+    // box-filter pass for every level — for 1080p that's 11 levels of
+    // memcpy + filter, which dominated the slow upload path (5–10 ms per
+    // 1080p bitmap on the user's profile, as confirmed by the
+    // jalium_query_bitmap_upload_stats telemetry showing 4 fresh uploads
+    // × 8 MB = 32 MB/frame all going through the non-dynamic mip-generating
+    // path). Skipping mip generation cuts that to zero CPU time and makes
+    // the upload pipeline a straight memcpy + CopyTextureRegion. Aliasing
+    // is bounded by the anisotropic sampler the bitmap PSO already uses;
+    // applications that genuinely scale a large image down by 4× or more
+    // (rare in UI) can request mips through a future explicit knob.
+    const UINT16 mipLevels = 1;
 
     ComPtr<ID3D12Resource> newTexture;
     ComPtr<ID3D12Resource> newUploadBuffer;
@@ -160,22 +210,39 @@ ID3D12Resource* D3D12Bitmap::GetOrCreateD3D12Texture(ID3D12Device* device, ID3D1
                                   footprints.data(), numRowsArr.data(),
                                   rowSizeBytesArr.data(), &uploadSize);
 
-    D3D12_HEAP_PROPERTIES uploadHeap = {};
-    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC bufDesc = {};
-    bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bufDesc.Width = uploadSize;
-    bufDesc.Height = 1;
-    bufDesc.DepthOrArraySize = 1;
-    bufDesc.MipLevels = 1;
-    bufDesc.SampleDesc.Count = 1;
-    bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // Upload-buffer reuse: for the dynamic-bitmap path (video frames,
+    // WriteableBitmap whose content is refreshed each frame) this used to
+    // CreateCommittedResource(uploadSize) every frame. Each call is ~1 ms
+    // on Windows, so 9 dynamic bitmaps × 1 ms = ~9 ms/frame just on
+    // upload-heap allocation. We keep d3d12UploadBuffer_ alive across
+    // frames and reuse it when its size is sufficient. Frame-fence gating
+    // in BeginFrame ensures the previous frame's GPU consumption finished
+    // before we Map/memcpy new pixels into the same buffer.
+    HRESULT hr = S_OK;
+    if (dynamicPath && d3d12UploadBuffer_) {
+        D3D12_RESOURCE_DESC existingDesc = d3d12UploadBuffer_->GetDesc();
+        if (existingDesc.Width >= uploadSize) {
+            newUploadBuffer = d3d12UploadBuffer_;
+        }
+    }
+    if (!newUploadBuffer) {
+        D3D12_HEAP_PROPERTIES uploadHeap = {};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bufDesc = {};
+        bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufDesc.Width = uploadSize;
+        bufDesc.Height = 1;
+        bufDesc.DepthOrArraySize = 1;
+        bufDesc.MipLevels = 1;
+        bufDesc.SampleDesc.Count = 1;
+        bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    HRESULT hr = device->CreateCommittedResource(
-        &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-        IID_PPV_ARGS(&newUploadBuffer));
-    if (FAILED(hr)) return nullptr;
+        hr = device->CreateCommittedResource(
+            &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&newUploadBuffer));
+        if (FAILED(hr)) return nullptr;
+    }
 
     // Validate pixelData_ has enough data for level 0 before copying.
     const uint32_t srcRowPitch0 = width_ * 4;
@@ -190,10 +257,14 @@ ID3D12Resource* D3D12Bitmap::GetOrCreateD3D12Texture(ID3D12Device* device, ID3D1
         return nullptr;
     }
 
+    // mipLevels is hard-coded to 1, so this loop runs exactly once with the
+    // raw pixelData_ as the source. (The loop is left intact rather than
+    // unrolled so reintroducing CPU-generated mip chains for a future
+    // opt-in path stays a one-line change.)
     for (UINT16 m = 0; m < mipLevels; ++m) {
         const uint32_t levelW = std::max(1u, width_ >> m);
         const uint32_t srcRowPitch = levelW * 4;
-        const uint8_t* src = (m == 0) ? pixelData_.data() : mipPixels[m].data();
+        const uint8_t* src = pixelData_.data();
         uint8_t* dst = static_cast<uint8_t*>(mapped) + footprints[m].Offset;
         const UINT rows = numRowsArr[m];
         const UINT dstRowPitch = footprints[m].Footprint.RowPitch;
@@ -244,26 +315,100 @@ ID3D12Resource* D3D12Bitmap::GetOrCreateD3D12Texture(ID3D12Device* device, ID3D1
     cmdList->ResourceBarrier(1, &barrier);
 
     if (!dynamicPath) {
-        // Slow path (static UI bitmap): retire N-2 generation (already drained
-        // by the current frame's fence wait) and stage N-1 for next-frame retire.
-        pendingRelease_.clear();
-        if (d3d12Texture_ || d3d12UploadBuffer_) {
-            pendingRelease_.push_back(std::move(d3d12Texture_));
-            pendingRelease_.push_back(std::move(d3d12UploadBuffer_));
+        // Slow path (static UI bitmap): retire the previous-generation
+        // texture + upload buffer through the backend graveyard so they
+        // survive until the most recently submitted fence is GPU-complete.
+        // pendingRelease_ used to be cleared here unconditionally, which
+        // relied on the renderer's BeginFrame fence wait having already
+        // drained N-2 — true for the renderer path, but D3D12Bitmap is
+        // also constructed/destroyed off-frame (cache synthesis, GC), so
+        // funnel everything through the same fence-gated path for safety.
+        if (backend_) {
+            for (auto& r : pendingRelease_) {
+                if (r) backend_->RetireGpuResource(std::move(r));
+            }
         }
+        pendingRelease_.clear();
+        if (d3d12Texture_) {
+            pendingRelease_.push_back(std::move(d3d12Texture_));
+        }
+        // d3d12UploadBuffer_ is retired below via the size-changed branch.
         d3d12Texture_ = std::move(newTexture);
     }
-    // Always retire the previous upload buffer; the new one carries this frame's pixels.
-    if (d3d12UploadBuffer_) {
-        pendingRelease_.push_back(std::move(d3d12UploadBuffer_));
+    // If we reused d3d12UploadBuffer_ above (newUploadBuffer aliases it), the
+    // assignment below is a no-op and we don't push to pendingRelease_. Only
+    // when we created a fresh buffer do we retire the old one for next-frame GC.
+    if (newUploadBuffer.Get() != d3d12UploadBuffer_.Get()) {
+        if (d3d12UploadBuffer_) {
+            pendingRelease_.push_back(std::move(d3d12UploadBuffer_));
+        }
+        d3d12UploadBuffer_ = std::move(newUploadBuffer);
     }
-    d3d12UploadBuffer_ = std::move(newUploadBuffer);
     d3d12TextureValid_ = true;
+
+    // Telemetry: classify the upload — dynamic-reuse path skips
+    // CreateCommittedResource / mip generation; the slow path pays both.
+    // GPU-resident accounting: dynamic-reuse overwrites in-place (delta 0);
+    // slow path created a fresh texture so the bitmap's GPU footprint
+    // grows by (uploadSize - previousPinnedBytes). The destructor below
+    // releases the final tally.
+    bitmap_stats::AddUpload(uploadSize);
+    if (dynamicPath) {
+        bitmap_stats::AddDynamicReuse();
+    } else {
+        int64_t delta = static_cast<int64_t>(uploadSize) -
+                        static_cast<int64_t>(pinnedGpuBytes_);
+        if (delta != 0) bitmap_stats::AddGpuResidentBytes(delta);
+        pinnedGpuBytes_ = uploadSize;
+    }
+
     return d3d12Texture_.Get();
 }
 
+D3D12Bitmap::~D3D12Bitmap() {
+    if (pinnedGpuBytes_ != 0) {
+        bitmap_stats::AddGpuResidentBytes(-static_cast<int64_t>(pinnedGpuBytes_));
+        pinnedGpuBytes_ = 0;
+    }
+
+    // Forward live GPU resources to the backend's fence-gated graveyard.
+    // The bitmap can be destroyed from *any* thread — worker pool (cache
+    // eviction), GC finalizer, UI thread — and may be destroyed mid-frame
+    // while the texture / upload buffer are still bound to an open command
+    // list (CopyTextureRegion source) or sampled by an in-flight draw. If
+    // we let the ComPtr members destruct here, that calls Release on the
+    // last ref and triggers D3D12 ERROR #921
+    // OBJECT_DELETED_WHILE_STILL_IN_USE on the next command queue execute.
+    //
+    // The backend keeps each ComPtr alive at refcount ≥ 1, tags it with the
+    // latest submitted fence value, and frees it only after that fence is
+    // GPU-complete (via ReclaimRetiredGpuResources, called from the renderer
+    // at frame boundaries after its fence wait succeeds).
+    if (backend_) {
+        if (d3d12Texture_) {
+            backend_->RetireGpuResource(std::move(d3d12Texture_));
+        }
+        if (d3d12UploadBuffer_) {
+            backend_->RetireGpuResource(std::move(d3d12UploadBuffer_));
+        }
+        for (auto& r : pendingRelease_) {
+            if (r) backend_->RetireGpuResource(std::move(r));
+        }
+        pendingRelease_.clear();
+    }
+    // Without a backend (defensive: shouldn't happen since the factory
+    // always passes one), the ComPtr destructors run as normal.
+}
+
 void D3D12Bitmap::ReleasePendingResources() {
-    pendingRelease_.clear();
+    if (backend_) {
+        for (auto& r : pendingRelease_) {
+            if (r) backend_->RetireGpuResource(std::move(r));
+        }
+        pendingRelease_.clear();
+    } else {
+        pendingRelease_.clear();
+    }
 }
 
 } // namespace jalium

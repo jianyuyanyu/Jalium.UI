@@ -436,6 +436,88 @@ internal static class RazorBindingEngine
         return true;
     }
 
+    /// <summary>
+    /// SourceGenerator-lowered Razor value-expression on a named property. The SG
+    /// pre-computed <paramref name="dependencies"/> from the expression text at codegen
+    /// time so we skip the reflection walk in <see cref="RazorExpressionAnalyzer"/>.
+    /// Mirrors the runtime <see cref="TryApplyRazorValue"/> path otherwise.
+    /// </summary>
+    internal static void ApplySgLoweredExpression(
+        object target,
+        string propertyName,
+        string expression,
+        string[] dependencies,
+        XamlParserContext context)
+    {
+        var property = target.GetType().GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance);
+        if (property == null)
+        {
+            // Fall back to runtime SetProperty pipeline — it knows about attached property
+            // and the message will surface the missing-member error consistently.
+            XamlReader.BuilderSetProperty(target, propertyName, expression, context);
+            return;
+        }
+
+        var template = RazorTemplateParser.Parse(expression);
+        if (!template.HasDynamicSegments)
+        {
+            var collapsed = EvaluateTemplateOncePublic(template, target, context.CodeBehindInstance);
+            if (TryFindDependencyProperty(target.GetType(), propertyName, out var literalDp) && target is DependencyObject literalTarget)
+            {
+                literalTarget.SetValue(literalDp, ConvertOnceValuePublic(collapsed, property.PropertyType));
+                return;
+            }
+            TryAssignClrPropertyPublic(target, property, collapsed);
+            return;
+        }
+
+        if (!TryFindDependencyProperty(target.GetType(), propertyName, out var dependencyProperty) || target is not DependencyObject dependencyObject)
+        {
+            // CLR-only property — best-effort one-time eval.
+            var resolved = EvaluateTemplateOncePublic(template, target, context.CodeBehindInstance);
+            TryAssignClrPropertyPublic(target, property, resolved);
+            return;
+        }
+
+        var binding = CreateBindingPublic(template, target, context.CodeBehindInstance);
+        dependencyObject.SetBinding(dependencyProperty, binding);
+    }
+
+    /// <summary>
+    /// SourceGenerator-lowered Razor value-expression on the element's content property
+    /// (resolved via <see cref="System.Windows.Markup.ContentPropertyAttribute"/>). Used by
+    /// SG-emitted <see cref="XamlBuilder.SetContentRazorBinding"/> calls for text-nodes like
+    /// <c>&lt;TextBlock&gt;Count: @Items.Count&lt;/TextBlock&gt;</c>.
+    /// </summary>
+    internal static void ApplySgLoweredContentExpression(
+        object target,
+        string expression,
+        string[] dependencies,
+        XamlParserContext context)
+    {
+        var contentPropertyName = ResolveContentPropertyName(target.GetType()) ?? "Content";
+        ApplySgLoweredExpression(target, contentPropertyName, expression, dependencies, context);
+    }
+
+    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Reads ContentPropertyAttribute via reflection on the runtime type.")]
+    private static string? ResolveContentPropertyName(Type type)
+    {
+        var attr = type.GetCustomAttribute<Jalium.UI.ContentPropertyAttribute>(inherit: true);
+        return attr?.Name;
+    }
+
+    // Internal accessors so the SG-facing methods above can reuse the private helpers
+    // without bumping their visibility. Keep these one-line forwarders inline so future
+    // refactors of the private helpers don't drift out of sync.
+    private static object? EvaluateTemplateOncePublic(RazorTemplate template, object target, object? codeBehind)
+        => EvaluateTemplateOnce(template, target, codeBehind);
+    private static object? ConvertOnceValuePublic(object? value, Type targetType)
+        => ConvertOnceValue(value, targetType);
+    private static bool TryAssignClrPropertyPublic(object instance, PropertyInfo property, object? value)
+        => TryAssignClrProperty(instance, property, value);
+    private static BindingBase CreateBindingPublic(RazorTemplate template, object targetObject, object? codeBehind)
+        => CreateBinding(template, targetObject, codeBehind);
+
     internal static bool EvaluateConditionOnce(
         object targetObject,
         object? codeBehind,
@@ -497,8 +579,7 @@ internal static class RazorBindingEngine
 
             if (!TryFindDependencyProperty(instance.GetType(), property.Name, out var literalProperty) || instance is not DependencyObject literalTarget)
             {
-                property.SetValue(instance, ConvertOnceValue(collapsedLiteral, property.PropertyType));
-                return true;
+                return TryAssignClrProperty(instance, property, collapsedLiteral);
             }
 
             literalTarget.SetValue(literalProperty, ConvertOnceValue(collapsedLiteral, property.PropertyType));
@@ -515,13 +596,61 @@ internal static class RazorBindingEngine
         {
             // CLR-only property fallback: evaluate once and assign.
             var resolved = EvaluateTemplateOnce(template, instance, context.CodeBehindInstance);
-            property.SetValue(instance, ConvertOnceValue(resolved, property.PropertyType));
-            return true;
+            return TryAssignClrProperty(instance, property, resolved);
         }
 
         var binding = CreateBinding(template, instance, context.CodeBehindInstance);
         dependencyObject.SetBinding(dependencyProperty, binding);
         return true;
+    }
+
+    /// <summary>
+    /// Assigns <paramref name="value"/> to <paramref name="property"/> on <paramref name="instance"/>.
+    /// When the property is read-only (typical for collection content properties such as
+    /// <c>Panel.Children</c> or <c>ItemsControl.Items</c>), the value is appended to the
+    /// underlying <see cref="System.Collections.IList"/> if the element type matches.
+    /// Returns <c>true</c> when the value was applied; <c>false</c> when the caller should
+    /// fall back to other handling (e.g. emitting raw text). The method never throws
+    /// <see cref="ArgumentException"/> for missing setters — that would turn an in-progress
+    /// editor edit (e.g. <c>@{ i }</c> inside a Grid) into a hard parse failure.
+    /// </summary>
+    private static bool TryAssignClrProperty(object instance, PropertyInfo property, object? value)
+    {
+        if (property.CanWrite)
+        {
+            property.SetValue(instance, ConvertOnceValue(value, property.PropertyType));
+            return true;
+        }
+
+        // Read-only property: only collection content properties make sense here.
+        object? existing;
+        try
+        {
+            existing = property.GetValue(instance);
+        }
+        catch
+        {
+            return false;
+        }
+
+        if (existing is not System.Collections.IList list)
+            return false;
+
+        var converted = ConvertOnceValue(value, property.PropertyType);
+        if (converted == null)
+            return false;
+
+        try
+        {
+            list.Add(converted);
+            return true;
+        }
+        catch
+        {
+            // Element type mismatch (e.g. adding a string to IList<UIElement>) — let the
+            // caller decide whether to emit fallback text. Don't crash the parser.
+            return false;
+        }
     }
 
     private static object? EvaluateTemplateOnce(RazorTemplate template, object target, object? codeBehind)

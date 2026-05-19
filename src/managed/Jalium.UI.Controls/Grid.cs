@@ -170,6 +170,12 @@ public class Grid : Panel
     /// <inheritdoc />
     protected override Size MeasureOverride(Size availableSize)
     {
+        // 让所有 Row/ColumnDefinition 知道自己的 owner Grid，这样 Width/Height 等
+        // 运行时被改变时（例如 OpenTabsCol.Width = new GridLength(160)）能反向通知
+        // Grid 重新 layout — 否则 framework 完全不知道 column/row 尺寸变了。
+        for (int i = 0; i < RowDefinitions.Count; i++) RowDefinitions[i].OwnerGrid = this;
+        for (int i = 0; i < ColumnDefinitions.Count; i++) ColumnDefinitions[i].OwnerGrid = this;
+
         // Ensure at least one row and column
         var rowCount = Math.Max(1, RowDefinitions.Count);
         var columnCount = Math.Max(1, ColumnDefinitions.Count);
