@@ -30,14 +30,43 @@ if(WIN32)
 endif()
 
 # Output directories
+#
+# Shared-DLL builds (the default) drop right into src/native/bin/native/<Config>/
+# so the Jalium.UI.Interop project picks them up via its <Content Include>. This
+# is the canonical location Visual Studio / `dotnet build` / Gallery all read,
+# so any cmake build (CLI or VS-integrated) immediately ships its output to
+# every downstream consumer without a separate copy step.
+#
+# Static (NativeAOT) builds stay under the cmake binary dir because they're
+# bundled by ConfigureJaliumNativeAot from build-native-static.ps1 instead.
 if(JALIUM_BUILD_STATIC)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin-static)
     set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib-static)
     set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib-static)
 else()
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+    set(_jalium_native_out "${CMAKE_CURRENT_SOURCE_DIR}/bin/native")
+    if(CMAKE_CONFIGURATION_TYPES)
+        # Multi-config (Visual Studio, Ninja Multi-Config): each config lands in
+        # its own bin/native/<Config>/ subdir so Debug and Release coexist.
+        set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${_jalium_native_out}")
+        set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${_jalium_native_out}")
+        set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${_jalium_native_out}")
+        foreach(_cfg ${CMAKE_CONFIGURATION_TYPES})
+            string(TOUPPER "${_cfg}" _cfgU)
+            set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_cfgU} "${_jalium_native_out}/${_cfg}")
+            set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${_cfgU} "${_jalium_native_out}/${_cfg}")
+            set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${_cfgU} "${_jalium_native_out}/${_cfg}")
+        endforeach()
+    else()
+        # Single-config generators (e.g. Unix Makefiles): default CMAKE_BUILD_TYPE
+        # to Debug so the output still lands somewhere predictable.
+        if(NOT CMAKE_BUILD_TYPE)
+            set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
+        endif()
+        set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${_jalium_native_out}/${CMAKE_BUILD_TYPE}")
+        set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${_jalium_native_out}/${CMAKE_BUILD_TYPE}")
+        set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${_jalium_native_out}/${CMAKE_BUILD_TYPE}")
+    endif()
 endif()
 
 # Subdirectories — order matters: text must precede vulkan/software for linkage

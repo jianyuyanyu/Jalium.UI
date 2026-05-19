@@ -279,12 +279,16 @@ public:
 
     /// Fills a path defined by a command buffer (lines + bezier curves).
     /// Command encoding: tag 0 = LineTo [0,x,y], tag 1 = BezierTo [1,cp1x,cp1y,cp2x,cp2y,ex,ey].
-    virtual void FillPath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, int32_t fillRule) = 0;
+    /// @param edgeMode Anti-aliasing mode (-1 = inherit/backend default,
+    ///                 1 = Aliased binary edges, 2 = Antialiased analytic coverage).
+    virtual void FillPath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, int32_t fillRule, int32_t edgeMode = -1) = 0;
 
     /// Strokes a path defined by a command buffer (lines + bezier curves).
     /// lineCap: 0 = Butt, 1 = Square, 2 = Round.
+    /// @param edgeMode Anti-aliasing mode (-1 = inherit/backend default,
+    ///                 1 = Aliased binary edges, 2 = Antialiased analytic coverage).
     virtual void StrokePath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, float strokeWidth, bool closed, int32_t lineJoin = 0, float miterLimit = 10.0f, int32_t lineCap = 0,
-        const float* dashPattern = nullptr, uint32_t dashCount = 0, float dashOffset = 0.0f) = 0;
+        const float* dashPattern = nullptr, uint32_t dashCount = 0, float dashOffset = 0.0f, int32_t edgeMode = -1) = 0;
 
 
     /// Draws a content area border: fills a rect with bottom-only rounded corners,

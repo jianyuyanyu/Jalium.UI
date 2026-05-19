@@ -95,6 +95,11 @@
     <ClInclude Include="include\jalium_backend.h" />
     <ClInclude Include="include\jalium_internal.h" />
     <ClInclude Include="include\jalium_rendering_engine.h" />
+    <ClInclude Include="include\jalium_bitmap_stats.h" />
+    <ClInclude Include="include\jalium_flatten.h" />
+    <ClInclude Include="include\jalium_path_cache.h" />
+    <ClInclude Include="include\jalium_path_stats.h" />
+    <ClInclude Include="include\jalium_stencil_path.h" />
     <ClInclude Include="include\jalium_string_util.h" />
     <ClInclude Include="include\jalium_triangulate.h" />
     <ClInclude Include="include\jalium_types.h" />
@@ -105,6 +110,10 @@
     <ClCompile Include="src\brush.cpp" />
     <ClCompile Include="src\bitmap.cpp" />
     <ClCompile Include="src\backend_registry.cpp" />
+    <ClCompile Include="src\jalium_path_stats.cpp" />
+    <ClCompile Include="src\jalium_path_cache.cpp" />
+    <ClCompile Include="src\jalium_stencil_path.cpp" />
+    <ClCompile Include="src\jalium_bitmap_stats.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
