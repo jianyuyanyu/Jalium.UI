@@ -27,6 +27,7 @@ internal static class JalxamlCodeGenerator
         {
             return null;
         }
+        AugmentUnresolvedTypes(result.Root!, xmlnsResolver);
         if (string.IsNullOrEmpty(result.Root!.ResolvedClrTypeName))
         {
             return null;
@@ -189,6 +190,7 @@ internal static class JalxamlCodeGenerator
     {
         if (result.Root == null || result.HasStructuralRazor)
             return null;
+        AugmentUnresolvedTypes(result.Root!, xmlnsResolver);
         if (string.IsNullOrEmpty(result.Root!.ResolvedClrTypeName))
             return null;
         if (HasUnresolvedNode(result.Root!))
@@ -208,6 +210,44 @@ internal static class JalxamlCodeGenerator
         EmitElementBody(sb, result.Root, "__target", counter, namedAlready, indent: 8, ctx);
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Fill in element types the parser's curated table could not resolve, using the
+    /// compilation-backed <see cref="XmlnsTypeResolver"/> (clr-namespace + assembly-declared
+    /// <c>XmlnsDefinition</c> + every referenced assembly). Without this, an element whose
+    /// XML namespace is a custom URI mapped via <c>[assembly: XmlnsDefinition]</c>
+    /// (third-party / library controls) is left unresolved and the WHOLE document falls
+    /// back to the runtime parser (<c>XamlReader.LoadComponentFromString</c>). Only fills
+    /// when the parser left the type empty — the curated fast path and the parser's
+    /// <c>clr-namespace:</c> concatenation stay authoritative where they apply. A null
+    /// resolver (e.g. white-box unit tests) makes this a no-op so prior behaviour is
+    /// preserved. Genuinely unknown types stay empty and still bail via
+    /// <see cref="HasUnresolvedNode"/> — this never forces a wrong type.
+    /// </summary>
+    private static void AugmentUnresolvedTypes(JalxamlAstNode node, XmlnsTypeResolver? resolver)
+    {
+        if (resolver == null)
+            return;
+
+        if (string.IsNullOrEmpty(node.ResolvedClrTypeName))
+        {
+            var g = resolver.ResolveToGlobalQualifiedName(node.LocalName, node.NamespaceUri);
+            if (!string.IsNullOrEmpty(g))
+            {
+                // ResolveToGlobalQualifiedName yields a `global::`-prefixed name; the
+                // codegen re-prefixes `global::` itself, so store the bare FQN.
+                var bare = g!.StartsWith("global::", StringComparison.Ordinal) ? g!.Substring(8) : g!;
+                node.ResolvedClrTypeName = bare;
+                node.FallbackClrTypeName = bare;
+            }
+        }
+
+        foreach (var child in node.Children)
+            AugmentUnresolvedTypes(child, resolver);
+        foreach (var pe in node.PropertyElements)
+            foreach (var child in pe.Children)
+                AugmentUnresolvedTypes(child, resolver);
     }
 
     private static bool HasUnresolvedNode(JalxamlAstNode node)
