@@ -35,8 +35,10 @@ bool VelloD3D12Engine::EncodeFillPath(
     const float* commands, uint32_t commandLength,
     const EngineBrushData& brush,
     FillRule fillRule,
-    const EngineTransform& transform)
+    const EngineTransform& transform,
+    int32_t edgeMode)
 {
+    (void)edgeMode;  // Vello path currently has analytic AA only; aliased fallback not implemented yet.
     uint32_t rule = (fillRule == FillRule::NonZero) ? kFillRuleNonZero : kFillRuleEvenOdd;
 
     // Solid color path (most common)
@@ -57,8 +59,10 @@ bool VelloD3D12Engine::EncodeStrokePath(
     int32_t lineJoin, float miterLimit,
     int32_t lineCap,
     const float* dashPattern, uint32_t dashCount, float dashOffset,
-    const EngineTransform& transform)
+    const EngineTransform& transform,
+    int32_t edgeMode)
 {
+    (void)edgeMode;  // Vello path currently has analytic AA only.
     return vello_.EncodeStrokePath(
         startX, startY, commands, commandLength,
         brush.r, brush.g, brush.b, brush.a,

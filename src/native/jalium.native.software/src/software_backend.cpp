@@ -1,4 +1,7 @@
 #include "software_backend.h"
+#include "jalium_scanline_rasterizer.h"   // PixelRect / RasterizePathToRects
+#include "jalium_impeller_stroke.h"       // ExpandStrokePath (collect-contours mode)
+#include "jalium_triangulate.h"           // FlattenPathToContours
 #include <algorithm>
 #include <cstring>
 #include <cmath>
@@ -1550,7 +1553,61 @@ static void ParsePathToSubPaths(float startX, float startY,
     }
 }
 
-void SoftwareRenderTarget::FillPath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, int32_t fillRule)
+void SoftwareRenderTarget::FillPath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, int32_t fillRule, int32_t edgeMode)
+{
+    if (!brush) return;
+    if (edgeMode < 0) edgeMode = 2;  // Default = Antialiased.
+
+    // Aliased branch: keep the legacy binary scanline (preserves the pixel-art
+    // look that some apps may rely on). Plumbed through edgeMode == 1 only.
+    if (edgeMode == 1) {
+        FillPathAliased(startX, startY, commands, commandLength, brush, fillRule);
+        return;
+    }
+
+    // Antialiased branch: flatten the command buffer into source-space
+    // contours, transform each contour point into device space, then run
+    // RasterizePathToRects (the analytic-coverage scanline used by every
+    // GPU backend) and blend the resulting rects into the framebuffer.
+    std::vector<Contour> contours = FlattenPathToContours(
+        startX, startY, commands, commandLength, 0.5f);
+    if (contours.empty()) return;
+
+    for (auto& c : contours) {
+        for (size_t i = 0; i + 1 < c.points.size(); i += 2) {
+            float tx = 0.0f, ty = 0.0f;
+            currentTransform_.Apply(c.points[i], c.points[i + 1], tx, ty);
+            c.points[i]     = tx;
+            c.points[i + 1] = ty;
+        }
+    }
+
+    FillRule rule = (fillRule == 1) ? FillRule::NonZero : FillRule::EvenOdd;
+    std::vector<PixelRect> rects;
+    rects.reserve(256);
+    RasterizePathToRects(contours, rule, rects);
+    if (rects.empty()) return;
+
+    for (const auto& rect : rects) {
+        if (rect.w <= 0 || rect.h <= 0) continue;
+        int32_t x0 = std::max(0, rect.x);
+        int32_t y0 = std::max(0, rect.y);
+        int32_t x1 = std::min(width_,  rect.x + rect.w);
+        int32_t y1 = std::min(height_, rect.y + rect.h);
+        for (int32_t y = y0; y < y1; ++y) {
+            for (int32_t x = x0; x < x1; ++x) {
+                if (!clipStack_.empty() && IsClipped((float)x, (float)y)) continue;
+                uint8_t r, g, b, a;
+                GetBrushColor(brush, (float)x, (float)y, r, g, b, a);
+                uint8_t aa = (uint8_t)std::lround(a * rect.alpha);
+                fb_.BlendPixel(x, y, r, g, b, aa);
+            }
+        }
+    }
+}
+
+// Legacy binary-coverage scanline fill kept around for EdgeMode.Aliased.
+void SoftwareRenderTarget::FillPathAliased(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, int32_t fillRule)
 {
     if (!brush) return;
 
@@ -1559,11 +1616,6 @@ void SoftwareRenderTarget::FillPath(float startX, float startY, const float* com
     ParsePathToSubPaths(startX, startY, commands, commandLength, subPaths);
     if (subPaths.empty()) return;
 
-    // For fill: collect ALL edges from all contours and do scanline fill.
-    // Each contour is a closed polygon for fill purposes.
-    // Merge all contour points, tracking contour boundaries for edge generation.
-
-    // Compute bounding box across all contours
     float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
     struct Edge { float x0, y0, x1, y1; };
     std::vector<Edge> allEdges;
@@ -1572,7 +1624,6 @@ void SoftwareRenderTarget::FillPath(float startX, float startY, const float* com
         uint32_t pc = (uint32_t)(sp.points.size() / 2);
         if (pc < 2) continue;
 
-        // Transform points
         std::vector<float> tpts(sp.points.size());
         for (uint32_t j = 0; j < pc; j++) {
             currentTransform_.Apply(sp.points[j * 2], sp.points[j * 2 + 1],
@@ -1583,7 +1634,6 @@ void SoftwareRenderTarget::FillPath(float startX, float startY, const float* com
             maxY = std::max(maxY, tpts[j * 2 + 1]);
         }
 
-        // Add edges for this contour (always closed for fill)
         for (uint32_t j = 0; j < pc; j++) {
             uint32_t k = (j + 1) % pc;
             allEdges.push_back({tpts[j * 2], tpts[j * 2 + 1],
@@ -1620,7 +1670,6 @@ void SoftwareRenderTarget::FillPath(float startX, float startY, const float* com
                 if (prevW == 0 && winding != 0) {
                     // Start of filled span
                 } else if (prevW != 0 && winding == 0) {
-                    // Find span start (backtrack to where winding became non-zero)
                     float spanStart = crossings[ci].first;
                     int w2 = 0;
                     for (size_t k = 0; k <= ci; k++) {
@@ -1639,7 +1688,6 @@ void SoftwareRenderTarget::FillPath(float startX, float startY, const float* com
                 }
             }
         } else {
-            // Even-odd rule
             std::vector<float> intersections;
             for (auto& e : allEdges) {
                 if ((e.y0 <= sy && e.y1 > sy) || (e.y1 <= sy && e.y0 > sy)) {
@@ -1662,23 +1710,127 @@ void SoftwareRenderTarget::FillPath(float startX, float startY, const float* com
     }
 }
 
-void SoftwareRenderTarget::StrokePath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, float strokeWidth, bool closed, int32_t lineJoin, float miterLimit, int32_t lineCap, const float* dashPattern, uint32_t dashCount, float dashOffset)
+void SoftwareRenderTarget::StrokePath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, float strokeWidth, bool closed, int32_t lineJoin, float miterLimit, int32_t lineCap, const float* dashPattern, uint32_t dashCount, float dashOffset, int32_t edgeMode)
+{
+    if (!brush) return;
+    if (edgeMode < 0) edgeMode = 2;  // Default = Antialiased.
+
+    // Aliased branch: keep the legacy outline-polygon / Bresenham path.
+    if (edgeMode == 1) {
+        StrokePathAliased(startX, startY, commands, commandLength, brush, strokeWidth, closed, lineJoin, miterLimit, lineCap, dashPattern, dashCount, dashOffset);
+        return;
+    }
+
+    // Antialiased branch: flatten → ExpandStrokePath collect-mode → analytic AA.
+    // Source-space flatten produces contours we then transform into device
+    // space before stroke widening, matching the pixel-space pipeline that
+    // the GPU backends use.
+    std::vector<Contour> contours = FlattenPathToContours(
+        startX, startY, commands, commandLength, 0.5f);
+    if (contours.empty()) return;
+
+    // Approximate device-space stroke width: use the row-norm of the
+    // transform matrix's linear part. SoftwareTransform stores the 3x2
+    // matrix as a flat array (m[0..3] are the 2x2 linear part, m[4..5]
+    // are tx/ty), so probe by transforming the unit basis vectors.
+    float ax = 0.0f, ay = 0.0f;
+    float bx = 0.0f, by = 0.0f;
+    currentTransform_.Apply(1.0f, 0.0f, ax, ay);
+    currentTransform_.Apply(0.0f, 1.0f, bx, by);
+    float tx0 = 0.0f, ty0 = 0.0f;
+    currentTransform_.Apply(0.0f, 0.0f, tx0, ty0);
+    float ex = ax - tx0, ey = ay - ty0;   // image of (1,0)
+    float fx = bx - tx0, fy = by - ty0;   // image of (0,1)
+    float sxLen = std::sqrt(ex * ex + ey * ey);
+    float syLen = std::sqrt(fx * fx + fy * fy);
+    float maxScale = std::max(sxLen, syLen);
+    float pxStrokeWidth = strokeWidth * maxScale;
+    if (pxStrokeWidth <= 0.0f) return;
+
+    // Transform each contour's points into device space in-place.
+    for (auto& c : contours) {
+        for (size_t i = 0; i + 1 < c.points.size(); i += 2) {
+            float tx = 0.0f, ty = 0.0f;
+            currentTransform_.Apply(c.points[i], c.points[i + 1], tx, ty);
+            c.points[i]     = tx;
+            c.points[i + 1] = ty;
+        }
+    }
+
+    auto join = static_cast<ImpellerJoin>(lineJoin);
+    auto cap  = static_cast<ImpellerCap>(lineCap);
+    // Dash patterns and the analytic stroke widener live entirely in
+    // jalium.native.core; we just hand the contours over and collect the
+    // expanded stroke shape, then rasterize it with the same scanline pass
+    // used by fill.
+    std::vector<Contour> strokeContours;
+    strokeContours.reserve(contours.size() * 8);
+
+    // ExpandStrokePath in collect-mode uses a templated vertex type only
+    // for the binary-mesh output, which we don't consume here — pass a
+    // throw-away vertex/index buffer pair to satisfy the API.
+    struct ScratchVertex { float x, y, r, g, b, a; };
+    std::vector<ScratchVertex> scratchVerts;
+    std::vector<uint32_t>       scratchIndices;
+
+    for (auto& c : contours) {
+        if (c.VertexCount() < 2) continue;
+        jalium::ExpandStrokePath<ScratchVertex>(
+            scratchVerts, scratchIndices,
+            c.points.data(), c.VertexCount(),
+            pxStrokeWidth, join, miterLimit, cap, closed,
+            0.0f, 0.0f, 0.0f, 1.0f,  // colour ignored in collect-mode
+            &strokeContours);
+        (void)dashPattern; (void)dashCount; (void)dashOffset;
+        // TODO: dash pattern is not yet applied in the analytic software
+        // path. Dashed strokes fall back to the Aliased branch below until
+        // dash walking lands here too.
+        if (dashPattern && dashCount > 0) {
+            StrokePathAliased(startX, startY, commands, commandLength, brush, strokeWidth, closed, lineJoin, miterLimit, lineCap, dashPattern, dashCount, dashOffset);
+            return;
+        }
+    }
+
+    if (strokeContours.empty()) return;
+
+    std::vector<PixelRect> rects;
+    rects.reserve(256);
+    RasterizePathToRects(strokeContours, FillRule::NonZero, rects);
+    if (rects.empty()) return;
+
+    for (const auto& rect : rects) {
+        if (rect.w <= 0 || rect.h <= 0) continue;
+        int32_t x0 = std::max(0, rect.x);
+        int32_t y0 = std::max(0, rect.y);
+        int32_t x1 = std::min(width_,  rect.x + rect.w);
+        int32_t y1 = std::min(height_, rect.y + rect.h);
+        for (int32_t y = y0; y < y1; ++y) {
+            for (int32_t x = x0; x < x1; ++x) {
+                if (!clipStack_.empty() && IsClipped((float)x, (float)y)) continue;
+                uint8_t r, g, b, a;
+                GetBrushColor(brush, (float)x, (float)y, r, g, b, a);
+                uint8_t aa = (uint8_t)std::lround(a * rect.alpha);
+                fb_.BlendPixel(x, y, r, g, b, aa);
+            }
+        }
+    }
+}
+
+// Legacy outline-polygon stroke kept for EdgeMode.Aliased.
+void SoftwareRenderTarget::StrokePathAliased(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, float strokeWidth, bool closed, int32_t lineJoin, float miterLimit, int32_t lineCap, const float* dashPattern, uint32_t dashCount, float dashOffset)
 {
     if (!brush) return;
 
-    // Parse into sub-paths
     std::vector<SubPath> subPaths;
     ParsePathToSubPaths(startX, startY, commands, commandLength, subPaths);
     if (subPaths.empty()) return;
 
-    // Stroke each sub-path independently
     for (auto& sp : subPaths) {
         uint32_t ptCount = (uint32_t)(sp.points.size() / 2);
         if (ptCount < 2) continue;
 
         bool subClosed = sp.closed || closed;
 
-        // Remove duplicated closing point if present
         if (subClosed && ptCount >= 3) {
             float fx = sp.points[0], fy = sp.points[1];
             float lx = sp.points[(ptCount - 1) * 2], ly = sp.points[(ptCount - 1) * 2 + 1];
@@ -1688,8 +1840,6 @@ void SoftwareRenderTarget::StrokePath(float startX, float startY, const float* c
         }
         if (ptCount < 2) continue;
 
-        // For thick strokes (> 2px), use outline polygon approach for proper joins.
-        // For thin strokes, use direct line drawing (more reliable at small sizes).
         if (strokeWidth > 2.0f && !dashPattern) {
             std::vector<std::vector<float>> contours;
             GenerateStrokeOutline(sp.points, ptCount, strokeWidth, subClosed, lineJoin, miterLimit, lineCap, contours);
@@ -1700,11 +1850,9 @@ void SoftwareRenderTarget::StrokePath(float startX, float startY, const float* c
             for (auto& seg : dashSegments) {
                 uint32_t segPts = (uint32_t)(seg.size() / 2);
                 if (segPts < 2) continue;
-                // Draw each dash segment
                 DrawPolygon(seg.data(), segPts, brush, strokeWidth, false, lineJoin, miterLimit);
             }
         } else {
-            // Direct line drawing for each segment of the sub-path
             DrawPolygon(sp.points.data(), ptCount, brush, strokeWidth, subClosed, lineJoin, miterLimit);
         }
     }

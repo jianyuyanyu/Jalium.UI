@@ -369,6 +369,22 @@ bool D3D12VelloRenderer::EnsureBuffers()
 
     if (!needRebuild && segmentBuffer_) return true;
 
+    // Park the previous-iteration default-heap buffers on the retired list
+    // before reassigning the ComPtrs. Without this, a mid-frame regrow would
+    // drop the old resource refcount while the open commandList still has
+    // queued CopyBufferRegion / Dispatch commands referencing it, triggering
+    // D3D12 ERROR #921 OBJECT_DELETED_WHILE_STILL_IN_USE on commandList Close.
+    auto retire = [this](ComPtr<ID3D12Resource>& res) {
+        if (res) pendingRetiredResources_.push_back(std::move(res));
+    };
+    retire(segmentBuffer_);
+    retire(pathInfoBuffer_);
+    retire(pathDrawBuffer_);
+    retire(lineSegBuffer_);
+    retire(lineCountBuffer_);
+    retire(tileBuffer_);
+    retire(tileCmdBuffer_);
+
     // GPU buffers (DEFAULT heap, UAV-capable)
     auto flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     auto state = D3D12_RESOURCE_STATE_COMMON;
@@ -381,16 +397,98 @@ bool D3D12VelloRenderer::EnsureBuffers()
     if (!CreateBuffer(device_, tileCapacity_ * 12, D3D12_HEAP_TYPE_DEFAULT, flags, state, tileBuffer_)) return false;
     if (!CreateBuffer(device_, tileCmdCapacity_ * 12, D3D12_HEAP_TYPE_DEFAULT, flags, state, tileCmdBuffer_)) return false;
 
-    // Upload buffers - per-frame to avoid GPU race conditions
+    // EnsureUploadBuffersForFrame creates the per-Dispatch upload buffers on
+    // demand, sized off the capacities we just set. We don't pre-create them
+    // for every frame slot here because RetireFrameUploadBuffers nulls them
+    // after each Dispatch — the next Dispatch's EnsureUploadBuffersForFrame
+    // is the single source of truth for "does this slot have fresh uploads".
+    return true;
+}
+
+bool D3D12VelloRenderer::EnsureUploadBuffersForFrame(uint32_t fi)
+{
+    if (fi >= kMaxFrames) return false;
+    auto& fu = frameUploads_[fi];
     auto uploadState = D3D12_RESOURCE_STATE_GENERIC_READ;
-    for (uint32_t f = 0; f < kMaxFrames; f++) {
-        auto& fu = frameUploads_[f];
-        if (!CreateBuffer(device_, segmentCapacity_ * sizeof(PathSegment), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, uploadState, fu.segmentUpload)) return false;
-        if (!CreateBuffer(device_, pathCapacity_ * sizeof(PathInfo), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, uploadState, fu.pathInfoUpload)) return false;
-        if (!CreateBuffer(device_, pathCapacity_ * sizeof(PathDraw), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, uploadState, fu.pathDrawUpload)) return false;
+
+    if (!fu.segmentUpload) {
+        if (!CreateBuffer(device_, segmentCapacity_ * sizeof(PathSegment),
+                          D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                          uploadState, fu.segmentUpload))
+            return false;
+    }
+    if (!fu.pathInfoUpload) {
+        if (!CreateBuffer(device_, pathCapacity_ * sizeof(PathInfo),
+                          D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                          uploadState, fu.pathInfoUpload))
+            return false;
+    }
+    if (!fu.pathDrawUpload) {
+        if (!CreateBuffer(device_, pathCapacity_ * sizeof(PathDraw),
+                          D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                          uploadState, fu.pathDrawUpload))
+            return false;
+    }
+    if (!fu.constantUpload) {
+        if (!CreateBuffer(device_, 256, D3D12_HEAP_TYPE_UPLOAD,
+                          D3D12_RESOURCE_FLAG_NONE, uploadState, fu.constantUpload))
+            return false;
+    }
+    if (!fu.lineCountUpload) {
+        if (!CreateBuffer(device_, 256, D3D12_HEAP_TYPE_UPLOAD,
+                          D3D12_RESOURCE_FLAG_NONE, uploadState, fu.lineCountUpload))
+            return false;
+        // lineCount is initialized to 0 in Initialize for the original Dispatch
+        // path; mid-frame recreated buffers don't need this because Dispatch
+        // overwrites the value in its CopyBufferRegion path.
     }
 
+    // lineSegUpload / ptclUpload / ptclOffsetsUpload / gradientRampUpload /
+    // drawTagUpload / drawMonoidUpload / bumpZeroUpload / clipInpUpload are
+    // sized against per-Dispatch capacity inside Dispatch / DispatchGPU itself
+    // and recreated lazily there — those code paths already handle a null
+    // ComPtr by calling CreateBuffer.
     return true;
+}
+
+void D3D12VelloRenderer::RetireFrameUploadBuffers(uint32_t fi)
+{
+    if (fi >= kMaxFrames) return;
+    auto& fu = frameUploads_[fi];
+    auto retire = [this](ComPtr<ID3D12Resource>& res) {
+        if (res) pendingRetiredResources_.push_back(std::move(res));
+    };
+    retire(fu.segmentUpload);
+    retire(fu.pathInfoUpload);
+    retire(fu.pathDrawUpload);
+    retire(fu.constantUpload);
+    retire(fu.lineCountUpload);
+    retire(fu.lineSegUpload);                   fu.lineSegUploadCapacity = 0;
+    retire(fu.ptclUpload);                       fu.ptclUploadCapacity = 0;
+    retire(fu.ptclOffsetsUpload);                fu.ptclOffsetsUploadCapacity = 0;
+    retire(fu.gradientRampUpload);               fu.gradientRampUploadCapacity = 0;
+    retire(fu.drawTagUpload);                    fu.drawTagUploadCapacity = 0;
+    retire(fu.drawMonoidUpload);                 fu.drawMonoidUploadCapacity = 0;
+    retire(fu.bumpZeroUpload);
+    retire(fu.clipInpUpload);                    fu.clipInpUploadCapacity = 0;
+}
+
+void D3D12VelloRenderer::DrainRetired(std::vector<ComPtr<ID3D12Resource>>& outRetired)
+{
+    outRetired.reserve(outRetired.size() + pendingRetiredResources_.size());
+    for (auto& r : pendingRetiredResources_) {
+        outRetired.push_back(std::move(r));
+    }
+    pendingRetiredResources_.clear();
+}
+
+void D3D12VelloRenderer::DrainRetiredHeaps(std::vector<ComPtr<ID3D12DescriptorHeap>>& outRetired)
+{
+    outRetired.reserve(outRetired.size() + pendingRetiredHeaps_.size());
+    for (auto& h : pendingRetiredHeaps_) {
+        outRetired.push_back(std::move(h));
+    }
+    pendingRetiredHeaps_.clear();
 }
 
 bool D3D12VelloRenderer::EnsureOutputTexture(uint32_t w, uint32_t h)
@@ -750,9 +848,16 @@ done:
         }
     }
 
-    // CPU flatten: convert PathSegments to LineSeg
+    // CPU flatten: convert PathSegments to LineSeg.
+    // Bezier curves use the shared chord-distance algorithm in jalium_triangulate.h
+    // (same one Impeller uses) — the previous midpoint-deviation heuristic missed
+    // S-shaped / inflection cubics, producing chunky / corrupt icon outlines.
     uint32_t lineSegStart = (uint32_t)cpuLineSegs_.size();
     {
+        constexpr float kFlattenTolerance = 0.25f;  // pixels (already in device space)
+        std::vector<float> curvePts;
+        curvePts.reserve(64);
+
         for (uint32_t si = segOffset; si < (uint32_t)segments_.size(); si++) {
             auto& s = segments_[si];
             if (s.tag == kSegTagLineTo) {
@@ -763,53 +868,28 @@ done:
                 ls.pathIndex = s.pathIndex;
                 cpuLineSegs_.push_back(ls);
             } else if (s.tag == kSegTagQuadTo) {
-                float tol = 0.25f;
-                float mx = 0.5f*(s.p0x+s.p2x), my = 0.5f*(s.p0y+s.p2y);
-                float ddx = s.p1x - mx, ddy = s.p1y - my;
-                float dev = std::sqrt(ddx*ddx+ddy*ddy);
-                int n = std::max(1, (int)std::ceil(std::sqrt(dev/(2.0f*tol))));
-                n = std::min(n, 64);
+                curvePts.clear();
+                FlattenQuadraticBezier(s.p0x, s.p0y, s.p1x, s.p1y, s.p2x, s.p2y,
+                                       curvePts, kFlattenTolerance);
                 float px = s.p0x, py = s.p0y;
-                for (int i = 1; i <= n; i++) {
-                    float t = (float)i / (float)n;
-                    float u = 1-t;
-                    float nx = u*u*s.p0x + 2*u*t*s.p1x + t*t*s.p2x;
-                    float ny = u*u*s.p0y + 2*u*t*s.p1y + t*t*s.p2y;
+                for (size_t pi = 0; pi + 1 < curvePts.size(); pi += 2) {
+                    float nx = curvePts[pi], ny = curvePts[pi + 1];
+                    if (std::abs(px - nx) < 1e-6f && std::abs(py - ny) < 1e-6f) continue;
                     LineSeg ls = {}; ls.p0x=px; ls.p0y=py; ls.p1x=nx; ls.p1y=ny; ls.pathIndex=s.pathIndex;
                     cpuLineSegs_.push_back(ls);
-                    px=nx; py=ny;
+                    px = nx; py = ny;
                 }
             } else if (s.tag == kSegTagCubicTo) {
-                float tol = 0.25f;
-                float tolSq = tol * tol;
-                struct CubicSplit { float t0, t1; };
-                CubicSplit stack[16];
-                int top = 0;
-                stack[top++] = {0.0f, 1.0f};
+                curvePts.clear();
+                FlattenCubicBezier(s.p0x, s.p0y, s.p1x, s.p1y, s.p2x, s.p2y, s.p3x, s.p3y,
+                                   curvePts, kFlattenTolerance);
                 float px = s.p0x, py = s.p0y;
-
-                auto evalCubic = [&](float t) -> std::pair<float, float> {
-                    float u = 1-t;
-                    return {u*u*u*s.p0x + 3*u*u*t*s.p1x + 3*u*t*t*s.p2x + t*t*t*s.p3x,
-                            u*u*u*s.p0y + 3*u*u*t*s.p1y + 3*u*t*t*s.p2y + t*t*t*s.p3y};
-                };
-
-                while (top > 0) {
-                    auto [t0, t1] = stack[--top];
-                    float tmid = 0.5f * (t0 + t1);
-                    auto [x0, y0] = evalCubic(t0);
-                    auto [x1, y1] = evalCubic(t1);
-                    auto [xm, ym] = evalCubic(tmid);
-                    float mx = 0.5f*(x0+x1), my = 0.5f*(y0+y1);
-                    float devX = xm - mx, devY = ym - my;
-                    if (devX*devX + devY*devY > tolSq && top < 15 && (t1 - t0) > 1e-5f) {
-                        stack[top++] = {tmid, t1};
-                        stack[top++] = {t0, tmid};
-                    } else {
-                        LineSeg ls = {}; ls.p0x=px; ls.p0y=py; ls.p1x=x1; ls.p1y=y1; ls.pathIndex=s.pathIndex;
-                        cpuLineSegs_.push_back(ls);
-                        px = x1; py = y1;
-                    }
+                for (size_t pi = 0; pi + 1 < curvePts.size(); pi += 2) {
+                    float nx = curvePts[pi], ny = curvePts[pi + 1];
+                    if (std::abs(px - nx) < 1e-6f && std::abs(py - ny) < 1e-6f) continue;
+                    LineSeg ls = {}; ls.p0x=px; ls.p0y=py; ls.p1x=nx; ls.p1y=ny; ls.pathIndex=s.pathIndex;
+                    cpuLineSegs_.push_back(ls);
+                    px = nx; py = ny;
                 }
             }
         }
@@ -852,11 +932,28 @@ done:
         }
     }
 
-    // Compute per-path tile bbox
+    // Compute per-path tile bbox.
+    //
+    // bbox right/bottom is exclusive (one past the last tile). The previous
+    // formula `(uint32_t)ceil(maxX) / kTileWidth + 1` over-padded by one tile
+    // whenever maxX wasn't strictly past an integer boundary — e.g. maxX=31.5
+    // gave bbox.right = 3 instead of 2, including an empty tile column. That
+    // phantom tile receives backdrop from DDA's `top_edge` rule (when a vertical
+    // right-edge segment ends at x = tile_count*kTileWidth), and through
+    // prefix-sum the phantom tile's backdrop becomes ±1, filling it solid.
+    // Visible result: extra block to the right of every closed path, edges
+    // appearing curved/distorted because the fill extends one tile too far.
+    //
+    // Correct formula: ceil(maxX / kTileWidth) — gives the tile index just past
+    // the rightmost tile actually touched by the path.
     uint32_t tileBboxX = (uint32_t)std::max(0.0f, std::floor(currentBboxMinX_)) / kTileWidth;
     uint32_t tileBboxY = (uint32_t)std::max(0.0f, std::floor(currentBboxMinY_)) / kTileHeight;
-    uint32_t tileBboxR = std::min((uint32_t)std::ceil(currentBboxMaxX_) / kTileWidth + 1, tilesX_);
-    uint32_t tileBboxB = std::min((uint32_t)std::ceil(currentBboxMaxY_) / kTileHeight + 1, tilesY_);
+    uint32_t tileBboxR = std::min(
+        (uint32_t)std::max(0.0f, std::ceil(currentBboxMaxX_ / (float)kTileWidth)),
+        tilesX_);
+    uint32_t tileBboxB = std::min(
+        (uint32_t)std::max(0.0f, std::ceil(currentBboxMaxY_ / (float)kTileHeight)),
+        tilesY_);
     uint32_t tileBboxW = tileBboxR > tileBboxX ? tileBboxR - tileBboxX : 0;
     uint32_t tileBboxH = tileBboxB > tileBboxY ? tileBboxB - tileBboxY : 0;
     uint32_t tileCount = tileBboxW * tileBboxH;
@@ -1258,19 +1355,79 @@ void D3D12VelloRenderer::BuildPtcl()
     };
 
     // Convert a LineSeg to VelloSortedSeg for the fine shader.
-    // y_edge is set to 1e9 (disabled) because the CPU pipeline's DDA-based
-    // BuildPtcl already computes correct per-tile backdrop winding via
-    // prefix sum.  The GPU pipeline uses y_edge as a per-segment winding
-    // correction, but combining it with DDA backdrop causes double-counting
-    // that fills the entire bounding box as a solid block.
-    auto makeVelloSeg = [](const LineSeg& ls) -> VelloSortedSeg {
-        return { ls.p0x, ls.p0y, ls.p1x, ls.p1y, 1e9f };
+    //
+    // The fine shader's fill_path expects:
+    //   1. Segment endpoints in TILE-RELATIVE coordinates
+    //      (vello_shared.hlsli:154 "point0; // relative to tile origin").
+    //   2. y_edge set to the y-coordinate (tile-relative) where the segment
+    //      crosses the tile's LEFT edge (x = 0). Vello reference fine.wgsl:
+    //          area += sign(delta.x) * clamp(xy.y - y_edge + 1, 0, 1)
+    //      This term gives every pixel below y_edge the segment's winding
+    //      delta, which is required because path_count's tile binning only
+    //      adds backdrop deltas for (a) segments completely left of the path
+    //      bbox and (b) segments crossing tile TOP edges. Segments crossing
+    //      a tile's LEFT edge from outside have no backdrop delta — fine
+    //      shader covers that case via y_edge.
+    //   3. y_edge = 1e9 (or any large value) when the segment does NOT cross
+    //      the tile's left edge → contribution clamps to 0.
+    //
+    // With y_edge disabled, any path whose segments cross tile left edges
+    // (almost every non-trivial path) loses winding contributions on the
+    // affected pixel rows, so the per-pixel area never reaches ±1, and
+    // nonzero rule produces partial coverage everywhere → looks like the
+    // whole shape is heavily anti-aliased / faded.
+    auto makeVelloSeg = [](const LineSeg& ls, float tileOriginX, float tileOriginY) -> VelloSortedSeg {
+        float p0x = ls.p0x - tileOriginX;
+        float p0y = ls.p0y - tileOriginY;
+        float p1x = ls.p1x - tileOriginX;
+        float p1y = ls.p1y - tileOriginY;
+
+        // Compute y where the segment intersects the tile's left edge (x = 0).
+        // Only meaningful when p0.x and p1.x straddle x = 0.
+        //
+        // Match Vello path_tiling.wgsl semantics:
+        //   - When clipped p0 lands on top-left corner (p0.x == 0 AND p0.y == 0),
+        //     y_edge is NOT set — top_edge backdrop in path_count covers it.
+        //   - In our unclipped impl this corresponds to y_intersect == 0 (segment
+        //     line passes through the tile's top-left corner). Use y_intersect > 0
+        //     as the strict-positive guard (also filters out negative y_intersect,
+        //     which means crossing happens above the tile and the segment doesn't
+        //     actually enter through the left edge).
+        float y_edge = 1e9f;
+        bool p0_left = p0x <= 0.0f;
+        bool p1_left = p1x <= 0.0f;
+        if (p0_left != p1_left) {
+            float dx = p1x - p0x;
+            // dx is non-zero here because p0x and p1x are on opposite sides of 0.
+            float t = -p0x / dx;
+            float y_intersect = p0y + t * (p1y - p0y);
+            if (y_intersect > 0.0f) {
+                y_edge = y_intersect;
+            }
+        }
+
+        // Vello path_tiling nudges segment endpoints off integer x boundaries
+        // (other than x=0) to avoid fill_path's `xmax - xmin` denominator
+        // collapsing to 0 when a segment is exactly aligned with a pixel edge.
+        constexpr float kEdgeEpsilon = 1.0e-6f;
+        if (p0x != 0.0f && p0x == std::floor(p0x)) {
+            p0x -= kEdgeEpsilon;
+        }
+        if (p1x != 0.0f && p1x == std::floor(p1x)) {
+            p1x -= kEdgeEpsilon;
+        }
+
+        return { p0x, p0y, p1x, p1y, y_edge };
     };
 
     // Helper: emit fill/solid + brush for a path at a specific tile
     auto emitPathForTile = [&](uint32_t pathIdx, uint32_t globalTileIdx) {
         // Find this path's entry in tilePaths for this tile
         auto& entries = tilePaths[globalTileIdx];
+        uint32_t tileX = globalTileIdx % tilesX_;
+        uint32_t tileY = globalTileIdx / tilesX_;
+        float tileOriginX = (float)(tileX * kTileWidth);
+        float tileOriginY = (float)(tileY * kTileHeight);
         for (auto& entry : entries) {
             if (entry.pathIdx != pathIdx) continue;
 
@@ -1280,7 +1437,9 @@ void D3D12VelloRenderer::BuildPtcl()
             if (entry.segCount > 0) {
                 uint32_t segStartInSorted = (uint32_t)cpuSortedSegs_.size();
                 for (uint32_t k = 0; k < entry.segCount; k++) {
-                    cpuSortedSegs_.push_back(makeVelloSeg(cpuLineSegs_[packedSegIndices[entry.segStart + k]]));
+                    cpuSortedSegs_.push_back(makeVelloSeg(
+                        cpuLineSegs_[packedSegIndices[entry.segStart + k]],
+                        tileOriginX, tileOriginY));
                 }
                 cpuPtcl_.push_back(kPtclFill);
                 // size_and_rule: segCount in upper bits, fill rule in bit 0
@@ -1317,6 +1476,8 @@ void D3D12VelloRenderer::BuildPtcl()
             if (!hasClips) {
                 // Fast path: no clips, emit all path entries directly (same as before)
                 auto& entries = tilePaths[globalTileIdx];
+                float tileOriginX = (float)(tx * kTileWidth);
+                float tileOriginY = (float)(ty * kTileHeight);
                 for (auto& entry : entries) {
                     auto& draw = pathDraws_[entry.pathIdx];
                     auto& pi = pathInfos_[entry.pathIdx];
@@ -1324,7 +1485,9 @@ void D3D12VelloRenderer::BuildPtcl()
                     if (entry.segCount > 0) {
                         uint32_t segStartInSorted = (uint32_t)cpuSortedSegs_.size();
                         for (uint32_t k = 0; k < entry.segCount; k++) {
-                            cpuSortedSegs_.push_back(makeVelloSeg(cpuLineSegs_[packedSegIndices[entry.segStart + k]]));
+                            cpuSortedSegs_.push_back(makeVelloSeg(
+                                cpuLineSegs_[packedSegIndices[entry.segStart + k]],
+                                tileOriginX, tileOriginY));
                         }
                         cpuPtcl_.push_back(kPtclFill);
                         uint32_t evenOdd = (pi.fillRule == kFillRuleEvenOdd) ? 1u : 0u;
@@ -1428,11 +1591,16 @@ bool D3D12VelloRenderer::EncodeFillPathCached(
         cpuLineSegs_.push_back(ls);
     }
 
-    // Compute tile bbox
+    // Compute tile bbox (exclusive right/bottom). See EncodePathGeometry for
+    // why `ceil(maxX / kTileWidth)` is correct vs the old `ceil(maxX)/kTileWidth + 1`.
     uint32_t tileBboxX = (uint32_t)std::max(0.0f, std::floor(bMinX)) / kTileWidth;
     uint32_t tileBboxY = (uint32_t)std::max(0.0f, std::floor(bMinY)) / kTileHeight;
-    uint32_t tileBboxR = std::min((uint32_t)std::ceil(bMaxX) / kTileWidth + 1, tilesX_);
-    uint32_t tileBboxB = std::min((uint32_t)std::ceil(bMaxY) / kTileHeight + 1, tilesY_);
+    uint32_t tileBboxR = std::min(
+        (uint32_t)std::max(0.0f, std::ceil(bMaxX / (float)kTileWidth)),
+        tilesX_);
+    uint32_t tileBboxB = std::min(
+        (uint32_t)std::max(0.0f, std::ceil(bMaxY / (float)kTileHeight)),
+        tilesY_);
     uint32_t tileBboxW = tileBboxR > tileBboxX ? tileBboxR - tileBboxX : 0;
     uint32_t tileBboxH = tileBboxB > tileBboxY ? tileBboxB - tileBboxY : 0;
 
@@ -1572,6 +1740,82 @@ bool D3D12VelloRenderer::EncodeFillPathBrush(
     clipEvents_.push_back({ClipEvent::kDraw, pathIdx, 0, 0});
     drawTags_.push_back({kDrawTagFill, pathIdx, 0, 0});
     return true;
+}
+
+// ============================================================================
+// Stroke geometry cache
+//
+// EncodeStrokePath's emission pipeline (flatten → simplify → quads → joins →
+// caps) is expensive and produces output that depends only on the path
+// commands + stroke parameters — never on the per-call transform or brush.
+// Cache that output keyed by the inputs that *do* affect geometry; on hit we
+// skip the entire emission and only run the transform stage.
+// ============================================================================
+
+namespace {
+inline void FnvMix64(uint64_t& h, const void* data, size_t size) noexcept {
+    auto* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; i++) {
+        h ^= p[i];
+        h *= 0x100000001B3ull;
+    }
+}
+}  // namespace
+
+uint64_t D3D12VelloRenderer::HashStrokeInputs(
+    float startX, float startY,
+    const float* commands, uint32_t commandLength,
+    float strokeWidth, bool closed,
+    int32_t lineJoin, float miterLimit, int32_t lineCap,
+    const float* dashPattern, uint32_t dashCount, float dashOffset) noexcept
+{
+    uint64_t h = 0xCBF29CE484222325ull;  // FNV-1a 64-bit offset basis
+    FnvMix64(h, &startX, sizeof(startX));
+    FnvMix64(h, &startY, sizeof(startY));
+    FnvMix64(h, &commandLength, sizeof(commandLength));
+    if (commands && commandLength > 0)
+        FnvMix64(h, commands, commandLength * sizeof(float));
+    FnvMix64(h, &strokeWidth, sizeof(strokeWidth));
+    uint8_t closedByte = closed ? 1 : 0;
+    FnvMix64(h, &closedByte, sizeof(closedByte));
+    FnvMix64(h, &lineJoin, sizeof(lineJoin));
+    FnvMix64(h, &miterLimit, sizeof(miterLimit));
+    FnvMix64(h, &lineCap, sizeof(lineCap));
+    FnvMix64(h, &dashCount, sizeof(dashCount));
+    if (dashPattern && dashCount > 0)
+        FnvMix64(h, dashPattern, dashCount * sizeof(float));
+    FnvMix64(h, &dashOffset, sizeof(dashOffset));
+    return h;
+}
+
+std::shared_ptr<const D3D12VelloRenderer::CachedStrokeGeometry>
+D3D12VelloRenderer::StrokeCacheFind(uint64_t key)
+{
+    auto it = strokeCacheMap_.find(key);
+    if (it == strokeCacheMap_.end()) return nullptr;
+    // Splice to head (most-recently-used).
+    strokeCacheList_.splice(strokeCacheList_.begin(), strokeCacheList_, it->second);
+    return it->second->entry;
+}
+
+void D3D12VelloRenderer::StrokeCacheInsert(
+    uint64_t key, std::shared_ptr<const CachedStrokeGeometry> entry)
+{
+    auto existing = strokeCacheMap_.find(key);
+    if (existing != strokeCacheMap_.end()) {
+        // Update + promote.
+        existing->second->entry = std::move(entry);
+        strokeCacheList_.splice(strokeCacheList_.begin(), strokeCacheList_, existing->second);
+        return;
+    }
+    if (strokeCacheList_.size() >= kStrokeCacheCapacity) {
+        // Evict LRU.
+        auto& lru = strokeCacheList_.back();
+        strokeCacheMap_.erase(lru.key);
+        strokeCacheList_.pop_back();
+    }
+    strokeCacheList_.push_front({key, std::move(entry)});
+    strokeCacheMap_[key] = strokeCacheList_.begin();
 }
 
 bool D3D12VelloRenderer::EncodeStrokePath(
@@ -1991,11 +2235,15 @@ bool D3D12VelloRenderer::EncodeStrokePath(
         cpuLineSegs_.push_back(ls);
     }
 
-    // Compute per-path tile bbox (same as EncodeFillPath)
+    // Compute per-path tile bbox (same formula as EncodeFillPath — exclusive right/bottom).
     uint32_t tileBboxX = (uint32_t)std::max(0.0f, std::floor(currentBboxMinX_)) / kTileWidth;
     uint32_t tileBboxY = (uint32_t)std::max(0.0f, std::floor(currentBboxMinY_)) / kTileHeight;
-    uint32_t tileBboxR = std::min((uint32_t)std::ceil(currentBboxMaxX_) / kTileWidth + 1, tilesX_);
-    uint32_t tileBboxB = std::min((uint32_t)std::ceil(currentBboxMaxY_) / kTileHeight + 1, tilesY_);
+    uint32_t tileBboxR = std::min(
+        (uint32_t)std::max(0.0f, std::ceil(currentBboxMaxX_ / (float)kTileWidth)),
+        tilesX_);
+    uint32_t tileBboxB = std::min(
+        (uint32_t)std::max(0.0f, std::ceil(currentBboxMaxY_ / (float)kTileHeight)),
+        tilesY_);
     uint32_t tileBboxW = tileBboxR > tileBboxX ? tileBboxR - tileBboxX : 0;
     uint32_t tileBboxH = tileBboxB > tileBboxY ? tileBboxB - tileBboxY : 0;
     uint32_t tileCount = tileBboxW * tileBboxH;
@@ -2128,8 +2376,12 @@ void D3D12VelloRenderer::EncodeBlurRect(
     info.fillRule = kFillRuleNonZero;
     info.tileBboxX = (uint32_t)std::max(0.0f, std::floor(bx0)) / kTileWidth;
     info.tileBboxY = (uint32_t)std::max(0.0f, std::floor(by0)) / kTileHeight;
-    uint32_t tileBboxR = std::min((uint32_t)std::ceil(bx1) / kTileWidth + 1, tilesX_);
-    uint32_t tileBboxB = std::min((uint32_t)std::ceil(by1) / kTileHeight + 1, tilesY_);
+    uint32_t tileBboxR = std::min(
+        (uint32_t)std::max(0.0f, std::ceil(bx1 / (float)kTileWidth)),
+        tilesX_);
+    uint32_t tileBboxB = std::min(
+        (uint32_t)std::max(0.0f, std::ceil(by1 / (float)kTileHeight)),
+        tilesY_);
     info.tileBboxW = tileBboxR > info.tileBboxX ? tileBboxR - info.tileBboxX : 0;
     info.tileBboxH = tileBboxB > info.tileBboxY ? tileBboxB - info.tileBboxY : 0;
     info.tileOffset = totalPathTiles_;
@@ -2307,8 +2559,12 @@ void D3D12VelloRenderer::EncodeBeginClipMask(uint32_t maskIndex, float x, float 
     info.fillRule = kFillRuleNonZero;
     info.tileBboxX = (uint32_t)std::max(0.0f, std::floor(x)) / kTileWidth;
     info.tileBboxY = (uint32_t)std::max(0.0f, std::floor(y)) / kTileHeight;
-    uint32_t tileBboxR = std::min((uint32_t)std::ceil(x + w) / kTileWidth + 1, tilesX_);
-    uint32_t tileBboxB = std::min((uint32_t)std::ceil(y + h) / kTileHeight + 1, tilesY_);
+    uint32_t tileBboxR = std::min(
+        (uint32_t)std::max(0.0f, std::ceil((x + w) / (float)kTileWidth)),
+        tilesX_);
+    uint32_t tileBboxB = std::min(
+        (uint32_t)std::max(0.0f, std::ceil((y + h) / (float)kTileHeight)),
+        tilesY_);
     info.tileBboxW = tileBboxR > info.tileBboxX ? tileBboxR - info.tileBboxX : 0;
     info.tileBboxH = tileBboxB > info.tileBboxY ? tileBboxB - info.tileBboxY : 0;
     info.tileOffset = totalPathTiles_;
@@ -2363,8 +2619,26 @@ bool D3D12VelloRenderer::Dispatch(ID3D12GraphicsCommandList* cmdList, uint32_t f
 
     // Select per-frame resources to avoid CPU/GPU race conditions
     uint32_t fi = frameIndex % kMaxFrames;
+    if (!EnsureUploadBuffersForFrame(fi)) return false;
     auto& fu = frameUploads_[fi];
-    auto& srvHeap = computeSrvHeap_[fi];
+
+    // Allocate a fresh shader-visible descriptor heap for THIS Dispatch.
+    // Multiple Dispatches per frame would otherwise overwrite each other's
+    // descriptors in the shared computeSrvHeap_[fi] before the GPU has read
+    // them — the heap is mutable storage, the GPU samples its entries when
+    // each compute command actually executes, so we need an independent
+    // copy per Dispatch. The retire call at the end keeps it alive until
+    // the GPU is done.
+    ComPtr<ID3D12DescriptorHeap> dispatchHeap;
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.NumDescriptors = 28;  // matches computeSrvHeap_ slot layout
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(device_->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&dispatchHeap))))
+            return false;
+    }
+    auto& srvHeap = dispatchHeap;
 
     // ── Upload CPU data to GPU ──
 
@@ -2798,6 +3072,16 @@ bool D3D12VelloRenderer::Dispatch(ID3D12GraphicsCommandList* cmdList, uint32_t f
     if (ptclReady && ptclBuffer_) resetBarriers[rCount++] = MakeBarrier(ptclBuffer_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     if (ptclReady && pathTileBuffer_) resetBarriers[rCount++] = MakeBarrier(pathTileBuffer_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     if (rCount > 0) cmdList->ResourceBarrier(rCount, resetBarriers);
+
+    // Retire this Dispatch's transient resources. Their GPU virtual addresses
+    // are still embedded in the cmdList's queued commands (CopyBufferRegion
+    // sources, SetComputeRootConstantBufferView CBV, SetDescriptorHeaps,
+    // SetComputeRootDescriptorTable), so the resources must outlive cmdList
+    // execution. ComPtrs land on pendingRetiredResources_ / pendingRetiredHeaps_
+    // until DrainRetired moves them to the per-frame retired list whose
+    // lifetime is gated by the frame fence.
+    RetireFrameUploadBuffers(fi);
+    pendingRetiredHeaps_.push_back(std::move(dispatchHeap));
 
     return ptclReady;  // true only if fine shader dispatched successfully
 }
@@ -3700,6 +3984,11 @@ bool D3D12VelloRenderer::EnsureGPUBuffers(uint32_t numPaths, uint32_t numSegs, u
     auto ensure = [&](ComPtr<ID3D12Resource>& buf, uint32_t& cap, uint32_t needed, uint32_t elemSize) {
         if (needed > cap || !buf) {
             cap = std::max(needed * 2, 256u);
+            // Park the old buffer on the retired list before overwriting the
+            // ComPtr. A prior Dispatch in this frame may have queued reads /
+            // writes against it; dropping the refcount here would invalidate
+            // those queued commands when commandList Close runs.
+            if (buf) pendingRetiredResources_.push_back(std::move(buf));
             return CreateBuffer(device_, (UINT64)cap * elemSize, D3D12_HEAP_TYPE_DEFAULT, uavFlags, state, buf);
         }
         return true;
@@ -3729,6 +4018,7 @@ bool D3D12VelloRenderer::EnsureGPUBuffers(uint32_t numPaths, uint32_t numSegs, u
     uint32_t clipBboxNeeded = std::max(totalClips, 1u);
     if (clipBboxNeeded > (uint32_t)(clipBboxBuffer_ ? clipBboxBuffer_->GetDesc().Width / 16 : 0) || !clipBboxBuffer_) {
         uint32_t cap = clipBboxNeeded * 2;
+        if (clipBboxBuffer_) pendingRetiredResources_.push_back(std::move(clipBboxBuffer_));
         if (!CreateBuffer(device_, cap * 16, D3D12_HEAP_TYPE_DEFAULT, uavFlags, state, clipBboxBuffer_)) return false;
     }
 
@@ -3889,6 +4179,7 @@ bool D3D12VelloRenderer::DispatchGPU(ID3D12GraphicsCommandList* cmdList, uint32_
     if (!EnsureBuffers()) return false;
 
     uint32_t fi = frameIndex % kMaxFrames;
+    if (!EnsureUploadBuffersForFrame(fi)) return false;
     auto& fu = frameUploads_[fi];
 
     // ── Build VelloConfig ──
@@ -3964,6 +4255,7 @@ bool D3D12VelloRenderer::DispatchGPU(ID3D12GraphicsCommandList* cmdList, uint32_
     // DrawTags
     if (numDrawObjs > drawTagCapacity_ || !drawTagBuffer_) {
         drawTagCapacity_ = numDrawObjs * 2;
+        if (drawTagBuffer_) pendingRetiredResources_.push_back(std::move(drawTagBuffer_));
         CreateBuffer(device_, drawTagCapacity_ * sizeof(DrawTag), D3D12_HEAP_TYPE_DEFAULT,
                      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, drawTagBuffer_);
     }
@@ -4111,26 +4403,40 @@ bool D3D12VelloRenderer::DispatchGPU(ID3D12GraphicsCommandList* cmdList, uint32_
         auto cpuHandle = cpuUavHeap_->GetCPUDescriptorHandleForHeapStart();
         device_->CreateUnorderedAccessView(outputTexture_.Get(), nullptr, &uavDesc, cpuHandle);
 
-        // Use a temporary shader-visible descriptor for the clear operation
-        if (!gpuSrvHeap_[fi]) {
+        // Allocate a FRESH shader-visible descriptor heap for THIS Dispatch.
+        // Mid-frame multi-Dispatch would otherwise overwrite each other's
+        // descriptor entries in the long-lived gpuSrvHeap_[fi] before the GPU
+        // has read them — descriptors are read at Dispatch execution time, not
+        // at command record time. The retire call at the end keeps it alive
+        // until the GPU finishes the consuming commandList.
+        // Layout: 256 descriptors (11 stages × 16 slots each + headroom; slot
+        // 255 reserved as a clear-UAV scratch).
+        ComPtr<ID3D12DescriptorHeap> dispatchGpuHeap;
+        {
             D3D12_DESCRIPTOR_HEAP_DESC hd = {};
             hd.NumDescriptors = 256;
             hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
             hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-            device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&gpuSrvHeap_[fi]));
+            if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dispatchGpuHeap))))
+                return false;
         }
         // Use the last slot (255) as a temporary for the clear UAV
-        auto gpuClearCpu = gpuSrvHeap_[fi]->GetCPUDescriptorHandleForHeapStart();
+        auto gpuClearCpu = dispatchGpuHeap->GetCPUDescriptorHandleForHeapStart();
         gpuClearCpu.ptr += 255 * device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         device_->CreateUnorderedAccessView(outputTexture_.Get(), nullptr, &uavDesc, gpuClearCpu);
-        auto gpuClearGpu = gpuSrvHeap_[fi]->GetGPUDescriptorHandleForHeapStart();
+        auto gpuClearGpu = dispatchGpuHeap->GetGPUDescriptorHandleForHeapStart();
         gpuClearGpu.ptr += 255 * device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-        ID3D12DescriptorHeap* clearHeaps[] = { gpuSrvHeap_[fi].Get() };
+        ID3D12DescriptorHeap* clearHeaps[] = { dispatchGpuHeap.Get() };
         cmdList->SetDescriptorHeaps(1, clearHeaps);
         const float clearColor[4] = { 0, 0, 0, 0 };
         cmdList->ClearUnorderedAccessViewFloat(gpuClearGpu, cpuHandle,
                                                 outputTexture_.Get(), clearColor, 0, nullptr);
+
+        // Park the dispatch heap on the per-frame retire list immediately —
+        // ownership transfers via DrainRetiredHeaps later. Keep a raw pointer
+        // alias for the rest of this Dispatch's setup.
+        pendingRetiredHeaps_.push_back(std::move(dispatchGpuHeap));
     }
 
     // ── Global UAV barrier helper ──
@@ -4141,21 +4447,15 @@ bool D3D12VelloRenderer::DispatchGPU(ID3D12GraphicsCommandList* cmdList, uint32_
         cmdList->ResourceBarrier(1, &b);
     };
 
-    // ── Create per-frame descriptor heap ──
-    // Each stage needs 16 slots (SRV t0-t7 at +0, UAV u0-u7 at +8).
-    // 11 stages * 16 = 176 descriptors minimum.  Use 256 for headroom.
-    if (!gpuSrvHeap_[fi]) {
-        D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-        hd.NumDescriptors = 256;
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&gpuSrvHeap_[fi]));
-    }
+    // ── Use the dispatch-local heap allocated above for the per-stage
+    //    descriptors. The heap is owned by pendingRetiredHeaps_ now; we just
+    //    grab a borrowed raw pointer to it. ──
     if (!srvDescSize_) srvDescSize_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    auto cpuHeapStart = gpuSrvHeap_[fi]->GetCPUDescriptorHandleForHeapStart();
-    auto gpuHeapStart = gpuSrvHeap_[fi]->GetGPUDescriptorHandleForHeapStart();
-    ID3D12DescriptorHeap* heaps[] = { gpuSrvHeap_[fi].Get() };
+    ID3D12DescriptorHeap* dispatchGpuHeapRaw = pendingRetiredHeaps_.back().Get();
+    auto cpuHeapStart = dispatchGpuHeapRaw->GetCPUDescriptorHandleForHeapStart();
+    auto gpuHeapStart = dispatchGpuHeapRaw->GetGPUDescriptorHandleForHeapStart();
+    ID3D12DescriptorHeap* heaps[] = { dispatchGpuHeapRaw };
 
     // Per-stage descriptor base — each stage gets 16 consecutive slots.
     // stageBase advances by 16 after each bindPipeline call.
@@ -4456,16 +4756,54 @@ bool D3D12VelloRenderer::DispatchGPU(ID3D12GraphicsCommandList* cmdList, uint32_
     bindPipeline(velloFinePSO_.Get());
     cmdList->Dispatch(tilesX_, tilesY_, 1);
 
-    // ── Transition output back to COMMON ──
+    // ── Transition every Dispatch-modified buffer back to COMMON ──
+    //
+    // Buffer state would normally decay back to COMMON at the next
+    // ExecuteCommandLists boundary, which is why a single Dispatch per
+    // ExecuteCommandLists used to "just work" without resetting most of these.
+    // Mid-frame multi-Dispatch (z-order subframe flush) keeps both Dispatches
+    // in the SAME ExecuteCommandLists, so no decay happens between them; the
+    // next Dispatch's CopyBufferRegion would then see e.g. pathDrawBuffer_
+    // still in NON_PIXEL_SHADER_RESOURCE and fail the COPY_DEST precondition.
+    //
+    // List must mirror the COPY_DEST→state transitions emitted at lines
+    // 4310-4318 above plus any UAV-promoted resources (bumpBuffer_, output
+    // texture). Indirect buffers do their own UAV↔INDIRECT_ARGUMENT round-trip
+    // inside this function so they end up back in UAV — and since they're
+    // re-promoted to INDIRECT_ARGUMENT at the start of the next Dispatch, they
+    // don't need a COMMON reset here. Same reasoning for the binning / tile /
+    // segment / blend scratch buffers that are read/written purely via implicit
+    // COMMON-state promotion.
     {
-        D3D12_RESOURCE_BARRIER b[4];
+        D3D12_RESOURCE_BARRIER b[16];
         int bc = 0;
-        b[bc++] = MakeBarrier(outputTexture_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-        b[bc++] = MakeBarrier(segmentBuffer_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-        b[bc++] = MakeBarrier(pathInfoBuffer_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        b[bc++] = MakeBarrier(outputTexture_.Get(),     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,         D3D12_RESOURCE_STATE_COMMON);
+        b[bc++] = MakeBarrier(segmentBuffer_.Get(),     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        b[bc++] = MakeBarrier(pathInfoBuffer_.Get(),    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        b[bc++] = MakeBarrier(pathDrawBuffer_.Get(),    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        b[bc++] = MakeBarrier(drawTagBuffer_.Get(),     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        b[bc++] = MakeBarrier(drawMonoidBuffer_.Get(),  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        b[bc++] = MakeBarrier(bumpBuffer_.Get(),        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,         D3D12_RESOURCE_STATE_COMMON);
         if (totalClipOps > 0 && clipInpBuffer_)
             b[bc++] = MakeBarrier(clipInpBuffer_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        if (gradientCount_ > 0 && gradientRampBuffer_)
+            b[bc++] = MakeBarrier(gradientRampBuffer_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         cmdList->ResourceBarrier(bc, b);
+    }
+
+    // Retire this Dispatch's transient resources so subsequent mid-frame
+    // Dispatches don't race the in-flight GPU reads. The dispatch descriptor
+    // heap was already moved onto pendingRetiredHeaps_ earlier; here we
+    // additionally retire the per-frame upload buffers (CopyBufferRegion
+    // sources for path / segment / draw / lineCount data, lineSeg / ptcl /
+    // gradient / clip / drawTag / drawMonoid / bumpZero scratch uploads), and
+    // the singleton config CBV upload buffer (bound directly via
+    // SetComputeRootConstantBufferView, so its data is read by the GPU
+    // throughout the entire dispatch chain). EnsureUploadBuffersForFrame /
+    // EnsureGPUBuffers will recreate them on the next Dispatch.
+    RetireFrameUploadBuffers(fi);
+    if (configUpload_) {
+        pendingRetiredResources_.push_back(std::move(configUpload_));
     }
 
     return true;  // GPU pipeline completed

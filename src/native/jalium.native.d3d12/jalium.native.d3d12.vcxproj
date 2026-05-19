@@ -120,6 +120,7 @@
     <ClCompile Include="src\d3d12_impeller_engine.cpp" />
     <ClCompile Include="src\d3d12_init.cpp" />
     <ClCompile Include="src\d3d12_ink_layer.cpp" />
+    <ClCompile Include="src\d3d12_path_pipeline.cpp" />
     <ClCompile Include="src\d3d12_render_target.cpp" />
     <ClCompile Include="src\d3d12_text.cpp" />
     <ClCompile Include="src\d3d12_vello.cpp" />

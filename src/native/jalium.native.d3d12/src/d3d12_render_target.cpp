@@ -529,10 +529,37 @@ void D3D12RenderTarget::Clear(float r, float g, float b, float a) {
 void D3D12RenderTarget::FlushVelloIfNeeded() {
     // Skip entirely when Impeller is active — no Vello code should execute.
     if (IsImpellerActive()) return;
-    // Mid-frame Vello flush is disabled: Dispatch may reallocate GPU buffers
-    // (lineSegBuffer_, ptclBuffer_, etc.) which frees resources still referenced
-    // by the current command list, causing OBJECT_DELETED_WHILE_STILL_IN_USE.
-    // Vello paths are flushed once at EndDraw instead.
+    if (!directRenderer_ || !directRenderer_->HasVelloPaths()) return;
+
+    // Vello accumulates all path encodes (FillPath / StrokePath) across the
+    // whole frame and produces a single offscreen RT in Dispatch. Compositing
+    // that RT once at EndDraw means every Vello path lands ON TOP of every
+    // rect / bitmap / text drawn afterwards — opaque cards stop covering the
+    // SaaSBackground waves drawn before them, so the cards LOOK translucent
+    // even though their Background is solid white. The Impeller pipeline
+    // doesn't have this problem because each path encode is immediately
+    // turned into triangles and sorted with the rest of the batch list.
+    //
+    // To restore the painter's-algorithm semantics for Vello as well, drain
+    // the accumulated Vello scene WHENEVER a non-Vello draw is about to
+    // record. FlushVelloPaths does the Dispatch + AddBitmap (capturing the
+    // current drawOrder), then ForceNewOutputTexture + BeginFrame so any
+    // subsequent paths in this frame land in a fresh subscene that gets its
+    // OWN Dispatch + composite at the next flush boundary or at EndDraw.
+    //
+    // Mid-frame multi-Dispatch is now safe because:
+    //   - EnsureBuffers / EnsureGPUBuffers retire-on-grow (old default-heap
+    //     buffer ComPtrs land on pendingRetiredResources_ before reassign).
+    //   - Each Dispatch allocates a FRESH shader-visible descriptor heap
+    //     (the long-lived gpuSrvHeap_[fi] would race because GPU reads
+    //     descriptors at execution time, not at record time).
+    //   - Each Dispatch retires its per-frame upload buffers + configUpload
+    //     so the next CPU write doesn't race the prior Dispatch's queued
+    //     CopyBufferRegion / CBV reads.
+    //   - DrainRetired moves all those ComPtrs onto FrameResources's
+    //     retiredInstanceBuffers / retiredDescriptorHeaps, whose lifetime is
+    //     gated by this slot's fence.
+    directRenderer_->FlushVelloPaths();
 }
 
 void D3D12RenderTarget::FlushImpellerBatches() {
@@ -683,41 +710,18 @@ void D3D12RenderTarget::DrawPerCornerRoundedRectangle(float x, float y, float w,
 }
 
 // ============================================================================
-// Drawing — Ellipses (approximated with SuperEllipse SDF)
+// Drawing — Ellipses (true ellipse SDF with analytical AA)
+//
+// Both filled and stroked ellipses go through the SdfRect PSO with
+// shapeType=1 (SuperEllipse) and shapeN=2 (real ellipse equation
+// |x/a|² + |y/b|² = 1). The pixel shader applies smoothstep(fwidth(dist))
+// analytical anti-aliasing, so edges stay smooth at any rx/ry ratio without
+// MSAA. This beats Impeller's triangle-strip tessellation (which has no AA
+// at all on the per-vertex-color PSO and visibly polygonalises flat ellipses).
 // ============================================================================
 
 void D3D12RenderTarget::FillEllipse(float cx, float cy, float rx, float ry, Brush* brush) {
     if (!isDrawing_ || !brush || !directRenderer_) return;
-
-    // Impeller engine: CPU tessellated ellipse
-    if (IsImpellerActive() && EnsureImpellerEngine()) {
-        float r, g, b, a;
-        if (ExtractBrushColor(brush, r, g, b, a)) {
-            auto t = directRenderer_->GetCurrentTransform();
-            float dpiScale = directRenderer_->GetDpiScale();
-            float opacity = directRenderer_->GetOpacity();
-
-            EngineBrushData bd;
-            bd.type = 0;
-            bd.r = r; bd.g = g; bd.b = b; bd.a = a * opacity;
-
-            EngineTransform et;
-            et.m11 = t.m11 * dpiScale; et.m12 = t.m12 * dpiScale;
-            et.m21 = t.m21 * dpiScale; et.m22 = t.m22 * dpiScale;
-            et.dx = t.dx * dpiScale; et.dy = t.dy * dpiScale;
-
-            if (impellerEngine_->EncodeFillEllipse(cx, cy, rx, ry, bd, et)) {
-                // Immediately drain Impeller batches into DirectRenderer so their
-                // drawOrder reflects the actual call site, not the end of the frame.
-                // Otherwise every Impeller-rendered shape ends up on top of all
-                // subsequent UI (e.g. popup menus cannot occlude icon paths).
-                FlushImpellerBatches();
-                return;
-            }
-        }
-    }
-
-    // Default: SDF rect rendering (fast path, works for both Vello and fallback)
     FlushVelloIfNeeded();
 
     SdfRectInstance inst = {};
@@ -726,6 +730,8 @@ void D3D12RenderTarget::FillEllipse(float cx, float cy, float rx, float ry, Brus
         inst.sizeX = rx * 2; inst.sizeY = ry * 2;
         inst.cornerTL = rx; inst.cornerTR = rx; inst.cornerBR = rx; inst.cornerBL = rx;
         inst.opacity = directRenderer_->GetOpacity();
+        inst.shapeType = 1.0f; // SuperEllipse
+        inst.shapeN = 2.0f;    // real ellipse
         directRenderer_->AddSdfRect(inst);
     }
 }
@@ -757,6 +763,8 @@ void D3D12RenderTarget::FillEllipseBatch(const float* data, uint32_t count) {
         inst.cornerTL = rx; inst.cornerTR = rx; inst.cornerBR = rx; inst.cornerBL = rx;
         inst.fillR = r; inst.fillG = g; inst.fillB = b; inst.fillA = a;
         inst.opacity = directRenderer_->GetOpacity();
+        inst.shapeType = 1.0f;
+        inst.shapeN = 2.0f;
         directRenderer_->AddSdfRect(inst);
     }
 }
@@ -773,6 +781,8 @@ void D3D12RenderTarget::DrawEllipse(float cx, float cy, float rx, float ry, Brus
         inst.borderR = r; inst.borderG = g; inst.borderB = b; inst.borderA = a;
         inst.borderWidth = strokeWidth;
         inst.opacity = directRenderer_->GetOpacity();
+        inst.shapeType = 1.0f;
+        inst.shapeN = 2.0f;
         directRenderer_->AddSdfRect(inst);
     }
 }
@@ -791,21 +801,87 @@ void D3D12RenderTarget::DrawLine(float x1, float y1, float x2, float y2, Brush* 
     float len = std::sqrt(dx * dx + dy * dy);
     if (len < 0.001f) return;
 
-    // Build two triangles for the line
-    float nx = -dy / len * strokeWidth * 0.5f;
-    float ny =  dx / len * strokeWidth * 0.5f;
-    float opacity = directRenderer_->GetOpacity();
-    float pr = r * a * opacity, pg = g * a * opacity, pb = b * a * opacity, pa = a * opacity;
+    // Unit perpendicular to line direction.
+    float invLen = 1.0f / len;
+    float nx = -dy * invLen;
+    float ny =  dx * invLen;
 
-    TriangleVertex verts[6] = {
-        { x1 + nx, y1 + ny, pr, pg, pb, pa },
-        { x1 - nx, y1 - ny, pr, pg, pb, pa },
-        { x2 + nx, y2 + ny, pr, pg, pb, pa },
-        { x2 + nx, y2 + ny, pr, pg, pb, pa },
-        { x1 - nx, y1 - ny, pr, pg, pb, pa },
-        { x2 - nx, y2 - ny, pr, pg, pb, pa },
-    };
-    directRenderer_->AddTriangles(verts, 6);
+    float opacity = directRenderer_->GetOpacity();
+    float baseA = a * opacity;
+    float pr = r * baseA, pg = g * baseA, pb = b * baseA;
+
+    // Manual analytical AA: render the line as three side-by-side strips —
+    // a solid core flanked by a 1-pixel alpha-ramp on each side. This is the
+    // same trick Direct2D uses for thin strokes and keeps oblique lines from
+    // looking like staircases on the per-vertex-color triangle PSO (which
+    // has no MSAA and no in-shader AA).
+    //
+    //   Stroke ≥ 1px: core half-width = (stroke - 1) * 0.5, then 1px feather
+    //                  on each side ramping alpha 1 → 0.
+    //   Stroke < 1px: no core, the whole stroke becomes the feather and we
+    //                  fade alpha by the stroke's pixel coverage so very thin
+    //                  lines don't pop.
+    constexpr float kFeather = 1.0f;
+    float halfStroke = strokeWidth * 0.5f;
+
+    float coreHalf;     // distance from line center to inner edge of feather
+    float outerHalf;    // distance from line center to outer (zero-alpha) edge
+    float coverage;     // alpha scale for sub-pixel widths
+
+    if (strokeWidth >= kFeather) {
+        coreHalf  = halfStroke - kFeather * 0.5f;
+        outerHalf = halfStroke + kFeather * 0.5f;
+        coverage  = 1.0f;
+    } else {
+        coreHalf  = 0.0f;
+        outerHalf = kFeather * 0.5f;            // 0.5px on each side
+        coverage  = strokeWidth / kFeather;     // fade thin lines proportionally
+    }
+
+    float caPr = pr * coverage, caPg = pg * coverage, caPb = pb * coverage, caPa = baseA * coverage;
+
+    // Endpoints (positive/negative perpendicular for inner core, outer for feather).
+    float p1cx = x1 + nx * coreHalf,  p1cy = y1 + ny * coreHalf;
+    float p1cnx = x1 - nx * coreHalf, p1cny = y1 - ny * coreHalf;
+    float p2cx = x2 + nx * coreHalf,  p2cy = y2 + ny * coreHalf;
+    float p2cnx = x2 - nx * coreHalf, p2cny = y2 - ny * coreHalf;
+
+    float p1ox = x1 + nx * outerHalf,  p1oy = y1 + ny * outerHalf;
+    float p1onx = x1 - nx * outerHalf, p1ony = y1 - ny * outerHalf;
+    float p2ox = x2 + nx * outerHalf,  p2oy = y2 + ny * outerHalf;
+    float p2onx = x2 - nx * outerHalf, p2ony = y2 - ny * outerHalf;
+
+    TriangleVertex verts[18];
+    uint32_t vi = 0;
+
+    // Core strip (solid alpha). Skipped for sub-pixel lines (coreHalf == 0).
+    if (coreHalf > 0.0f) {
+        verts[vi++] = { p1cx,  p1cy,  caPr, caPg, caPb, caPa };
+        verts[vi++] = { p1cnx, p1cny, caPr, caPg, caPb, caPa };
+        verts[vi++] = { p2cx,  p2cy,  caPr, caPg, caPb, caPa };
+        verts[vi++] = { p2cx,  p2cy,  caPr, caPg, caPb, caPa };
+        verts[vi++] = { p1cnx, p1cny, caPr, caPg, caPb, caPa };
+        verts[vi++] = { p2cnx, p2cny, caPr, caPg, caPb, caPa };
+    }
+
+    // Outer feather (alpha-ramped on the outside edge).
+    // Positive-perpendicular side: solid edge → zero-alpha outer edge.
+    verts[vi++] = { p1cx, p1cy, caPr, caPg, caPb, caPa };
+    verts[vi++] = { p1ox, p1oy, 0.0f, 0.0f, 0.0f, 0.0f };
+    verts[vi++] = { p2cx, p2cy, caPr, caPg, caPb, caPa };
+    verts[vi++] = { p2cx, p2cy, caPr, caPg, caPb, caPa };
+    verts[vi++] = { p1ox, p1oy, 0.0f, 0.0f, 0.0f, 0.0f };
+    verts[vi++] = { p2ox, p2oy, 0.0f, 0.0f, 0.0f, 0.0f };
+
+    // Negative-perpendicular side.
+    verts[vi++] = { p1cnx, p1cny, caPr, caPg, caPb, caPa };
+    verts[vi++] = { p2cnx, p2cny, caPr, caPg, caPb, caPa };
+    verts[vi++] = { p1onx, p1ony, 0.0f, 0.0f, 0.0f, 0.0f };
+    verts[vi++] = { p1onx, p1ony, 0.0f, 0.0f, 0.0f, 0.0f };
+    verts[vi++] = { p2cnx, p2cny, caPr, caPg, caPb, caPa };
+    verts[vi++] = { p2onx, p2ony, 0.0f, 0.0f, 0.0f, 0.0f };
+
+    directRenderer_->AddTriangles(verts, vi);
 }
 
 // ============================================================================
@@ -1035,8 +1111,33 @@ void D3D12RenderTarget::DrawPolygon(const float* points, uint32_t pointCount, Br
         directRenderer_->AddTriangles(verts.data(), (uint32_t)verts.size());
 }
 
-void D3D12RenderTarget::FillPath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, int32_t fillRule) {
+void D3D12RenderTarget::FillPath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, int32_t fillRule, int32_t edgeMode) {
     if (!isDrawing_ || !brush || !directRenderer_) return;
+
+    // ── Stencil-then-cover fast path (solid color brushes only).
+    //
+    // Mirrors docs/reference/pure_d3d12_path_renderer.h:
+    //  • CPU once: flatten + fan triangulate, cached per (commands, scaleBucket)
+    //    so the SAME upload bytes cover every frame of a smooth scale animation.
+    //  • Per frame: two DrawInstanced calls (stencil pass + cover pass) per
+    //    path. No CPU rasterization, no ear-clipping, no pixel-rect emit. The
+    //    transform is applied in the vertex shader from a root constant.
+    //
+    // Gradient / image brushes don't fit the stencil model (gradient sampling
+    // happens at fragment time and needs barycentric vertex colors), so they
+    // fall through to the Impeller path below — which is unchanged.
+    {
+        float r, g, b, a;
+        if (ExtractBrushColor(brush, r, g, b, a)) {
+            auto geom = directRenderer_->GetOrBuildStencilPathGeometry(
+                startX, startY, commands, commandLength);
+            if (directRenderer_->AddStencilPath(geom, r, g, b, a, fillRule)) {
+                return;
+            }
+        }
+        // Brush wasn't a solid color, or the renderer wasn't ready: drop through
+        // to the engine routing below.
+    }
 
     // Route based on active rendering engine
     if (IsImpellerActive()) {
@@ -1058,7 +1159,7 @@ void D3D12RenderTarget::FillPath(float startX, float startY, const float* comman
                 et.dx = t.dx * dpiScale; et.dy = t.dy * dpiScale;
 
                 FillRule fr = (fillRule == 1) ? FillRule::NonZero : FillRule::EvenOdd;
-                if (impellerEngine_->EncodeFillPath(startX, startY, commands, commandLength, bd, fr, et)) {
+                if (impellerEngine_->EncodeFillPath(startX, startY, commands, commandLength, bd, fr, et, edgeMode)) {
                     FlushImpellerBatches();
                     return;
                 }
@@ -1125,7 +1226,7 @@ void D3D12RenderTarget::FillPath(float startX, float startY, const float* comman
 
 void D3D12RenderTarget::StrokePath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, float strokeWidth, bool closed,
     int32_t lineJoin, float miterLimit, int32_t lineCap,
-    const float* dashPattern, uint32_t dashCount, float dashOffset) {
+    const float* dashPattern, uint32_t dashCount, float dashOffset, int32_t edgeMode) {
     if (!isDrawing_ || !brush || !directRenderer_) return;
 
     // Route based on active rendering engine
@@ -1149,7 +1250,7 @@ void D3D12RenderTarget::StrokePath(float startX, float startY, const float* comm
 
                 if (impellerEngine_->EncodeStrokePath(startX, startY, commands, commandLength,
                         bd, strokeWidth, closed, lineJoin, miterLimit, lineCap,
-                        dashPattern, dashCount, dashOffset, et)) {
+                        dashPattern, dashCount, dashOffset, et, edgeMode)) {
                     FlushImpellerBatches();
                     return;
                 }
@@ -1254,8 +1355,16 @@ void D3D12RenderTarget::DrawBitmap(Bitmap* bitmap, float x, float y, float w, fl
     // Query the actual texture format — WIC bitmaps are typically B8G8R8A8, not R8G8B8A8.
     // Using the wrong format family for the SRV causes D3D12 validation failure → device lost.
     auto texDesc = tex->GetDesc();
+    // Pass the upload buffer so AddBitmap keeps a ref alive in bitmapTextures_
+    // until the next BeginFrame fence-wait drains it. Without this the upload
+    // buffer's only owner is the D3D12Bitmap; if the bitmap is Disposed
+    // mid-frame (worker-thread LRU eviction, finalizer), the upload buffer
+    // ref hits zero while the just-recorded CopyTextureRegion is still
+    // pending GPU execution — D3D12 ERROR #921.
+    auto uploadBuffer = d3d12Bmp->GetCurrentUploadBuffer();
     directRenderer_->AddBitmap(x, y, w, h, opacity * directRenderer_->GetOpacity(),
-                                tex, texDesc.Format, 1.0f, 1.0f, scalingMode);
+                                tex, texDesc.Format, 1.0f, 1.0f, scalingMode,
+                                uploadBuffer.Get());
 }
 
 void D3D12RenderTarget::BlitInkLayer(D3D12InkLayerBitmap* inkBitmap,

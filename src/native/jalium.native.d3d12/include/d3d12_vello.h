@@ -5,7 +5,10 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
+#include <list>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 
 namespace jalium {
 
@@ -806,6 +809,26 @@ public:
     bool HasWork() const { return !pathInfos_.empty(); }
     uint32_t GetPathCount() const { return (uint32_t)pathInfos_.size(); }
 
+    /// Move ComPtrs to GPU resources retired during recent Dispatch / EnsureBuffers
+    /// rebuilds into the caller-owned out vector. The caller must keep them alive
+    /// until the GPU has finished executing the commandList that consumed them
+    /// (typically by stashing on a per-frame retired list whose lifetime is gated
+    /// by that frame's fence). Resource categories drained:
+    ///   - Per-Dispatch upload heap buffers (segment / pathInfo / pathDraw /
+    ///     constant / lineSeg / ptcl / ptclOffsets / gradientRamp / drawTag /
+    ///     drawMonoid / bumpZero / clipInp), which the CPU re-writes on each
+    ///     subsequent Dispatch and therefore cannot be safely reused while a
+    ///     prior Dispatch's CopyBufferRegion / CBV reads are still queued.
+    ///   - Per-Dispatch shader-visible descriptor heaps, whose entries get
+    ///     overwritten by the next Dispatch and would otherwise race the GPU's
+    ///     descriptor reads from the prior Dispatch.
+    ///   - Default-heap GPU buffers (segmentBuffer_ / lineSegBuffer_ / ...) when
+    ///     EnsureBuffers grew them mid-frame; the old buffer is parked here so
+    ///     queued commands referencing it stay valid.
+    /// After draining, the internal pending list is empty.
+    void DrainRetired(std::vector<ComPtr<ID3D12Resource>>& outRetired);
+    void DrainRetiredHeaps(std::vector<ComPtr<ID3D12DescriptorHeap>>& outRetired);
+
 private:
     // --- Path encoding helpers ---
     void FlattenBezierToSegments(float p0x, float p0y, float p1x, float p1y,
@@ -875,6 +898,50 @@ private:
     // CPU-side flattened line segments (bypass GPU flatten)
     std::vector<LineSeg> cpuLineSegs_;
     uint32_t totalPathTiles_ = 0;  // total per-path tiles allocated this frame
+
+    // ─── Stroke geometry cache ────────────────────────────────────────────
+    //
+    // Why: EncodeStrokePath runs the full CPU widening pipeline every frame
+    // (FlattenPathCommands → simplify → per-segment quads → joins → caps).
+    // For a static path this is the dominant CPU cost on D3D12 — IL_STUB_PInvoke
+    // shows ~80% self CPU because profilers attribute the entire native call
+    // back to the P/Invoke stub. Vulkan resolved the FillPath analogue with
+    // PathGeometryCache (project_vulkan_path_cache.md). This is the stroke
+    // counterpart for D3D12.
+    //
+    // What we cache: the local-space (pre-transform) line segments produced
+    // by stroke widening, plus the local-space bbox. On hit we skip the
+    // entire emission pipeline and only apply the per-frame transform.
+    //
+    // Cache key: 64-bit FNV-1a hash over (startX, startY, commandLength,
+    // commands raw bytes, strokeWidth, closed, lineJoin, miterLimit,
+    // lineCap, dashPattern bytes, dashCount, dashOffset). Transform / brush
+    // are *not* part of the key — they're applied per-call.
+    struct CachedStrokeGeometry {
+        // Each line is 4 floats: p0x p0y p1x p1y. tag is always kSegTagLineTo
+        // for stroke segments and p2 == p3 == p1, so we don't store them.
+        std::vector<float> localLines;
+        float bboxMinX, bboxMinY, bboxMaxX, bboxMaxY;
+    };
+
+    struct StrokeCacheNode {
+        uint64_t key;
+        std::shared_ptr<const CachedStrokeGeometry> entry;
+    };
+
+    std::list<StrokeCacheNode> strokeCacheList_;
+    std::unordered_map<uint64_t, std::list<StrokeCacheNode>::iterator> strokeCacheMap_;
+    static constexpr size_t kStrokeCacheCapacity = 256;
+
+    static uint64_t HashStrokeInputs(
+        float startX, float startY,
+        const float* commands, uint32_t commandLength,
+        float strokeWidth, bool closed,
+        int32_t lineJoin, float miterLimit, int32_t lineCap,
+        const float* dashPattern, uint32_t dashCount, float dashOffset) noexcept;
+
+    std::shared_ptr<const CachedStrokeGeometry> StrokeCacheFind(uint64_t key);
+    void StrokeCacheInsert(uint64_t key, std::shared_ptr<const CachedStrokeGeometry> entry);
 
     // CPU-side per-path tile data (backdrop + segment count)
     std::vector<VelloTile> cpuPathTiles_;
@@ -1007,6 +1074,25 @@ private:
         uint32_t clipInpUploadCapacity = 0;
     };
     FrameUploadBuffers frameUploads_[kMaxFrames];
+
+    // Resources retired during the current frame's Dispatches that must stay
+    // alive until the GPU has executed the consuming commandList. Drained by
+    // DrainRetired into the caller-owned per-frame retired list (whose lifetime
+    // is gated by the frame's fence). See DrainRetired() doc above.
+    std::vector<ComPtr<ID3D12Resource>>      pendingRetiredResources_;
+    std::vector<ComPtr<ID3D12DescriptorHeap>> pendingRetiredHeaps_;
+
+    /// Move all upload buffers used by a Dispatch off `fu` into the retired
+    /// list, leaving `fu`'s upload ComPtrs null so the next Dispatch's
+    /// EnsureUploadBuffersForFrame allocates fresh storage. Must be called
+    /// AFTER all CopyBufferRegion / SetComputeRootConstantBufferView commands
+    /// referencing the old upload buffers are queued on the commandList.
+    void RetireFrameUploadBuffers(uint32_t fi);
+    /// Ensure the per-frame upload buffers needed for one CPU-pipeline Dispatch
+    /// exist on `frameUploads_[fi]`. Recreates any that were retired by the
+    /// previous Dispatch. Sized off the current default-heap capacities, which
+    /// EnsureBuffers must be called first to set.
+    bool EnsureUploadBuffersForFrame(uint32_t fi);
     ComPtr<ID3D12Resource> tileZeroUpload_;       // for zeroing the tile buffer
     uint32_t tileZeroUploadSize_ = 0;
     uint32_t ptclCapacity_ = 0;

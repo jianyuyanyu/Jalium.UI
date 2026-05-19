@@ -233,8 +233,12 @@ public:
     void DrawLine(float x1, float y1, float x2, float y2, Brush* brush, float strokeWidth) override;
     void FillPolygon(const float* points, uint32_t pointCount, Brush* brush, int32_t fillRule) override;
     void DrawPolygon(const float* points, uint32_t pointCount, Brush* brush, float strokeWidth, bool closed, int32_t lineJoin = 0, float miterLimit = 10.0f) override;
-    void FillPath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, int32_t fillRule) override;
-    void StrokePath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, float strokeWidth, bool closed, int32_t lineJoin = 0, float miterLimit = 10.0f, int32_t lineCap = 0, const float* dashPattern = nullptr, uint32_t dashCount = 0, float dashOffset = 0.0f) override;
+    void FillPath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, int32_t fillRule, int32_t edgeMode = -1) override;
+    void StrokePath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, float strokeWidth, bool closed, int32_t lineJoin = 0, float miterLimit = 10.0f, int32_t lineCap = 0, const float* dashPattern = nullptr, uint32_t dashCount = 0, float dashOffset = 0.0f, int32_t edgeMode = -1) override;
+    // Legacy binary-coverage scanline fill kept for EdgeMode.Aliased.
+    void FillPathAliased(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, int32_t fillRule);
+    // Legacy outline-polygon stroke kept for EdgeMode.Aliased.
+    void StrokePathAliased(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, float strokeWidth, bool closed, int32_t lineJoin, float miterLimit, int32_t lineCap, const float* dashPattern, uint32_t dashCount, float dashOffset);
     void DrawContentBorder(float x, float y, float w, float h,
         float blRadius, float brRadius,
         Brush* fillBrush, Brush* strokeBrush, float strokeWidth) override;

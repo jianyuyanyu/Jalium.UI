@@ -4,6 +4,8 @@
 #include "jalium_impeller_shapes.h"   // Trig / TrigCache / shape generators
 #include "jalium_impeller_stroke.h"   // ImpellerCap / ImpellerJoin / ExpandStrokePath
 #include "jalium_gradient_sample.h"   // SampleBrushGradient / FlattenGradientStops
+#include "jalium_scanline_rasterizer.h"  // PixelRect — needed by stroke rasterized cache
+#include "jalium_path_cache.h"        // PathGeometryCache (cross-backend source-space cache)
 #include "d3d12_backend.h"
 #include "d3d12_triangulate.h"
 #include <vector>
@@ -11,6 +13,9 @@
 #include <cmath>
 #include <array>
 #include <limits>
+#include <list>
+#include <memory>
+#include <unordered_map>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -85,7 +90,8 @@ public:
         const float* commands, uint32_t commandLength,
         const EngineBrushData& brush,
         FillRule fillRule,
-        const EngineTransform& transform) override;
+        const EngineTransform& transform,
+        int32_t edgeMode = -1) override;
 
     bool EncodeStrokePath(
         float startX, float startY,
@@ -95,7 +101,8 @@ public:
         int32_t lineJoin, float miterLimit,
         int32_t lineCap,
         const float* dashPattern, uint32_t dashCount, float dashOffset,
-        const EngineTransform& transform) override;
+        const EngineTransform& transform,
+        int32_t edgeMode = -1) override;
 
 
     bool EncodeFillPolygon(
@@ -130,6 +137,87 @@ public:
             batch.scissorB = scissorBottom_;
         }
         ComputeBatchCoverage(batch);
+        batches_.push_back(std::move(batch));
+    }
+
+    /// Fast-path PushBatch for callers that already know the batch's coverage
+    /// AABB — typically the cache-hit branch in EncodeStrokePath / EncodeFillPath
+    /// where we have the cached origin-relative bbox plus the per-call (intDx,
+    /// intDy) offset. Skips the full vertex walk and additionally coalesces
+    /// the batch into the previous batch when both share the same pipeline +
+    /// scissor state, turning N consecutive solid-fill draws into a single GPU
+    /// DrawIndexedInstanced. SaaSBackground.DrawWaveLines (28 strokes back-to-
+    /// back, no scissor changes between them) used to issue 28 GPU draw calls;
+    /// they now collapse to one.
+    void PushBatchWithCoverage(ImpellerDrawBatch&& batch,
+                               float coverL, float coverT,
+                               float coverR, float coverB) {
+        batch.hasScissor = hasScissor_;
+        if (hasScissor_) {
+            batch.scissorL = scissorLeft_;
+            batch.scissorT = scissorTop_;
+            batch.scissorR = scissorRight_;
+            batch.scissorB = scissorBottom_;
+        }
+        bool batchHasCoverage = (coverR > coverL && coverB > coverT);
+        if (batchHasCoverage) {
+            batch.hasCoverage = true;
+            batch.coverageL = coverL;
+            batch.coverageT = coverT;
+            batch.coverageR = coverR;
+            batch.coverageB = coverB;
+        } else {
+            batch.hasCoverage = false;
+        }
+
+        // Try to coalesce into the previous batch when both share the same
+        // pipeline + scissor state. We only coalesce solid-fill (pipelineType
+        // 0) batches — stencil-then-cover (1) needs its own pass, and any
+        // batch carrying user-supplied stencil contours can't be merged.
+        if (batch.pipelineType == 0 && batch.stencilContours.empty()
+            && !batches_.empty())
+        {
+            auto& last = batches_.back();
+            bool scissorEq = (last.hasScissor == batch.hasScissor) &&
+                (!batch.hasScissor ||
+                 (last.scissorL == batch.scissorL &&
+                  last.scissorT == batch.scissorT &&
+                  last.scissorR == batch.scissorR &&
+                  last.scissorB == batch.scissorB));
+            if (last.pipelineType == 0 && last.stencilContours.empty() && scissorEq)
+            {
+                uint32_t baseVertex = (uint32_t)last.vertices.size();
+                size_t oldIndexCount = last.indices.size();
+
+                last.vertices.insert(last.vertices.end(),
+                    batch.vertices.begin(), batch.vertices.end());
+
+                last.indices.resize(oldIndexCount + batch.indices.size());
+                uint32_t* dst = last.indices.data() + oldIndexCount;
+                const uint32_t* src = batch.indices.data();
+                size_t n = batch.indices.size();
+                for (size_t i = 0; i < n; i++) {
+                    dst[i] = src[i] + baseVertex;
+                }
+
+                if (batchHasCoverage) {
+                    if (last.hasCoverage) {
+                        if (coverL < last.coverageL) last.coverageL = coverL;
+                        if (coverT < last.coverageT) last.coverageT = coverT;
+                        if (coverR > last.coverageR) last.coverageR = coverR;
+                        if (coverB > last.coverageB) last.coverageB = coverB;
+                    } else {
+                        last.coverageL = coverL;
+                        last.coverageT = coverT;
+                        last.coverageR = coverR;
+                        last.coverageB = coverB;
+                        last.hasCoverage = true;
+                    }
+                }
+                return;
+            }
+        }
+
         batches_.push_back(std::move(batch));
     }
 
@@ -263,6 +351,16 @@ private:
 
     float flattenTolerance_ = 0.25f;
 
+    // Source-space PathGeometryCache. Hoisted from jalium.native.vulkan to
+    // jalium.native.core; D3D12 holds it but does NOT use it yet — the
+    // pixel-space flatten that EncodeFillPath does today bakes transform
+    // into the cached vertices, so naively caching by source-only key would
+    // re-introduce the under-subdivision bug that pixel-space flatten was
+    // supposed to fix (see d3d12_impeller_engine.cpp:1737-1755). Wired up in
+    // the tolerance-scale-aware commit once scaleBucket lands in the cache
+    // key — only then is source-space caching safe across scales.
+    std::unique_ptr<PathGeometryCache> pathGeometryCache_;
+
     // Precomputed trig cache (shared across frames)
     TrigCache trigCache_;
 
@@ -302,6 +400,125 @@ private:
 
     bool EnsureStencilVertexBuffer(size_t requiredBytes);
     bool EnsureStencilIndexBuffer(size_t requiredBytes);
+
+    // ─── Stroke rasterization cache ───────────────────────────────────────
+    //
+    // Why: ImpellerD3D12Engine::EncodeStrokePath runs the full CPU stroke
+    // pipeline every frame for every path: pre-transform to pixel space →
+    // FlattenPathToContours → optional dash expansion → ExpandStroke (mesh)
+    // → RasterizePathToRects (analytic-AA scanline). Profiler attributes
+    // the entire native cost back to IL_STUB_PInvoke (~80% self CPU); the
+    // real work is the rasterizer (O(W × H × edges) on the bbox).
+    //
+    // What we cache: the final PixelRect list emitted by RasterizePathToRects.
+    // This is the most-derived form available before the per-frame batch
+    // build, so cache hits skip every CPU stage. PixelRect is plain data
+    // (4 ints + alpha), so cache entries are dense and trivially copyable.
+    //
+    // Cache key: 64-bit FNV-1a hash over (commands raw bytes, startX/Y,
+    // strokeWidth, closed, lineJoin, miterLimit, lineCap, dashPattern bytes,
+    // dashCount, dashOffset, transform 6-float matrix). Transform is part
+    // of the key because the entire pipeline runs in pixel space — a
+    // different transform produces different rects. Static UI keeps the
+    // same transform every frame, so hit rate is high in normal use;
+    // scrolling/animating geometry naturally falls back to the slow path.
+    // Cached stroke geometry: binary triangle mesh from ExpandStrokePath
+    // (origin-relative pixel positions). Used when EdgeMode == Aliased (sharp,
+    // no AA). ~200 verts per long bezier wave; the GPU rasterizer fills the
+    // triangles directly. Coverage is implicit (binary 1× sampling).
+    // For Antialiased (the default), strokes route through the analytic
+    // cache below — PixelRect list with per-rect alpha, ~6000 rects per long
+    // bezier wave but smooth edges and identical algorithm to fill.
+    struct CachedStrokeRects {
+        std::vector<float> positions;   // 2 floats per vertex, origin-relative
+        std::vector<uint8_t> coverage;  // 0..255 per-vertex AA coverage mask
+                                        //   (outer feather = 0, inner solid = 255)
+                                        //   emit multiplies the premultiplied brush
+                                        //   color by coverage/255 to reproduce the
+                                        //   vertex-feather AA at draw time.
+        std::vector<uint32_t> indices;
+        float bboxL = 0, bboxT = 0, bboxR = 0, bboxB = 0;
+    };
+
+    struct StrokeRectsNode {
+        uint64_t key;
+        std::shared_ptr<const CachedStrokeRects> entry;
+    };
+
+    std::list<StrokeRectsNode> strokeCacheList_;
+    std::unordered_map<uint64_t, std::list<StrokeRectsNode>::iterator> strokeCacheMap_;
+    static constexpr size_t kStrokeCacheCapacity = 512;
+
+    // Analytic-coverage stroke cache: same shape as fill cache (PixelRect list),
+    // populated by RasterizePathToRects on the expanded stroke contours. Used
+    // when EdgeMode == Antialiased (default) so stroke edges get the same per-
+    // rect alpha coverage that fill already gets — matches Vulkan stroke
+    // exactly. HashStrokeInputs is shared with the binary cache; the cache key
+    // partitions Antialiased vs Aliased entries via the trailing edgeMode byte.
+    struct CachedStrokeAnalyticRects {
+        std::vector<jalium::PixelRect> rects;
+    };
+
+    struct StrokeAnalyticRectsNode {
+        uint64_t key;
+        std::shared_ptr<const CachedStrokeAnalyticRects> entry;
+    };
+
+    std::list<StrokeAnalyticRectsNode> strokeAnalyticCacheList_;
+    std::unordered_map<uint64_t, std::list<StrokeAnalyticRectsNode>::iterator> strokeAnalyticCacheMap_;
+    static constexpr size_t kStrokeAnalyticCacheCapacity = 512;
+
+    static uint64_t HashStrokeInputs(
+        float startX, float startY,
+        const float* commands, uint32_t commandLength,
+        float strokeWidth, bool closed,
+        int32_t lineJoin, float miterLimit, int32_t lineCap,
+        const float* dashPattern, uint32_t dashCount, float dashOffset,
+        const EngineTransform& transform,
+        int32_t edgeMode) noexcept;
+
+    std::shared_ptr<const CachedStrokeRects> StrokeCacheFind(uint64_t key);
+    void StrokeCacheInsert(uint64_t key, std::shared_ptr<const CachedStrokeRects> entry);
+
+    std::shared_ptr<const CachedStrokeAnalyticRects> StrokeAnalyticCacheFind(uint64_t key);
+    void StrokeAnalyticCacheInsert(uint64_t key, std::shared_ptr<const CachedStrokeAnalyticRects> entry);
+
+    // ─── Solid fill rasterization cache ───────────────────────────────────
+    //
+    // Mirrors StrokeCache for EncodeFillPath's solid-fill branch. Same
+    // rationale: the RasterizePathToRects scanline pass dominates CPU
+    // time and is purely a function of (commands, fillRule, transform).
+    // A separate LRU keeps fill and stroke entries from evicting each
+    // other under typical UI workloads where both populations are
+    // sizeable. Gradient fills take the legacy source-space code path
+    // and don't participate in this cache.
+    // Fill cache stays on the PixelRect / scanline-rasterizer path because
+    // RasterizePathToRects's analytic per-row coverage gives correct AA fills
+    // for arbitrary concave / self-intersecting polygons (the kinds glyph and
+    // SVG icon fills produce). Strokes were the only caller that hit the
+    // 1500-rect-per-thin-curve pathology; fills typically produce dozens of
+    // rects so the trade-off is fine.
+    struct CachedFillRects {
+        std::vector<jalium::PixelRect> rects;
+    };
+
+    struct FillRectsNode {
+        uint64_t key;
+        std::shared_ptr<const CachedFillRects> entry;
+    };
+
+    std::list<FillRectsNode> fillCacheList_;
+    std::unordered_map<uint64_t, std::list<FillRectsNode>::iterator> fillCacheMap_;
+    static constexpr size_t kFillCacheCapacity = 512;
+
+    static uint64_t HashFillInputs(
+        float startX, float startY,
+        const float* commands, uint32_t commandLength,
+        int32_t fillRule,
+        const EngineTransform& transform) noexcept;
+
+    std::shared_ptr<const CachedFillRects> FillCacheFind(uint64_t key);
+    void FillCacheInsert(uint64_t key, std::shared_ptr<const CachedFillRects> entry);
 };
 
 } // namespace jalium

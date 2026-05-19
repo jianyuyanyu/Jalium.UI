@@ -7,6 +7,8 @@
 #include <dwrite_3.h>
 #include <wincodec.h>
 #include <wrl/client.h>
+#include <mutex>
+#include <vector>
 
 namespace jalium {
 
@@ -66,6 +68,28 @@ public:
 
     IWICImagingFactory* GetWICFactory() const { return wicFactory_.Get(); }
 
+    // ──────────────────────────────────────────────────────────────────
+    // Fence-gated GPU-resource graveyard
+    // ──────────────────────────────────────────────────────────────────
+    //
+    // Any code path that drops the last reference to a D3D12 resource which
+    // *might* still be referenced by an open or in-flight command list
+    // (bitmap textures + upload buffers being the primary case — a
+    // BitmapImage can be GC'd or LRU-evicted from any thread at any time)
+    // must hand the ComPtr to RetireGpuResource instead of letting it
+    // destruct directly.  The backend keeps the resource alive at refcount
+    // ≥ 1, tags it with the highest fence value seen so far, and frees it
+    // from ReclaimRetiredGpuResources once the renderer reports that fence
+    // is GPU-complete.
+    //
+    // Threading: RetireGpuResource is safe from any thread (worker pool,
+    // finalizer, UI). ReclaimRetiredGpuResources / NoteSubmittedFenceValue
+    // are expected to be called from the renderer's UI thread at frame
+    // boundaries; both take the same mutex.
+    void RetireGpuResource(ComPtr<ID3D12Resource>&& resource);
+    void NoteSubmittedFenceValue(uint64_t fenceValue);
+    void ReclaimRetiredGpuResources(uint64_t completedFenceValue);
+
 private:
     bool CreateD3D12Device(void* preferredWindow = nullptr);
     bool CreateDWriteFactory();
@@ -85,6 +109,20 @@ private:
 
     JaliumGpuPreference gpuPrefFromEnv_ = JALIUM_GPU_PREFERENCE_AUTO;
     bool initialized_ = false;
+
+    // Graveyard storage. resource_ holds the live ref, fenceValue is the
+    // largest renderer fence value submitted at retirement time — when
+    // GetCompletedValue() ≥ fenceValue the resource is GPU-idle.
+    struct RetiredResource {
+        ComPtr<ID3D12Resource> resource;
+        uint64_t fenceValue;
+    };
+    std::mutex graveyardMutex_;
+    std::vector<RetiredResource> graveyard_;
+    // Highest fence value the renderer has submitted (passed to Signal).
+    // Used as the "this resource must outlive at least up to" tag for any
+    // resource retired before the next Signal lands.
+    uint64_t lastSubmittedFenceValue_ = 0;
 };
 
 /// Factory function to create D3D12 backend.

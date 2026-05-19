@@ -634,10 +634,11 @@ void MetalRenderTarget::DrawPolygon(const float* points, uint32_t pointCount, Br
 #endif
 }
 
-void MetalRenderTarget::FillPath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, int32_t fillRule)
+void MetalRenderTarget::FillPath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, int32_t fillRule, int32_t edgeMode)
 {
 #ifdef __APPLE__
     if (!cgContext_ || !brush) return;
+    (void)edgeMode;  // Metal backend AA: CoreGraphics enables AA on graphics state below.
     CGContextSaveGState(cgContext_);
 
     CGPathRef path = BuildCommandPath(startX, startY, commands, commandLength, true);
@@ -666,10 +667,11 @@ void MetalRenderTarget::FillPath(float startX, float startY, const float* comman
 #endif
 }
 
-void MetalRenderTarget::StrokePath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, float strokeWidth, bool closed, int32_t lineJoin, float miterLimit, int32_t lineCap, const float* dashPattern, uint32_t dashCount, float dashOffset)
+void MetalRenderTarget::StrokePath(float startX, float startY, const float* commands, uint32_t commandLength, Brush* brush, float strokeWidth, bool closed, int32_t lineJoin, float miterLimit, int32_t lineCap, const float* dashPattern, uint32_t dashCount, float dashOffset, int32_t edgeMode)
 {
 #ifdef __APPLE__
     if (!cgContext_ || !brush) return;
+    (void)edgeMode;  // Metal backend AA: CoreGraphics enables AA on graphics state below.
     ApplyBrush(cgContext_, brush, true);
     CGContextSetLineWidth(cgContext_, strokeWidth);
 

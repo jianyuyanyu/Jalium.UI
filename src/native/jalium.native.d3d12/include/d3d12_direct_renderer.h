@@ -2,6 +2,7 @@
 
 #include "d3d12_backend.h"
 #include "d3d12_glyph_atlas.h"
+#include "jalium_stencil_path.h"
 #include <vector>
 #include <stack>
 #include <memory>
@@ -128,6 +129,7 @@ enum class DrawBatchType : uint8_t {
     PunchRect,      // copy-blend (writes RGBA directly, no alpha blending)
     SnapshotBlit,   // draw captured snapshot region as textured quad
     Triangle,       // flat-shaded triangles for path/polygon fill
+    StencilPath,    // stencil-then-cover SVG path fill (see d3d12_path_pipeline)
     LiquidGlass,    // full liquid glass effect (SDF refraction, highlight, shadow)
 };
 
@@ -206,7 +208,8 @@ public:
     void AddBitmap(float x, float y, float w, float h, float opacity,
                    ID3D12Resource* textureResource, DXGI_FORMAT format,
                    float uvMaxX = 1.0f, float uvMaxY = 1.0f,
-                   int scalingMode = 0 /* JALIUM_BITMAP_SCALING_UNSPECIFIED */);
+                   int scalingMode = 0 /* JALIUM_BITMAP_SCALING_UNSPECIFIED */,
+                   ID3D12Resource* uploadBuffer = nullptr);
 
     // --- Triangle path fill (flat-shaded triangulated polygon) ---
     void AddTriangles(const TriangleVertex* vertices, uint32_t vertexCount);
@@ -215,6 +218,27 @@ public:
     /// Used by Impeller engine which produces vertices already in pixel-space with
     /// opacity baked into vertex colors.
     void AddTrianglesPreTransformed(const TriangleVertex* vertices, uint32_t vertexCount);
+
+    /// Stencil-then-cover path fill (solid color brush). Uses the current
+    /// transform stack + dpiScale to project local-space verts into pixels
+    /// inside the vertex shader. Works for any contour topology (concave,
+    /// self-intersecting, multi-figure). Falls back gracefully when the
+    /// stencil pipeline isn't ready: the caller (D3D12RenderTarget::FillPath)
+    /// then routes to the Impeller engine.
+    /// fillRule: 0 = EvenOdd, 1 = NonZero.
+    /// Returns false when the stencil renderer is unavailable.
+    bool AddStencilPath(std::shared_ptr<const StencilPathGeometry> geom,
+                        float r, float g, float b, float a,
+                        int32_t fillRule);
+
+    /// Look up or build a cached StencilPathGeometry for the given source
+    /// path commands. Caller passes the same buffer it would feed to
+    /// FillPath; the cache key includes the current transform's scale
+    /// bucket so vertex density tracks on-screen size. Always returns a
+    /// non-null geometry (possibly empty when the path is degenerate).
+    std::shared_ptr<const StencilPathGeometry>
+    GetOrBuildStencilPathGeometry(float startX, float startY,
+                                  const float* commands, uint32_t commandLength);
 
     // --- Punch transparent rect (copy blend, writes 0,0,0,0 directly) ---
     void PunchTransparentRect(float x, float y, float w, float h);
@@ -341,6 +365,13 @@ public:
     ID3D12Device* GetDevice() const { return device_; }
     ID3D12GraphicsCommandList* GetCommandList() const { return commandList_.Get(); }
     D3D12_CPU_DESCRIPTOR_HANDLE GetRtvHandle() const {
+        // Phase 2 MSAA was rolled back — render directly into the swap-chain
+        // back buffer. MSAA infrastructure remains behind GetMsaaRtvHandle /
+        // EnsureMsaaColorBuffer for future re-enablement when bitmap path
+        // can be taught to bypass the 4× target.
+        return GetSwapChainRtvHandle();
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE GetSwapChainRtvHandle() const {
         auto h = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
         h.ptr += currentFrame_ * rtvDescriptorSize_;
         return h;
@@ -399,6 +430,8 @@ private:
     bool CreateRootSignature();
     bool CreateFrameResources();
     bool CreateBlurResources();
+    bool CreateStencilPathResources();
+    bool EnsureStencilDepthBuffer(UINT width, UINT height);
     void WaitForGpuIdle();
     bool EnsureSnapshotTexture();
     bool EnsureBlurTemps(UINT requiredWidth, UINT requiredHeight);
@@ -428,7 +461,15 @@ private:
         // descriptor-table references to the old buffer's resource.  We park the old ComPtr
         // here to keep its refcount > 0 until the GPU finishes this frame; BeginFrame clears
         // the list after the per-frame fence wait succeeds.
+        // Also receives the per-Dispatch upload / config / scratch resources Vello
+        // retires from its DrainRetired API (mid-frame multi-Dispatch z-order
+        // path), since the same fence-gated lifetime applies.
         std::vector<ComPtr<ID3D12Resource>> retiredInstanceBuffers;
+        // Per-Dispatch shader-visible descriptor heaps that Vello allocates fresh
+        // each Dispatch (so mid-frame multi-Dispatch doesn't overwrite each other's
+        // descriptors before the GPU reads them). Lifetime gated by the same
+        // fence as retiredInstanceBuffers.
+        std::vector<ComPtr<ID3D12DescriptorHeap>> retiredDescriptorHeaps;
     };
 
     // Grow the persistently-mapped UPLOAD heap that backs both per-frame instance
@@ -449,10 +490,32 @@ private:
     HANDLE fenceEvent_ = nullptr;
     uint64_t nextFenceValue_ = 1;
 
-    // RTV descriptor heap (for swap chain back buffers)
+    // RTV descriptor heap (for swap chain back buffers + offscreen RTs)
     ComPtr<ID3D12DescriptorHeap> rtvHeap_;
     UINT rtvDescriptorSize_ = 0;
     ComPtr<ID3D12Resource> renderTargets_[kMaxFrames];
+
+    // ── 4× MSAA color buffer (Phase 2 of stroke-quality fix) ────────────
+    // We render into a 4-sample MSAA texture rather than the swap-chain
+    // back buffer directly; the back buffer gets the result via
+    // ResolveSubresource at the end of the frame. This re-introduces
+    // edge AA for the stroke triangle pipeline (which was switched from
+    // CPU scanline rasterization to direct GPU triangulation in Phase 1)
+    // without paying the per-pixel rect cost the analytic-AA path was
+    // imposing. RTV slot for the MSAA target follows the per-frame back-
+    // buffer RTV slots; we re-create on resize alongside renderTargets_.
+    ComPtr<ID3D12Resource> msaaColorBuffer_;
+    uint32_t msaaWidth_ = 0;
+    uint32_t msaaHeight_ = 0;
+    static constexpr UINT kMsaaSampleCount = 4;
+    bool EnsureMsaaColorBuffer(uint32_t width, uint32_t height);
+    D3D12_CPU_DESCRIPTOR_HANDLE GetMsaaRtvHandle() const {
+        auto h = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        // RTV heap layout: [0..frameCount_-1] back buffers, [frameCount_..frameCount_+1]
+        // offscreen RT slots, [frameCount_+2] MSAA.
+        h.ptr += (frameCount_ + 2) * rtvDescriptorSize_;
+        return h;
+    }
 
     // SRV descriptor heap (for StructuredBuffer<Instance>)
     ComPtr<ID3D12DescriptorHeap> srvHeap_;
@@ -484,6 +547,82 @@ private:
     ComPtr<ID3DBlob> trianglePS_;
     ComPtr<ID3DBlob> customEffectVS_;
 
+    // ── Stencil-then-cover path renderer ────────────────────────────────
+    // Architecture mirrors docs/reference/pure_d3d12_path_renderer.h, with
+    // an 8× MSAA scratch buffer added so SVG edges land with the same
+    // sample density as Direct2D/Skia at high quality:
+    //   • CPU once: flatten path commands → local-space fan triangles +
+    //     local-space cover quad (jalium_stencil_path.h, cached LRU).
+    //   • Per frame, per path:
+    //       0) (Lazy on first stencil-path batch in this frame) bind the
+    //          per-renderer 8× MSAA scratch color + 8× MSAA stencil.
+    //       1) Stencil PSO (NonZero or EvenOdd) writes stencil with the fan
+    //          triangles (RenderTargetWriteMask = 0, no color).
+    //       2) Cover PSO with stencil-NotEqual-zero writes the path color
+    //          (premultiplied) into the MSAA scratch and resets stencil
+    //          via STENCIL_OP_REPLACE so the next path starts clean.
+    //   • At any path → non-path transition (or end of frame):
+    //       3) ResolveSubresource MSAA color → 1× scratch (sample average
+    //          gives correct premult-alpha edge coverage).
+    //       4) A fullscreen-triangle "path resolve" PSO blits the 1×
+    //          scratch onto the back buffer with premult alpha blend.
+    //
+    // Vertex shader applies the per-draw transform supplied via root
+    // constants (transform 6 floats + color 4 + screen 4 + pad 2 = 16).
+    ComPtr<ID3D12RootSignature> stencilPathRootSig_;
+    ComPtr<ID3D12PipelineState> psoStencilFillNonZero_;
+    ComPtr<ID3D12PipelineState> psoStencilFillEvenOdd_;
+    ComPtr<ID3D12PipelineState> psoStencilCover_;
+    ComPtr<ID3DBlob>            stencilPathVS_;
+    ComPtr<ID3DBlob>            stencilPathPS_;
+
+    // Resolve pipeline: fullscreen triangle samples the 1× resolved
+    // path scratch and premult-alpha-blends it onto the back buffer.
+    ComPtr<ID3D12RootSignature> pathResolveRootSig_;
+    ComPtr<ID3D12PipelineState> psoPathResolve_;
+    ComPtr<ID3DBlob>            pathResolveVS_;
+    ComPtr<ID3DBlob>            pathResolvePS_;
+
+    // 8× MSAA scratch resources (color + stencil) and 1× resolve target.
+    // Sized to viewport on first use and on resize.
+    ComPtr<ID3D12Resource>       pathMsaaColor_;
+    ComPtr<ID3D12Resource>       pathMsaaDepth_;
+    ComPtr<ID3D12Resource>       pathResolveTexture_;
+    ComPtr<ID3D12DescriptorHeap> pathMsaaRtvHeap_;
+    ComPtr<ID3D12DescriptorHeap> stencilDsvHeap_;  // 8× DSV for pathMsaaDepth_
+    UINT  pathMsaaWidth_  = 0;
+    UINT  pathMsaaHeight_ = 0;
+    static constexpr UINT kPathMsaaSampleCount = 8;
+    D3D12_RESOURCE_STATES pathMsaaColorState_   = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    D3D12_RESOURCE_STATES pathResolveTexState_  = D3D12_RESOURCE_STATE_COMMON;
+    bool  stencilPathReady_   = false;
+
+    // Per-frame queue of stencil-path draws. DrawBatch references entries by
+    // index (DrawBatch::instanceOffset). Cleared each BeginFrame.
+    struct StencilPathDraw {
+        std::shared_ptr<const StencilPathGeometry> geom;
+        // Pixel-space transform (current transform * dpi at record time).
+        float m11, m12, m21, m22, dx, dy;
+        // Premultiplied color * opacity.
+        float r, g, b, a;
+        // Stencil pipeline (0 = EvenOdd, 1 = NonZero).
+        int32_t fillRule;
+        // GPU vertex buffer offsets into the per-frame upload heap, filled
+        // at UploadInstances time.
+        size_t fillVbOffsetBytes  = 0;
+        UINT   fillVertexCount    = 0;
+        size_t coverVbOffsetBytes = 0;
+        UINT   coverVertexCount   = 0;
+    };
+    std::vector<StencilPathDraw> stencilPathDraws_;
+    // Source-space LRU keyed on (start, commands, scaleBucket). Capacity
+    // 256 is enough for typical UI working sets (Gallery, DesktopDemo).
+    std::unique_ptr<StencilPathCache> stencilPathCache_;
+    static constexpr size_t kStencilPathCacheCapacity = 256;
+    // Total bytes of stencil-path vertex data this frame; placed in the
+    // shared per-frame UPLOAD heap after triangle vertices.
+    size_t stencilPathBufferByteOffset_ = 0;
+
     // Glyph atlas for text rendering
     std::unique_ptr<D3D12GlyphAtlas> glyphAtlas_;
 
@@ -497,9 +636,18 @@ private:
 
     // Per-frame bitmap texture binding (one texture per bitmap batch)
     // Uses ComPtr to prevent the resource from being freed before the GPU executes the draw.
+    // uploadBuffer is the *most recent* upload buffer of the source D3D12Bitmap
+    // at the time this batch was recorded — keeping a ref here ensures the
+    // CopyTextureRegion src (recorded into the same command list) survives
+    // until the next BeginFrame's fence-wait drains it, even if the bitmap is
+    // Disposed mid-frame from a worker thread (cache eviction) or by the GC
+    // finalizer. Without this, the upload buffer's only owner is the bitmap
+    // itself; destroying the bitmap drops it and triggers
+    // OBJECT_DELETED_WHILE_STILL_IN_USE on Close.
     struct BitmapBatchTexture {
         uint32_t batchIndex;
         ComPtr<ID3D12Resource> textureResource;
+        ComPtr<ID3D12Resource> uploadBuffer;  // optional: nullptr for non-D3D12Bitmap sources (offscreen RT, desktop dup)
         DXGI_FORMAT format;
     };
     std::vector<BitmapBatchTexture> bitmapTextures_;
@@ -541,6 +689,12 @@ private:
     UINT srvAllocOffset_ = 0;            // ring-buffer offset into SRV heap for descriptor versioning
     UINT lastFlushSrvBase_ = 0;          // base SRV slot of the most recent flush (used by RecordDrawCommands)
     UINT lastFlushSlotsPerFlush_ = 8;    // total slots allocated for the most recent flush
+    // Stencil-path resolve SRV region — placed AFTER the bitmap region so
+    // bitmap descriptor pairs stay stride-2 aligned even when path runs
+    // interleave with bitmap batches. UploadInstances writes both fields;
+    // RecordDrawCommands' resolve allocator reads them.
+    UINT lastFlushPathResolveBase_ = 0;  // offset (in slots) from lastFlushSrvBase_ to first resolve slot
+    UINT lastFlushPathResolveCount_ = 0; // number of resolve slots reserved this flush
 
     // Helper to count snapshot blit batches for descriptor slot calculation
     UINT CountSnapshotBlitBatches() const {

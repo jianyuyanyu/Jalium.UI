@@ -1,5 +1,8 @@
 #include "d3d12_impeller_engine.h"
 #include "jalium_scanline_rasterizer.h"   // PixelRect / RasterizePathToRects
+#include "jalium_api.h"                   // JALIUM_API export macro
+#include "jalium_path_stats.h"            // unified path telemetry (core dll)
+#include <atomic>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
@@ -376,8 +379,12 @@ bool ImpellerD3D12Engine::EncodeGradientFillPath(
 
     int32_t fr = 0; // even-odd default
     std::vector<float> triVerts;
-    if (!TriangulateCompoundPath(contours, fr, triVerts) || triVerts.size() < 6)
-        return false;
+    {
+        path_stats::ScopedTriangulateTimer triTimer;
+        bool ok = TriangulateCompoundPath(contours, fr, triVerts) && triVerts.size() >= 6;
+        if (ok) triTimer.MarkOk();
+        if (!ok) return false;
+    }
 
     uint32_t vertCount = (uint32_t)(triVerts.size() / 2);
     ImpellerDrawBatch batch;
@@ -859,8 +866,11 @@ bool ImpellerD3D12Engine::TessellateCurrentPath(const EngineBrushData& brush, Fi
     if (pointCount < 3) return false;
 
     std::vector<uint32_t> indices;
-    if (!TriangulatePolygon(flatPoints_.data(), pointCount, indices)) {
-        return false;
+    {
+        path_stats::ScopedTriangulateTimer triTimer;
+        bool ok = TriangulatePolygon(flatPoints_.data(), pointCount, indices);
+        if (ok) triTimer.MarkOk();
+        if (!ok) return false;
     }
 
     if (indices.empty()) return false;
@@ -1557,8 +1567,11 @@ bool ImpellerD3D12Engine::EncodeFillPath(
     const float* commands, uint32_t commandLength,
     const EngineBrushData& brush,
     FillRule fillRule,
-    const EngineTransform& transform)
+    const EngineTransform& transformIn,
+    int32_t edgeMode)
 {
+    (void)edgeMode;  // D3D12 fill already runs analytic AA via RasterizePathToRects;
+                     // Aliased fallback is reserved for the binary-mesh fast path.
     auto fillPathEntryTime = std::chrono::high_resolution_clock::now();
 
     // ------------------------------------------------------------------
@@ -1568,22 +1581,170 @@ bool ImpellerD3D12Engine::EncodeFillPath(
     // in path space) and only transforms to pixels after sampling.
     // Touching that contract would require rewriting the gradient
     // sampler — out of scope for this fix, so we keep the legacy path.
+    //
+    // Gradient path also bypasses the rasterized-fill cache (key would
+    // need brush stops), which is fine because gradients are a small
+    // fraction of total fills in typical UI workloads.
     // ------------------------------------------------------------------
     if (brush.type == 1 || brush.type == 2) {
         float gradMaxScale = std::max(
-            std::sqrt(transform.m11 * transform.m11 + transform.m12 * transform.m12),
-            std::sqrt(transform.m21 * transform.m21 + transform.m22 * transform.m22));
+            std::sqrt(transformIn.m11 * transformIn.m11 + transformIn.m12 * transformIn.m12),
+            std::sqrt(transformIn.m21 * transformIn.m21 + transformIn.m22 * transformIn.m22));
         float gradTolerance = (gradMaxScale > 0.001f)
             ? flattenTolerance_ / gradMaxScale
             : flattenTolerance_;
 
-        std::vector<Contour> gradContours = FlattenPathToContours(
-            startX, startY, commands, commandLength, gradTolerance);
+        std::vector<Contour> gradContours;
+        {
+            path_stats::ScopedFlattenTimer flattenTimer(commandLength);
+            gradContours = FlattenPathToContours(
+                startX, startY, commands, commandLength, gradTolerance);
+            uint64_t outputVerts = 0;
+            for (const auto& c : gradContours) outputVerts += c.VertexCount();
+            flattenTimer.RecordOutputVerts(outputVerts);
+        }
         if (gradContours.empty()) return false;
 
-        bool gradOk = EncodeGradientFillPath(gradContours, brush, transform);
+        bool gradOk = EncodeGradientFillPath(gradContours, brush, transformIn);
         if (gradOk) encodedPathCount_++;
         return gradOk;
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Solid fill: same 1/8-px-quantized dx/dy stripping as EncodeStrokePath.
+    // Repeated controls at any DPI-snapped position share a cache entry.
+    // ───────────────────────────────────────────────────────────────────
+    int intDx, intDy;
+    EngineTransform transform = transformIn;
+    {
+        constexpr float kFracQuant = 8.0f;
+        constexpr float kInvFracQuant = 1.0f / 8.0f;
+        int qDx = (int)std::lround(transformIn.dx * kFracQuant);
+        int qDy = (int)std::lround(transformIn.dy * kFracQuant);
+        int fracDxBucket = ((qDx % 8) + 8) % 8;
+        int fracDyBucket = ((qDy % 8) + 8) % 8;
+        intDx = (qDx - fracDxBucket) / 8;
+        intDy = (qDy - fracDyBucket) / 8;
+        transform.dx = fracDxBucket * kInvFracQuant;
+        transform.dy = fracDyBucket * kInvFracQuant;
+    }
+
+    // Local helper — same in-place coalescing + resize+index-write hot loop
+    // as EncodeStrokePath's emitter (zero temp-batch allocation).
+    auto emitFillRectsAsBatch = [this, &brush](const std::vector<PixelRect>& rects, int sx, int sy) {
+        size_t rectCount = rects.size();
+        if (rectCount == 0) return;
+
+        float br = brush.r * brush.a;
+        float bg = brush.g * brush.a;
+        float bb = brush.b * brush.a;
+        float ba = brush.a;
+        float fsx = (float)sx, fsy = (float)sy;
+
+        ImpellerDrawBatch* target = nullptr;
+        if (!batches_.empty()) {
+            auto& last = batches_.back();
+            if (last.pipelineType == 0 && last.stencilContours.empty() &&
+                last.hasScissor == hasScissor_ &&
+                (!hasScissor_ ||
+                 (last.scissorL == scissorLeft_ && last.scissorT == scissorTop_ &&
+                  last.scissorR == scissorRight_ && last.scissorB == scissorBottom_)))
+            {
+                target = &last;
+            }
+        }
+        if (target == nullptr) {
+            batches_.emplace_back();
+            target = &batches_.back();
+            target->pipelineType = 0;
+            target->hasScissor = hasScissor_;
+            if (hasScissor_) {
+                target->scissorL = scissorLeft_;
+                target->scissorT = scissorTop_;
+                target->scissorR = scissorRight_;
+                target->scissorB = scissorBottom_;
+            }
+        }
+
+        size_t oldV = target->vertices.size();
+        size_t oldI = target->indices.size();
+        target->vertices.resize(oldV + rectCount * 4);
+        target->indices.resize(oldI + rectCount * 6);
+
+        auto* vp = target->vertices.data() + oldV;
+        auto* ip = target->indices.data() + oldI;
+        const auto* rp = rects.data();
+        uint32_t baseVertex = (uint32_t)oldV;
+
+        float minX = std::numeric_limits<float>::infinity();
+        float minY = std::numeric_limits<float>::infinity();
+        float maxX = -std::numeric_limits<float>::infinity();
+        float maxY = -std::numeric_limits<float>::infinity();
+
+        for (size_t i = 0; i < rectCount; i++) {
+            const auto& rect = rp[i];
+            float x0 = (float)rect.x + fsx;
+            float y0 = (float)rect.y + fsy;
+            float x1 = x0 + (float)rect.w;
+            float y1 = y0 + (float)rect.h;
+            float cov = rect.alpha;
+            float ra = br * cov;
+            float ga = bg * cov;
+            float bbA = bb * cov;
+            float aa = ba * cov;
+
+            size_t v = i * 4;
+            vp[v + 0] = { x0, y0, ra, ga, bbA, aa };
+            vp[v + 1] = { x1, y0, ra, ga, bbA, aa };
+            vp[v + 2] = { x1, y1, ra, ga, bbA, aa };
+            vp[v + 3] = { x0, y1, ra, ga, bbA, aa };
+
+            uint32_t b = baseVertex + (uint32_t)v;
+            size_t k = i * 6;
+            ip[k + 0] = b;
+            ip[k + 1] = b + 1;
+            ip[k + 2] = b + 2;
+            ip[k + 3] = b;
+            ip[k + 4] = b + 2;
+            ip[k + 5] = b + 3;
+
+            if (x0 < minX) minX = x0;
+            if (y0 < minY) minY = y0;
+            if (x1 > maxX) maxX = x1;
+            if (y1 > maxY) maxY = y1;
+        }
+
+        if (target->hasCoverage) {
+            if (minX < target->coverageL) target->coverageL = minX;
+            if (minY < target->coverageT) target->coverageT = minY;
+            if (maxX > target->coverageR) target->coverageR = maxX;
+            if (maxY > target->coverageB) target->coverageB = maxY;
+        } else {
+            target->hasCoverage = true;
+            target->coverageL = minX;
+            target->coverageT = minY;
+            target->coverageR = maxX;
+            target->coverageB = maxY;
+        }
+        encodedPathCount_++;
+    };
+
+    uint64_t fillCacheKey = HashFillInputs(
+        startX, startY, commands, commandLength,
+        (int32_t)fillRule, transform);
+
+    if (auto cached = FillCacheFind(fillCacheKey)) {
+        path_stats::AddFillHit(cached->rects.size());
+        if (cached->rects.empty()) {
+            // Empty result was previously seen — fall through to
+            // triangulation fallback (rasterizer-empty doesn't mean
+            // fully empty; sub-pixel paths still render via triangulator).
+        } else {
+            emitFillRectsAsBatch(cached->rects, intDx, intDy);
+            return true;
+        }
+    } else {
+        path_stats::AddFillMiss();
     }
 
     // ------------------------------------------------------------------
@@ -1684,9 +1845,16 @@ bool ImpellerD3D12Engine::EncodeFillPath(
     // Fixed pixel-space tolerance — independent of source scale.
     float adaptiveTolerance = flattenTolerance_;
 
-    std::vector<Contour> contours = FlattenPathToContours(
-        pxStartX, pxStartY, pxCommands.data(), (uint32_t)pxCommands.size(),
-        adaptiveTolerance);
+    std::vector<Contour> contours;
+    {
+        path_stats::ScopedFlattenTimer flattenTimer(commandLength);
+        contours = FlattenPathToContours(
+            pxStartX, pxStartY, pxCommands.data(), (uint32_t)pxCommands.size(),
+            adaptiveTolerance);
+        uint64_t outputVerts = 0;
+        for (const auto& c : contours) outputVerts += c.VertexCount();
+        flattenTimer.RecordOutputVerts(outputVerts);
+    }
 
     if (contours.empty()) {
         return false;
@@ -1736,39 +1904,12 @@ bool ImpellerD3D12Engine::EncodeFillPath(
         RasterizePathToRects(contours, fillRule, rects);
 
         if (!rects.empty()) {
-            ImpellerDrawBatch batch;
-            batch.vertices.reserve(rects.size() * 4);
-            batch.indices.reserve(rects.size() * 6);
-            for (const auto& rect : rects) {
-                float x0 = (float)rect.x;
-                float y0 = (float)rect.y;
-                float x1 = (float)(rect.x + rect.w);
-                float y1 = (float)(rect.y + rect.h);
-                // Apply per-rect analytic coverage to the already
-                // premultiplied brush color. Because r,g,b were
-                // multiplied by a at the top of the function, scaling
-                // all four channels by rect.alpha produces valid
-                // premult-alpha values the blend mode consumes as
-                // (src * 1 + dst * (1 - src.a)).
-                float ra = r * rect.alpha;
-                float ga = g * rect.alpha;
-                float ba = b * rect.alpha;
-                float aa = a * rect.alpha;
-                uint32_t base = (uint32_t)batch.vertices.size();
-                batch.vertices.push_back({ x0, y0, ra, ga, ba, aa });
-                batch.vertices.push_back({ x1, y0, ra, ga, ba, aa });
-                batch.vertices.push_back({ x1, y1, ra, ga, ba, aa });
-                batch.vertices.push_back({ x0, y1, ra, ga, ba, aa });
-                batch.indices.push_back(base);
-                batch.indices.push_back(base + 1);
-                batch.indices.push_back(base + 2);
-                batch.indices.push_back(base);
-                batch.indices.push_back(base + 2);
-                batch.indices.push_back(base + 3);
-            }
-            batch.pipelineType = 0;
-            PushBatch(std::move(batch));
-            encodedPathCount_++;
+            // Cache rects origin-relative; emit lambda applies (intDx, intDy).
+            auto entry = std::make_shared<CachedFillRects>();
+            entry->rects = rects;
+            FillCacheInsert(fillCacheKey, std::move(entry));
+
+            emitFillRectsAsBatch(rects, intDx, intDy);
             return true;
         }
         // Empty rect list — sub-pixel or degenerate. Fall through to
@@ -1789,16 +1930,29 @@ bool ImpellerD3D12Engine::EncodeFillPath(
     // ------------------------------------------------------------------
     int32_t fr = (fillRule == FillRule::NonZero) ? 1 : 0;
 
+    // Triangulation paths emit pixel-space vertices directly; because the
+    // pipeline above ran with dx/dy zeroed (cache requires origin-relative
+    // output), we must add (intDx, intDy) here to land at the correct
+    // screen position. fdx/fdy are the per-vertex offsets.
+    float fdx = (float)intDx;
+    float fdy = (float)intDy;
+
     if (contours.size() == 1) {
         const auto& c = contours[0];
         std::vector<uint32_t> indices;
-        if (TriangulatePolygon(c.points.data(), c.VertexCount(), indices)
-            && indices.size() >= 3)
+        bool triOk;
+        {
+            path_stats::ScopedTriangulateTimer triTimer;
+            triOk = TriangulatePolygon(c.points.data(), c.VertexCount(), indices)
+                    && indices.size() >= 3;
+            if (triOk) triTimer.MarkOk();
+        }
+        if (triOk)
         {
             ImpellerDrawBatch batch;
             batch.vertices.reserve(c.VertexCount());
             for (uint32_t i = 0; i < c.VertexCount(); ++i) {
-                batch.vertices.push_back({ c.X(i), c.Y(i), r, g, b, a });
+                batch.vertices.push_back({ c.X(i) + fdx, c.Y(i) + fdy, r, g, b, a });
             }
             batch.indices = std::move(indices);
             batch.pipelineType = 0;
@@ -1808,13 +1962,19 @@ bool ImpellerD3D12Engine::EncodeFillPath(
         }
     } else {
         std::vector<float> triVerts;
-        if (TriangulateCompoundPath(contours, fr, triVerts) && triVerts.size() >= 6) {
+        bool triOk;
+        {
+            path_stats::ScopedTriangulateTimer triTimer;
+            triOk = TriangulateCompoundPath(contours, fr, triVerts) && triVerts.size() >= 6;
+            if (triOk) triTimer.MarkOk();
+        }
+        if (triOk) {
             ImpellerDrawBatch batch;
             uint32_t vertCount = (uint32_t)(triVerts.size() / 2);
             batch.vertices.reserve(vertCount);
             batch.indices.reserve(vertCount);
             for (uint32_t i = 0; i < vertCount; ++i) {
-                batch.vertices.push_back({ triVerts[i * 2], triVerts[i * 2 + 1], r, g, b, a });
+                batch.vertices.push_back({ triVerts[i * 2] + fdx, triVerts[i * 2 + 1] + fdy, r, g, b, a });
                 batch.indices.push_back(i);
             }
             batch.pipelineType = 0;
@@ -1833,13 +1993,19 @@ bool ImpellerD3D12Engine::EncodeFillPath(
             uint32_t vc = c.VertexCount();
             if (vc < 3) continue;
             std::vector<uint32_t> indices;
-            if (TriangulatePolygon(c.points.data(), vc, indices) && indices.size() >= 3) {
+            bool triOk;
+            {
+                path_stats::ScopedTriangulateTimer triTimer;
+                triOk = TriangulatePolygon(c.points.data(), vc, indices) && indices.size() >= 3;
+                if (triOk) triTimer.MarkOk();
+            }
+            if (triOk) {
                 ImpellerDrawBatch batch;
                 batch.vertices.reserve(indices.size());
                 batch.indices.reserve(indices.size());
                 for (uint32_t idx = 0; idx < (uint32_t)indices.size(); ++idx) {
                     uint32_t vi = indices[idx];
-                    batch.vertices.push_back({ c.X(vi), c.Y(vi), r, g, b, a });
+                    batch.vertices.push_back({ c.X(vi) + fdx, c.Y(vi) + fdy, r, g, b, a });
                     batch.indices.push_back(idx);
                 }
                 batch.pipelineType = 0;
@@ -1852,6 +2018,172 @@ bool ImpellerD3D12Engine::EncodeFillPath(
     }
 }
 
+// ============================================================================
+// Stroke rasterization cache helpers
+//
+// EncodeStrokePath's CPU pipeline (transform commands → flatten → optional dash
+// → ExpandStroke mesh → RasterizePathToRects) dominates StreamGeometry /
+// DrawGeometry profiles when many static paths are redrawn each frame. The
+// cache stores the final PixelRect list so hits skip the entire pipeline and
+// only run the per-frame batch build. See d3d12_impeller_engine.h for the full
+// rationale and key design.
+// ============================================================================
+
+namespace {
+inline void FnvMix64(uint64_t& h, const void* data, size_t size) noexcept {
+    auto* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; i++) {
+        h ^= p[i];
+        h *= 0x100000001B3ull;
+    }
+}
+}  // namespace
+
+uint64_t ImpellerD3D12Engine::HashStrokeInputs(
+    float startX, float startY,
+    const float* commands, uint32_t commandLength,
+    float strokeWidth, bool closed,
+    int32_t lineJoin, float miterLimit, int32_t lineCap,
+    const float* dashPattern, uint32_t dashCount, float dashOffset,
+    const EngineTransform& transform,
+    int32_t edgeMode) noexcept
+{
+    uint64_t h = 0xCBF29CE484222325ull;  // FNV-1a 64-bit offset basis
+    FnvMix64(h, &startX, sizeof(startX));
+    FnvMix64(h, &startY, sizeof(startY));
+    FnvMix64(h, &commandLength, sizeof(commandLength));
+    if (commands && commandLength > 0)
+        FnvMix64(h, commands, commandLength * sizeof(float));
+    FnvMix64(h, &strokeWidth, sizeof(strokeWidth));
+    uint8_t closedByte = closed ? 1 : 0;
+    FnvMix64(h, &closedByte, sizeof(closedByte));
+    FnvMix64(h, &lineJoin, sizeof(lineJoin));
+    FnvMix64(h, &miterLimit, sizeof(miterLimit));
+    FnvMix64(h, &lineCap, sizeof(lineCap));
+    FnvMix64(h, &dashCount, sizeof(dashCount));
+    if (dashPattern && dashCount > 0)
+        FnvMix64(h, dashPattern, dashCount * sizeof(float));
+    FnvMix64(h, &dashOffset, sizeof(dashOffset));
+    // Transform must be in the key — the entire pipeline (including command
+    // pre-transform) runs in pixel space, so different transforms produce
+    // different rects. Static UI keeps transform stable across frames.
+    FnvMix64(h, &transform.m11, sizeof(float));
+    FnvMix64(h, &transform.m12, sizeof(float));
+    FnvMix64(h, &transform.m21, sizeof(float));
+    FnvMix64(h, &transform.m22, sizeof(float));
+    FnvMix64(h, &transform.dx,  sizeof(float));
+    FnvMix64(h, &transform.dy,  sizeof(float));
+    // edgeMode partitions Antialiased (analytic) vs Aliased (binary) entries
+    // so the two pipelines don't poison each other's cache.
+    uint8_t edgeByte = (uint8_t)(edgeMode & 0xFF);
+    FnvMix64(h, &edgeByte, sizeof(edgeByte));
+    return h;
+}
+
+std::shared_ptr<const ImpellerD3D12Engine::CachedStrokeRects>
+ImpellerD3D12Engine::StrokeCacheFind(uint64_t key)
+{
+    auto it = strokeCacheMap_.find(key);
+    if (it == strokeCacheMap_.end()) return nullptr;
+    // Promote to head (most-recently-used).
+    strokeCacheList_.splice(strokeCacheList_.begin(), strokeCacheList_, it->second);
+    return it->second->entry;
+}
+
+void ImpellerD3D12Engine::StrokeCacheInsert(
+    uint64_t key, std::shared_ptr<const CachedStrokeRects> entry)
+{
+    auto existing = strokeCacheMap_.find(key);
+    if (existing != strokeCacheMap_.end()) {
+        existing->second->entry = std::move(entry);
+        strokeCacheList_.splice(strokeCacheList_.begin(), strokeCacheList_, existing->second);
+        return;
+    }
+    if (strokeCacheList_.size() >= kStrokeCacheCapacity) {
+        auto& lru = strokeCacheList_.back();
+        strokeCacheMap_.erase(lru.key);
+        strokeCacheList_.pop_back();
+    }
+    strokeCacheList_.push_front({key, std::move(entry)});
+    strokeCacheMap_[key] = strokeCacheList_.begin();
+}
+
+std::shared_ptr<const ImpellerD3D12Engine::CachedStrokeAnalyticRects>
+ImpellerD3D12Engine::StrokeAnalyticCacheFind(uint64_t key)
+{
+    auto it = strokeAnalyticCacheMap_.find(key);
+    if (it == strokeAnalyticCacheMap_.end()) return nullptr;
+    strokeAnalyticCacheList_.splice(strokeAnalyticCacheList_.begin(), strokeAnalyticCacheList_, it->second);
+    return it->second->entry;
+}
+
+void ImpellerD3D12Engine::StrokeAnalyticCacheInsert(
+    uint64_t key, std::shared_ptr<const CachedStrokeAnalyticRects> entry)
+{
+    auto existing = strokeAnalyticCacheMap_.find(key);
+    if (existing != strokeAnalyticCacheMap_.end()) {
+        existing->second->entry = std::move(entry);
+        strokeAnalyticCacheList_.splice(strokeAnalyticCacheList_.begin(), strokeAnalyticCacheList_, existing->second);
+        return;
+    }
+    if (strokeAnalyticCacheList_.size() >= kStrokeAnalyticCacheCapacity) {
+        auto& lru = strokeAnalyticCacheList_.back();
+        strokeAnalyticCacheMap_.erase(lru.key);
+        strokeAnalyticCacheList_.pop_back();
+    }
+    strokeAnalyticCacheList_.push_front({key, std::move(entry)});
+    strokeAnalyticCacheMap_[key] = strokeAnalyticCacheList_.begin();
+}
+
+uint64_t ImpellerD3D12Engine::HashFillInputs(
+    float startX, float startY,
+    const float* commands, uint32_t commandLength,
+    int32_t fillRule,
+    const EngineTransform& transform) noexcept
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    FnvMix64(h, &startX, sizeof(startX));
+    FnvMix64(h, &startY, sizeof(startY));
+    FnvMix64(h, &commandLength, sizeof(commandLength));
+    if (commands && commandLength > 0)
+        FnvMix64(h, commands, commandLength * sizeof(float));
+    FnvMix64(h, &fillRule, sizeof(fillRule));
+    FnvMix64(h, &transform.m11, sizeof(float));
+    FnvMix64(h, &transform.m12, sizeof(float));
+    FnvMix64(h, &transform.m21, sizeof(float));
+    FnvMix64(h, &transform.m22, sizeof(float));
+    FnvMix64(h, &transform.dx,  sizeof(float));
+    FnvMix64(h, &transform.dy,  sizeof(float));
+    return h;
+}
+
+std::shared_ptr<const ImpellerD3D12Engine::CachedFillRects>
+ImpellerD3D12Engine::FillCacheFind(uint64_t key)
+{
+    auto it = fillCacheMap_.find(key);
+    if (it == fillCacheMap_.end()) return nullptr;
+    fillCacheList_.splice(fillCacheList_.begin(), fillCacheList_, it->second);
+    return it->second->entry;
+}
+
+void ImpellerD3D12Engine::FillCacheInsert(
+    uint64_t key, std::shared_ptr<const CachedFillRects> entry)
+{
+    auto existing = fillCacheMap_.find(key);
+    if (existing != fillCacheMap_.end()) {
+        existing->second->entry = std::move(entry);
+        fillCacheList_.splice(fillCacheList_.begin(), fillCacheList_, existing->second);
+        return;
+    }
+    if (fillCacheList_.size() >= kFillCacheCapacity) {
+        auto& lru = fillCacheList_.back();
+        fillCacheMap_.erase(lru.key);
+        fillCacheList_.pop_back();
+    }
+    fillCacheList_.push_front({key, std::move(entry)});
+    fillCacheMap_[key] = fillCacheList_.begin();
+}
+
 bool ImpellerD3D12Engine::EncodeStrokePath(
     float startX, float startY,
     const float* commands, uint32_t commandLength,
@@ -1860,8 +2192,284 @@ bool ImpellerD3D12Engine::EncodeStrokePath(
     int32_t lineJoin, float miterLimit,
     int32_t lineCap,
     const float* dashPattern, uint32_t dashCount, float dashOffset,
-    const EngineTransform& transform)
+    const EngineTransform& transformIn,
+    int32_t edgeMode)
 {
+    // Resolve edge mode. D3D12 stroke default = binary mesh + vertex
+    // feather AA (vertex-stage analytic coverage via outer-skirt verts at
+    // alpha=0 — GPU's bilinear-on-color does the per-pixel coverage
+    // interpolation for free). ~300 verts per stroke vs ~6000 for the
+    // full RasterizePathToRects path; ≥4× lower CPU + steady GPU cost.
+    // edgeMode == 2 (explicit Antialiased) opts into the full analytic
+    // RasterizePathToRects rect-list for the highest quality (preferred
+    // for non-animated icons).
+    if (edgeMode < 0) edgeMode = 1 /* Aliased = binary mesh + feather */;
+
+    // ───────────────────────────────────────────────────────────────────
+    // Quantize transform.dx/dy to 1/8 pixel to maximize cache sharing.
+    //
+    // Earlier integer-only stripping failed on DPI=1.5 (and 1.25 / 1.75)
+    // setups: an integer-DIP ox like 10 becomes pixel et.dx=15 (integer)
+    // but ox=11 becomes 16.5 (fractional), so half the controls hit the
+    // slow non-integer fall-through and miss cache. Hit rate stayed low,
+    // and the extra PushTransform/PopTransform cost made things WORSE.
+    //
+    // Fix: ALWAYS strip dx/dy. Quantize to 1/8 px buckets — fractional
+    // bucket goes into the cache key, integer-pixel part is the per-call
+    // emit offset. AA correctness within 1/8 px (imperceptible). 100
+    // ListBoxItems at any layout-snapped position now share one entry
+    // regardless of DPI, while sub-pixel animation still rasterizes
+    // correctly per fractional bucket.
+    // ───────────────────────────────────────────────────────────────────
+    int intDx, intDy;
+    EngineTransform transform = transformIn;
+    {
+        constexpr float kFracQuant = 8.0f;
+        constexpr float kInvFracQuant = 1.0f / 8.0f;
+        int qDx = (int)std::lround(transformIn.dx * kFracQuant);
+        int qDy = (int)std::lround(transformIn.dy * kFracQuant);
+        // Floor-mod into [0, 7] so negative qDx is handled too.
+        int fracDxBucket = ((qDx % 8) + 8) % 8;
+        int fracDyBucket = ((qDy % 8) + 8) % 8;
+        intDx = (qDx - fracDxBucket) / 8;
+        intDy = (qDy - fracDyBucket) / 8;
+        transform.dx = fracDxBucket * kInvFracQuant;
+        transform.dy = fracDyBucket * kInvFracQuant;
+    }
+
+    // Emits a cached triangle mesh (origin-relative positions + indices) into
+    // the last solid-fill batch on batches_ when state matches (in-place
+    // coalescing — zero temp batch alloc), or into a freshly emplaced batch
+    // otherwise. Per-vertex work is just (read 8 B position, +offset, write
+    // 24 B vertex with brush color) — vastly cheaper than the previous
+    // PixelRect → 4-vertex expansion. ~200 verts per long bezier stroke vs
+    // ~6000 verts under the scanline path → ≥ 30× fewer per-stroke writes.
+    auto emitCachedMesh = [this, &brush](const CachedStrokeRects& cached, int sx, int sy) {
+        size_t vertexCount = cached.positions.size() / 2;
+        size_t indexCount  = cached.indices.size();
+        if (vertexCount == 0 || indexCount == 0) return;
+
+        float br = brush.r * brush.a;
+        float bg = brush.g * brush.a;
+        float bb = brush.b * brush.a;
+        float ba = brush.a;
+        float fsx = (float)sx, fsy = (float)sy;
+
+        ImpellerDrawBatch* target = nullptr;
+        if (!batches_.empty()) {
+            auto& last = batches_.back();
+            if (last.pipelineType == 0 && last.stencilContours.empty() &&
+                last.hasScissor == hasScissor_ &&
+                (!hasScissor_ ||
+                 (last.scissorL == scissorLeft_ && last.scissorT == scissorTop_ &&
+                  last.scissorR == scissorRight_ && last.scissorB == scissorBottom_)))
+            {
+                target = &last;
+            }
+        }
+        if (target == nullptr) {
+            batches_.emplace_back();
+            target = &batches_.back();
+            target->pipelineType = 0;
+            target->hasScissor = hasScissor_;
+            if (hasScissor_) {
+                target->scissorL = scissorLeft_;
+                target->scissorT = scissorTop_;
+                target->scissorR = scissorRight_;
+                target->scissorB = scissorBottom_;
+            }
+        }
+
+        size_t oldV = target->vertices.size();
+        size_t oldI = target->indices.size();
+        target->vertices.resize(oldV + vertexCount);
+        target->indices.resize(oldI + indexCount);
+
+        auto* vp = target->vertices.data() + oldV;
+        const auto* pp = cached.positions.data();
+        const auto* cp = cached.coverage.empty() ? nullptr : cached.coverage.data();
+        const float kCovScale = 1.0f / 255.0f;
+        for (size_t i = 0; i < vertexCount; i++) {
+            float x = pp[i * 2]     + fsx;
+            float y = pp[i * 2 + 1] + fsy;
+            // Per-vertex coverage carries the vertex-feather AA mask
+            // (outer feather verts = 0, inner solid = 255). Multiply both
+            // color and alpha channels because the engine vertex format is
+            // premultiplied alpha — covering a 0-alpha edge means both
+            // visible color and opacity drop to 0.
+            float cov = cp ? (float)cp[i] * kCovScale : 1.0f;
+            vp[i].x = x;
+            vp[i].y = y;
+            vp[i].r = br * cov;
+            vp[i].g = bg * cov;
+            vp[i].b = bb * cov;
+            vp[i].a = ba * cov;
+        }
+
+        auto* ip = target->indices.data() + oldI;
+        const auto* sip = cached.indices.data();
+        uint32_t base = (uint32_t)oldV;
+        for (size_t i = 0; i < indexCount; i++) {
+            ip[i] = sip[i] + base;
+        }
+
+        // Union the cached origin-relative bbox into target's coverage,
+        // shifted by the per-call offset.
+        float bL = cached.bboxL + fsx;
+        float bT = cached.bboxT + fsy;
+        float bR = cached.bboxR + fsx;
+        float bB = cached.bboxB + fsy;
+        if (target->hasCoverage) {
+            if (bL < target->coverageL) target->coverageL = bL;
+            if (bT < target->coverageT) target->coverageT = bT;
+            if (bR > target->coverageR) target->coverageR = bR;
+            if (bB > target->coverageB) target->coverageB = bB;
+        } else {
+            target->hasCoverage = true;
+            target->coverageL = bL;
+            target->coverageT = bT;
+            target->coverageR = bR;
+            target->coverageB = bB;
+        }
+        encodedPathCount_++;
+    };
+
+    // EdgeMode dispatch: Antialiased (default) routes through analytic
+    // coverage scanline — same algorithm as fill, matches Vulkan stroke;
+    // Aliased keeps the binary triangle-mesh fast path for pixel-art icons
+    // and one-pixel hairline rulings.
+    const bool useAnalytic = (edgeMode != 1 /* Aliased */);
+
+    // Analytic-mode emitter — mirror of EncodeFillPath::emitFillRectsAsBatch.
+    // Takes a PixelRect list and emits one 4-vertex quad per rect into the
+    // current batch (in-place coalescing into the last solid-fill batch when
+    // state matches; new batch otherwise). Per-rect alpha is multiplied into
+    // the brush color, producing the analytic coverage edge.
+    auto emitStrokeRectsAsBatch = [this, &brush](const std::vector<PixelRect>& rects, int sx, int sy) {
+        size_t rectCount = rects.size();
+        if (rectCount == 0) return;
+
+        float br = brush.r * brush.a;
+        float bg = brush.g * brush.a;
+        float bb = brush.b * brush.a;
+        float ba = brush.a;
+        float fsx = (float)sx, fsy = (float)sy;
+
+        ImpellerDrawBatch* target = nullptr;
+        if (!batches_.empty()) {
+            auto& last = batches_.back();
+            if (last.pipelineType == 0 && last.stencilContours.empty() &&
+                last.hasScissor == hasScissor_ &&
+                (!hasScissor_ ||
+                 (last.scissorL == scissorLeft_ && last.scissorT == scissorTop_ &&
+                  last.scissorR == scissorRight_ && last.scissorB == scissorBottom_)))
+            {
+                target = &last;
+            }
+        }
+        if (target == nullptr) {
+            batches_.emplace_back();
+            target = &batches_.back();
+            target->pipelineType = 0;
+            target->hasScissor = hasScissor_;
+            if (hasScissor_) {
+                target->scissorL = scissorLeft_;
+                target->scissorT = scissorTop_;
+                target->scissorR = scissorRight_;
+                target->scissorB = scissorBottom_;
+            }
+        }
+
+        size_t oldV = target->vertices.size();
+        size_t oldI = target->indices.size();
+        target->vertices.resize(oldV + rectCount * 4);
+        target->indices.resize(oldI + rectCount * 6);
+
+        auto* vp = target->vertices.data() + oldV;
+        auto* ip = target->indices.data() + oldI;
+        const auto* rp = rects.data();
+        uint32_t baseVertex = (uint32_t)oldV;
+
+        float minX = std::numeric_limits<float>::infinity();
+        float minY = std::numeric_limits<float>::infinity();
+        float maxX = -std::numeric_limits<float>::infinity();
+        float maxY = -std::numeric_limits<float>::infinity();
+
+        for (size_t i = 0; i < rectCount; i++) {
+            const auto& rect = rp[i];
+            float x0 = (float)rect.x + fsx;
+            float y0 = (float)rect.y + fsy;
+            float x1 = x0 + (float)rect.w;
+            float y1 = y0 + (float)rect.h;
+            float cov = rect.alpha;
+            float ra = br * cov;
+            float ga = bg * cov;
+            float bbA = bb * cov;
+            float aa = ba * cov;
+
+            size_t v = i * 4;
+            vp[v + 0] = { x0, y0, ra, ga, bbA, aa };
+            vp[v + 1] = { x1, y0, ra, ga, bbA, aa };
+            vp[v + 2] = { x1, y1, ra, ga, bbA, aa };
+            vp[v + 3] = { x0, y1, ra, ga, bbA, aa };
+
+            uint32_t bIdx = baseVertex + (uint32_t)v;
+            size_t k = i * 6;
+            ip[k + 0] = bIdx;
+            ip[k + 1] = bIdx + 1;
+            ip[k + 2] = bIdx + 2;
+            ip[k + 3] = bIdx;
+            ip[k + 4] = bIdx + 2;
+            ip[k + 5] = bIdx + 3;
+
+            if (x0 < minX) minX = x0;
+            if (y0 < minY) minY = y0;
+            if (x1 > maxX) maxX = x1;
+            if (y1 > maxY) maxY = y1;
+        }
+
+        if (target->hasCoverage) {
+            if (minX < target->coverageL) target->coverageL = minX;
+            if (minY < target->coverageT) target->coverageT = minY;
+            if (maxX > target->coverageR) target->coverageR = maxX;
+            if (maxY > target->coverageB) target->coverageB = maxY;
+        } else {
+            target->hasCoverage = true;
+            target->coverageL = minX;
+            target->coverageT = minY;
+            target->coverageR = maxX;
+            target->coverageB = maxY;
+        }
+        encodedPathCount_++;
+    };
+
+    // Cache lookup — same inputs (commands, stroke params, transform with
+    // 1/8-px-quantized fractional dx/dy) always produce the same origin-
+    // relative geometry. The edgeMode byte in the hash partitions
+    // Antialiased (PixelRect list) and Aliased (triangle mesh) entries
+    // so they don't poison each other.
+    uint64_t cacheKey = HashStrokeInputs(
+        startX, startY, commands, commandLength,
+        strokeWidth, closed, lineJoin, miterLimit, lineCap,
+        dashPattern, dashCount, dashOffset, transform, edgeMode);
+    if (useAnalytic) {
+        if (auto cached = StrokeAnalyticCacheFind(cacheKey)) {
+            path_stats::AddStrokeHit(cached->rects.size());
+            if (cached->rects.empty()) return false;
+            emitStrokeRectsAsBatch(cached->rects, intDx, intDy);
+            return true;
+        }
+    } else {
+        if (auto cached = StrokeCacheFind(cacheKey)) {
+            path_stats::AddStrokeHit(cached->positions.size() / 2);
+            if (cached->positions.empty()) return false;
+            emitCachedMesh(*cached, intDx, intDy);
+            return true;
+        }
+    }
+    path_stats::AddStrokeMiss();
+
+
     // ------------------------------------------------------------------
     // Pixel-space flattening — mirrors the fix EncodeFillPath already
     // applied (see L1640-1658 for the full rationale). Transforming the
@@ -1969,9 +2577,16 @@ bool ImpellerD3D12Engine::EncodeStrokePath(
 
     float adaptiveTolerance = flattenTolerance_;
 
-    std::vector<Contour> contours = FlattenPathToContours(
-        pxStartX, pxStartY, pxCommands.data(), (uint32_t)pxCommands.size(),
-        adaptiveTolerance);
+    std::vector<Contour> contours;
+    {
+        path_stats::ScopedFlattenTimer flattenTimer(commandLength);
+        contours = FlattenPathToContours(
+            pxStartX, pxStartY, pxCommands.data(), (uint32_t)pxCommands.size(),
+            adaptiveTolerance);
+        uint64_t outputVerts = 0;
+        for (const auto& c : contours) outputVerts += c.VertexCount();
+        flattenTimer.RecordOutputVerts(outputVerts);
+    }
 
     if (contours.empty()) return false;
 
@@ -1979,38 +2594,47 @@ bool ImpellerD3D12Engine::EncodeStrokePath(
     auto cap = static_cast<ImpellerCap>(lineCap);
 
     // -------------------------------------------------------------
-    // Route the whole stroke through the analytic-AA rasterizer.
+    // Stroke widening with two output modes selected by useAnalytic:
     //
-    // ExpandStroke normally builds a triangle mesh and pushes it as
-    // an ImpellerDrawBatch — the GPU then rasterizes it with binary
-    // SampleDesc.Count=1 coverage, giving visibly aliased edges on
-    // everything that isn't axis-aligned (the symptom the user saw
-    // on DockLayout tab outlines).
+    //   Antialiased (useAnalytic = true, the default):
+    //     ExpandStrokePath collects expanded contours into strokeContours.
+    //     A subsequent RasterizePathToRects pass produces a PixelRect list
+    //     with per-rect alpha coverage — same algorithm and shape as fill.
+    //     Smooth edges, identical to Vulkan stroke output.
     //
-    // In "collect" mode it instead appends one CCW-normalized
-    // triangle contour per mesh triangle to strokeContours. We then
-    // feed all of those contours as a single NonZero compound path
-    // to RasterizePathToRects, which produces alpha-weighted rects
-    // — the same path fills already take, so strokes now share the
-    // same 4× vertical / analytic-horizontal AA quality.
+    //   Aliased (useAnalytic = false):
+    //     ExpandStrokePath emits a tessellated triangle mesh directly
+    //     (per-segment quads + miter/round joins + caps). ~200 verts for
+    //     a long bezier wave; GPU rasterizer fills triangles with a
+    //     constant brush color. Sharp binary edges — pixel-art look.
     //
-    // Dash expansion still produces multiple logical sub-polylines
-    // per source contour, but all of them dump their triangles into
-    // the same strokeContours vector, so there's exactly one final
-    // rasterize + emit pass regardless of dash count.
+    // Dash patterns accumulate sub-stroke output into the same buffer
+    // regardless of mode.
     // -------------------------------------------------------------
     std::vector<Contour> strokeContours;
-    strokeContours.reserve(contours.size() * 8);
+    std::vector<ImpellerVertex> meshVerts;
+    std::vector<uint32_t>       meshIndices;
+    if (useAnalytic) {
+        strokeContours.reserve(contours.size() * 8);
+    } else {
+        meshVerts.reserve(contours.size() * 64);
+        meshIndices.reserve(contours.size() * 96);
+    }
 
-    // Stroke each contour separately. Contours are already in pixel
-    // space (pxCommands were transformed before flattening above), so
-    // we just copy the points verbatim — no per-vertex transform.
+    auto expandSubStroke = [&](uint32_t pointCount, bool subClosed) {
+        jalium::ExpandStrokePath<ImpellerVertex>(
+            meshVerts, meshIndices,
+            flatPoints_.data(), pointCount,
+            pxStrokeWidth, join, miterLimit, cap, subClosed,
+            brush.r, brush.g, brush.b, brush.a,
+            /* collectContours */ useAnalytic ? &strokeContours : nullptr);
+    };
+
     for (auto& c : contours) {
         if (c.VertexCount() < 2) continue;
 
         flatPoints_ = c.points;
 
-        // Apply dash pattern if specified (pixel-space lengths).
         if (!pxDashPattern.empty()) {
             uint32_t pointCount = (uint32_t)(flatPoints_.size() / 2);
             if (pointCount < 2) continue;
@@ -2053,7 +2677,7 @@ bool ImpellerD3D12Engine::EncodeStrokePath(
                     if (dashRemain <= 1e-6f) {
                         if (isDraw && currentSegment.size() >= 4) {
                             flatPoints_ = std::move(currentSegment);
-                            ExpandStroke(brush, pxStrokeWidth, join, miterLimit, cap, false, &strokeContours);
+                            expandSubStroke((uint32_t)(flatPoints_.size() / 2), false);
                         }
                         currentSegment.clear();
                         dashIdx = (dashIdx + 1) % dashCount; dashRemain = pxDashPattern[dashIdx]; isDraw = !isDraw;
@@ -2062,55 +2686,77 @@ bool ImpellerD3D12Engine::EncodeStrokePath(
             }
             if (isDraw && currentSegment.size() >= 4) {
                 flatPoints_ = std::move(currentSegment);
-                ExpandStroke(brush, pxStrokeWidth, join, miterLimit, cap, false, &strokeContours);
+                expandSubStroke((uint32_t)(flatPoints_.size() / 2), false);
             }
         } else {
-            ExpandStroke(brush, pxStrokeWidth, join, miterLimit, cap, closed, &strokeContours);
+            expandSubStroke((uint32_t)(flatPoints_.size() / 2), closed);
         }
     }
 
-    if (strokeContours.empty()) return false;
-
-    // Rasterize the full stroke mesh as a compound NonZero path and
-    // emit alpha-weighted rects through the solid-fill PSO.
-    std::vector<PixelRect> rects;
-    rects.reserve(strokeContours.size() * 2);
-    RasterizePathToRects(strokeContours, FillRule::NonZero, rects);
-
-    if (rects.empty()) return false;
-
-    float r = brush.r * brush.a;
-    float g = brush.g * brush.a;
-    float b = brush.b * brush.a;
-    float a = brush.a;
-
-    ImpellerDrawBatch batch;
-    batch.vertices.reserve(rects.size() * 4);
-    batch.indices.reserve(rects.size() * 6);
-    for (const auto& rect : rects) {
-        float x0 = (float)rect.x;
-        float y0 = (float)rect.y;
-        float x1 = (float)(rect.x + rect.w);
-        float y1 = (float)(rect.y + rect.h);
-        float ra = r * rect.alpha;
-        float ga = g * rect.alpha;
-        float ba = b * rect.alpha;
-        float aa = a * rect.alpha;
-        uint32_t base = (uint32_t)batch.vertices.size();
-        batch.vertices.push_back({ x0, y0, ra, ga, ba, aa });
-        batch.vertices.push_back({ x1, y0, ra, ga, ba, aa });
-        batch.vertices.push_back({ x1, y1, ra, ga, ba, aa });
-        batch.vertices.push_back({ x0, y1, ra, ga, ba, aa });
-        batch.indices.push_back(base);
-        batch.indices.push_back(base + 1);
-        batch.indices.push_back(base + 2);
-        batch.indices.push_back(base);
-        batch.indices.push_back(base + 2);
-        batch.indices.push_back(base + 3);
+    // ──────────────────────────────────────────────────────────────
+    // Analytic branch: feed strokeContours into RasterizePathToRects
+    // (the same analytic-AA scanline rasterizer fill already uses).
+    // Cache the resulting PixelRect list so subsequent frames bypass
+    // both stroke expansion and rasterization.
+    // ──────────────────────────────────────────────────────────────
+    if (useAnalytic) {
+        if (strokeContours.empty()) {
+            StrokeAnalyticCacheInsert(cacheKey, std::make_shared<CachedStrokeAnalyticRects>());
+            return false;
+        }
+        auto cached = std::make_shared<CachedStrokeAnalyticRects>();
+        cached->rects.reserve(256);
+        // Stroke widening always produces NonZero-fill polygons (cap/join
+        // tessellations are convex and don't cross themselves with
+        // alternating winding), so we hard-code FillRule::NonZero here.
+        RasterizePathToRects(strokeContours, FillRule::NonZero, cached->rects);
+        if (cached->rects.empty()) {
+            StrokeAnalyticCacheInsert(cacheKey, std::move(cached));
+            return false;
+        }
+        emitStrokeRectsAsBatch(cached->rects, intDx, intDy);
+        StrokeAnalyticCacheInsert(cacheKey, std::move(cached));
+        return true;
     }
-    batch.pipelineType = 0;
-    PushBatch(std::move(batch));
-    encodedPathCount_++;
+
+    // ──────────────────────────────────────────────────────────────
+    // Aliased branch: cache the raw triangle mesh and emit it as-is.
+    // ──────────────────────────────────────────────────────────────
+    if (meshVerts.empty() || meshIndices.empty()) {
+        StrokeCacheInsert(cacheKey, std::make_shared<CachedStrokeRects>());
+        return false;
+    }
+
+    auto cached = std::make_shared<CachedStrokeRects>();
+    cached->positions.resize(meshVerts.size() * 2);
+    cached->coverage.resize(meshVerts.size());
+    float minX =  std::numeric_limits<float>::infinity();
+    float minY =  std::numeric_limits<float>::infinity();
+    float maxX = -std::numeric_limits<float>::infinity();
+    float maxY = -std::numeric_limits<float>::infinity();
+    const float invBrushA = (brush.a > 0.0f) ? (1.0f / brush.a) : 0.0f;
+    for (size_t i = 0; i < meshVerts.size(); i++) {
+        const auto& v = meshVerts[i];
+        cached->positions[i * 2]     = v.x;
+        cached->positions[i * 2 + 1] = v.y;
+        // Normalize the vertex alpha back to 0..1 coverage so the cache
+        // entry is brush-independent: ExpandStrokePath emitted alpha as
+        // `brushA × coverage`, divide to recover the geometry-only mask.
+        // Outer feather verts come out as coverage=0, inner solid =1.
+        float cov = v.a * invBrushA;
+        if (cov < 0.0f) cov = 0.0f; else if (cov > 1.0f) cov = 1.0f;
+        cached->coverage[i] = (uint8_t)std::lround(cov * 255.0f);
+        if (v.x < minX) minX = v.x;
+        if (v.y < minY) minY = v.y;
+        if (v.x > maxX) maxX = v.x;
+        if (v.y > maxY) maxY = v.y;
+    }
+    cached->indices = std::move(meshIndices);
+    cached->bboxL = minX; cached->bboxT = minY;
+    cached->bboxR = maxX; cached->bboxB = maxY;
+
+    StrokeCacheInsert(cacheKey, cached);
+    emitCachedMesh(*cached, intDx, intDy);
     return true;
 }
 
