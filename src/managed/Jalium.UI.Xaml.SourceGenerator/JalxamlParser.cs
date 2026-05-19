@@ -1220,10 +1220,12 @@ public static class JalxamlParser
         var inAttr = false;
         char attrQuote = '\0';
         // Open block stack — 'I' = @if, 'S' = @section. A text-level '}' closes the
-        // innermost block and emits the matching close tag. @if condition layering for
-        // nesting is rebuilt later from the XML nesting of <__RazorIf> (FlattenRazorIf),
-        // not from this scan; the stack only needs the block kind.
-        var blocks = new System.Collections.Generic.Stack<char>();
+        // innermost block and emits the matching close tag. For @if, the frame also
+        // carries the chain conditions seen so far so a following `else if` / `else`
+        // can compute its mutually-exclusive effective condition exactly as the runtime
+        // (XamlReader RazorIfBlockEntry.ChainBranchConditions). Nesting is rebuilt later
+        // from the XML nesting of <__RazorIf> by FlattenRazorIf.
+        var blocks = new System.Collections.Generic.Stack<RazorBlock>();
         var liftedAny = false;
 
         while (i < content.Length)
@@ -1294,10 +1296,11 @@ public static class JalxamlParser
                         if (brace >= content.Length || content[brace] != '{')
                             return false;
 
+                        var c1 = condition.Trim();
                         sb.Append('<').Append(RazorIfElementName)
-                          .Append(" Condition=\"").Append(EscapeXmlAttribute(condition.Trim()))
+                          .Append(" Condition=\"").Append(EscapeXmlAttribute(c1))
                           .Append("\">");
-                        blocks.Push('I');
+                        blocks.Push(new RazorBlock { Kind = 'I', Chain = new System.Collections.Generic.List<string> { c1 } });
                         liftedAny = true;
                         i = brace + 1;
                         continue;
@@ -1326,7 +1329,7 @@ public static class JalxamlParser
                     sb.Append('<').Append(RazorSectionElementName)
                       .Append(" __SectionName=\"").Append(EscapeXmlAttribute(sectionName))
                       .Append("\">");
-                    blocks.Push('S');
+                    blocks.Push(new RazorBlock { Kind = 'S' });
                     liftedAny = true;
                     i = brace + 1;
                     continue;
@@ -1367,21 +1370,65 @@ public static class JalxamlParser
             // which also treats a '}' in text content as the block terminator.
             if (c == '}' && blocks.Count > 0)
             {
-                var kind = blocks.Pop();
+                var frame = blocks.Pop();
                 i++;
-                if (kind == 'I')
-                {
-                    sb.Append("</").Append(RazorIfElementName).Append('>');
-                    // `} else` / `} else if` — an else-chain is not lowerable.
-                    var afterBrace = SkipWhitespace(content, i);
-                    if (IsWordAt(content, afterBrace, "else", out _))
-                        return false;
-                }
-                else
+                if (frame.Kind != 'I')
                 {
                     sb.Append("</").Append(RazorSectionElementName).Append('>');
+                    continue;
                 }
-                continue;
+
+                sb.Append("</").Append(RazorIfElementName).Append('>');
+
+                // `} else` / `} else if(c) {` — open the next mutually-exclusive branch
+                // as a sibling <__RazorIf> whose Condition is the effective expression
+                // computed exactly as the runtime (negate every prior chain condition,
+                // AND the new one for else-if). FlattenRazorIf later wraps + combines
+                // these with ancestors, reproducing BuildCombinedIfConditionExpression.
+                var afterBrace = SkipWhitespace(content, i);
+                if (!IsWordAt(content, afterBrace, "else", out var afterElse))
+                    continue; // chain ends here.
+
+                var p = SkipWhitespace(content, afterElse);
+                if (IsWordAt(content, p, "if", out var afterElseIf))
+                {
+                    var ep = SkipWhitespace(content, afterElseIf);
+                    if (ep >= content.Length || content[ep] != '(')
+                        return false;
+                    if (!TryReadBalancedParens(content, ep, out var elseIfCond, out var afterEp))
+                        return false;
+                    var eb = SkipWhitespace(content, afterEp);
+                    if (eb >= content.Length || content[eb] != '{')
+                        return false;
+
+                    var ck = elseIfCond.Trim();
+                    sb.Append('<').Append(RazorIfElementName)
+                      .Append(" Condition=\"")
+                      .Append(EscapeXmlAttribute(BuildElseIfEffectiveCondition(frame.Chain!, ck)))
+                      .Append("\">");
+                    var newChain = new System.Collections.Generic.List<string>(frame.Chain!) { ck };
+                    blocks.Push(new RazorBlock { Kind = 'I', Chain = newChain });
+                    liftedAny = true;
+                    i = eb + 1;
+                    continue;
+                }
+
+                if (p < content.Length && content[p] == '{')
+                {
+                    sb.Append('<').Append(RazorIfElementName)
+                      .Append(" Condition=\"")
+                      .Append(EscapeXmlAttribute(BuildElseEffectiveCondition(frame.Chain!)))
+                      .Append("\">");
+                    // `else` adds no new condition; a later (illegal) else would simply
+                    // re-negate the same chain — harmless, mirrors the runtime.
+                    blocks.Push(new RazorBlock { Kind = 'I', Chain = frame.Chain });
+                    liftedAny = true;
+                    i = p + 1;
+                    continue;
+                }
+
+                // `else` not followed by `if(` or `{` — malformed; defer to runtime.
+                return false;
             }
 
             sb.Append(c);
@@ -1411,6 +1458,56 @@ public static class JalxamlParser
         var end = t.IndexOf(q, 1);
         if (end <= 0) return null;
         return t.Substring(1, end - 1);
+    }
+
+    /// <summary>One open structural block in the lift scanner.</summary>
+    private sealed class RazorBlock
+    {
+        /// <summary>'I' = @if branch, 'S' = @section.</summary>
+        public char Kind;
+
+        /// <summary>
+        /// For an @if branch: every branch condition seen so far in this if/else-if chain
+        /// (c1 .. c_k for the currently-open k-th branch), mirroring the runtime
+        /// <c>RazorIfBlockEntry.ChainBranchConditions</c>. Null for @section.
+        /// </summary>
+        public System.Collections.Generic.List<string>? Chain;
+    }
+
+    /// <summary>
+    /// Effective condition for an <c>else if(ck)</c> branch following branches whose
+    /// conditions are <paramref name="priorChain"/> (c1..c_{k-1} ... actually the popped
+    /// branch's full chain). Byte-identical to the runtime
+    /// (<c>XamlReader</c>: <c>!(c1) &amp;&amp; !(c2) &amp;&amp; ... &amp;&amp; (ck)</c>, always joined).
+    /// </summary>
+    private static string BuildElseIfEffectiveCondition(System.Collections.Generic.List<string> priorChain, string ck)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var cond in priorChain)
+        {
+            sb.Append("!(").Append(cond).Append(") && ");
+        }
+        sb.Append('(').Append(ck).Append(')');
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Effective condition for a plain <c>else</c> following branches
+    /// <paramref name="priorChain"/>. Byte-identical to the runtime: a single prior
+    /// condition is emitted as <c>!(c1)</c> (NOT joined); multiple as
+    /// <c>!(c1) &amp;&amp; !(c2) &amp;&amp; ...</c>.
+    /// </summary>
+    private static string BuildElseEffectiveCondition(System.Collections.Generic.List<string> priorChain)
+    {
+        if (priorChain.Count == 1)
+            return "!(" + priorChain[0] + ")";
+        var sb = new System.Text.StringBuilder();
+        for (var k = 0; k < priorChain.Count; k++)
+        {
+            if (k > 0) sb.Append(" && ");
+            sb.Append("!(").Append(priorChain[k]).Append(')');
+        }
+        return sb.ToString();
     }
 
     private static bool StartsWith(string s, int pos, string token)
