@@ -32,7 +32,6 @@
     <!-- ToastNotificationHost Style -->
     <!-- ============================================== -->
     <Style TargetType="ToastNotificationHost">
-        <Setter Property="Background" Value="Transparent" />
         <Setter Property="IsHitTestVisible" Value="True" />
     </Style>
 

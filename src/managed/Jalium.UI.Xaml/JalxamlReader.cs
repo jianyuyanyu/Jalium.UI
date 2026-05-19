@@ -1091,8 +1091,7 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
                     // @{ ... } — inline code block. Expand via interpreter, then tokenize result.
                     if (next == '{')
                     {
-                        FlushText(sb, ref textStartLine, ref textStartCol, ref textStartPos);
-                        HandleCodeBlock();
+                        HandleCodeBlock(sb, ref textStartLine, ref textStartCol, ref textStartPos);
                         continue;
                     }
 
@@ -1195,15 +1194,16 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
         /// <see cref="RazorCodeBlockPreprocessor.FindMatchingBrace"/>, expands it with
         /// the AOT-safe interpreter, then recursively tokenizes the result inline.
         /// </summary>
-        private void HandleCodeBlock()
+        private void HandleCodeBlock(StringBuilder sb, ref int textStartLine, ref int textStartCol, ref int textStartPos)
         {
             // _src[_pos..] starts with "@{"
-            var atPos = _pos;
+            var blockStart = _pos;
             var codeStart = _pos + 2;
             var braceEnd = RazorCodeBlockPreprocessor.FindMatchingBrace(_src, codeStart);
             if (braceEnd < 0)
             {
-                // Unbalanced — consume the '@' and let the loop continue
+                // Unbalanced — emit the '@' as literal text and let the loop continue
+                sb.Append('@');
                 Advance();
                 return;
             }
@@ -1214,8 +1214,21 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
             while (_pos < braceEnd + 1) Advance();
 
             var expanded = RazorCodeBlockPreprocessor.ExpandCodeBlock(code);
-            if (!string.IsNullOrEmpty(expanded))
-                TokenizeNested(expanded);
+            if (string.IsNullOrEmpty(expanded))
+                return;
+
+            if (RazorCodeBlockPreprocessor.IsRuntimeCodeBlock(expanded))
+            {
+                // Pure C# code block — defer to the runtime RazorTemplate engine, which
+                // executes the block against the live DataContext. Emit the original
+                // @{ ... } source verbatim as text rather than recursively tokenizing the
+                // identical string (which would loop forever and overflow the stack).
+                sb.Append(_src, blockStart, _pos - blockStart);
+                return;
+            }
+
+            FlushText(sb, ref textStartLine, ref textStartCol, ref textStartPos);
+            TokenizeNested(expanded);
         }
 
         /// <summary>

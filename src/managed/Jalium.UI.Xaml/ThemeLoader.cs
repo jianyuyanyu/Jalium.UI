@@ -42,11 +42,16 @@ public static class ThemeLoader
         // 让渲染层强转崩溃。
         Style.StringValueConverter = TypeConverterRegistry.ConvertValue;
 
-        // If Application was already created but theme not yet loaded, load now
-        if (Application.Current != null && !ThemeManager.IsInitialized)
-        {
-            ThemeManager.Initialize(Application.Current);
-        }
+        // NOTE on intentional restraint: this ModuleInitializer ONLY registers callbacks
+        // (XamlLoader, SourceLoader, StartupObjectLoader, type resolver, value converter).
+        // It MUST NOT call back into ThemeManager.Initialize here — even guarded by
+        // "Application.Current != null && !IsInitialized". The CLR does not guarantee
+        // ordering between sibling [ModuleInitializer] methods in the same assembly, so a
+        // reentry from here may run before XamlBuilderInitializer.Register has wired
+        // XamlBuilder.BeginComponentImpl, leading to "BeginComponentImpl has not been
+        // registered" when LoadGenericTheme tries to materialize the prebuilt dictionary.
+        // Theme loading is owned by Application.ctor → ThemeManager.Initialize, which calls
+        // EnsureXamlLoaderRegistered first; that path is the single, ordered driver.
     }
 
     [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Defers to LoadResourceDictionaryFromPayload which uses XamlReader (RUC).")]
@@ -55,6 +60,36 @@ public static class ThemeLoader
     {
         try
         {
+            // Top-level entry from ThemeManager.LoadGenericTheme — same prebuilt-dictionary
+            // shortcut as LoadReferencedResourceDictionary. When the SG emitted a builder
+            // for this resource we skip the embedded-resource read entirely; the framework
+            // theme dictionaries are the hot path here (Generic.jalxaml + 27 control
+            // dictionaries).
+            //
+            // Diagnostic: log every entry into this loader plus the prebuilt-registry size
+            // so a startup trace shows whether the SG actually populated the registry. A
+            // zero count usually means the consuming project did not reference the SG as
+            // an analyzer or its [ModuleInitializer] did not run.
+            Jalium.UI.Controls.XamlLoadStartupTrace.Emit(
+                $"[Jalium.UI startup]     LoadResourceDictionaryFromStream '{resourceName}' (registry: {XamlPrebuiltDictionaryRegistry.Count} prebuilt entries)");
+
+            if (TryBuildFromPrebuiltRegistryByResourceName(resourceName, sourceAssembly, out var prebuilt))
+            {
+                Jalium.UI.Controls.XamlLoadStartupTrace.Emit($"[Jalium.UI startup]       prebuilt HIT '{resourceName}'");
+                return prebuilt;
+            }
+
+            // No prebuilt builder — fall back to streaming the manifest resource through
+            // the runtime XAML reader. An empty/zero-length stream means the manifest
+            // entry is missing AND no prebuilt builder matched, so theming will silently
+            // degrade.
+            if (stream.CanSeek && stream.Length == 0)
+            {
+                Jalium.UI.Controls.XamlLoadStartupTrace.Emit($"[Jalium.UI startup]       prebuilt MISS + empty stream '{resourceName}' — theming degraded");
+                return null;
+            }
+
+            Jalium.UI.Controls.XamlLoadStartupTrace.Emit($"[Jalium.UI startup]       prebuilt MISS, falling back to embedded stream '{resourceName}'");
             using var payloadStream = new MemoryStream();
             stream.CopyTo(payloadStream);
             return LoadResourceDictionaryFromPayload(payloadStream.ToArray(), resourceName, sourceAssembly, null);
@@ -65,6 +100,78 @@ public static class ThemeLoader
         }
     }
 
+    /// <summary>
+    /// Try to build a ResourceDictionary from <see cref="XamlPrebuiltDictionaryRegistry"/>
+    /// keyed by a top-level resource name. Tries multiple spellings since the SG's
+    /// registration uses the canonical manifest form (<c>{AssemblyName}.{path}.jalxaml</c>)
+    /// while callers may pass other shapes (path-only, slash-separated, dot-separated).
+    /// </summary>
+    private static bool TryBuildFromPrebuiltRegistryByResourceName(string resourceName, Assembly sourceAssembly, out ResourceDictionary? dict)
+    {
+        var assemblyName = sourceAssembly.GetName().Name ?? string.Empty;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var normalizedSlash = resourceName.Replace('\\', '/').TrimStart('/');
+        var dotted = normalizedSlash.Replace('/', '.');
+
+        // CRITICAL: BaseUri must use the slash form so the URI parser's
+        // relative-resolution treats path segments correctly. Generic.jalxaml then
+        // resolves "<ResourceDictionary Source='DarkTheme.jalxaml' />" against
+        //   resource:///Jalium.UI.Controls/Themes/Generic.jalxaml
+        // → resource:///Jalium.UI.Controls/Themes/DarkTheme.jalxaml      (slash form keeps "Themes/")
+        //
+        // Using the dotted manifest name as a URI segment collapses the entire
+        // "Themes/Generic.jalxaml" path into a single filename token; relative
+        // resolution then strips it whole and the child becomes
+        //   resource:///Jalium.UI.Controls/DarkTheme.jalxaml             (loses "Themes/")
+        // which makes prebuilt-registry lookups for the child miss every spelling.
+        var sourceUri = new Uri($"resource:///{assemblyName}/{normalizedSlash}", UriKind.Absolute);
+
+        foreach (var candidate in new[]
+        {
+            resourceName,
+            normalizedSlash,
+            dotted,
+            $"{assemblyName}.{normalizedSlash}",
+            $"{assemblyName}.{dotted}",
+        })
+        {
+            if (string.IsNullOrEmpty(candidate) || !seen.Add(candidate))
+                continue;
+
+            if (XamlPrebuiltDictionaryRegistry.TryGetFactory(candidate, out var factory) && factory != null)
+            {
+                var typed = factory();
+                typed.Source = sourceUri;
+                typed.BaseUri = sourceUri;
+                typed.SourceAssembly = sourceAssembly;
+                dict = typed;
+                return true;
+            }
+
+            if (XamlPrebuiltDictionaryRegistry.TryGet(candidate, out var builder) && builder != null)
+            {
+                var built = new ResourceDictionary
+                {
+                    Source = sourceUri,
+                    BaseUri = sourceUri,
+                    SourceAssembly = sourceAssembly,
+                };
+                using (built.DeferNotifications())
+                {
+                    var ctx = XamlBuilder.BeginComponent(built, sourceUri, sourceAssembly);
+                    builder(built, ctx);
+                    XamlBuilder.EndComponent(built, ctx);
+                }
+                dict = built;
+                return true;
+            }
+        }
+
+        dict = null;
+        return false;
+    }
+
     [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Defers to LoadResourceDictionaryFromPayload which uses XamlReader (RUC).")]
     private static ResourceDictionary? LoadReferencedResourceDictionary(
         ResourceDictionary owner,
@@ -73,6 +180,12 @@ public static class ThemeLoader
     {
         ArgumentNullException.ThrowIfNull(owner);
         ArgumentNullException.ThrowIfNull(sourceUri);
+
+        // 给每个嵌套 ResourceDictionary 加载计时 — Generic.jalxaml 的 27 个 MergedDictionary
+        // 都走这里递归。trace 默认开,通过 JALIUM_STARTUP_TRACE=0 关闭。耗时显著(>10ms)
+        // 才输出,避免极小字典刷屏。
+        bool trace = Environment.GetEnvironmentVariable("JALIUM_STARTUP_TRACE") != "0";
+        long tStart = trace ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         try
         {
@@ -123,6 +236,27 @@ public static class ThemeLoader
                 return null;
             }
 
+            // Compile-time generated dictionaries first. The SourceGenerator emits one
+            // builder per prebuilt jalxaml resource and registers it in
+            // XamlPrebuiltDictionaryRegistry under the canonical manifest name. When the
+            // lookup hits, we skip the entire embedded-resource + XML reader path — at
+            // startup this is the single biggest theme-loading saving (no XML lex / no
+            // element-name → Type reflection / no per-attribute type-converter dispatch).
+            var prebuilt = TryBuildFromPrebuiltRegistry(owner, sourceUri, assembly, pathCandidates);
+            if (prebuilt != null)
+            {
+                if (trace)
+                {
+                    long ms = (long)System.Diagnostics.Stopwatch.GetElapsedTime(tStart, System.Diagnostics.Stopwatch.GetTimestamp()).TotalMilliseconds;
+                    if (ms >= 1)
+                    {
+                        Jalium.UI.Controls.XamlLoadStartupTrace.Emit(
+                            $"[Jalium.UI startup]     ResourceDict prebuilt {ms,4}ms  {sourceUri.OriginalString}");
+                    }
+                }
+                return prebuilt;
+            }
+
             var attemptedResourceNames = new List<string>();
             using var stream = TryOpenEmbeddedResource(assembly, pathCandidates, attemptedResourceNames, out var resolvedResourceName);
             if (stream == null || string.IsNullOrEmpty(resolvedResourceName))
@@ -134,13 +268,107 @@ public static class ThemeLoader
 
             using var payloadStream = new MemoryStream();
             stream.CopyTo(payloadStream);
-            return LoadResourceDictionaryFromPayload(payloadStream.ToArray(), resolvedResourceName, assembly, sourceUri);
+            var result = LoadResourceDictionaryFromPayload(payloadStream.ToArray(), resolvedResourceName, assembly, sourceUri);
+            if (trace)
+            {
+                long ms = (long)System.Diagnostics.Stopwatch.GetElapsedTime(tStart, System.Diagnostics.Stopwatch.GetTimestamp()).TotalMilliseconds;
+                if (ms >= 5) // 只输出 ≥5ms 的字典,避免噪音
+                {
+                    Jalium.UI.Controls.XamlLoadStartupTrace.Emit(
+                        $"[Jalium.UI startup]     ResourceDict load {ms,4}ms  {sourceUri.OriginalString}");
+                }
+            }
+            return result;
         }
         catch (Exception ex)
         {
             LogResourceDictionaryLoadFailure(sourceUri, ex.ToString());
             return null;
         }
+    }
+
+    /// <summary>
+    /// Iterate the SDK-style manifest-resource candidates and check the SG-emitted
+    /// <see cref="XamlPrebuiltDictionaryRegistry"/>. Returns a fully-populated
+    /// ResourceDictionary on the first hit (no XML reader, no embedded resource read);
+    /// returns null when no candidate is registered, in which case the caller takes
+    /// the legacy embedded-resource path.
+    /// </summary>
+    /// <remarks>
+    /// We mirror the candidate-name fan-out used by <see cref="TryOpenEmbeddedResource"/>:
+    /// each path is normalised to <c>foo/bar/baz.jalxaml</c>, then the registry is queried
+    /// under both the raw form and the dotted form, with and without the assembly name
+    /// prefix. The SG emits the canonical <c>{RootNamespace}.{dotted}</c> form; the rest
+    /// are tried as a safety net for projects whose RootNamespace differs from
+    /// AssemblyName.
+    /// </remarks>
+    private static ResourceDictionary? TryBuildFromPrebuiltRegistry(
+        ResourceDictionary owner,
+        Uri sourceUri,
+        Assembly assembly,
+        IReadOnlyList<string> pathCandidates)
+    {
+        var assemblyName = assembly.GetName().Name ?? string.Empty;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var path in pathCandidates)
+        {
+            var normalized = path.Replace('\\', '/').TrimStart('/');
+            var dotted = normalized.Replace('/', '.');
+
+            foreach (var candidate in new[]
+            {
+                $"{assemblyName}.{dotted}",
+                dotted,
+                $"{assemblyName}.{normalized}",
+                normalized,
+            })
+            {
+                if (!seen.Add(candidate))
+                    continue;
+
+                // Typed factory registration wins — the codebehind ctor has already populated
+                // the returned instance via the SG-generated InitializeComponent. We only set
+                // Source/BaseUri/SourceAssembly so downstream relative-URI resolution and
+                // theme-cache invalidation see the right metadata; we never re-run a builder.
+                if (XamlPrebuiltDictionaryRegistry.TryGetFactory(candidate, out var factory) && factory != null)
+                {
+                    var typedDict = factory();
+                    typedDict.Source = sourceUri;
+                    typedDict.BaseUri = sourceUri;
+                    typedDict.SourceAssembly = assembly;
+                    return typedDict;
+                }
+
+                if (XamlPrebuiltDictionaryRegistry.TryGet(candidate, out var builder) && builder != null)
+                {
+                    var dict = new ResourceDictionary
+                    {
+                        Source = sourceUri,
+                        BaseUri = sourceUri,
+                        SourceAssembly = assembly,
+                    };
+
+                    // Bulk-load: coalesce the dozens-to-hundreds of OnChangedForKey calls the
+                    // builder triggers (one per Style.TargetType / Setter.Value insertion)
+                    // into a single deferred notification when the dict is finally added to
+                    // its parent's MergedDictionaries. Without this every individual Add
+                    // bumps the global resource cache generation and re-fires Changed up the
+                    // ancestor chain — turning a 60ms dict build into 600ms+ when N MergedDicts
+                    // are nested. The scope only suppresses outbound events while the dict is
+                    // still detached; consumers see a single coalesced "all keys changed"
+                    // notification once the dict is published.
+                    using (dict.DeferNotifications())
+                    {
+                        var ctx = XamlBuilder.BeginComponent(dict, sourceUri, assembly);
+                        builder(dict, ctx);
+                        XamlBuilder.EndComponent(dict, ctx);
+                    }
+                    return dict;
+                }
+            }
+        }
+        return null;
     }
 
     /// <summary>
@@ -233,13 +461,30 @@ public static class ThemeLoader
             throw new InvalidOperationException($"StartupUri '{startupUriText}' is not a valid startup path.");
         }
 
+        // Compile-time path: the SG registers (uri spelling → type) entries in its
+        // ModuleInitializer for every code-behind jalxaml. When the StartupUri matches
+        // one of those entries we skip the manifest-resource lookup entirely — the
+        // codebehind ctor + SG-generated InitializeComponent already build the visual
+        // tree. This is the preferred path now that .jalxaml is no longer embedded.
+        foreach (var candidate in pathCandidates)
+        {
+            var registered = XamlTypeRegistry.GetStartupTypeByUri(candidate);
+            if (registered != null)
+            {
+                return CreateStartupInstance(registered);
+            }
+        }
+
         var attemptedResourceNames = new List<string>();
         var stream = TryOpenEmbeddedResource(assembly, pathCandidates, attemptedResourceNames, out var resolvedResourceName);
         if (stream == null || string.IsNullOrEmpty(resolvedResourceName))
         {
             throw new XamlParseException(
                 $"Cannot resolve StartupUri '{startupUriText}' in assembly '{assembly.GetName().Name}'. " +
-                $"Candidates=[{string.Join(", ", attemptedResourceNames)}].");
+                $"Candidates=[{string.Join(", ", attemptedResourceNames)}]. " +
+                $"Hint: when EmbedJalxamlSources=false the SourceGenerator must have observed " +
+                $"the file at compile time so it could register the StartupUri mapping. " +
+                $"Verify the .jalxaml file is included in @(JalxamlPage) / @(JalxamlApplicationDefinition).");
         }
 
         using (stream)
