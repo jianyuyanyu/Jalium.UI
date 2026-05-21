@@ -21,7 +21,10 @@ struct PsOutput
 
 PsOutput main(PsInput input)
 {
-    DiscardOutsideRoundedClip(input.clipPos.xy);
+    // Rounded clip 改用 alpha coverage：避免 discard 在 ClearType 双源混合
+    // 路径上把字形的子像素覆盖率打成二值锯齿。coverage 同时乘到 .color 与
+    // SV_Target1 的 coverage 通道上，让圆角边缘的字也走 ClearType AA。
+    float clipCoverage = RoundedClipCoverage(input.clipPos.xy);
 
     // Atlas is R8G8B8A8_UNORM: .rgb = per-channel sub-pixel coverage, .a = max coverage
     float4 atlas = glyphAtlas.Sample(glyphSampler, input.uv);
@@ -31,6 +34,9 @@ PsOutput main(PsInput input)
     float3 contrast = saturate(coverage * 1.2 - 0.1);
     coverage = lerp(coverage, contrast, 0.3);
 
+    // 圆角裁剪以 alpha mask 形式衰减每通道覆盖率 + max coverage，让
+    // 圆角边缘的子像素 AA 与字形 ClearType AA 自然叠加，不再 1px 硬切。
+    coverage *= clipCoverage;
     float maxCoverage = max(coverage.r, max(coverage.g, coverage.b));
     if (maxCoverage < 1.0 / 255.0) discard;
 
