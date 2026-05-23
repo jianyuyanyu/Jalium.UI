@@ -1076,6 +1076,33 @@ internal static partial class NativeMethods
     internal static partial void TextFormatSetMaxLines(nint textFormat, uint maxLines);
 
     /// <summary>
+    /// Sets the per-format text rendering (anti-alias) mode mirroring
+    /// <see cref="Jalium.UI.Media.TextRenderingMode"/>:
+    /// 0=Auto, 1=Aliased, 2=Grayscale, 3=ClearType. Auto falls through to
+    /// the process-wide <c>jalium_text_set_global_antialias_mode</c>.
+    /// </summary>
+    [LibraryImport(CoreLib, EntryPoint = "jalium_text_format_set_text_rendering_mode")]
+    internal static partial void TextFormatSetTextRenderingMode(nint textFormat, int mode);
+
+    /// <summary>
+    /// Sets the per-format text formatting mode mirroring
+    /// <see cref="Jalium.UI.Media.TextFormattingMode"/>:
+    /// 0=Ideal (resolution-independent metrics), 1=Display (pixel-snapped).
+    /// </summary>
+    [LibraryImport(CoreLib, EntryPoint = "jalium_text_format_set_text_formatting_mode")]
+    internal static partial void TextFormatSetTextFormattingMode(nint textFormat, int mode);
+
+    /// <summary>
+    /// Sets the per-format text hinting mode mirroring
+    /// <see cref="Jalium.UI.Media.TextHintingMode"/>:
+    /// 0=Auto, 1=Fixed, 2=Animated. Animated is the mode WPF storyboards
+    /// switch to during sub-pixel slide / fade so the hinting doesn't pop
+    /// a pixel mid-animation.
+    /// </summary>
+    [LibraryImport(CoreLib, EntryPoint = "jalium_text_format_set_text_hinting_mode")]
+    internal static partial void TextFormatSetTextHintingMode(nint textFormat, int mode);
+
+    /// <summary>
     /// Hit-tests a point against a text layout.
     /// </summary>
     [LibraryImport(CoreLib, EntryPoint = "jalium_text_format_hit_test_point", StringMarshalling = StringMarshalling.Utf16)]

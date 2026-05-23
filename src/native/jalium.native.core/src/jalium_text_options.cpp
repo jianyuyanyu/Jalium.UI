@@ -1,4 +1,5 @@
 #include "jalium_text_options.h"
+#include "jalium_backend.h"
 
 #include <atomic>
 #include <cstdio>
@@ -22,34 +23,49 @@ std::atomic<uint64_t> g_generation{0};
 }  // namespace
 
 int32_t ResolveMode(int32_t mode) noexcept {
-    // Auto resolves to the platform's expected default: ClearType on Windows
-    // (the WPF / Win32 convention every desktop app honours), Grayscale on
-    // every other platform (macOS, Android, iOS, Linux — none of them ship
-    // sub-pixel text rendering by default). Grayscale stays available on
-    // Windows for callers that need it (high-DPI authoring tools, off-screen
-    // render targets that get resampled) via
-    //     TextOptions.ProcessTextRenderingMode = TextRenderingMode.Grayscale;
-    // but we don't impose it as the framework default because Windows users
-    // expect their text to look exactly like every other desktop app on the
-    // same OS.
+    // Auto resolves to Grayscale on every platform. Earlier this returned
+    // ClearType on Windows to match the WPF / Win32 convention, but the
+    // framework now defaults to Grayscale everywhere because:
+    //   - High-DPI screens (the common case for new installs) make ClearType's
+    //     sub-pixel fringe more distracting than helpful.
+    //   - Any render target that gets resampled — off-screen bitmaps,
+    //     RenderTargetBitmap, ScaleTransform, ImageBrush — must NOT carry
+    //     sub-pixel fringes; ClearType makes the resampled text look broken,
+    //     and the framework can't always know which path a glyph will take.
+    //   - The Vello / Impeller / Vulkan / software backends already render
+    //     grayscale natively; only D3D12 had a separate ClearType path. Picking
+    //     Grayscale as the universal default keeps text identical across
+    //     backends so a single asset / screenshot is reproducible everywhere.
+    // Windows callers that still want sub-pixel ClearType opt in explicitly:
+    //     TextOptions.ProcessTextRenderingMode = TextRenderingMode.ClearType;
+    // Per-element overrides via TextOptions.TextRenderingModeProperty also
+    // still work; only the Auto fallback chain landed here.
     if (mode == JALIUM_TEXT_AA_AUTO) {
-#if defined(_WIN32)
-        return JALIUM_TEXT_AA_CLEARTYPE;
-#else
         return JALIUM_TEXT_AA_GRAYSCALE;
-#endif
     }
     if (mode < JALIUM_TEXT_AA_AUTO || mode > JALIUM_TEXT_AA_CLEARTYPE) {
-#if defined(_WIN32)
-        return JALIUM_TEXT_AA_CLEARTYPE;
-#else
         return JALIUM_TEXT_AA_GRAYSCALE;
-#endif
     }
     return mode;
 }
 
 }  // namespace text_options
+
+int32_t TextFormat::ResolveEffectiveTextRenderingMode() const noexcept {
+    // Per-format mode wins when the caller explicitly picked one. Auto
+    // (the managed-side default) delegates to the process-wide setting so
+    // a single TextOptions.ProcessTextRenderingMode = ClearType still flips
+    // every glyph globally; only formats that opt out by setting their own
+    // value override that. Process-wide Auto resolves to Grayscale on every
+    // platform via ResolveMode — opting back into Windows-style sub-pixel
+    // ClearType means setting the process-wide mode explicitly.
+    int32_t mode = text_rendering_mode_;
+    if (mode == JALIUM_TEXT_AA_AUTO) {
+        mode = jalium_text_get_global_antialias_mode();
+    }
+    return jalium::text_options::ResolveMode(mode);
+}
+
 }  // namespace jalium
 
 extern "C" {

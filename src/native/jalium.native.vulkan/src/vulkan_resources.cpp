@@ -128,7 +128,20 @@ bool VulkanBitmap::UpdatePackedPixels(const uint8_t* pixels, uint32_t width, uin
 namespace {
 
 // Helper: create a GDI font matching the text format properties.
-HFONT CreateGdiFont(const std::wstring& fontFamily, float fontSize, int32_t fontWeight, int32_t fontStyle)
+// Quality defaults to ANTIALIASED_QUALITY (= grayscale AA), matching the
+// framework-wide default after the 2026-05-24 Auto→Grayscale switch in
+// jalium::text_options::ResolveMode. Using CLEARTYPE_QUALITY here used to
+// cause measure-vs-render mismatch (CT-tuned glyph widths reported by GDI's
+// measurement APIs differ ~0.5–1px from grayscale-rendered widths), which
+// produced layout jitter when GetTextExtentPoint32 results fed back into
+// caret / selection geometry computed off the actually rendered bitmap.
+// Pass CLEARTYPE_QUALITY explicitly when measuring text that the caller
+// has already opted into ClearType rendering for.
+HFONT CreateGdiFont(const std::wstring& fontFamily,
+                    float fontSize,
+                    int32_t fontWeight,
+                    int32_t fontStyle,
+                    uint8_t quality = ANTIALIASED_QUALITY)
 {
     const int fontHeight = -static_cast<int>(std::round(fontSize));
     return CreateFontW(
@@ -136,7 +149,7 @@ HFONT CreateGdiFont(const std::wstring& fontFamily, float fontSize, int32_t font
         fontWeight,
         (fontStyle == 1 || fontStyle == 2) ? TRUE : FALSE,
         FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+        CLIP_DEFAULT_PRECIS, quality, DEFAULT_PITCH | FF_DONTCARE,
         fontFamily.c_str());
 }
 

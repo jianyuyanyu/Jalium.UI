@@ -768,6 +768,12 @@ public abstract partial class UIElement : Visual, IInputElement
     /// </summary>
     internal void SetIsMouseOver(bool value)
     {
+        // A disabled element must never enter the hover state. Hover visuals
+        // (IsMouseOver triggers, "MouseOver" visual states) do not apply to a
+        // disabled control. IsEnabled is the effective value — it walks the
+        // parent chain — so a child of a disabled ancestor is rejected too.
+        if (value && !IsEnabled)
+            value = false;
         SetValue(IsMouseOverPropertyKey.DependencyProperty, value);
     }
 
@@ -782,6 +788,10 @@ public abstract partial class UIElement : Visual, IInputElement
     /// </summary>
     internal void SetIsPressed(bool value)
     {
+        // A disabled element must never enter the pressed state, mirroring
+        // SetIsMouseOver — pressed visuals do not apply to a disabled control.
+        if (value && !IsEnabled)
+            value = false;
         SetValue(IsPressedPropertyKey.DependencyProperty, value);
     }
 
@@ -1558,6 +1568,20 @@ public abstract partial class UIElement : Visual, IInputElement
     /// </summary>
     protected virtual void OnIsEnabledChanged(bool oldValue, bool newValue)
     {
+        // When an element becomes (effectively) disabled, drop any lingering
+        // interaction state. A control that was hovered or pressed at the
+        // moment it got disabled would otherwise keep IsMouseOver/IsPressed
+        // true, and its single-condition IsMouseOver/IsPressed triggers would
+        // stay active — the disabled control would keep showing hover visuals.
+        // This also covers descendants: PropagateIsEnabledToDescendants invokes
+        // this method on the whole subtree when an ancestor is disabled.
+        if (!IsEnabled)
+        {
+            if (IsMouseOver)
+                SetIsMouseOver(false);
+            if (IsPressed)
+                SetIsPressed(false);
+        }
     }
 
     private void PropagateIsEnabledToDescendants()

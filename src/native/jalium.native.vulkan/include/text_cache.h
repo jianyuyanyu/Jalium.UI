@@ -25,6 +25,13 @@ struct TextCacheKey {
     uint16_t drawFlags = 0;      // DT_LEFT / DT_CENTER / etc.
     int16_t  fontWeight = 0;
     uint8_t  fontStyle = 0;      // 0=normal, 1=italic, 2=oblique.
+    // LOGFONT.lfQuality resolved from the source TextFormat's per-element
+    // TextRenderingMode (NONANTIALIASED_QUALITY / ANTIALIASED_QUALITY /
+    // CLEARTYPE_QUALITY). Two elements asking for the same text/family/size
+    // at different quality levels rasterize different pixels, so the cache
+    // key has to distinguish them — otherwise a ClearType element would
+    // receive the Grayscale-rendered bitmap left by an earlier sibling.
+    uint8_t  fontQuality = 5;    // 5 = CLEARTYPE_QUALITY (historical default).
 };
 
 // Same shape as TextCacheKey but with a wstring_view — used purely for
@@ -39,6 +46,7 @@ struct TextCacheKeyView {
     uint16_t drawFlags = 0;
     int16_t  fontWeight = 0;
     uint8_t  fontStyle = 0;
+    uint8_t  fontQuality = 5;    // See TextCacheKey::fontQuality above.
 };
 
 struct TextCacheHash {

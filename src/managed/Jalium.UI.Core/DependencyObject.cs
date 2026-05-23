@@ -125,6 +125,7 @@ public class DependencyObject : DispatcherObject
     public void SetValue(DependencyProperty dp, object? value)
     {
         ArgumentNullException.ThrowIfNull(dp);
+        ValidateValueOrThrow(dp, value);
         MutateValue(
             dp,
             () =>
@@ -144,8 +145,24 @@ public class DependencyObject : DispatcherObject
     public void SetCurrentValue(DependencyProperty dp, object? value)
     {
         ArgumentNullException.ThrowIfNull(dp);
+        ValidateValueOrThrow(dp, value);
         var source = GetValueSourceInternal(dp);
         SetCurrentValueForSource(dp, value, source.BaseValueSource, allowAutoTransition: true);
+    }
+
+    private static void ValidateValueOrThrow(DependencyProperty dp, object? value)
+    {
+        // Mirrors WPF: the per-property ValidateValueCallback (registered via the
+        // Register/RegisterAttached overloads that take a validator) gates every
+        // public write of the value. Enum-typed attached properties such as
+        // TextOptions.TextRenderingMode use it to reject out-of-range members so an
+        // illegal value never reaches the render pipeline.
+        if (!dp.IsValidValue(value))
+        {
+            throw new ArgumentException(
+                $"Value '{value ?? "<null>"}' is not valid for dependency property '{dp.OwnerType.Name}.{dp.Name}'.",
+                nameof(value));
+        }
     }
 
     private void SetCurrentValueForSource(DependencyProperty dp, object? value, BaseValueSource baseSource)

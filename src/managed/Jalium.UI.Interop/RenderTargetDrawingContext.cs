@@ -49,6 +49,12 @@ public sealed class RenderTargetDrawingContext : DrawingContext, IOffsetDrawingC
     // Elements are m11, m12, m21, m22, dx, dy (same layout as Transform2D).
     private readonly double[] _currentNativeMatrix = new double[6] { 1, 0, 0, 1, 0, 0 };
     private readonly Stack<double[]> _nativeMatrixStack = new();
+
+    // Scoped opt-out for effects that deliberately deform their content with
+    // the active matrix. Liquid glass drag uses this so text follows the same
+    // transform as child borders and bitmaps instead of becoming a font-size
+    // substitution inside the panel.
+    private int _nativeTextTransformDepth;
     private long _bitmapCacheBytes;
     private long _bitmapCacheSequence;
     private long _brushCacheSequence;
@@ -759,12 +765,25 @@ public sealed class RenderTargetDrawingContext : DrawingContext, IOffsetDrawingC
         // already an integer so snapping is a no-op, but the weight degradation matters
         // for small-size bold that's blurry regardless of scale.
         var fontScale = 1.0;
+        var preserveNativeScaleDeformation = _nativeTextTransformDepth > 0;
         if (!isIdentity)
         {
             var scaleX = Math.Sqrt(nm11 * nm11 + nm12 * nm12);
             var scaleY = Math.Sqrt(nm21 * nm21 + nm22 * nm22);
             if (scaleX <= 1e-6 || scaleY <= 1e-6) return; // degenerate
-            fontScale = Math.Max(scaleX, scaleY);
+
+            // The screen-resolution compensation below intentionally flattens
+            // the active matrix into one font size. That is right for a regular
+            // uniform zoom, but it erases axis-aligned non-uniform deformation:
+            // liquid-glass drag stretches the border on one axis and compresses
+            // it on the other, so text must keep the native matrix just like the
+            // other child content does.
+            preserveNativeScaleDeformation |= ShouldPreserveNativeTextScaleDeformation(
+                nm11, nm12, nm21, nm22, scaleX, scaleY);
+            if (!preserveNativeScaleDeformation)
+            {
+                fontScale = Math.Max(scaleX, scaleY);
+            }
         }
 
         var rawScaledFontSize = formattedText.FontSize * fontScale;
@@ -779,13 +798,16 @@ public sealed class RenderTargetDrawingContext : DrawingContext, IOffsetDrawingC
             effectiveWeight = 400;
         }
 
-        if (isIdentity)
+        if (isIdentity || preserveNativeScaleDeformation)
         {
             var format = GetTextFormat(
                 formattedText.FontFamily,
                 effectiveFontSize,
                 effectiveWeight,
-                formattedText.FontStyle);
+                formattedText.FontStyle,
+                formattedText.TextRenderingMode,
+                formattedText.TextFormattingMode,
+                formattedText.TextHintingMode);
             if (format == null) return;
 
             var x = (float)mx;
@@ -798,7 +820,10 @@ public sealed class RenderTargetDrawingContext : DrawingContext, IOffsetDrawingC
             formattedText.FontFamily,
             effectiveFontSize,
             effectiveWeight,
-            formattedText.FontStyle);
+            formattedText.FontStyle,
+            formattedText.TextRenderingMode,
+            formattedText.TextFormattingMode,
+            formattedText.TextHintingMode);
         if (scaledFormat == null) return;
 
         // Screen-space origin = current matrix applied to (mx, my).
@@ -840,6 +865,35 @@ public sealed class RenderTargetDrawingContext : DrawingContext, IOffsetDrawingC
         finally
         {
             _renderTarget.PopTransform();
+        }
+    }
+
+    private static bool ShouldPreserveNativeTextScaleDeformation(
+        double m11,
+        double m12,
+        double m21,
+        double m22,
+        double scaleX,
+        double scaleY)
+    {
+        const double axisAlignmentEpsilon = 1e-6;
+        const double scaleDifferenceEpsilon = 0.001;
+
+        return Math.Abs(m12) <= axisAlignmentEpsilon &&
+               Math.Abs(m21) <= axisAlignmentEpsilon &&
+               Math.Abs(scaleX - scaleY) > scaleDifferenceEpsilon;
+    }
+
+    internal void PushNativeTextTransform()
+    {
+        _nativeTextTransformDepth++;
+    }
+
+    internal void PopNativeTextTransform()
+    {
+        if (_nativeTextTransformDepth > 0)
+        {
+            _nativeTextTransformDepth--;
         }
     }
 
@@ -963,6 +1017,46 @@ public sealed class RenderTargetDrawingContext : DrawingContext, IOffsetDrawingC
         return false;
     }
 
+    /// <summary>
+    /// Returns true if any fill figure's bounding box is contained within
+    /// another figure's bounding box — the necessary condition for one figure
+    /// to cut a hole in another. When no figure nests inside another, the
+    /// figures are disjoint or overlapping siblings with no hole relationship
+    /// and must each be filled independently (their union); routing them
+    /// through the compound-path triangulator would let its winding-direction
+    /// hole heuristic corrupt the fill. Bounding-box containment is a
+    /// conservative test: a genuine hole always has its bbox nested, so a real
+    /// hole is never mis-routed to separate fills.
+    /// </summary>
+    private static bool FiguresHaveNesting(List<PathFigure> figures)
+    {
+        int n = figures.Count;
+        if (n < 2) return false;
+
+        var bounds = new Rect[n];
+        for (int i = 0; i < n; i++)
+            bounds[i] = SingleFigureBounds(figures[i]);
+
+        for (int i = 0; i < n; i++)
+        {
+            if (bounds[i].IsEmpty) continue;
+            for (int j = 0; j < n; j++)
+            {
+                if (i != j && bounds[j].Contains(bounds[i]))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>Computes the tight bounding box of a single path figure.</summary>
+    private static Rect SingleFigureBounds(PathFigure figure)
+    {
+        var pg = new PathGeometry();
+        pg.Figures.Add(figure);
+        return pg.Bounds;
+    }
+
     private void DrawPathGeometry(Brush? brush, Pen? pen, PathGeometry pathGeom)
     {
         // Check if we need managed dashed stroke rendering
@@ -990,8 +1084,33 @@ public sealed class RenderTargetDrawingContext : DrawingContext, IOffsetDrawingC
 
         if (fillFigures != null && fillFigures.Count > 1)
         {
-            // Send all figures as a single compound path with MoveTo separators
-            DrawCompoundPathFill(brush!, fillFigures, pathGeom.FillRule, geoBounds);
+            // The native compound-path triangulator classifies each contour as
+            // outer-vs-hole by its winding DIRECTION. That assumption only holds
+            // for the "outer CCW + holes CW" convention; two independent solid
+            // shapes that happen to wind the same way get one mis-classified as
+            // a hole of the other and bridge-subtracted — a corrupted fill.
+            //
+            // A hole can only exist when one figure NESTS inside another. When
+            // no figure nests, the figures are disjoint / overlapping siblings
+            // whose correct fill is simply their union — render each one as an
+            // independent single-figure fill, which has no cross-figure
+            // winding interaction.  Compound fill is reserved for genuinely
+            // nested figures (real holes), where it is needed and correct.
+            if (FiguresHaveNesting(fillFigures))
+            {
+                // Send all figures as a single compound path with MoveTo separators
+                DrawCompoundPathFill(brush!, fillFigures, pathGeom.FillRule, geoBounds);
+            }
+            else
+            {
+                foreach (var figure in fillFigures)
+                {
+                    if (FigureHasCurves(figure))
+                        DrawPathFigureNative(brush, null, figure, pathGeom.FillRule, geoBounds);
+                    else
+                        DrawPathFigurePolygon(brush, null, figure, pathGeom.FillRule, geoBounds);
+                }
+            }
         }
         else if (fillFigures != null && fillFigures.Count == 1)
         {
@@ -3429,7 +3548,14 @@ public sealed class RenderTargetDrawingContext : DrawingContext, IOffsetDrawingC
         return nb;
     }
 
-    private NativeTextFormat? GetTextFormat(string fontFamily, double fontSize, int fontWeight, int fontStyle)
+    private NativeTextFormat? GetTextFormat(
+        string fontFamily,
+        double fontSize,
+        int fontWeight,
+        int fontStyle,
+        int textRenderingMode,
+        int textFormattingMode,
+        int textHintingMode)
     {
         if (string.IsNullOrWhiteSpace(fontFamily))
         {
@@ -3441,7 +3567,13 @@ public sealed class RenderTargetDrawingContext : DrawingContext, IOffsetDrawingC
             fontSize = 12;
         }
 
-        var key = $"{fontFamily}_{fontSize}_{fontWeight}_{fontStyle}";
+        // TextOptions modes are part of the cache key — the native format
+        // stores them, and two elements asking for the same family/size/weight
+        // /style but different rendering/hinting modes (e.g. an authoring
+        // canvas next to a Grayscale text panel inside a ClearType chrome)
+        // must NOT share one cached handle: the second caller would otherwise
+        // silently get the first caller's mode.
+        var key = $"{fontFamily}_{fontSize}_{fontWeight}_{fontStyle}_{textRenderingMode}_{textFormattingMode}_{textHintingMode}";
 
         if (_textFormatCache.TryGetValue(key, out var cached) && cached.IsValid)
         {
@@ -3452,6 +3584,15 @@ public sealed class RenderTargetDrawingContext : DrawingContext, IOffsetDrawingC
         var format = _context.CreateTextFormat(fontFamily, (float)fontSize, fontWeight, fontStyle);
         if (format != null)
         {
+            // Push the resolved TextOptions modes into the freshly created
+            // native format. These are per-format on the native side, stored
+            // on the TextFormat base class; the backend reads them on every
+            // DrawText (D3D12 glyph atlas keys off them; Vulkan maps to
+            // LOGFONT.lfQuality). Calling the setter on Auto / Ideal / Auto
+            // is harmless because the native side just stores the value.
+            format.SetTextRenderingMode(textRenderingMode);
+            format.SetTextFormattingMode(textFormattingMode);
+            format.SetTextHintingMode(textHintingMode);
             format.LastAccessSequence = ++_textFormatCacheSequence;
             _textFormatCache[key] = format;
         }

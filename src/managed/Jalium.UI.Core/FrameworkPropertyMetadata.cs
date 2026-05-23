@@ -63,6 +63,14 @@ public class FrameworkPropertyMetadata : UIPropertyMetadata
         Journal = (flags & FrameworkPropertyMetadataOptions.Journal) != 0;
         SubPropertiesDoNotAffectRender = (flags & FrameworkPropertyMetadataOptions.SubPropertiesDoNotAffectRender) != 0;
         OverridesInheritanceBehavior = (flags & FrameworkPropertyMetadataOptions.OverridesInheritanceBehavior) != 0;
+        // PropertyMetadata.Inherits used to be read-only and was set only via the 4-arg
+        // base ctor. FrameworkPropertyMetadata never went through that ctor, so any
+        // FrameworkPropertyMetadataOptions.Inherits passed via flags was silently dropped
+        // and FrameworkElement.InheritanceContext walked over the property in vain
+        // (TextOptions.TextFormattingMode et al. were never inheriting). Now that
+        // PropertyMetadata.Inherits has an internal setter, propagate the flag here so
+        // the bit actually reaches the inheritance-aware code paths.
+        Inherits = (flags & FrameworkPropertyMetadataOptions.Inherits) != 0;
     }
 }
 

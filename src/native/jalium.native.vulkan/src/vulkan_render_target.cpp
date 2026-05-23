@@ -1,6 +1,7 @@
 #include "vulkan_render_target.h"
 #include "jalium_internal.h"
 #include "jalium_path_stats.h"
+#include "jalium_text_options.h"  // JALIUM_TEXT_AA_* enum (TextRenderingMode mapping)
 #include "jalium_flatten.h"
 
 #include "vulkan_backend.h"
@@ -8879,6 +8880,23 @@ void VulkanRenderTarget::RenderText(const wchar_t* text, uint32_t textLength, Te
     const int  fontStyle  = textFormat->GetFontStyle();
     const bool italic     = (fontStyle == 1 || fontStyle == 2);
 
+    // Map the WPF-aligned per-format TextRenderingMode onto a LOGFONT.lfQuality
+    // value. The Vulkan backend rasterizes text through GDI (no DirectWrite
+    // CreateGlyphRunAnalysis); LOGFONT.lfQuality is the only knob GDI offers
+    // to switch between bilevel / grayscale AA / sub-pixel rendering. The
+    // mapping mirrors what every desktop app does — Aliased → bilevel,
+    // Grayscale → smoothed, ClearType → CLEARTYPE (sub-pixel). The resolved
+    // value also feeds the text cache + GDI font pool keys so two elements at
+    // different qualities don't share each other's rasterized pixels.
+    const int32_t aaMode = textFormat->ResolveEffectiveTextRenderingMode();
+    uint8_t fontQuality;
+    switch (aaMode) {
+        case JALIUM_TEXT_AA_ALIASED:   fontQuality = NONANTIALIASED_QUALITY; break;
+        case JALIUM_TEXT_AA_GRAYSCALE: fontQuality = ANTIALIASED_QUALITY;    break;
+        case JALIUM_TEXT_AA_CLEARTYPE: fontQuality = CLEARTYPE_QUALITY;      break;
+        default:                       fontQuality = CLEARTYPE_QUALITY;      break;
+    }
+
     // Intern the family wstring → uint32_t. Hot path: no allocation when the
     // family was seen before.
     const uint32_t fontFamilyId = familyInterner_.Intern(textFormat->GetFontFamily());
@@ -8905,7 +8923,8 @@ void VulkanRenderTarget::RenderText(const wchar_t* text, uint32_t textLength, Te
         textFormat->GetFontFamily().c_str(),
         fontHeight,
         fontWeight,
-        italic);
+        italic,
+        fontQuality);
     if (!font) return;
 
     SelectObject(dc, font);
@@ -8934,7 +8953,8 @@ void VulkanRenderTarget::RenderText(const wchar_t* text, uint32_t textLength, Te
         brushBgra,
         static_cast<uint16_t>(drawFlags),
         static_cast<int16_t>(fontWeight),
-        static_cast<uint8_t>(fontStyle)
+        static_cast<uint8_t>(fontStyle),
+        fontQuality
     };
 
     // Layout-box alignment offset. The cached bitmap is tightly sized to the
@@ -9033,7 +9053,8 @@ void VulkanRenderTarget::RenderText(const wchar_t* text, uint32_t textLength, Te
             brushBgra,
             static_cast<uint16_t>(drawFlags),
             static_cast<int16_t>(fontWeight),
-            static_cast<uint8_t>(fontStyle)
+            static_cast<uint8_t>(fontStyle),
+            fontQuality
         },
         pixels,
         renderedW,

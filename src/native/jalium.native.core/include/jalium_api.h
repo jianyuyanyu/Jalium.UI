@@ -610,6 +610,34 @@ JALIUM_API void jalium_text_format_set_line_spacing(JaliumTextFormat* format, in
 /// Sets maximum number of lines (0 = unlimited).
 JALIUM_API void jalium_text_format_set_max_lines(JaliumTextFormat* format, uint32_t maxLines);
 
+/// Sets the per-format text rendering (anti-alias) mode.
+/// Mirrors managed Jalium.UI.Media.TextRenderingMode:
+///   0 = Auto      — delegate to jalium_text_set_global_antialias_mode
+///   1 = Aliased   — bilevel, no antialiasing
+///   2 = Grayscale — per-pixel coverage AA
+///   3 = ClearType — sub-pixel AA (LCD-stripe aware)
+/// Auto is the WPF default; an element that wants its own override (e.g. an
+/// authoring-tool canvas that rejects sub-pixel fringe) sets Grayscale/Aliased
+/// here and it wins over the process-wide setting for that one DrawText call.
+JALIUM_API void jalium_text_format_set_text_rendering_mode(JaliumTextFormat* format, int32_t mode);
+
+/// Sets the per-format text formatting mode.
+/// Mirrors managed Jalium.UI.Media.TextFormattingMode:
+///   0 = Ideal   — resolution-independent glyph metrics (WPF default)
+///   1 = Display — pixel-snapped metrics (sharp at small sizes; less uniform
+///                 across DPI scaling). Backends typically forward this to
+///                 their layout engine (DWrite "GDI Classic"/"Natural", etc).
+JALIUM_API void jalium_text_format_set_text_formatting_mode(JaliumTextFormat* format, int32_t mode);
+
+/// Sets the per-format text hinting mode.
+/// Mirrors managed Jalium.UI.Media.TextHintingMode:
+///   0 = Auto     — backend decides
+///   1 = Fixed    — full hinting (sharper static text)
+///   2 = Animated — hinting suppressed (smoother subpixel animation)
+/// Animated is the mode WPF storyboards switch to during a glyph's slide /
+/// fade so the hinting doesn't pop a pixel mid-animation.
+JALIUM_API void jalium_text_format_set_text_hinting_mode(JaliumTextFormat* format, int32_t mode);
+
 /// Hit-tests a point against a text layout.
 JALIUM_API JaliumResult jalium_text_format_hit_test_point(
     JaliumTextFormat* format,
