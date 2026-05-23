@@ -62,71 +62,43 @@ public abstract class TextBoxBase : Control
 
     #endregion
 
-    #region Surrogate-Pair Boundary Helpers
+    #region Grapheme Cluster Boundary Helpers
 
     /// <summary>
-    /// Snaps <paramref name="offset"/> to the nearest legal UTF-16 code-point
-    /// boundary in <paramref name="text"/>. Prevents splitting a surrogate pair
-    /// in half — which would render emoji and other BMP-supplementary code
-    /// points as two broken halves and let the user select / delete only one
-    /// half of the glyph.
+    /// Snaps <paramref name="offset"/> to the nearest legal grapheme-cluster
+    /// boundary in <paramref name="text"/>. A grapheme cluster is one
+    /// user-perceived character; it can span several UTF-16 code units — an
+    /// emoji, a skin-tone or ZWJ sequence, a flag, or a base letter plus
+    /// combining marks. Snapping stops a caret, selection endpoint or edit from
+    /// cutting such a cluster apart, which would render broken glyph fragments
+    /// and let the user select or delete only part of one emoji.
     /// </summary>
     /// <remarks>
-    /// When <paramref name="offset"/> falls on a low surrogate, the position is
-    /// snapped past the pair (<paramref name="snapForward"/>=true, the normal
-    /// case while extending selection or moving the caret right) or before it
-    /// (<paramref name="snapForward"/>=false, used when moving left). Out-of-
-    /// range values are clamped to <c>[0, text.Length]</c>.
+    /// An <paramref name="offset"/> that falls inside a cluster is moved past it
+    /// (<paramref name="snapForward"/>=true — the normal case while extending a
+    /// selection or moving the caret right) or before it
+    /// (<paramref name="snapForward"/>=false — used when moving left). Values
+    /// outside <c>[0, text.Length]</c> are clamped. See <see cref="GraphemeClusters"/>.
     /// </remarks>
     protected static int SnapToCharacterBoundary(string text, int offset, bool snapForward = true)
-    {
-        if (string.IsNullOrEmpty(text) || offset <= 0)
-            return Math.Max(0, offset);
-        if (offset >= text.Length)
-            return text.Length;
-
-        // Mid-surrogate-pair: text[offset-1] is a high surrogate and
-        // text[offset] is its low surrogate counterpart. Splitting here would
-        // emit half an emoji, so jump to the neighbouring full-codepoint
-        // boundary in the requested direction.
-        if (char.IsLowSurrogate(text[offset]) && char.IsHighSurrogate(text[offset - 1]))
-        {
-            return snapForward ? Math.Min(offset + 1, text.Length) : offset - 1;
-        }
-        return offset;
-    }
+        => GraphemeClusters.Snap(text, offset, snapForward);
 
     /// <summary>
-    /// Computes the offset of the next code-point boundary after
-    /// <paramref name="offset"/>, stepping over a full surrogate pair when one
-    /// is present so caret motion always moves a whole emoji at a time.
+    /// Returns the offset of the next grapheme-cluster boundary after
+    /// <paramref name="offset"/>, so caret motion and forward deletion always
+    /// move over one whole user-perceived character — a multi-code-unit emoji,
+    /// ZWJ sequence or combining sequence travels as a single unit.
     /// </summary>
-    protected static int StepForwardCodepoint(string text, int offset)
-    {
-        if (string.IsNullOrEmpty(text) || offset >= text.Length)
-            return text?.Length ?? 0;
-        int step = (offset + 1 < text.Length
-                    && char.IsHighSurrogate(text[offset])
-                    && char.IsLowSurrogate(text[offset + 1]))
-                   ? 2 : 1;
-        return offset + step;
-    }
+    protected static int StepForwardGrapheme(string text, int offset)
+        => GraphemeClusters.NextBoundary(text, offset);
 
     /// <summary>
-    /// Computes the offset of the previous code-point boundary before
-    /// <paramref name="offset"/>, stepping over a full surrogate pair so
-    /// Backspace and Left-arrow consume an entire emoji rather than half.
+    /// Returns the offset of the previous grapheme-cluster boundary before
+    /// <paramref name="offset"/>, so Backspace and the Left arrow consume an
+    /// entire user-perceived character rather than a fragment of one.
     /// </summary>
-    protected static int StepBackwardCodepoint(string text, int offset)
-    {
-        if (string.IsNullOrEmpty(text) || offset <= 0)
-            return 0;
-        int step = (offset - 2 >= 0
-                    && char.IsHighSurrogate(text[offset - 2])
-                    && char.IsLowSurrogate(text[offset - 1]))
-                   ? 2 : 1;
-        return offset - step;
-    }
+    protected static int StepBackwardGrapheme(string text, int offset)
+        => GraphemeClusters.PreviousBoundary(text, offset);
 
     #endregion
 
@@ -1869,9 +1841,9 @@ public abstract class TextBoxBase : Control
         }
         else
         {
-            // Step over a surrogate pair as one unit so an emoji becomes a
-            // single Left-arrow press, not two.
-            newIndex = StepBackwardCodepoint(text, _caretIndex);
+            // Step over a whole grapheme cluster so an emoji — including a
+            // multi-scalar ZWJ or skin-tone sequence — is one Left-arrow press.
+            newIndex = StepBackwardGrapheme(text, _caretIndex);
         }
 
         if (shift)
@@ -1904,8 +1876,8 @@ public abstract class TextBoxBase : Control
         }
         else
         {
-            // Step over a surrogate pair as one unit (symmetric with HandleLeftKey).
-            newIndex = StepForwardCodepoint(text, _caretIndex);
+            // Step over a whole grapheme cluster (symmetric with HandleLeftKey).
+            newIndex = StepForwardGrapheme(text, _caretIndex);
         }
 
         if (shift)
@@ -1947,7 +1919,10 @@ public abstract class TextBoxBase : Control
         }
         else
         {
-            var newIndex = GetCharIndexFromLineColumn(lineIndex - 1, columnIndex);
+            // Carrying a column across lines can land mid-cluster; snap so the
+            // caret never settles inside an emoji on the line above.
+            var newIndex = SnapToCharacterBoundary(
+                GetText(), GetCharIndexFromLineColumn(lineIndex - 1, columnIndex), snapForward: true);
             if (shift)
                 ExtendSelection(newIndex);
             else
@@ -1984,7 +1959,10 @@ public abstract class TextBoxBase : Control
         }
         else
         {
-            var newIndex = GetCharIndexFromLineColumn(lineIndex + 1, columnIndex);
+            // Snap the carried column so the caret never settles inside an
+            // emoji on the line below.
+            var newIndex = SnapToCharacterBoundary(
+                GetText(), GetCharIndexFromLineColumn(lineIndex + 1, columnIndex), snapForward: true);
             if (shift)
                 ExtendSelection(newIndex);
             else
@@ -2083,9 +2061,9 @@ public abstract class TextBoxBase : Control
             }
             else
             {
-                // Delete a whole code-point — collapses a surrogate pair so
-                // Backspace removes the whole emoji rather than orphaning a half.
-                startIndex = StepBackwardCodepoint(text, _caretIndex);
+                // Delete a whole grapheme cluster so Backspace removes the whole
+                // emoji — ZWJ sequence, skin tone or flag included — never a fragment.
+                startIndex = StepBackwardGrapheme(text, _caretIndex);
             }
 
             SetText(text.Substring(0, startIndex) + text.Substring(_caretIndex));
@@ -2121,8 +2099,8 @@ public abstract class TextBoxBase : Control
                 }
                 else
                 {
-                    // Delete a whole code-point forward (surrogate-pair aware).
-                    endIndex = StepForwardCodepoint(text, _caretIndex);
+                    // Delete a whole grapheme cluster forward (symmetric with Backspace).
+                    endIndex = StepForwardGrapheme(text, _caretIndex);
                 }
 
                 SetText(text.Substring(0, _caretIndex) + text.Substring(Math.Min(endIndex, text.Length)));
@@ -2132,23 +2110,44 @@ public abstract class TextBoxBase : Control
         EnsureCaretVisible();
     }
 
+    /// <summary>
+    /// Classifies the grapheme cluster that begins at boundary
+    /// <paramref name="start"/>. A cluster is a word separator when it is a
+    /// single whitespace code unit, or — when <paramref name="includePunctuation"/>
+    /// is set — a single punctuation code unit. Any multi-code-unit cluster
+    /// (emoji, ZWJ or combining sequence) is always a word character, so a
+    /// word-wise caret jump or a double-click never splits one.
+    /// </summary>
+    private static bool IsWordSeparatorAt(string text, int start, bool includePunctuation)
+    {
+        if (start < 0 || start >= text.Length)
+            return false;
+        // A separator is always a lone code unit; a wider cluster is an emoji
+        // or combining sequence, which counts as a word character.
+        if (GraphemeClusters.NextBoundary(text, start) - start != 1)
+            return false;
+        char c = text[start];
+        return char.IsWhiteSpace(c) || (includePunctuation && char.IsPunctuation(c));
+    }
+
     private int FindPreviousWordBoundary(int index)
     {
         var text = GetText();
         if (index <= 0)
             return 0;
 
-        index--;
+        // Walk in grapheme-cluster steps: start one cluster back from the caret.
+        int i = GraphemeClusters.PreviousBoundary(text, index);
 
-        // Skip whitespace
-        while (index > 0 && char.IsWhiteSpace(text[index]))
-            index--;
+        // Skip whitespace clusters.
+        while (i > 0 && IsWordSeparatorAt(text, i, includePunctuation: false))
+            i = GraphemeClusters.PreviousBoundary(text, i);
 
-        // Find start of word
-        while (index > 0 && !char.IsWhiteSpace(text[index - 1]))
-            index--;
+        // Walk back to the start of the word.
+        while (i > 0 && !IsWordSeparatorAt(text, GraphemeClusters.PreviousBoundary(text, i), includePunctuation: false))
+            i = GraphemeClusters.PreviousBoundary(text, i);
 
-        return index;
+        return i;
     }
 
     private int FindNextWordBoundary(int index)
@@ -2157,15 +2156,17 @@ public abstract class TextBoxBase : Control
         if (index >= text.Length)
             return text.Length;
 
-        // Skip current word
-        while (index < text.Length && !char.IsWhiteSpace(text[index]))
-            index++;
+        int i = GraphemeClusters.Snap(text, index, forward: true);
 
-        // Skip whitespace
-        while (index < text.Length && char.IsWhiteSpace(text[index]))
-            index++;
+        // Skip the current word.
+        while (i < text.Length && !IsWordSeparatorAt(text, i, includePunctuation: false))
+            i = GraphemeClusters.NextBoundary(text, i);
 
-        return index;
+        // Skip whitespace clusters.
+        while (i < text.Length && IsWordSeparatorAt(text, i, includePunctuation: false))
+            i = GraphemeClusters.NextBoundary(text, i);
+
+        return i;
     }
 
     private void ExtendWordSelection(int newCaretIndex)
@@ -2216,42 +2217,56 @@ public abstract class TextBoxBase : Control
             return (0, 0);
         }
 
-        var clampedIndex = Math.Clamp(index, 0, text.Length);
-        if (clampedIndex == text.Length && clampedIndex > 0 && !IsWordBoundary(text[clampedIndex - 1]))
+        int length = text.Length;
+        // Operate on grapheme-cluster boundaries so an emoji is one indivisible
+        // unit — never half-selected by a double-click.
+        int pos = GraphemeClusters.Snap(text, Math.Clamp(index, 0, length), forward: false);
+
+        // A hit past the last cluster snaps back onto it when it is a word
+        // character.
+        if (pos == length && pos > 0)
         {
-            clampedIndex--;
+            int prev = GraphemeClusters.PreviousBoundary(text, pos);
+            if (!IsWordSeparatorAt(text, prev, includePunctuation: true))
+            {
+                pos = prev;
+            }
         }
 
-        if (clampedIndex < text.Length && IsWordBoundary(text[clampedIndex]))
+        // Landed on a separator cluster: take the word immediately before it,
+        // or the whole run of separators when there is no such word.
+        if (pos < length && IsWordSeparatorAt(text, pos, includePunctuation: true))
         {
-            if (clampedIndex > 0 && !IsWordBoundary(text[clampedIndex - 1]))
+            int prev = GraphemeClusters.PreviousBoundary(text, pos);
+            if (pos > 0 && !IsWordSeparatorAt(text, prev, includePunctuation: true))
             {
-                clampedIndex--;
+                pos = prev;
             }
             else
             {
-                while (clampedIndex < text.Length && IsWordBoundary(text[clampedIndex]))
+                while (pos < length && IsWordSeparatorAt(text, pos, includePunctuation: true))
                 {
-                    clampedIndex++;
+                    pos = GraphemeClusters.NextBoundary(text, pos);
                 }
 
-                if (clampedIndex >= text.Length)
+                if (pos >= length)
                 {
-                    return (text.Length, text.Length);
+                    return (length, length);
                 }
             }
         }
 
-        var start = clampedIndex;
-        while (start > 0 && !IsWordBoundary(text[start - 1]))
+        int start = pos;
+        while (start > 0
+               && !IsWordSeparatorAt(text, GraphemeClusters.PreviousBoundary(text, start), includePunctuation: true))
         {
-            start--;
+            start = GraphemeClusters.PreviousBoundary(text, start);
         }
 
-        var end = clampedIndex;
-        while (end < text.Length && !IsWordBoundary(text[end]))
+        int end = pos;
+        while (end < length && !IsWordSeparatorAt(text, end, includePunctuation: true))
         {
-            end++;
+            end = GraphemeClusters.NextBoundary(text, end);
         }
 
         return (start, end);
@@ -2263,16 +2278,22 @@ public abstract class TextBoxBase : Control
         if (string.IsNullOrEmpty(text))
             return;
 
-        var pos = _caretIndex;
+        // Walk word boundaries in grapheme-cluster space so the selection edges
+        // land on whole user-perceived characters.
+        int pos = GraphemeClusters.Snap(text, _caretIndex, forward: false);
 
-        // Find word boundaries
-        var start = pos;
-        while (start > 0 && !IsWordBoundary(text[start - 1]))
-            start--;
+        int start = pos;
+        while (start > 0
+               && !IsWordSeparatorAt(text, GraphemeClusters.PreviousBoundary(text, start), includePunctuation: true))
+        {
+            start = GraphemeClusters.PreviousBoundary(text, start);
+        }
 
-        var end = pos;
-        while (end < text.Length && !IsWordBoundary(text[end]))
-            end++;
+        int end = pos;
+        while (end < text.Length && !IsWordSeparatorAt(text, end, includePunctuation: true))
+        {
+            end = GraphemeClusters.NextBoundary(text, end);
+        }
 
         _selectionStart = start;
         _selectionLength = end - start;
@@ -2294,11 +2315,6 @@ public abstract class TextBoxBase : Control
         _selectionAnchor = lineStart;
 
         OnSelectionChanged();
-    }
-
-    private static bool IsWordBoundary(char c)
-    {
-        return char.IsWhiteSpace(c) || char.IsPunctuation(c);
     }
 
     protected Brush? ResolveSelectionBrush()

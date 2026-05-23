@@ -135,9 +135,16 @@ internal sealed class WindowInputDispatcher
                 RaisePointerMovePipeline(target, pointerPoint, modifiers, timestamp);
         }
 
-        // Update cursor based on hit element
-        if (hitElement is FrameworkElement fe && fe.Cursor != null)
-            _host.SetPlatformCursor((int)fe.Cursor.CursorType);
+        // Update cursor based on hit element. A disabled element shows the
+        // standard arrow — its Cursor (including any inherited cursor) must not
+        // apply, mirroring how disabled controls drop hover/pressed visuals.
+        if (hitElement is FrameworkElement fe)
+        {
+            if (!fe.IsEnabled)
+                _host.SetPlatformCursor((int)Jalium.UI.Cursors.Arrow.CursorType);
+            else if (fe.Cursor != null)
+                _host.SetPlatformCursor((int)fe.Cursor.CursorType);
+        }
     }
 
     /// <summary>Handles mouse button down.</summary>

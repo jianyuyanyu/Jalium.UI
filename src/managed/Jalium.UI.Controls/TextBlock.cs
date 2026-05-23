@@ -479,6 +479,11 @@ public class TextBlock : FrameworkElement
                     FontStyle = fontStyle,
                     Trimming = TextWrapping == TextWrapping.NoWrap ? TextTrimming : TextTrimming.None
                 };
+                // Pull TextOptions.{TextRenderingMode,TextFormattingMode,TextHintingMode}
+                // off the TextBlock so the native glyph atlas can honour per-element
+                // overrides. Defaults are Auto/Ideal/Auto — same effective behaviour
+                // as before for elements that didn't set any of the attached properties.
+                formattedText.ApplyTextOptionsFrom(this);
                 _cachedFormattedLines.Add(formattedText);
             }
             _formattedLinesCacheDirty = false;
@@ -768,31 +773,48 @@ public class TextBlock : FrameworkElement
 
     private void SelectWordAt(int index)
     {
-        if (string.IsNullOrEmpty(Text))
+        var text = Text;
+        if (string.IsNullOrEmpty(text))
         {
             return;
         }
 
-        var clampedIndex = Math.Clamp(index, 0, Text.Length);
-        var start = clampedIndex;
-        while (start > 0 && !IsWordBoundary(Text[start - 1]))
+        // Walk word boundaries in grapheme-cluster space so the selection edges
+        // land on whole user-perceived characters.
+        int pos = GraphemeClusters.Snap(text, Math.Clamp(index, 0, text.Length), forward: false);
+
+        int start = pos;
+        while (start > 0
+               && !IsWordSeparatorAt(text, GraphemeClusters.PreviousBoundary(text, start), includePunctuation: true))
         {
-            start--;
+            start = GraphemeClusters.PreviousBoundary(text, start);
         }
 
-        var end = clampedIndex;
-        while (end < Text.Length && !IsWordBoundary(Text[end]))
+        int end = pos;
+        while (end < text.Length && !IsWordSeparatorAt(text, end, includePunctuation: true))
         {
-            end++;
+            end = GraphemeClusters.NextBoundary(text, end);
         }
 
         _selectionAnchor = start;
         ApplySelection(start, end - start);
     }
 
-    private static bool IsWordBoundary(char c)
+    /// <summary>
+    /// Classifies the grapheme cluster beginning at <paramref name="start"/>. A
+    /// cluster is a word separator only when it is a single whitespace code
+    /// unit, or — with <paramref name="includePunctuation"/> — a single
+    /// punctuation code unit. A multi-code-unit cluster (emoji, ZWJ or combining
+    /// sequence) is always a word character, so word selection never splits one.
+    /// </summary>
+    private static bool IsWordSeparatorAt(string text, int start, bool includePunctuation)
     {
-        return char.IsWhiteSpace(c) || char.IsPunctuation(c);
+        if (start < 0 || start >= text.Length)
+            return false;
+        if (GraphemeClusters.NextBoundary(text, start) - start != 1)
+            return false;
+        char c = text[start];
+        return char.IsWhiteSpace(c) || (includePunctuation && char.IsPunctuation(c));
     }
 
     private void ExtendWordSelection(int caretIndex)
@@ -828,47 +850,58 @@ public class TextBlock : FrameworkElement
 
     private (int start, int end) GetWordRangeAtIndex(int index)
     {
-        if (string.IsNullOrEmpty(Text))
+        var text = Text;
+        if (string.IsNullOrEmpty(text))
         {
             return (0, 0);
         }
 
-        var clampedIndex = Math.Clamp(index, 0, Text.Length);
-        if (clampedIndex == Text.Length && clampedIndex > 0 && !IsWordBoundary(Text[clampedIndex - 1]))
+        int length = text.Length;
+        // Operate on grapheme-cluster boundaries so an emoji is one indivisible
+        // unit — never half-selected by a double-click.
+        int pos = GraphemeClusters.Snap(text, Math.Clamp(index, 0, length), forward: false);
+
+        if (pos == length && pos > 0)
         {
-            clampedIndex--;
+            int prev = GraphemeClusters.PreviousBoundary(text, pos);
+            if (!IsWordSeparatorAt(text, prev, includePunctuation: true))
+            {
+                pos = prev;
+            }
         }
 
-        if (clampedIndex < Text.Length && IsWordBoundary(Text[clampedIndex]))
+        if (pos < length && IsWordSeparatorAt(text, pos, includePunctuation: true))
         {
-            if (clampedIndex > 0 && !IsWordBoundary(Text[clampedIndex - 1]))
+            int prev = GraphemeClusters.PreviousBoundary(text, pos);
+            if (pos > 0 && !IsWordSeparatorAt(text, prev, includePunctuation: true))
             {
-                clampedIndex--;
+                pos = prev;
             }
             else
             {
-                while (clampedIndex < Text.Length && IsWordBoundary(Text[clampedIndex]))
+                while (pos < length && IsWordSeparatorAt(text, pos, includePunctuation: true))
                 {
-                    clampedIndex++;
+                    pos = GraphemeClusters.NextBoundary(text, pos);
                 }
 
-                if (clampedIndex >= Text.Length)
+                if (pos >= length)
                 {
-                    return (Text.Length, Text.Length);
+                    return (length, length);
                 }
             }
         }
 
-        var start = clampedIndex;
-        while (start > 0 && !IsWordBoundary(Text[start - 1]))
+        int start = pos;
+        while (start > 0
+               && !IsWordSeparatorAt(text, GraphemeClusters.PreviousBoundary(text, start), includePunctuation: true))
         {
-            start--;
+            start = GraphemeClusters.PreviousBoundary(text, start);
         }
 
-        var end = clampedIndex;
-        while (end < Text.Length && !IsWordBoundary(Text[end]))
+        int end = pos;
+        while (end < length && !IsWordSeparatorAt(text, end, includePunctuation: true))
         {
-            end++;
+            end = GraphemeClusters.NextBoundary(text, end);
         }
 
         return (start, end);
@@ -883,9 +916,17 @@ public class TextBlock : FrameworkElement
 
     private void ApplySelection(int start, int length)
     {
-        var textLength = Text.Length;
-        var clampedStart = Math.Clamp(start, 0, textLength);
-        var clampedLength = Math.Clamp(length, 0, textLength - clampedStart);
+        var text = Text ?? string.Empty;
+        var textLength = text.Length;
+        var rawStart = Math.Clamp(start, 0, textLength);
+        var rawLength = Math.Clamp(length, 0, textLength - rawStart);
+        // Snap the selection outward onto grapheme-cluster boundaries so an emoji
+        // is never partially highlighted.
+        var clampedStart = GraphemeClusters.Snap(text, rawStart, forward: false);
+        var clampedEnd = rawLength <= 0
+            ? clampedStart
+            : GraphemeClusters.Snap(text, rawStart + rawLength, forward: true);
+        var clampedLength = clampedEnd - clampedStart;
 
         if (_selectionStart == clampedStart && _selectionLength == clampedLength)
         {
@@ -960,7 +1001,8 @@ public class TextBlock : FrameworkElement
             previousWidth = width;
         }
 
-        return line.StartIndex + columnIndex;
+        // Snap onto a grapheme-cluster edge so a click never lands inside an emoji.
+        return line.StartIndex + GraphemeClusters.SnapNearest(lineText, columnIndex);
     }
 
     private double GetLineOriginX(in TextLayoutLine line, double renderWidth)

@@ -42,6 +42,17 @@ internal class TerminalProcess : IDisposable
     /// </summary>
     private bool _disposed;
 
+    /// <summary>
+    /// Character encoding for shell I/O. Defaults to UTF-8.
+    /// </summary>
+    private Encoding _encoding = Encoding.UTF8;
+
+    /// <summary>
+    /// Stateful decoder for shell output — carries a multi-byte sequence that
+    /// straddles two ConPTY reads over to the next chunk instead of corrupting it.
+    /// </summary>
+    private Decoder _decoder = Encoding.UTF8.GetDecoder();
+
     #endregion
 
     #region Events
@@ -67,6 +78,16 @@ internal class TerminalProcess : IDisposable
     /// Gets whether the process is currently running.
     /// </summary>
     public bool IsRunning => _isRunning;
+
+    /// <summary>
+    /// Gets or sets the character encoding used to decode shell output and
+    /// encode input. Defaults to UTF-8. Takes effect on the next <see cref="Start"/>.
+    /// </summary>
+    public Encoding Encoding
+    {
+        get => _encoding;
+        set => _encoding = value ?? Encoding.UTF8;
+    }
 
     #endregion
 
@@ -102,6 +123,10 @@ internal class TerminalProcess : IDisposable
 
         _isRunning = true;
         _cts = new CancellationTokenSource();
+
+        // Fresh decoder per session so leftover bytes from a previous shell can
+        // never bleed into the new one.
+        _decoder = _encoding.GetDecoder();
 
         // Start reading output from ConPTY
         _readTask = Task.Run(() => ReadOutputLoop(_cts.Token));
@@ -151,7 +176,7 @@ internal class TerminalProcess : IDisposable
 
         try
         {
-            byte[] bytes = Encoding.UTF8.GetBytes(data);
+            byte[] bytes = _encoding.GetBytes(data);
             ConPty.WriteInput(_session.InputWriteHandle, bytes);
         }
         catch
@@ -200,15 +225,24 @@ internal class TerminalProcess : IDisposable
 
     private void ReadOutputLoop(CancellationToken ct)
     {
+        // Capture the session decoder locally; this loop is its only consumer.
+        var decoder = _decoder;
         try
         {
             while (!ct.IsCancellationRequested && _session != null)
             {
                 byte[]? data = ConPty.ReadOutput(_session.OutputReadHandle);
                 if (data == null) break; // Pipe closed
+                if (data.Length == 0) continue;
 
-                string text = Encoding.UTF8.GetString(data);
-                OutputReceived?.Invoke(text);
+                // Stateful decode: a multi-byte character split across two reads
+                // is held by the decoder and completed when the next chunk arrives,
+                // so no encoding (UTF-8, GBK, Shift-JIS, …) is ever corrupted.
+                int charCount = decoder.GetCharCount(data, 0, data.Length, flush: false);
+                if (charCount == 0) continue;
+                char[] chars = new char[charCount];
+                decoder.GetChars(data, 0, data.Length, chars, 0, flush: false);
+                OutputReceived?.Invoke(new string(chars, 0, charCount));
             }
         }
         catch when (ct.IsCancellationRequested)
