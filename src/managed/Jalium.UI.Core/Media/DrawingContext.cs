@@ -710,6 +710,32 @@ public sealed class FormattedText
     public int FontStretch { get; set; } = 5;
 
     /// <summary>
+    /// Gets or sets the per-element text rendering (anti-alias) mode resolved
+    /// from <c>TextOptions.TextRenderingMode</c> on the source element.
+    /// 0 = Auto (process-wide fallback), 1 = Aliased, 2 = Grayscale, 3 = ClearType.
+    /// The renderer forwards this to the native glyph atlas so each element
+    /// can render in its own mode within the same frame instead of inheriting
+    /// the process-wide value.
+    /// </summary>
+    public int TextRenderingMode { get; set; }
+
+    /// <summary>
+    /// Gets or sets the per-element text formatting mode resolved from
+    /// <c>TextOptions.TextFormattingMode</c> on the source element.
+    /// 0 = Ideal (WPF default — resolution-independent metrics),
+    /// 1 = Display (pixel-snapped metrics — sharper at small sizes).
+    /// </summary>
+    public int TextFormattingMode { get; set; }
+
+    /// <summary>
+    /// Gets or sets the per-element text hinting mode resolved from
+    /// <c>TextOptions.TextHintingMode</c> on the source element.
+    /// 0 = Auto, 1 = Fixed (full hinting), 2 = Animated (no hinting — smoother
+    /// sub-pixel motion through animations).
+    /// </summary>
+    public int TextHintingMode { get; set; }
+
+    /// <summary>
     /// Initializes a new instance of the <see cref="FormattedText"/> class.
     /// </summary>
     public FormattedText(string text, string fontFamily, double fontSize)

@@ -127,6 +127,21 @@ public class Markdown : Control
     }
 
     /// <summary>
+    /// Replaces <see cref="Text"/> (the Markdown source) with the contents of a
+    /// file. A byte-order mark, if present, decides the encoding; otherwise
+    /// <paramref name="encoding"/> is used — UTF-8 when it is <see langword="null"/>.
+    /// </summary>
+    public void LoadFromFile(string path, System.Text.Encoding? encoding = null)
+        => Text = TextFile.ReadAllText(path, encoding);
+
+    /// <summary>
+    /// Writes the Markdown source to a file using <paramref name="encoding"/> —
+    /// UTF-8 when it is <see langword="null"/>.
+    /// </summary>
+    public void SaveToFile(string path, System.Text.Encoding? encoding = null)
+        => TextFile.WriteAllText(path, Text, encoding);
+
+    /// <summary>
     /// Gets or sets the base URI used to resolve relative links.
     /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]

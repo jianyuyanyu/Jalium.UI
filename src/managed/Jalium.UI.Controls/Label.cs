@@ -350,26 +350,42 @@ public class Label : ContentControl
 
     private void SelectDirectWordAt(string text, int index)
     {
-        var clampedIndex = Math.Clamp(index, 0, text.Length);
-        var start = clampedIndex;
-        while (start > 0 && !IsWordBoundary(text[start - 1]))
+        // Walk word boundaries in grapheme-cluster space so the selection edges
+        // land on whole user-perceived characters.
+        int pos = GraphemeClusters.Snap(text, Math.Clamp(index, 0, text.Length), forward: false);
+
+        int start = pos;
+        while (start > 0
+               && !IsWordSeparatorAt(text, GraphemeClusters.PreviousBoundary(text, start), includePunctuation: true))
         {
-            start--;
+            start = GraphemeClusters.PreviousBoundary(text, start);
         }
 
-        var end = clampedIndex;
-        while (end < text.Length && !IsWordBoundary(text[end]))
+        int end = pos;
+        while (end < text.Length && !IsWordSeparatorAt(text, end, includePunctuation: true))
         {
-            end++;
+            end = GraphemeClusters.NextBoundary(text, end);
         }
 
         _directSelectionAnchor = start;
         ApplyDirectSelection(start, end - start);
     }
 
-    private static bool IsWordBoundary(char c)
+    /// <summary>
+    /// Classifies the grapheme cluster beginning at <paramref name="start"/>. A
+    /// cluster is a word separator only when it is a single whitespace code
+    /// unit, or — with <paramref name="includePunctuation"/> — a single
+    /// punctuation code unit. A multi-code-unit cluster (emoji, ZWJ or combining
+    /// sequence) is always a word character, so word selection never splits one.
+    /// </summary>
+    private static bool IsWordSeparatorAt(string text, int start, bool includePunctuation)
     {
-        return char.IsWhiteSpace(c) || char.IsPunctuation(c);
+        if (start < 0 || start >= text.Length)
+            return false;
+        if (GraphemeClusters.NextBoundary(text, start) - start != 1)
+            return false;
+        char c = text[start];
+        return char.IsWhiteSpace(c) || (includePunctuation && char.IsPunctuation(c));
     }
 
     private void UpdateDirectSelection(int caretIndex)
@@ -419,8 +435,15 @@ public class Label : ContentControl
             return;
         }
 
-        var clampedStart = Math.Clamp(start, 0, text.Length);
-        var clampedLength = Math.Clamp(length, 0, text.Length - clampedStart);
+        var rawStart = Math.Clamp(start, 0, text.Length);
+        var rawLength = Math.Clamp(length, 0, text.Length - rawStart);
+        // Snap the selection outward onto grapheme-cluster boundaries so an emoji
+        // is never partially highlighted.
+        var clampedStart = GraphemeClusters.Snap(text, rawStart, forward: false);
+        var clampedEnd = rawLength <= 0
+            ? clampedStart
+            : GraphemeClusters.Snap(text, rawStart + rawLength, forward: true);
+        var clampedLength = clampedEnd - clampedStart;
         if (_directSelectionStart == clampedStart && _directSelectionLength == clampedLength)
         {
             return;
@@ -438,42 +461,52 @@ public class Label : ContentControl
             return (0, 0);
         }
 
-        var clampedIndex = Math.Clamp(index, 0, text.Length);
-        if (clampedIndex == text.Length && clampedIndex > 0 && !IsWordBoundary(text[clampedIndex - 1]))
+        int length = text.Length;
+        // Operate on grapheme-cluster boundaries so an emoji is one indivisible
+        // unit — never half-selected by a double-click.
+        int pos = GraphemeClusters.Snap(text, Math.Clamp(index, 0, length), forward: false);
+
+        if (pos == length && pos > 0)
         {
-            clampedIndex--;
+            int prev = GraphemeClusters.PreviousBoundary(text, pos);
+            if (!IsWordSeparatorAt(text, prev, includePunctuation: true))
+            {
+                pos = prev;
+            }
         }
 
-        if (clampedIndex < text.Length && IsWordBoundary(text[clampedIndex]))
+        if (pos < length && IsWordSeparatorAt(text, pos, includePunctuation: true))
         {
-            if (clampedIndex > 0 && !IsWordBoundary(text[clampedIndex - 1]))
+            int prev = GraphemeClusters.PreviousBoundary(text, pos);
+            if (pos > 0 && !IsWordSeparatorAt(text, prev, includePunctuation: true))
             {
-                clampedIndex--;
+                pos = prev;
             }
             else
             {
-                while (clampedIndex < text.Length && IsWordBoundary(text[clampedIndex]))
+                while (pos < length && IsWordSeparatorAt(text, pos, includePunctuation: true))
                 {
-                    clampedIndex++;
+                    pos = GraphemeClusters.NextBoundary(text, pos);
                 }
 
-                if (clampedIndex >= text.Length)
+                if (pos >= length)
                 {
-                    return (text.Length, text.Length);
+                    return (length, length);
                 }
             }
         }
 
-        var start = clampedIndex;
-        while (start > 0 && !IsWordBoundary(text[start - 1]))
+        int start = pos;
+        while (start > 0
+               && !IsWordSeparatorAt(text, GraphemeClusters.PreviousBoundary(text, start), includePunctuation: true))
         {
-            start--;
+            start = GraphemeClusters.PreviousBoundary(text, start);
         }
 
-        var end = clampedIndex;
-        while (end < text.Length && !IsWordBoundary(text[end]))
+        int end = pos;
+        while (end < length && !IsWordSeparatorAt(text, end, includePunctuation: true))
         {
-            end++;
+            end = GraphemeClusters.NextBoundary(text, end);
         }
 
         return (start, end);
@@ -821,7 +854,8 @@ public class Label : ContentControl
             previousWidth = width;
         }
 
-        return index;
+        // Snap onto a grapheme-cluster edge so a click never lands inside an emoji.
+        return GraphemeClusters.SnapNearest(text, index);
     }
 
     private Point GetDirectTextOrigin(string text)

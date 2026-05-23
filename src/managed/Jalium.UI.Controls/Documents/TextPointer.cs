@@ -1,3 +1,5 @@
+using Jalium.UI.Controls;
+
 namespace Jalium.UI.Documents;
 
 /// <summary>
@@ -188,14 +190,25 @@ public sealed class TextPointer : IComparable<TextPointer>
     /// <returns>The next insertion position, or null if none exists.</returns>
     public TextPointer? GetNextInsertionPosition(LogicalDirection direction)
     {
-        if (direction == LogicalDirection.Forward)
+        // Step over a whole grapheme cluster when this position sits inside a
+        // Run's text, so caret motion and Backspace/Delete treat an emoji — a
+        // ZWJ sequence, skin-tone modifier or flag included — as one unit. At a
+        // Run edge or a non-Run element the step is one structural position.
+        int step = 1;
+        if (_parent is Run run && run.Text.Length > 0)
         {
-            return GetPositionAtOffset(1, direction);
+            if (direction == LogicalDirection.Forward)
+            {
+                if (_offset < run.Text.Length)
+                    step = GraphemeClusters.NextBoundary(run.Text, _offset) - _offset;
+            }
+            else if (_offset > 0)
+            {
+                step = _offset - GraphemeClusters.PreviousBoundary(run.Text, _offset);
+            }
         }
-        else
-        {
-            return GetPositionAtOffset(-1, direction);
-        }
+
+        return GetPositionAtOffset(direction == LogicalDirection.Forward ? step : -step, direction);
     }
 
     /// <summary>

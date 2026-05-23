@@ -50,19 +50,49 @@ struct GlyphKey {
     uint16_t glyphIndex;
     uint16_t fontSize;      // physical pixel size (rounded, no further quantization)
     uint8_t  subpixelX;     // sub-pixel X offset quantized to 1/4 pixel (0..3)
+    // Per-glyph rendering mode resolved from the source TextFormat's
+    // TextRenderingMode / TextHintingMode. Cached separately for each combo
+    // because the rasterized bitmap differs:
+    //   - aaMode picks 1- vs 3-bytes-per-pixel coverage and which DWrite
+    //     antialias mode runs (Aliased / Grayscale / ClearType — 0 stays
+    //     reserved for "fall back to SyncAntialiasMode" only at the caller).
+    //   - hintingMode toggles DWRITE_GRID_FIT_MODE_ENABLED/DISABLED so the
+    //     same glyph rasterizes differently when WPF's TextOptions.TextHintingMode
+    //     is Animated (no grid fit, smoother sub-pixel animation) vs Fixed.
+    // Without these fields the cache would hand back the wrong bitmap on the
+    // very next glyph after a per-format mode switch.
+    uint8_t  aaMode;
+    uint8_t  hintingMode;
 
     bool operator==(const GlyphKey& other) const {
         return fontFace == other.fontFace &&
                glyphIndex == other.glyphIndex &&
                fontSize == other.fontSize &&
-               subpixelX == other.subpixelX;
+               subpixelX == other.subpixelX &&
+               aaMode == other.aaMode &&
+               hintingMode == other.hintingMode;
     }
 };
 
 struct GlyphKeyHash {
     size_t operator()(const GlyphKey& k) const {
         size_t h = std::hash<void*>{}(k.fontFace);
-        h ^= std::hash<uint32_t>{}(((uint32_t)k.glyphIndex << 16) | ((uint32_t)k.fontSize << 2) | k.subpixelX) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        // Pack every per-glyph field into a 40-bit slot in one uint64 so each
+        // tuple gets a distinct hash input. Layout (LSB → MSB):
+        //   [ 0.. 1] subpixelX  (2 bits — only 4 sub-pixel buckets ever exist)
+        //   [ 2.. 4] aaMode     (3 bits — 0..3 today, 1 bit headroom)
+        //   [ 5.. 7] hintingMode(3 bits — 0..2 today, 1 bit headroom)
+        //   [ 8..23] fontSize   (16 bits — full uint16 range)
+        //   [24..39] glyphIndex (16 bits — full uint16 range)
+        // No fields overlap, so two different keys hash through different
+        // packed words (the secondary collision risk is the std::hash
+        // distribution itself, which is independent of our packing).
+        uint64_t packed = ((uint64_t)(k.subpixelX & 0x3))
+                        | ((uint64_t)(k.aaMode    & 0x7) << 2)
+                        | ((uint64_t)(k.hintingMode & 0x7) << 5)
+                        | ((uint64_t)k.fontSize   << 8)
+                        | ((uint64_t)k.glyphIndex << 24);
+        h ^= std::hash<uint64_t>{}(packed) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -102,17 +132,28 @@ public:
     /// `layoutKey` (0 = uncacheable) is a stable content hash of the source
     /// text + format + constraints (from D3D12TextFormat::CreateLayout). When
     /// non-zero the resolved glyph quads + decorations are memoized per
-    /// (layoutKey, origin) so repeat frames skip layout->Draw + the per-glyph
-    /// atlas walk — the dominant DrawText cost once the layout itself is
-    /// cached. Entries are tagged with the atlas generation and ignored after
-    /// any Reset()/GrowAtlas() so stale atlas UVs are never served.
+    /// (layoutKey, origin, aaMode, hintingMode) so repeat frames skip
+    /// layout->Draw + the per-glyph atlas walk — the dominant DrawText cost
+    /// once the layout itself is cached. Entries are tagged with the atlas
+    /// generation and ignored after any Reset()/GrowAtlas() so stale atlas
+    /// UVs are never served.
+    ///
+    /// `aaMode` (JALIUM_TEXT_AA_*) and `hintingMode` (0=Auto, 1=Fixed,
+    /// 2=Animated) come from the source TextFormat's per-element TextOptions
+    /// values, already resolved against the process-wide override by
+    /// TextFormat::ResolveEffectiveTextRenderingMode. Pass 0 / 0 to take
+    /// the historical "process-wide only" behaviour, which still re-resolves
+    /// against the global setting on every call (since aaMode=0 / Auto is the
+    /// signal that nobody asked for an explicit override).
     uint32_t GenerateGlyphs(
         IDWriteTextLayout* layout,
         float originX, float originY,
         float colorR, float colorG, float colorB, float colorA,
         std::vector<GlyphQuadInstance>& outInstances,
         std::vector<TextDecorationRect>* outDecorations = nullptr,
-        uint64_t layoutKey = 0);
+        uint64_t layoutKey = 0,
+        int32_t aaMode = 0,
+        int32_t hintingMode = 0);
 
     /// Uploads any pending glyph data to the GPU atlas texture.
     /// Must be called before rendering text in a frame.
@@ -237,7 +278,9 @@ private:
 
     static uint64_t HashInstanceKey(uint64_t layoutKey,
                                     float originX, float originY,
-                                    float dpiScale) noexcept;
+                                    float dpiScale,
+                                    int32_t aaMode,
+                                    int32_t hintingMode) noexcept;
 
     // Simple row-based atlas packer
     uint16_t packX_ = 0;

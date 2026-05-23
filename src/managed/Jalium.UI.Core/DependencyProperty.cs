@@ -66,17 +66,41 @@ public sealed class DependencyProperty
     /// </summary>
     public int GlobalIndex { get; }
 
-    private DependencyProperty(string name, Type propertyType, Type ownerType, PropertyMetadata? metadata, bool readOnly)
+    /// <summary>
+    /// Gets the value-validation callback supplied at registration. When set,
+    /// <see cref="DependencyObject.SetValue(DependencyProperty, object?)"/> and
+    /// <see cref="DependencyObject.SetCurrentValue(DependencyProperty, object?)"/>
+    /// invoke it and reject the write with <see cref="ArgumentException"/>
+    /// when the callback returns <see langword="false"/>. Mirrors the WPF
+    /// <c>DependencyProperty.ValidateValueCallback</c> contract — used by enum
+    /// attached properties (<c>TextOptions.TextRenderingMode</c>, …) to fence
+    /// out-of-range values at the API boundary instead of letting them rot
+    /// in the property store.
+    /// </summary>
+    public ValidateValueCallback? ValidateValueCallback { get; }
+
+    private DependencyProperty(string name, Type propertyType, Type ownerType, PropertyMetadata? metadata, bool readOnly, ValidateValueCallback? validateValueCallback)
     {
         Name = name;
         PropertyType = propertyType;
         OwnerType = ownerType;
         DefaultMetadata = metadata ?? new PropertyMetadata();
         ReadOnly = readOnly;
+        ValidateValueCallback = validateValueCallback;
         GlobalIndex = Interlocked.Increment(ref _globalIndex);
 
         // Store the initial owner's metadata for GetMetadata lookups
         _typeMetadata[ownerType] = DefaultMetadata;
+    }
+
+    /// <summary>
+    /// Runs the registered <see cref="ValidateValueCallback"/> against <paramref name="value"/>.
+    /// Returns <see langword="true"/> when no callback is registered (matching the WPF behaviour
+    /// where the absence of a validator means any value is acceptable).
+    /// </summary>
+    public bool IsValidValue(object? value)
+    {
+        return ValidateValueCallback is null || ValidateValueCallback(value);
     }
 
     /// <summary>
@@ -89,12 +113,23 @@ public sealed class DependencyProperty
     /// <returns>The registered dependency property.</returns>
     public static DependencyProperty Register(string name, Type propertyType, Type ownerType, PropertyMetadata? metadata = null)
     {
+        return Register(name, propertyType, ownerType, metadata, validateValueCallback: null);
+    }
+
+    /// <summary>
+    /// Registers a new dependency property with a value-validation callback.
+    /// Mirrors the WPF <c>DependencyProperty.Register(name, propertyType, ownerType, typeMetadata, validateValueCallback)</c> overload.
+    /// </summary>
+    public static DependencyProperty Register(string name, Type propertyType, Type ownerType, PropertyMetadata? metadata, ValidateValueCallback? validateValueCallback)
+    {
         ArgumentNullException.ThrowIfNull(name);
         ArgumentNullException.ThrowIfNull(propertyType);
         ArgumentNullException.ThrowIfNull(ownerType);
 
+        ValidateDefaultValue(metadata, propertyType, ownerType, name, validateValueCallback);
+
         var key = (ownerType, name);
-        var dp = new DependencyProperty(name, propertyType, ownerType, metadata, readOnly: false);
+        var dp = new DependencyProperty(name, propertyType, ownerType, metadata, readOnly: false, validateValueCallback);
 
         if (!_registered.TryAdd(key, dp))
         {
@@ -115,12 +150,22 @@ public sealed class DependencyProperty
     /// <returns>The dependency property key for the read-only property.</returns>
     public static DependencyPropertyKey RegisterReadOnly(string name, Type propertyType, Type ownerType, PropertyMetadata? metadata = null)
     {
+        return RegisterReadOnly(name, propertyType, ownerType, metadata, validateValueCallback: null);
+    }
+
+    /// <summary>
+    /// Registers a new read-only dependency property with a value-validation callback.
+    /// </summary>
+    public static DependencyPropertyKey RegisterReadOnly(string name, Type propertyType, Type ownerType, PropertyMetadata? metadata, ValidateValueCallback? validateValueCallback)
+    {
         ArgumentNullException.ThrowIfNull(name);
         ArgumentNullException.ThrowIfNull(propertyType);
         ArgumentNullException.ThrowIfNull(ownerType);
 
+        ValidateDefaultValue(metadata, propertyType, ownerType, name, validateValueCallback);
+
         var key = (ownerType, name);
-        var dp = new DependencyProperty(name, propertyType, ownerType, metadata, readOnly: true);
+        var dp = new DependencyProperty(name, propertyType, ownerType, metadata, readOnly: true, validateValueCallback);
 
         if (!_registered.TryAdd(key, dp))
         {
@@ -141,8 +186,35 @@ public sealed class DependencyProperty
     /// <returns>The registered dependency property.</returns>
     public static DependencyProperty RegisterAttached(string name, Type propertyType, Type ownerType, PropertyMetadata? metadata = null)
     {
-        // For now, attached properties are implemented the same as regular properties
-        return Register(name, propertyType, ownerType, metadata);
+        return Register(name, propertyType, ownerType, metadata, validateValueCallback: null);
+    }
+
+    /// <summary>
+    /// Registers a new attached dependency property with a value-validation callback.
+    /// Mirrors the WPF <c>DependencyProperty.RegisterAttached(name, propertyType, ownerType, defaultMetadata, validateValueCallback)</c> overload.
+    /// </summary>
+    public static DependencyProperty RegisterAttached(string name, Type propertyType, Type ownerType, PropertyMetadata? metadata, ValidateValueCallback? validateValueCallback)
+    {
+        return Register(name, propertyType, ownerType, metadata, validateValueCallback);
+    }
+
+    private static void ValidateDefaultValue(PropertyMetadata? metadata, Type propertyType, Type ownerType, string name, ValidateValueCallback? validateValueCallback)
+    {
+        if (validateValueCallback is null || metadata is null)
+            return;
+
+        // WPF rejects registrations whose default value already fails the validator —
+        // catch the inconsistency at registration time rather than letting every read
+        // of the unset value silently return an illegal default.
+        var defaultValue = metadata.DefaultValue;
+        if (defaultValue is null && propertyType.IsValueType)
+            return;
+
+        if (!validateValueCallback(defaultValue))
+        {
+            throw new ArgumentException(
+                $"Default value of dependency property '{ownerType.Name}.{name}' is not valid according to its ValidateValueCallback.");
+        }
     }
 
     /// <summary>
@@ -311,7 +383,15 @@ public class PropertyMetadata
     /// <summary>
     /// Gets a value indicating whether this property inherits its value from parent elements.
     /// </summary>
-    public bool Inherits { get; }
+    /// <remarks>
+    /// The setter is intentionally <c>internal</c>: only <see cref="FrameworkPropertyMetadata"/>
+    /// (which translates <see cref="FrameworkPropertyMetadataOptions.Inherits"/> into this flag)
+    /// and the <see cref="PropertyMetadata"/> constructor that accepts an <c>inherits</c>
+    /// parameter are allowed to write it. Public callers must go through
+    /// <see cref="FrameworkPropertyMetadata"/> or the 4-arg <see cref="PropertyMetadata"/>
+    /// constructor so the value is locked at construction time.
+    /// </remarks>
+    public bool Inherits { get; internal set; }
 
     /// <summary>
     /// Gets or sets the factory used to create automatic transition animations for this property.

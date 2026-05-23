@@ -127,6 +127,47 @@ public sealed class NativeTextFormat : IDisposable
     }
 
     /// <summary>
+    /// Sets the per-format text anti-alias mode. Mirrors the WPF
+    /// <c>TextOptions.TextRenderingMode</c> attached property: each text
+    /// element can independently choose Aliased / Grayscale / ClearType
+    /// instead of inheriting the process-wide value. Auto delegates to
+    /// <see cref="Jalium.UI.Media.TextOptions.ProcessTextRenderingMode"/>,
+    /// which itself resolves to the platform default (ClearType on Windows,
+    /// Grayscale elsewhere).
+    /// </summary>
+    public void SetTextRenderingMode(int mode)
+    {
+        ThrowIfDisposed();
+        NativeMethods.TextFormatSetTextRenderingMode(_handle, mode);
+    }
+
+    /// <summary>
+    /// Sets the per-format text formatting mode. Mirrors the WPF
+    /// <c>TextOptions.TextFormattingMode</c> attached property:
+    /// 0 = Ideal (resolution-independent glyph metrics, WPF default);
+    /// 1 = Display (pixel-snapped — sharper at small sizes, less uniform
+    /// under DPI scaling).
+    /// </summary>
+    public void SetTextFormattingMode(int mode)
+    {
+        ThrowIfDisposed();
+        NativeMethods.TextFormatSetTextFormattingMode(_handle, mode);
+    }
+
+    /// <summary>
+    /// Sets the per-format text hinting mode. Mirrors the WPF
+    /// <c>TextOptions.TextHintingMode</c> attached property:
+    /// 0 = Auto (backend decides via the font's gasp table);
+    /// 1 = Fixed (full hinting — sharper static text);
+    /// 2 = Animated (hinting suppressed — smoother sub-pixel motion).
+    /// </summary>
+    public void SetTextHintingMode(int mode)
+    {
+        ThrowIfDisposed();
+        NativeMethods.TextFormatSetTextHintingMode(_handle, mode);
+    }
+
+    /// <summary>
     /// Measures text and returns metrics including dimensions and font information.
     /// </summary>
     /// <param name="text">The text to measure.</param>

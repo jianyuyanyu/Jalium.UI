@@ -27,14 +27,18 @@ thread_local int      g_dibCapW         = 0;
 thread_local int      g_dibCapH         = 0;
 thread_local HGDIOBJ  g_oldDibInDc      = nullptr; // SelectObject's previous-bitmap return — restore-then-delete.
 
-inline uint64_t MakeFontKey(uint32_t fontFamilyId, int height, int weight, bool italic) noexcept
+inline uint64_t MakeFontKey(uint32_t fontFamilyId, int height, int weight, bool italic, uint8_t quality) noexcept
 {
     // 16 bits family id, 16 bits height (signed → store as uint16),
-    // 16 bits weight (LOGFONT range 100..900), 1 bit italic. Plenty of room.
+    // 16 bits weight (LOGFONT range 100..900), 1 bit italic, 8 bits quality.
+    // Quality occupies bits 49..56 — keeps the italic bit at 48 stable so
+    // existing callers that pass the historical default land on the same key
+    // bucket as before once their HFONT is re-created at the new quality.
     return  (static_cast<uint64_t>(fontFamilyId) & 0xFFFFu)
          | ((static_cast<uint64_t>(static_cast<uint16_t>(height))   & 0xFFFFu) << 16)
          | ((static_cast<uint64_t>(static_cast<uint16_t>(weight))   & 0xFFFFu) << 32)
-         |  (italic ? (1ULL << 48) : 0ULL);
+         |  (italic ? (1ULL << 48) : 0ULL)
+         | ((static_cast<uint64_t>(quality) & 0xFFu) << 49);
 }
 
 } // namespace
@@ -43,9 +47,17 @@ HFONT Win32GdiPool::AcquireFont(uint32_t fontFamilyId,
                                 const wchar_t* fontFamily,
                                 int height,
                                 int weight,
-                                bool italic)
+                                bool italic,
+                                uint8_t quality)
 {
-    const uint64_t key = MakeFontKey(fontFamilyId, height, weight, italic);
+    // Clamp out-of-range quality values to the historical default so a managed
+    // bug can't make CreateFontW silently fall back to DEFAULT_QUALITY (which
+    // would render the same text differently from every other element on the
+    // same backend).
+    if (quality > CLEARTYPE_QUALITY) {
+        quality = CLEARTYPE_QUALITY;
+    }
+    const uint64_t key = MakeFontKey(fontFamilyId, height, weight, italic, quality);
     auto it = g_fontPool.find(key);
     if (it != g_fontPool.end()) {
         return it->second;
@@ -61,7 +73,7 @@ HFONT Win32GdiPool::AcquireFont(uint32_t fontFamilyId,
         DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY,
+        quality,
         DEFAULT_PITCH | FF_DONTCARE,
         fontFamily);
     if (!font) {

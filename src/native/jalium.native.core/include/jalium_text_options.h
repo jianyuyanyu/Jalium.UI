@@ -16,7 +16,9 @@ extern "C" {
 #endif
 
 // Mirrors managed Jalium.UI.Media.TextRenderingMode.
-//   0 = Auto (platform default — ClearType on Windows, Grayscale on mobile)
+//   0 = Auto (framework-wide default — resolves to Grayscale on every
+//       platform; see ResolveMode in jalium_text_options.cpp for the
+//       rationale and the explicit-opt-in path back to ClearType)
 //   1 = Aliased (bilevel)
 //   2 = Grayscale
 //   3 = ClearType
@@ -47,8 +49,10 @@ JALIUM_API uint64_t jalium_text_get_antialias_generation(void);
 namespace jalium {
 namespace text_options {
 
-/// Resolves Auto to a platform-appropriate concrete mode. Windows → ClearType,
-/// other platforms → Grayscale. Aliased / Grayscale / ClearType pass through.
+/// Resolves Auto to the framework-wide default Grayscale on every platform.
+/// Aliased / Grayscale / ClearType pass through. Invalid mode values clamp
+/// to Grayscale. Callers that need Windows-style sub-pixel ClearType set
+/// it explicitly via TextOptions.ProcessTextRenderingMode = ClearType.
 JALIUM_API int32_t ResolveMode(int32_t mode) noexcept;
 
 }  // namespace text_options

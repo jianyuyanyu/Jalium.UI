@@ -556,6 +556,27 @@ public class Terminal : Control, IImeSupport
     #region Public API
 
     /// <summary>
+    /// Gets or sets the character encoding used to decode shell output and encode
+    /// terminal input. Defaults to UTF-8. Assign before <see cref="StartShell"/>
+    /// (or restart the shell) for a change to take effect — e.g. a legacy Chinese
+    /// console may need <c>Encoding.GetEncoding(936)</c> (GBK). Non-Unicode code
+    /// pages are available because the framework registers
+    /// <see cref="System.Text.CodePagesEncodingProvider"/> at startup.
+    /// </summary>
+    public Encoding Encoding
+    {
+        get => _encoding;
+        set
+        {
+            _encoding = value ?? Encoding.UTF8;
+            if (_process != null)
+                _process.Encoding = _encoding;
+        }
+    }
+
+    private Encoding _encoding = Encoding.UTF8;
+
+    /// <summary>
     /// Starts the shell process.
     /// </summary>
     public void StartShell()
@@ -564,6 +585,7 @@ public class Terminal : Control, IImeSupport
         _process = new TerminalProcess();
         _process.OutputReceived += OnProcessOutput;
         _process.ProcessExited += OnProcessExited;
+        _process.Encoding = _encoding;
 
         string workDir = string.IsNullOrEmpty(WorkingDirectory)
             ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
@@ -1601,9 +1623,23 @@ public class Terminal : Control, IImeSupport
         else
             lineText = _buffer.GetRowTextRaw(totalRow - _buffer.ScrollbackCount);
 
-        // If click lands outside the line or on a non-word character, just
-        // make a caret-style empty selection at that column.
-        if (charCol < 0 || charCol >= lineText.Length || !IsWordChar(lineText, charCol))
+        // Snap onto the grapheme cluster the click landed in — an emoji can
+        // occupy several cells and must select (or not) as one whole unit.
+        int col = GraphemeClusters.Snap(lineText, Math.Clamp(charCol, 0, lineText.Length), forward: false);
+        int clusterEnd = col < lineText.Length ? GraphemeClusters.NextBoundary(lineText, col) : col;
+
+        // A multi-cell cluster (emoji, ZWJ sequence) selects as exactly itself.
+        if (clusterEnd - col > 1)
+        {
+            _selectionStart = (totalRow, col);
+            _selectionEnd = (totalRow, clusterEnd);
+            _hasSelection = true;
+            return;
+        }
+
+        // Outside the line or on a single non-word character: caret-style empty
+        // selection at the clicked column.
+        if (col >= lineText.Length || !IsWordChar(lineText, col))
         {
             _selectionStart = (totalRow, charCol);
             _selectionEnd = (totalRow, charCol);
@@ -1614,8 +1650,8 @@ public class Terminal : Control, IImeSupport
         // Expand left and right to the full word. `end` is the inclusive
         // index of the last word character; the selection uses an exclusive
         // end boundary, so we store `end + 1`.
-        int start = charCol;
-        int end = charCol;
+        int start = col;
+        int end = col;
 
         while (start > 0 && IsWordChar(lineText, start - 1))
             start--;

@@ -81,6 +81,35 @@ add_subdirectory(jalium.native.platform)
 # Per-platform implementation libraries link to this for the C ABI header.
 add_subdirectory(jalium.native.media.core)
 
+# ---------------------------------------------------------------------------
+# Shared audio TUs: physically live under jalium.native.media.core/src/audio/
+# but are compiled INTO each per-platform library (jalium.native.media.{windows,
+# apple, linux, android}) so the audio symbols ship inside the same DLL that
+# managed P/Invoke loads (`jalium.native.media`). This avoids having to
+# re-export symbols across DLL boundaries on Windows or pkg-config across
+# .so boundaries on Linux.
+# ---------------------------------------------------------------------------
+set(JALIUM_AUDIO_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/jalium.native.media.core/src/audio/audio_init.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/jalium.native.media.core/src/audio/audio_stats.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/jalium.native.media.core/src/audio/miniaudio_backend.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/jalium.native.media.core/src/audio/audio_device.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/jalium.native.media.core/src/audio/audio_decoder.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/jalium.native.media.core/src/audio/decoder_wav.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/jalium.native.media.core/src/audio/decoder_flac.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/jalium.native.media.core/src/audio/decoder_mp3.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/jalium.native.media.core/src/audio/decoder_vorbis.cpp
+    CACHE INTERNAL "Audio TUs compiled into each per-platform jalium.native.media library"
+)
+set(JALIUM_AUDIO_PRIVATE_INCLUDES
+    ${CMAKE_CURRENT_SOURCE_DIR}/jalium.native.media.core/src/audio
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/miniaudio
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/dr_libs
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/minimp3
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/stb
+    CACHE INTERNAL "Private include dirs needed by JALIUM_AUDIO_SOURCES"
+)
+
 # Cross-platform text engine (FreeType + HarfBuzz) — must be before backends that link it
 if(NOT WIN32)
     add_subdirectory(jalium.native.text)

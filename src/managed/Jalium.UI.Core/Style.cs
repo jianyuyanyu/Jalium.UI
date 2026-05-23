@@ -949,8 +949,10 @@ public abstract class TriggerBase
 
     /// <summary>
     /// Gets the target element for a setter, handling TargetName lookup.
+    /// Also reused by <see cref="Trigger"/> / <see cref="MultiTrigger"/> for SourceName
+    /// (same logic: FindName 优先，失败则从 templated parent 起做一次 visual-tree 搜索）。
     /// </summary>
-    private static FrameworkElement? GetSetterTarget(FrameworkElement element, string? targetName)
+    protected static FrameworkElement? GetSetterTarget(FrameworkElement element, string? targetName)
     {
         if (string.IsNullOrEmpty(targetName))
             return element;
@@ -1016,6 +1018,11 @@ public sealed class Trigger : TriggerBase
     {
         public bool IsActive;
         public Action<DependencyProperty, object?, object?>? Handler;
+        /// <summary>
+        /// 实际被订阅的"源"元素：SourceName=null 时就是 templated parent；
+        /// SourceName 指向命名模板部件时是该部件。Detach 时按此还原订阅。
+        /// </summary>
+        public FrameworkElement? SourceElement;
     }
 
     private readonly Dictionary<FrameworkElement, ElementState> _elementStates = new();
@@ -1030,6 +1037,17 @@ public sealed class Trigger : TriggerBase
     /// </summary>
     public object? Value { get; set; }
 
+    /// <summary>
+    /// 可选——监听具名模板部件而非 templated parent 本身的 <see cref="Property"/>。
+    /// 典型用法 <c>&lt;Trigger SourceName="PART_Btn" Property="IsMouseOver"&gt;</c>：
+    /// 按钮自身 hover 触发 trigger，Setter 可改 sibling 命名部件的属性，从而把按钮 hover
+    /// 反馈传染到模板里其它视觉（例如图标 Fill 切换）。
+    /// 解析时机：trigger Attach 时通过 <see cref="TriggerBase.GetSetterTarget"/> 在 templated
+    /// parent 的 NameScope 里查找；ControlTemplate.Triggers 在模板应用之后才 Attach，命名部件
+    /// 此刻已存在。SourceName 解不到（空模板 / 拼写错误）时 trigger 静默不挂——不抛、不崩。
+    /// </summary>
+    public string? SourceName { get; set; }
+
     /// <inheritdoc />
     internal override void Attach(FrameworkElement element)
     {
@@ -1040,6 +1058,13 @@ public sealed class Trigger : TriggerBase
         var state = new ElementState();
         _elementStates[element] = state;
 
+        // 解析 SourceName：null/空 → 监听 templated parent 自己；否则去命名部件。
+        // 解析失败（命名部件未找到）→ 整条 trigger 不挂，避免无声错位。
+        var source = GetSetterTarget(element, SourceName);
+        if (source == null)
+            return;
+        state.SourceElement = source;
+
         // Create a closure that captures this specific element
         state.Handler = (dp, oldValue, newValue) =>
         {
@@ -1049,11 +1074,11 @@ public sealed class Trigger : TriggerBase
             }
         };
 
-        // Subscribe to property changes
-        element.PropertyChangedInternal += state.Handler;
+        // Subscribe to property changes on the resolved source
+        source.PropertyChangedInternal += state.Handler;
 
         // Check initial state
-        var currentValue = element.GetValue(Property);
+        var currentValue = source.GetValue(Property);
         EvaluateTriggerForElement(element, currentValue);
     }
 
@@ -1062,10 +1087,10 @@ public sealed class Trigger : TriggerBase
     {
         if (_elementStates.TryGetValue(element, out var state))
         {
-            // Unsubscribe from property changes
-            if (state.Handler != null)
+            // Unsubscribe from property changes on the source we subscribed to
+            if (state.Handler != null && state.SourceElement != null)
             {
-                element.PropertyChangedInternal -= state.Handler;
+                state.SourceElement.PropertyChangedInternal -= state.Handler;
             }
 
             if (state.IsActive)
@@ -1125,6 +1150,14 @@ public sealed class Condition
     /// Gets or sets the value that the property must equal for the condition to be true.
     /// </summary>
     public object? Value { get; set; }
+
+    /// <summary>
+    /// 可选——按命名模板部件取 <see cref="Property"/> 值（而非 templated parent 自身）。
+    /// 用于跨子部件组合条件：例如 MultiTrigger 同时检查"按钮被按下"+"父控件已选中"。
+    /// 解析逻辑与 <see cref="Trigger.SourceName"/> 一致，由 <see cref="MultiTrigger.Attach"/>
+    /// 在挂载时一次性缓存到 condition-source 数组。
+    /// </summary>
+    public string? SourceName { get; set; }
 }
 
 /// <summary>
@@ -1156,6 +1189,12 @@ public sealed class MultiTrigger : TriggerBase
     {
         public bool IsActive;
         public Action<DependencyProperty, object?, object?>? Handler;
+        /// <summary>
+        /// 每条 Condition 解析到的源元素，与 <see cref="MultiTrigger.Conditions"/> 平行索引；
+        /// 元素为 null 表示该 condition 的 SourceName 解析失败（命名部件不存在）。
+        /// EvaluateTriggerForElement 按此数组逐条取值，避免每次重新走 visual-tree 搜索。
+        /// </summary>
+        public FrameworkElement?[] ConditionSources = Array.Empty<FrameworkElement?>();
     }
 
     private readonly Dictionary<FrameworkElement, ElementState> _elementStates = new();
@@ -1171,6 +1210,22 @@ public sealed class MultiTrigger : TriggerBase
         // Create per-element state
         var state = new ElementState();
         _elementStates[element] = state;
+
+        // 解析每条 Condition 的 source（SourceName=null → templated parent 自己）。
+        // 收集去重后的源元素集合，handler 订阅到每个唯一源——任何一个源的相关 DP 变化
+        // 都会触发整组重评估（"all must be true" 语义）。
+        state.ConditionSources = new FrameworkElement?[Conditions.Count];
+        var uniqueSources = new HashSet<FrameworkElement>();
+        for (int i = 0; i < Conditions.Count; i++)
+        {
+            var source = GetSetterTarget(element, Conditions[i].SourceName);
+            state.ConditionSources[i] = source;
+            if (source != null) uniqueSources.Add(source);
+        }
+
+        // 没有任何可订阅的源：所有 SourceName 都没解到——直接放弃，避免无效订阅与误激活。
+        if (uniqueSources.Count == 0)
+            return;
 
         // Create a closure that captures this specific element
         state.Handler = (dp, oldValue, newValue) =>
@@ -1194,8 +1249,12 @@ public sealed class MultiTrigger : TriggerBase
             }
         };
 
-        // Subscribe to property changes
-        element.PropertyChangedInternal += state.Handler;
+        // Subscribe handler to every distinct source so any of them firing PropertyChanged
+        // wakes this MultiTrigger.
+        foreach (var source in uniqueSources)
+        {
+            source.PropertyChangedInternal += state.Handler;
+        }
 
         // Check initial state
         EvaluateTriggerForElement(element);
@@ -1206,10 +1265,16 @@ public sealed class MultiTrigger : TriggerBase
     {
         if (_elementStates.TryGetValue(element, out var state))
         {
-            // Unsubscribe from property changes
-            if (state.Handler != null)
+            // Unsubscribe handler from every distinct source we subscribed to in Attach.
+            if (state.Handler != null && state.ConditionSources.Length > 0)
             {
-                element.PropertyChangedInternal -= state.Handler;
+                var unsubscribed = new HashSet<FrameworkElement>();
+                foreach (var source in state.ConditionSources)
+                {
+                    if (source == null) continue;
+                    if (!unsubscribed.Add(source)) continue;
+                    source.PropertyChangedInternal -= state.Handler;
+                }
             }
 
             if (state.IsActive)
@@ -1237,15 +1302,24 @@ public sealed class MultiTrigger : TriggerBase
         // All conditions must be true
         var shouldBeActive = true;
 
-        foreach (var condition in Conditions)
+        for (int i = 0; i < Conditions.Count; i++)
         {
+            var condition = Conditions[i];
             if (condition.Property == null)
             {
                 shouldBeActive = false;
                 break;
             }
 
-            var currentValue = element.GetValue(condition.Property);
+            // 用 Attach 时缓存的 source（与 Conditions 平行）取值。SourceName 解析失败的
+            // condition（source==null）视为不满足——MultiTrigger 整体不激活。
+            var source = i < state.ConditionSources.Length ? state.ConditionSources[i] : null;
+            if (source == null)
+            {
+                shouldBeActive = false;
+                break;
+            }
+            var currentValue = source.GetValue(condition.Property);
             var conditionValue = ConvertValueIfNeeded(condition.Value, condition.Property.PropertyType);
 
             if (!Equals(currentValue, conditionValue))

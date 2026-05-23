@@ -1197,7 +1197,7 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
 
         UpdateClickCount(position);
 
-        int offset = _view.GetOffsetFromPoint(position, ShowLineNumbers);
+        int offset = SnapCaretOffset(_view.GetOffsetFromPoint(position, ShowLineNumbers));
 
         if (_clickCount == 3)
         {
@@ -1375,7 +1375,7 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
         int oldSelectionStart = _selection.StartOffset;
         int oldSelectionLength = _selection.Length;
         int oldCaret = _caret.Offset;
-        int offset = _view.GetOffsetFromPoint(position, ShowLineNumbers);
+        int offset = SnapCaretOffset(_view.GetOffsetFromPoint(position, ShowLineNumbers));
 
         if (_isWordSelecting)
         {
@@ -1923,6 +1923,11 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
         int targetLine = _view.MoveVisibleLine(currentLine, lineDelta);
         var targetDocLine = _document.GetLineByNumber(targetLine);
         int targetColumn = Math.Min(_caret.DesiredColumn, targetDocLine.Length);
+        // Snap the carried column so the caret never lands inside a grapheme
+        // cluster on the target line.
+        string targetLineText = _document.GetLineText(targetLine);
+        targetColumn = GraphemeClusters.Snap(
+            targetLineText, Math.Min(targetColumn, targetLineText.Length), forward: true);
         int newOffset = targetDocLine.Offset + targetColumn;
 
         if (extendSelection)
@@ -1978,26 +1983,138 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
 
         if (direction > 0)
         {
-            // Move right: skip current word chars, then skip whitespace
-            while (offset < _document.TextLength && IsWordChar(_document.GetCharAt(offset)))
-                offset++;
-            while (offset < _document.TextLength && !IsWordChar(_document.GetCharAt(offset)))
-                offset++;
+            // Move right: skip the current word, then skip the separators —
+            // stepping a whole grapheme cluster at a time so an emoji is never
+            // entered mid-cluster.
+            while (offset < _document.TextLength && IsWordCharAtDocOffset(offset))
+                offset = NextGraphemeOffset(offset);
+            while (offset < _document.TextLength && !IsWordCharAtDocOffset(offset))
+                offset = NextGraphemeOffset(offset);
         }
         else
         {
-            // Move left: skip whitespace, then skip word chars
-            if (offset > 0) offset--;
-            while (offset > 0 && !IsWordChar(_document.GetCharAt(offset)))
-                offset--;
-            while (offset > 0 && IsWordChar(_document.GetCharAt(offset - 1)))
-                offset--;
+            // Move left: skip separators, then skip the word.
+            if (offset > 0) offset = PreviousGraphemeOffset(offset);
+            while (offset > 0 && !IsWordCharAtDocOffset(offset))
+                offset = PreviousGraphemeOffset(offset);
+            while (offset > 0 && IsWordCharAtDocOffset(PreviousGraphemeOffset(offset)))
+                offset = PreviousGraphemeOffset(offset);
         }
 
         return offset;
     }
 
     private static bool IsWordChar(char c) => char.IsLetterOrDigit(c) || c == '_';
+
+    /// <summary>
+    /// Returns the document offset of the next grapheme-cluster boundary after
+    /// <paramref name="offset"/>. A grapheme cluster — an emoji, a ZWJ or
+    /// skin-tone sequence, a flag, a combining sequence — moves as one unit so
+    /// the caret and forward deletion never split one. Clusters never span a
+    /// line delimiter, so the scan only ever materialises the current line.
+    /// </summary>
+    private int NextGraphemeOffset(int offset)
+    {
+        int length = _document.TextLength;
+        if (offset >= length) return length;
+        if (offset < 0) return 0;
+
+        var line = _document.GetLineByOffset(offset);
+        int column = offset - line.Offset;
+        // At or inside the line delimiter: step one code unit, as before.
+        if (column >= line.Length) return Math.Min(length, offset + 1);
+
+        string lineText = _document.GetLineText(line.LineNumber);
+        if (column >= lineText.Length) return Math.Min(length, offset + 1);
+        return line.Offset + GraphemeClusters.NextBoundary(lineText, column);
+    }
+
+    /// <summary>
+    /// Returns the document offset of the previous grapheme-cluster boundary
+    /// before <paramref name="offset"/>, so the caret and Backspace consume a
+    /// whole user-perceived character. See <see cref="NextGraphemeOffset"/>.
+    /// </summary>
+    private int PreviousGraphemeOffset(int offset)
+    {
+        if (offset <= 0) return 0;
+        int length = _document.TextLength;
+        if (offset > length) return length;
+
+        var line = _document.GetLineByOffset(offset);
+        int column = offset - line.Offset;
+        // At the line start: step back one code unit over the previous delimiter.
+        if (column <= 0) return offset - 1;
+
+        string lineText = _document.GetLineText(line.LineNumber);
+        int safeColumn = Math.Min(column, lineText.Length);
+        if (safeColumn <= 0) return offset - 1;
+        return line.Offset + GraphemeClusters.PreviousBoundary(lineText, safeColumn);
+    }
+
+    /// <summary>
+    /// Snaps a document <paramref name="offset"/> onto a grapheme-cluster
+    /// boundary, moving it forward or backward per <paramref name="forward"/>.
+    /// </summary>
+    private int SnapGraphemeOffset(int offset, bool forward)
+    {
+        offset = Math.Clamp(offset, 0, _document.TextLength);
+        if (offset <= 0 || offset >= _document.TextLength) return offset;
+
+        var line = _document.GetLineByOffset(offset);
+        int column = offset - line.Offset;
+        // Line-content edges and the delimiter region are already boundaries.
+        if (column <= 0 || column >= line.Length) return offset;
+
+        string lineText = _document.GetLineText(line.LineNumber);
+        int safeColumn = Math.Min(column, lineText.Length);
+        return line.Offset + GraphemeClusters.Snap(lineText, safeColumn, forward);
+    }
+
+    /// <summary>
+    /// Snaps a document <paramref name="offset"/> — typically a raw hit-test
+    /// result — onto the nearest grapheme-cluster boundary, so a mouse click or
+    /// drag never places the caret or a selection edge inside an emoji. The
+    /// view's <c>GetOffsetFromPoint</c> stays a pure geometric query; this is
+    /// where its result becomes a valid caret position.
+    /// </summary>
+    private int SnapCaretOffset(int offset)
+    {
+        offset = Math.Clamp(offset, 0, _document.TextLength);
+        if (offset <= 0 || offset >= _document.TextLength) return offset;
+
+        var line = _document.GetLineByOffset(offset);
+        int column = offset - line.Offset;
+        // Line-content edges and the delimiter region are already boundaries.
+        if (column <= 0 || column >= line.Length) return offset;
+
+        string lineText = _document.GetLineText(line.LineNumber);
+        int safeColumn = Math.Min(column, lineText.Length);
+        return line.Offset + GraphemeClusters.SnapNearest(lineText, safeColumn);
+    }
+
+    /// <summary>
+    /// Returns whether the grapheme cluster at document <paramref name="offset"/>
+    /// is a word character. A multi-code-unit cluster (emoji, ZWJ or combining
+    /// sequence) is never a word character — a word-wise jump steps over the
+    /// whole cluster instead of into the middle of it.
+    /// </summary>
+    private bool IsWordCharAtDocOffset(int offset)
+    {
+        if (offset < 0 || offset >= _document.TextLength) return false;
+        if (NextGraphemeOffset(offset) - offset != 1) return false;
+        return IsWordChar(_document.GetCharAt(offset));
+    }
+
+    /// <summary>
+    /// Returns whether the grapheme cluster beginning at <paramref name="start"/>
+    /// within <paramref name="text"/> is a word character.
+    /// </summary>
+    private static bool IsWordGrapheme(string text, int start)
+    {
+        if (start < 0 || start >= text.Length) return false;
+        if (GraphemeClusters.NextBoundary(text, start) - start != 1) return false;
+        return IsWordChar(text[start]);
+    }
 
     private void EnsureCaretVisible(bool allowAnimation = false)
     {
@@ -2087,7 +2204,7 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
 
         if (_caret.Offset == 0) return;
 
-        int deleteFrom = ctrl ? MoveToWordBoundary(_caret.Offset, -1) : _caret.Offset - 1;
+        int deleteFrom = ctrl ? MoveToWordBoundary(_caret.Offset, -1) : PreviousGraphemeOffset(_caret.Offset);
         int length = _caret.Offset - deleteFrom;
 
         _document.Remove(deleteFrom, length);
@@ -2117,7 +2234,7 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
 
         if (_caret.Offset >= _document.TextLength) return;
 
-        int deleteTo = ctrl ? MoveToWordBoundary(_caret.Offset, 1) : _caret.Offset + 1;
+        int deleteTo = ctrl ? MoveToWordBoundary(_caret.Offset, 1) : NextGraphemeOffset(_caret.Offset);
         int length = deleteTo - _caret.Offset;
 
         _document.Remove(_caret.Offset, length);
@@ -2411,17 +2528,37 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
             return (0, 0);
 
         offset = Math.Clamp(offset, 0, _document.TextLength - 1);
-        if (!IsWordChar(_document.GetCharAt(offset)))
+
+        // Work within the clicked line: a word never spans a line delimiter, and
+        // a line-local string keeps the grapheme scan cheap.
+        var line = _document.GetLineByOffset(offset);
+        string lineText = _document.GetLineText(line.LineNumber);
+        int column = Math.Clamp(offset - line.Offset, 0, lineText.Length);
+
+        // A click in the delimiter region selects a single code unit, as before.
+        if (column >= lineText.Length)
             return (offset, 1);
 
-        int start = offset;
-        int end = offset;
-        while (start > 0 && IsWordChar(_document.GetCharAt(start - 1)))
-            start--;
-        while (end < _document.TextLength && IsWordChar(_document.GetCharAt(end)))
-            end++;
+        // Snap onto the grapheme cluster the click landed in.
+        int clusterStart = GraphemeClusters.Snap(lineText, column, forward: false);
 
-        return (start, end - start);
+        // A non-word cluster (emoji, punctuation) selects as one whole cluster —
+        // never just the leading surrogate of an emoji.
+        if (!IsWordGrapheme(lineText, clusterStart))
+        {
+            int clusterEnd = GraphemeClusters.NextBoundary(lineText, clusterStart);
+            return (line.Offset + clusterStart, Math.Max(1, clusterEnd - clusterStart));
+        }
+
+        int start = clusterStart;
+        while (start > 0 && IsWordGrapheme(lineText, GraphemeClusters.PreviousBoundary(lineText, start)))
+            start = GraphemeClusters.PreviousBoundary(lineText, start);
+
+        int end = clusterStart;
+        while (end < lineText.Length && IsWordGrapheme(lineText, end))
+            end = GraphemeClusters.NextBoundary(lineText, end);
+
+        return (line.Offset + start, end - start);
     }
 
     private void SelectNextOccurrenceByWord()
@@ -2536,6 +2673,13 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
         start = Math.Clamp(start, 0, _document.TextLength);
         length = Math.Clamp(length, 0, _document.TextLength - start);
 
+        // Snap the range outward onto grapheme-cluster boundaries so a
+        // programmatic selection never begins or ends inside an emoji.
+        int snappedStart = SnapGraphemeOffset(start, forward: false);
+        int snappedEnd = SnapGraphemeOffset(start + length, forward: true);
+        start = snappedStart;
+        length = snappedEnd - snappedStart;
+
         int oldSelectionStart = _selection.StartOffset;
         int oldSelectionLength = _selection.Length;
         int oldCaret = _caret.Offset;
@@ -2558,13 +2702,13 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
 
     public void MoveCaretLeft(bool extendSelection = false)
     {
-        MoveCaret(_caret.Offset - 1, extendSelection);
+        MoveCaret(PreviousGraphemeOffset(_caret.Offset), extendSelection);
         _caret.DesiredColumn = -1;
     }
 
     public void MoveCaretRight(bool extendSelection = false)
     {
-        MoveCaret(_caret.Offset + 1, extendSelection);
+        MoveCaret(NextGraphemeOffset(_caret.Offset), extendSelection);
         _caret.DesiredColumn = -1;
     }
 
@@ -2768,6 +2912,22 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
         OnCaretPositionChanged();
         InvalidateVisual();
     }
+
+    /// <summary>
+    /// Loads a text file into the editor, replacing all content. A byte-order
+    /// mark, if present, decides the encoding; otherwise <paramref name="encoding"/>
+    /// is used — UTF-8 when it is <see langword="null"/>. Legacy code pages such
+    /// as <c>Encoding.GetEncoding(936)</c> (GBK) are supported.
+    /// </summary>
+    public void LoadFromFile(string path, System.Text.Encoding? encoding = null)
+        => LoadText(TextFile.ReadAllText(path, encoding));
+
+    /// <summary>
+    /// Writes the editor's text to a file using <paramref name="encoding"/> —
+    /// UTF-8 when it is <see langword="null"/>.
+    /// </summary>
+    public void SaveToFile(string path, System.Text.Encoding? encoding = null)
+        => TextFile.WriteAllText(path, Text, encoding);
 
     public void AppendText(string text)
     {

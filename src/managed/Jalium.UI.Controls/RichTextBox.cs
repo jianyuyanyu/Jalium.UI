@@ -615,6 +615,22 @@ public class RichTextBox : Control, IImeSupport
     }
 
     /// <summary>
+    /// Loads a text file as plain text, replacing the document. A byte-order
+    /// mark, if present, decides the encoding; otherwise <paramref name="encoding"/>
+    /// is used — UTF-8 when it is <see langword="null"/>. Legacy code pages such
+    /// as <c>Encoding.GetEncoding(936)</c> (GBK) are supported.
+    /// </summary>
+    public void LoadFromFile(string path, System.Text.Encoding? encoding = null)
+        => SetText(TextFile.ReadAllText(path, encoding));
+
+    /// <summary>
+    /// Writes the document's plain text to a file using <paramref name="encoding"/>
+    /// — UTF-8 when it is <see langword="null"/>.
+    /// </summary>
+    public void SaveToFile(string path, System.Text.Encoding? encoding = null)
+        => TextFile.WriteAllText(path, GetText(), encoding);
+
+    /// <summary>
     /// Sets the document content from plain text.
     /// </summary>
     /// <param name="text">The plain text to set.</param>
@@ -2209,6 +2225,7 @@ public class RichTextBox : Control, IImeSupport
         if (fontSize <= 0)
             fontSize = _document.FontSize;
 
+        int index = text.Length;
         double prevWidth = 0;
         for (int i = 0; i <= text.Length; i++)
         {
@@ -2221,13 +2238,14 @@ public class RichTextBox : Control, IImeSupport
             var width = formattedText.Width;
             if (width >= x)
             {
-                if (i > 0 && (x - prevWidth) < (width - x))
-                    return i - 1;
-                return i;
+                index = (i > 0 && (x - prevWidth) < (width - x)) ? i - 1 : i;
+                break;
             }
             prevWidth = width;
         }
-        return text.Length;
+
+        // Snap onto a grapheme-cluster edge so a hit never lands inside an emoji.
+        return GraphemeClusters.SnapNearest(text, index);
     }
 
     /// <inheritdoc />
@@ -2788,50 +2806,76 @@ public class RichTextBox : Control, IImeSupport
             return (0, 0);
         }
 
-        var clampedOffset = Math.Clamp(offset, 0, text.Length);
-        if (clampedOffset == text.Length && clampedOffset > 0 && !IsWordBoundary(text[clampedOffset - 1]))
+        int length = text.Length;
+        // Operate on grapheme-cluster boundaries so an emoji is one indivisible
+        // unit — never half-selected by a double-click.
+        int pos = GraphemeClusters.Snap(text, Math.Clamp(offset, 0, length), forward: false);
+
+        // A hit past the last cluster snaps back onto it when it is a word
+        // character.
+        if (pos == length && pos > 0)
         {
-            clampedOffset--;
+            int prev = GraphemeClusters.PreviousBoundary(text, pos);
+            if (!IsWordSeparatorAt(text, prev, includePunctuation: true))
+            {
+                pos = prev;
+            }
         }
 
-        if (clampedOffset < text.Length && IsWordBoundary(text[clampedOffset]))
+        // Landed on a separator cluster: take the word immediately before it,
+        // or the whole run of separators when there is no such word.
+        if (pos < length && IsWordSeparatorAt(text, pos, includePunctuation: true))
         {
-            if (clampedOffset > 0 && !IsWordBoundary(text[clampedOffset - 1]))
+            int prev = GraphemeClusters.PreviousBoundary(text, pos);
+            if (pos > 0 && !IsWordSeparatorAt(text, prev, includePunctuation: true))
             {
-                clampedOffset--;
+                pos = prev;
             }
             else
             {
-                while (clampedOffset < text.Length && IsWordBoundary(text[clampedOffset]))
+                while (pos < length && IsWordSeparatorAt(text, pos, includePunctuation: true))
                 {
-                    clampedOffset++;
+                    pos = GraphemeClusters.NextBoundary(text, pos);
                 }
 
-                if (clampedOffset >= text.Length)
+                if (pos >= length)
                 {
-                    return (text.Length, text.Length);
+                    return (length, length);
                 }
             }
         }
 
-        var start = clampedOffset;
-        while (start > 0 && !IsWordBoundary(text[start - 1]))
+        int start = pos;
+        while (start > 0
+               && !IsWordSeparatorAt(text, GraphemeClusters.PreviousBoundary(text, start), includePunctuation: true))
         {
-            start--;
+            start = GraphemeClusters.PreviousBoundary(text, start);
         }
 
-        var end = clampedOffset;
-        while (end < text.Length && !IsWordBoundary(text[end]))
+        int end = pos;
+        while (end < length && !IsWordSeparatorAt(text, end, includePunctuation: true))
         {
-            end++;
+            end = GraphemeClusters.NextBoundary(text, end);
         }
 
         return (start, end);
     }
 
-    private static bool IsWordBoundary(char c)
+    /// <summary>
+    /// Classifies the grapheme cluster beginning at <paramref name="start"/>. A
+    /// cluster is a word separator only when it is a single whitespace code
+    /// unit, or — with <paramref name="includePunctuation"/> — a single
+    /// punctuation code unit. A multi-code-unit cluster (emoji, ZWJ or combining
+    /// sequence) is always a word character, so word selection never splits one.
+    /// </summary>
+    private static bool IsWordSeparatorAt(string text, int start, bool includePunctuation)
     {
-        return char.IsWhiteSpace(c) || char.IsPunctuation(c);
+        if (start < 0 || start >= text.Length)
+            return false;
+        if (GraphemeClusters.NextBoundary(text, start) - start != 1)
+            return false;
+        char c = text[start];
+        return char.IsWhiteSpace(c) || (includePunctuation && char.IsPunctuation(c));
     }
 
     #endregion
@@ -2963,17 +3007,18 @@ public class RichTextBox : Control, IImeSupport
         if (offset <= 0)
             return _document.ContentStart;
 
-        offset--;
+        // Walk in grapheme-cluster steps so an emoji is never entered mid-cluster.
+        int i = GraphemeClusters.PreviousBoundary(text, offset);
 
-        // Skip whitespace
-        while (offset > 0 && char.IsWhiteSpace(text[offset]))
-            offset--;
+        // Skip whitespace clusters.
+        while (i > 0 && IsWordSeparatorAt(text, i, includePunctuation: false))
+            i = GraphemeClusters.PreviousBoundary(text, i);
 
-        // Find start of word
-        while (offset > 0 && !char.IsWhiteSpace(text[offset - 1]))
-            offset--;
+        // Walk back to the start of the word.
+        while (i > 0 && !IsWordSeparatorAt(text, GraphemeClusters.PreviousBoundary(text, i), includePunctuation: false))
+            i = GraphemeClusters.PreviousBoundary(text, i);
 
-        return _document.GetPositionAtOffset(offset, LogicalDirection.Forward);
+        return _document.GetPositionAtOffset(i, LogicalDirection.Forward);
     }
 
     private TextPointer? FindNextWordBoundary(TextPointer position)
@@ -2984,15 +3029,17 @@ public class RichTextBox : Control, IImeSupport
         if (offset >= text.Length)
             return _document.ContentEnd;
 
-        // Skip current word
-        while (offset < text.Length && !char.IsWhiteSpace(text[offset]))
-            offset++;
+        int i = GraphemeClusters.Snap(text, offset, forward: true);
 
-        // Skip whitespace
-        while (offset < text.Length && char.IsWhiteSpace(text[offset]))
-            offset++;
+        // Skip the current word.
+        while (i < text.Length && !IsWordSeparatorAt(text, i, includePunctuation: false))
+            i = GraphemeClusters.NextBoundary(text, i);
 
-        return _document.GetPositionAtOffset(offset, LogicalDirection.Forward);
+        // Skip whitespace clusters.
+        while (i < text.Length && IsWordSeparatorAt(text, i, includePunctuation: false))
+            i = GraphemeClusters.NextBoundary(text, i);
+
+        return _document.GetPositionAtOffset(i, LogicalDirection.Forward);
     }
 
     #endregion

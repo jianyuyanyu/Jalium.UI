@@ -18,7 +18,8 @@ inline size_t HashFields(std::wstring_view text,
                          uint32_t brushBgra,
                          uint16_t drawFlags,
                          int16_t fontWeight,
-                         uint8_t fontStyle) noexcept
+                         uint8_t fontStyle,
+                         uint8_t fontQuality) noexcept
 {
     size_t h = std::hash<std::wstring_view>{}(text);
 
@@ -28,6 +29,9 @@ inline size_t HashFields(std::wstring_view text,
 
     // Pack the small ints into u64 chunks so we mix three times instead of
     // eight. The bit layout doesn't have to be canonical — only stable.
+    // fontQuality joins fontStyle in the third chunk because both are tiny
+    // (≤ 8 bits) and putting them together preserves the existing chunk
+    // boundary while still differentiating the new TextRenderingMode mapping.
     const uint64_t a =  static_cast<uint64_t>(fontFamilyId)
                      | (static_cast<uint64_t>(static_cast<uint16_t>(fontHeight)) << 32)
                      | (static_cast<uint64_t>(static_cast<uint16_t>(bitmapW))   << 48);
@@ -35,7 +39,8 @@ inline size_t HashFields(std::wstring_view text,
                      | (static_cast<uint64_t>(brushBgra) << 16)
                      | (static_cast<uint64_t>(drawFlags) << 48);
     const uint64_t c =  static_cast<uint64_t>(static_cast<uint16_t>(fontWeight))
-                     | (static_cast<uint64_t>(fontStyle) << 16);
+                     | (static_cast<uint64_t>(fontStyle) << 16)
+                     | (static_cast<uint64_t>(fontQuality) << 24);
     mix(a);
     mix(b);
     mix(c);
@@ -48,14 +53,14 @@ size_t TextCacheHash::operator()(const TextCacheKey& k) const noexcept
 {
     return HashFields(std::wstring_view{k.text}, k.fontFamilyId, k.fontHeight,
                       k.bitmapW, k.bitmapH, k.brushBgra, k.drawFlags,
-                      k.fontWeight, k.fontStyle);
+                      k.fontWeight, k.fontStyle, k.fontQuality);
 }
 
 size_t TextCacheHash::operator()(const TextCacheKeyView& v) const noexcept
 {
     return HashFields(v.text, v.fontFamilyId, v.fontHeight,
                       v.bitmapW, v.bitmapH, v.brushBgra, v.drawFlags,
-                      v.fontWeight, v.fontStyle);
+                      v.fontWeight, v.fontStyle, v.fontQuality);
 }
 
 bool TextCacheEq::operator()(const TextCacheKey& a, const TextCacheKey& b) const noexcept
@@ -70,6 +75,7 @@ bool TextCacheEq::operator()(const TextCacheKey& a, const TextCacheKey& b) const
         && a.drawFlags    == b.drawFlags
         && a.fontWeight   == b.fontWeight
         && a.fontStyle    == b.fontStyle
+        && a.fontQuality  == b.fontQuality
         && a.text         == b.text;
 }
 
@@ -83,6 +89,7 @@ bool TextCacheEq::operator()(const TextCacheKeyView& v, const TextCacheKey& k) c
         && v.drawFlags    == k.drawFlags
         && v.fontWeight   == k.fontWeight
         && v.fontStyle    == k.fontStyle
+        && v.fontQuality  == k.fontQuality
         && v.text         == std::wstring_view{k.text};
 }
 

@@ -1350,7 +1350,13 @@ void D3D12RenderTarget::RenderText(
     ComPtr<IDWriteTextLayout> layout;
     uint64_t layoutKey = 0;
     if (FAILED(tf->CreateLayout(text, textLength, w, h, &layout, &layoutKey))) return;
-    directRenderer_->AddText(layout.Get(), x, y, r, g, b, a, layoutKey);
+    // Resolve per-element TextOptions against the process-wide fallback chain
+    // here at the boundary so AddText / GenerateGlyphs / RasterizeGlyph only
+    // see concrete modes; the glyph atlas keys off the resolved AA mode so
+    // ClearType and Grayscale runs cache independently within the same frame.
+    const int32_t aaMode = tf->ResolveEffectiveTextRenderingMode();
+    const int32_t hintingMode = tf->GetTextHintingMode();
+    directRenderer_->AddText(layout.Get(), x, y, r, g, b, a, layoutKey, aaMode, hintingMode);
 }
 
 // ============================================================================

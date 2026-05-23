@@ -391,7 +391,9 @@ public class PasswordBox : Control, IImeSupport
         get => _caretIndex;
         set
         {
-            var newValue = Math.Clamp(_password.Length, 0, value);
+            // Snap forward so a caret placed inside a grapheme cluster lands on
+            // the next whole boundary instead of splitting an emoji.
+            var newValue = GraphemeClusters.Snap(_password, Math.Clamp(value, 0, _password.Length), forward: true);
             if (_caretIndex != newValue)
             {
                 _caretIndex = newValue;
@@ -410,7 +412,9 @@ public class PasswordBox : Control, IImeSupport
         get => _selectionStart;
         set
         {
-            var newValue = Math.Clamp(_password.Length, 0, value);
+            // Snap backward so a selection that starts inside a grapheme cluster
+            // grows to include the whole emoji.
+            var newValue = GraphemeClusters.Snap(_password, Math.Clamp(value, 0, _password.Length), forward: false);
             if (_selectionStart != newValue)
             {
                 _selectionStart = newValue;
@@ -428,7 +432,10 @@ public class PasswordBox : Control, IImeSupport
         set
         {
             var maxLength = _password.Length - _selectionStart;
-            var newValue = Math.Clamp(maxLength, 0, value);
+            var raw = Math.Clamp(value, 0, maxLength);
+            // Snap the selection end forward so it spans whole grapheme clusters.
+            var snappedEnd = GraphemeClusters.Snap(_password, _selectionStart + raw, forward: true);
+            var newValue = snappedEnd - _selectionStart;
             if (_selectionLength != newValue)
             {
                 _selectionLength = newValue;
@@ -538,8 +545,13 @@ public class PasswordBox : Control, IImeSupport
     /// </summary>
     public void Select(int start, int length)
     {
-        _selectionStart = Math.Clamp(_password.Length, 0, start);
-        _selectionLength = Math.Clamp(_password.Length - _selectionStart, 0, length);
+        // Snap both endpoints onto grapheme-cluster boundaries so a programmatic
+        // selection never begins or ends inside an emoji.
+        var snappedStart = GraphemeClusters.Snap(_password, Math.Clamp(start, 0, _password.Length), forward: false);
+        var rawEnd = Math.Clamp(snappedStart + length, snappedStart, _password.Length);
+        var snappedEnd = GraphemeClusters.Snap(_password, rawEnd, forward: true);
+        _selectionStart = snappedStart;
+        _selectionLength = snappedEnd - snappedStart;
         _caretIndex = _selectionStart + _selectionLength;
         InvalidateVisual();
     }
@@ -959,9 +971,14 @@ public class PasswordBox : Control, IImeSupport
             _selectionAnchor = _caretIndex;
         }
 
-        _selectionStart = Math.Min(_selectionAnchor, newCaretIndex);
-        _selectionLength = Math.Abs(newCaretIndex - _selectionAnchor);
-        _caretIndex = newCaretIndex;
+        // Snap both endpoints outward so Shift+Arrow or a drag over an emoji
+        // never leaves half a grapheme cluster selected.
+        bool extendingRight = newCaretIndex >= _selectionAnchor;
+        int anchor = GraphemeClusters.Snap(_password, _selectionAnchor, forward: !extendingRight);
+        int caret = GraphemeClusters.Snap(_password, newCaretIndex, forward: extendingRight);
+        _selectionStart = Math.Min(anchor, caret);
+        _selectionLength = Math.Abs(caret - anchor);
+        _caretIndex = caret;
 
         InvalidateVisual();
     }
@@ -1091,7 +1108,8 @@ public class PasswordBox : Control, IImeSupport
             columnIndex = i;
         }
 
-        return columnIndex;
+        // Snap onto a grapheme-cluster edge so a click never lands inside an emoji.
+        return GraphemeClusters.SnapNearest(_password, columnIndex);
     }
 
     private void ResetCaretBlink()
@@ -1513,7 +1531,7 @@ public class PasswordBox : Control, IImeSupport
         }
         else
         {
-            newIndex = Math.Max(0, _caretIndex - 1);
+            newIndex = GraphemeClusters.PreviousBoundary(_password, _caretIndex);
         }
 
         if (shift)
@@ -1545,7 +1563,7 @@ public class PasswordBox : Control, IImeSupport
         }
         else
         {
-            newIndex = Math.Min(_password.Length, _caretIndex + 1);
+            newIndex = GraphemeClusters.NextBoundary(_password, _caretIndex);
         }
 
         if (shift)
@@ -1618,22 +1636,11 @@ public class PasswordBox : Control, IImeSupport
         {
             PushUndo();
 
-            int deleteCount;
-            if (ctrl)
-            {
-                // For passwords, Ctrl+Backspace deletes to start
-                deleteCount = _caretIndex;
-            }
-            else
-            {
-                deleteCount = 1;
-            }
-
-            var startIndex = Math.Max(0, _caretIndex - deleteCount);
+            // Ctrl+Backspace clears to the start; otherwise remove one whole
+            // grapheme cluster so an emoji is never half-deleted.
+            int startIndex = ctrl ? 0 : GraphemeClusters.PreviousBoundary(_password, _caretIndex);
             _password = _password.Substring(0, startIndex) + _password.Substring(_caretIndex);
             _caretIndex = startIndex;
-
-            if (_caretIndex < 0) _caretIndex = 0;
 
             RaisePasswordChanged();
         }
@@ -1654,18 +1661,10 @@ public class PasswordBox : Control, IImeSupport
         {
             PushUndo();
 
-            int deleteCount;
-            if (ctrl)
-            {
-                // For passwords, Ctrl+Delete deletes to end
-                deleteCount = _password.Length - _caretIndex;
-            }
-            else
-            {
-                deleteCount = 1;
-            }
-
-            _password = _password.Substring(0, _caretIndex) + _password.Substring(Math.Min(_caretIndex + deleteCount, _password.Length));
+            // Ctrl+Delete clears to the end; otherwise remove one whole grapheme
+            // cluster so an emoji is never half-deleted.
+            int endIndex = ctrl ? _password.Length : GraphemeClusters.NextBoundary(_password, _caretIndex);
+            _password = _password.Substring(0, _caretIndex) + _password.Substring(endIndex);
 
             RaisePasswordChanged();
         }

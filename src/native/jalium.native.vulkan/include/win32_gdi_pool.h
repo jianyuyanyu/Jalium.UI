@@ -40,13 +40,22 @@ namespace jalium {
 class Win32GdiPool {
 public:
     // Acquire (or create) a cached HFONT keyed by (fontFamilyId, height,
-    // weight, italic). fontFamily is only consulted on miss. Returns null
-    // if CreateFontW fails — the caller should bail in that case.
+    // weight, italic, quality). fontFamily is only consulted on miss.
+    // Returns null if CreateFontW fails — the caller should bail in that case.
+    //
+    // `quality` is a LOGFONT.lfQuality value (NONANTIALIASED_QUALITY = 3,
+    // ANTIALIASED_QUALITY = 4, CLEARTYPE_QUALITY = 5) resolved upstream from
+    // the source TextFormat's per-element TextRenderingMode. The default
+    // 5 (CLEARTYPE_QUALITY) preserves the historical Vulkan-backend behaviour
+    // for Auto callers. The field is in the cache key so two elements that
+    // ask for the same family/size at different qualities coexist instead of
+    // returning the wrong HFONT.
     static HFONT AcquireFont(uint32_t fontFamilyId,
                              const wchar_t* fontFamily,
                              int height,
                              int weight,
-                             bool italic);
+                             bool italic,
+                             uint8_t quality = 5);
 
     // Returns the thread-local memory DC. Creates it on first use.
     static HDC AcquireMemoryDc();

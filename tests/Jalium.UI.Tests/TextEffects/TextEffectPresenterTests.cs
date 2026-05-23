@@ -51,6 +51,33 @@ public class TextEffectPresenterTests
         Assert.Equal("e\u0301", p.Cells[0].Text);
     }
 
+    [Fact]
+    public void AppendText_ZwjEmojiSequence_StaysAsOneCell()
+    {
+        var p = CreateWithAnimation();
+        // A ZWJ family sequence is one extended grapheme cluster.
+        string family = EmojiTestStrings.Family;
+        p.AppendText("a" + family + "b");
+
+        Assert.Equal(3, p.Cells.Count);
+        Assert.Equal("a", p.Cells[0].Text);
+        Assert.Equal(family, p.Cells[1].Text);
+        Assert.Equal("b", p.Cells[2].Text);
+    }
+
+    [Fact]
+    public void AppendText_CrLf_IsASingleCell()
+    {
+        var p = CreateWithAnimation();
+        // UAX #29 treats CR+LF as one grapheme cluster.
+        p.AppendText("a\r\nb");
+
+        Assert.Equal(3, p.Cells.Count);
+        Assert.Equal("a", p.Cells[0].Text);
+        Assert.Equal("\r\n", p.Cells[1].Text);
+        Assert.Equal("b", p.Cells[2].Text);
+    }
+
     #endregion
 
     #region State machine — new cells enter

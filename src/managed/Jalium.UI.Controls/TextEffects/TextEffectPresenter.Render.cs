@@ -85,7 +85,7 @@ partial class TextEffectPresenter
             var cell = _cells[i];
             cell.LineHeight = lineHeight;
 
-            if (cell.Text == "\n")
+            if (IsLineBreakText(cell.Text))
             {
                 cell.Bounds = new Rect(x, y, 0, lineHeight);
                 maxLineWidth = Math.Max(maxLineWidth, x);
@@ -125,7 +125,7 @@ partial class TextEffectPresenter
             cell.LineHeight = lineHeight;
 
             // Explicit newline — always breaks and resets state.
-            if (cell.Text == "\n")
+            if (IsLineBreakText(cell.Text))
             {
                 cell.Bounds = new Rect(x, y, 0, lineHeight);
                 maxLineWidth = Math.Max(maxLineWidth, x);
@@ -481,7 +481,7 @@ partial class TextEffectPresenter
         {
             var c = cells[i];
             if (c.Phase == TextEffectCellPhase.Hidden) continue;
-            if (c.Text == "\n" || string.IsNullOrEmpty(c.Text) || c.Bounds.Width <= 0) continue;
+            if (IsLineBreakText(c.Text) || string.IsNullOrEmpty(c.Text) || c.Bounds.Width <= 0) continue;
             any = true;
             var x = c.Bounds.X;
             var y = c.Bounds.Y;
@@ -538,7 +538,7 @@ partial class TextEffectPresenter
         ref double max, ref double minX, ref double minY, ref double maxX, ref double maxY, ref bool any)
     {
         if (cell.Phase == TextEffectCellPhase.Hidden) return;
-        if (cell.Text == "\n" || string.IsNullOrEmpty(cell.Text)) return;
+        if (IsLineBreakText(cell.Text) || string.IsNullOrEmpty(cell.Text)) return;
 
         var payload = TextCellRenderPayload.Identity;
         var ctx = new TextEffectFrameContext(
@@ -627,7 +627,7 @@ partial class TextEffectPresenter
             return;
         }
 
-        if (cell.Text == "\n" || string.IsNullOrEmpty(cell.Text) || cell.Bounds.Width <= 0)
+        if (IsLineBreakText(cell.Text) || string.IsNullOrEmpty(cell.Text) || cell.Bounds.Width <= 0)
         {
             return;
         }

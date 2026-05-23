@@ -597,7 +597,15 @@ int32_t D3D12GlyphAtlas::SyncAntialiasMode()
 
 bool D3D12GlyphAtlas::RasterizeGlyph(const GlyphKey& key, GlyphEntry& entry)
 {
-    int32_t aaMode = SyncAntialiasMode();
+    // Prefer the per-key mode captured at GenerateGlyphs time. Auto (0) is the
+    // legacy "follow the process-wide setting" fallback for callers that
+    // didn't fill the key (e.g. internal codepaths that build a GlyphKey
+    // ad-hoc rather than going through GenerateGlyphs).
+    int32_t aaMode = key.aaMode;
+    if (aaMode == JALIUM_TEXT_AA_AUTO ||
+        aaMode < JALIUM_TEXT_AA_AUTO || aaMode > JALIUM_TEXT_AA_CLEARTYPE) {
+        aaMode = SyncAntialiasMode();
+    }
 
     // Colour-emoji fast path: Segoe UI Emoji and other COLR/CPAL fonts publish
     // multiple layers per glyph that have to be composited in their authored
@@ -705,6 +713,21 @@ bool D3D12GlyphAtlas::RasterizeGlyph(const GlyphKey& key, GlyphEntry& entry)
         DWRITE_GRID_FIT_MODE gridFitMode = DWRITE_GRID_FIT_MODE_DEFAULT;
         bool useGdiFallback = false;
 
+        // TextHintingMode override (WPF TextOptions.TextHintingMode):
+        //   1=Fixed    → force grid fit on so the glyph is crisp every frame
+        //   2=Animated → force grid fit off so the glyph stays smooth as it
+        //                slides sub-pixel through a storyboard (otherwise the
+        //                hinted stems pop every time penX crosses a pixel)
+        //   0=Auto     → let GetRecommendedRenderingMode below pick (which
+        //                consults the font's gasp table for the right answer
+        //                at this em size)
+        const uint8_t hint = key.hintingMode;
+        if (hint == 1) {
+            gridFitMode = DWRITE_GRID_FIT_MODE_ENABLED;
+        } else if (hint == 2) {
+            gridFitMode = DWRITE_GRID_FIT_MODE_DISABLED;
+        }
+
         // For pure Aliased (bilevel) we route through GDI: CreateGlyphRunAnalysis
         // can't produce an ALIASED texture without a matching rendering mode and
         // the legacy GDI path is the established source of bilevel glyphs.
@@ -736,7 +759,13 @@ bool D3D12GlyphAtlas::RasterizeGlyph(const GlyphKey& key, GlyphEntry& entry)
                     useGdiFallback = true;
                 } else {
                     renderingMode = recMode;
-                    gridFitMode = recGridFit;
+                    // Only adopt the recommended grid-fit policy when the
+                    // caller didn't pin an explicit Fixed / Animated mode —
+                    // otherwise WPF's TextOptions.TextHintingMode override
+                    // would silently lose to the font's gasp-table hint.
+                    if (hint == 0) {
+                        gridFitMode = recGridFit;
+                    }
                 }
             }
         }
@@ -1330,7 +1359,9 @@ bool D3D12GlyphAtlas::RasterizeColorGlyph(const GlyphKey& key, GlyphEntry& entry
 
 uint64_t D3D12GlyphAtlas::HashInstanceKey(uint64_t layoutKey,
                                           float originX, float originY,
-                                          float dpiScale) noexcept
+                                          float dpiScale,
+                                          int32_t aaMode,
+                                          int32_t hintingMode) noexcept
 {
     uint64_t h = 0xCBF29CE484222325ull;  // FNV-1a 64-bit
     auto mix = [&h](const void* p, size_t n) {
@@ -1341,6 +1372,12 @@ uint64_t D3D12GlyphAtlas::HashInstanceKey(uint64_t layoutKey,
     mix(&originX, sizeof(originX));
     mix(&originY, sizeof(originY));
     mix(&dpiScale, sizeof(dpiScale));
+    // Mode bits must enter the key — two text elements at the same origin
+    // with the same layoutKey but different TextRenderingMode/TextHintingMode
+    // would otherwise hand back the cached run rasterized in the other
+    // element's mode (e.g. ClearType glyphs served to a Grayscale element).
+    mix(&aaMode, sizeof(aaMode));
+    mix(&hintingMode, sizeof(hintingMode));
     return h;
 }
 
@@ -1350,15 +1387,37 @@ uint32_t D3D12GlyphAtlas::GenerateGlyphs(
     float colorR, float colorG, float colorB, float colorA,
     std::vector<GlyphQuadInstance>& outInstances,
     std::vector<TextDecorationRect>* outDecorations,
-    uint64_t layoutKey)
+    uint64_t layoutKey,
+    int32_t aaMode,
+    int32_t hintingMode)
 {
     if (!layout || !initialized_) return 0;
 
-    // Detect a runtime ClearType↔Grayscale swap. SyncAntialiasMode() bumps
-    // needsReset_ when it spots a mode change so the cached glyph pixels
-    // (R/G/B sub-pixel fringes from a previous ClearType pass, or vice versa)
-    // don't survive into the new mode's frame.
-    SyncAntialiasMode();
+    // Detect a runtime process-wide ClearType↔Grayscale swap. SyncAntialiasMode()
+    // bumps needsReset_ when it spots a mode change so cached glyph pixels
+    // from the old mode don't survive into the new mode's frame. With per-format
+    // mode plumbing the atlas can now also hold (ClearType, Grayscale) entries
+    // for the same glyph simultaneously — those are distinguished by GlyphKey,
+    // so the reset is only needed for the global-mode swap path.
+    int32_t globalMode = SyncAntialiasMode();
+
+    // Resolve the effective rendering mode for THIS call. aaMode == 0 (Auto)
+    // means the caller didn't override at the format level, so fall through to
+    // the process-wide value. Anything explicit wins so an authoring-tool
+    // panel can render its Grayscale text next to a ClearType chrome border in
+    // the same frame.
+    int32_t effectiveAaMode = (aaMode != 0) ? aaMode : globalMode;
+    // Clamp to valid JALIUM_TEXT_AA_* range; out-of-band values would index
+    // off the end of the rasterizer mode table downstream.
+    if (effectiveAaMode < JALIUM_TEXT_AA_AUTO || effectiveAaMode > JALIUM_TEXT_AA_CLEARTYPE) {
+        effectiveAaMode = globalMode;
+    }
+    // hintingMode is consumed as-is by RasterizeGlyph (0..2). Anything else is
+    // also clamped to Auto so the GlyphKey field stays small and predictable.
+    int32_t effectiveHintingMode = hintingMode;
+    if (effectiveHintingMode < 0 || effectiveHintingMode > 2) {
+        effectiveHintingMode = 0;
+    }
 
     // Apply this call's premultiplied colour to a colour-neutral run (cached
     // or freshly built) and append it to the caller's buffers. Decorations
@@ -1401,7 +1460,8 @@ uint32_t D3D12GlyphAtlas::GenerateGlyphs(
     // (its cached UVs would now point at the wrong atlas slots) so stale-UV
     // garbled text is impossible.
     if (layoutKey != 0) {
-        const uint64_t ck = HashInstanceKey(layoutKey, originX, originY, dpiScale_);
+        const uint64_t ck = HashInstanceKey(layoutKey, originX, originY, dpiScale_,
+                                            effectiveAaMode, effectiveHintingMode);
         auto mit = instMap_.find(ck);
         if (mit != instMap_.end()) {
             if (mit->second->run.gen == atlasGeneration_) {
@@ -1464,6 +1524,13 @@ uint32_t D3D12GlyphAtlas::GenerateGlyphs(
             key.glyphIndex = run.glyphIndices[i];
             key.fontSize = fontSize;
             key.subpixelX = subpixelQuant;
+            // The effective AA + hinting modes are baked into the key so the
+            // same glyph rasterized in ClearType for one element doesn't get
+            // re-emitted for a different element that asked for Grayscale or
+            // Animated hinting — RasterizeGlyph reads them straight off the
+            // key and skips the SyncAntialiasMode() fallback when set.
+            key.aaMode = static_cast<uint8_t>(effectiveAaMode);
+            key.hintingMode = static_cast<uint8_t>(effectiveHintingMode);
 
             auto it = cache_.find(key);
             if (it == cache_.end()) {
@@ -1527,7 +1594,8 @@ uint32_t D3D12GlyphAtlas::GenerateGlyphs(
 
     if (layoutKey != 0) {
         built.gen = atlasGeneration_;
-        const uint64_t ck = HashInstanceKey(layoutKey, originX, originY, dpiScale_);
+        const uint64_t ck = HashInstanceKey(layoutKey, originX, originY, dpiScale_,
+                                            effectiveAaMode, effectiveHintingMode);
         if (auto ex = instMap_.find(ck); ex != instMap_.end()) {
             instLru_.erase(ex->second);
             instMap_.erase(ex);

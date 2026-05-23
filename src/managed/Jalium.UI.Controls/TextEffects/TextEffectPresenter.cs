@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using Jalium.UI;
+using Jalium.UI.Controls;
 using Jalium.UI.Controls.TextEffects.Effects;
 using Jalium.UI.Input;
 using Jalium.UI.Media;
@@ -1017,28 +1017,21 @@ public partial class TextEffectPresenter : FrameworkElement
     #region Grapheme Splitting
 
     /// <summary>
-    /// Splits a string into grapheme clusters (user-perceived characters), using
-    /// <see cref="StringInfo.ParseCombiningCharacters"/>. Emoji, ZWJ sequences,
-    /// surrogate pairs, and combining marks each map to a single grapheme.
-    /// Newline characters are kept as their own graphemes so layout can recognise them.
+    /// Returns whether a grapheme cluster is a line break — a lone CR or LF, or a
+    /// CR+LF pair (which UAX #29 treats as a single grapheme cluster). Layout uses
+    /// this to recognise the cells that force a new line.
+    /// </summary>
+    private static bool IsLineBreakText(string text)
+        => text is "\n" or "\r" or "\r\n";
+
+    /// <summary>
+    /// Splits a string into grapheme clusters (user-perceived characters) via the
+    /// shared <see cref="GraphemeClusters"/> helper. Emoji — including ZWJ
+    /// sequences, skin-tone modifiers and flags — surrogate pairs and combining
+    /// marks each map to a single grapheme; a CR+LF pair is one grapheme.
     /// </summary>
     internal static List<string> SplitGraphemes(string text)
-    {
-        var result = new List<string>();
-        if (string.IsNullOrEmpty(text))
-        {
-            return result;
-        }
-
-        var starts = StringInfo.ParseCombiningCharacters(text);
-        for (int i = 0; i < starts.Length; i++)
-        {
-            var start = starts[i];
-            var end = i + 1 < starts.Length ? starts[i + 1] : text.Length;
-            result.Add(text.Substring(start, end - start));
-        }
-        return result;
-    }
+        => GraphemeClusters.Split(text);
 
     #endregion
 }
