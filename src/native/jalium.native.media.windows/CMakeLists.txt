@@ -5,6 +5,7 @@ set(HEADERS
     include/win_wic_decoder.h
     include/win_mf_video_decoder.h
     include/win_mf_camera_source.h
+    include/win_mf_aac_decoder.h
 )
 
 set(SOURCES
@@ -13,14 +14,22 @@ set(SOURCES
     src/win_mf_video_decoder.cpp
     src/win_mf_codec_caps.cpp
     src/win_mf_camera_source.cpp
+    src/win_mf_aac_decoder.cpp
     src/win_media_exports.cpp
 )
 
-add_library(${PROJECT_NAME} ${JALIUM_LIB_TYPE} ${HEADERS} ${SOURCES})
+# Pull in the shared audio TUs so their symbols ship from this DLL too
+# (see root CMakeLists.txt for the rationale).
+add_library(${PROJECT_NAME} ${JALIUM_LIB_TYPE}
+    ${HEADERS}
+    ${SOURCES}
+    ${JALIUM_AUDIO_SOURCES}
+)
 
 target_include_directories(${PROJECT_NAME}
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${JALIUM_AUDIO_PRIVATE_INCLUDES}
 )
 
 target_link_libraries(${PROJECT_NAME}
@@ -35,6 +44,7 @@ target_link_libraries(${PROJECT_NAME}
         ole32
         oleaut32
         shlwapi
+        winmm           # miniaudio WASAPI/WinMM backend
 )
 
 target_compile_definitions(${PROJECT_NAME}

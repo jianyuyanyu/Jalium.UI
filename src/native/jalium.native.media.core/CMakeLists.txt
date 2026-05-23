@@ -3,8 +3,16 @@ project(jalium.native.media.core)
 set(HEADERS
     include/jalium_media.h
     include/jalium_media_internal.h
+    include/jalium_audio.h
+    src/audio/audio_internal.h
 )
 
+# .core only ships the cross-platform helpers + status string + the audio
+# ABI/internal headers. The audio TUs themselves are compiled INTO the
+# per-platform `jalium.native.media.{windows,android,apple,linux}` library so
+# the audio symbols land in the same DLL as video/image/camera. The list of
+# audio sources is published as a root-level cache variable (see root
+# CMakeLists.txt) so all platforms reference the same canonical files.
 set(SOURCES
     src/jalium_media_common.cpp
 )

@@ -1,5 +1,7 @@
 #define JALIUM_MEDIA_EXPORTS
 #include "win_media_init.h"
+#include "win_mf_aac_decoder.h"
+#include "../../jalium.native.media.core/src/audio/audio_internal.h"
 
 #include <atomic>
 #include <mutex>
@@ -51,6 +53,12 @@ jalium_media_status_t Initialize()
         g_supportedCodecs = JALIUM_CODEC_H264;
     }
 
+    // Register the MF-backed AAC decoder into the cross-platform audio dispatch
+    // table. Memory-based AAC is deferred — pass nullptr so that path keeps
+    // surfacing NOT_IMPLEMENTED until MFCreateMFByteStreamOnStream support is
+    // added (Step 4 follow-up).
+    jalium::audio::RegisterAacDecoderHooks(&MfAacDecoderOpenFile, nullptr);
+
     g_initCount = 1;
     return JALIUM_MEDIA_OK;
 }
@@ -65,6 +73,10 @@ void Shutdown()
     if (g_initCount > 0) {
         return;
     }
+
+    // Unregister our AAC hook so subsequent dispatch falls back to NOT_IMPLEMENTED
+    // rather than calling a possibly-stale function pointer.
+    jalium::audio::RegisterAacDecoderHooks(nullptr, nullptr);
 
     if (g_mfStarted) {
         MFShutdown();
