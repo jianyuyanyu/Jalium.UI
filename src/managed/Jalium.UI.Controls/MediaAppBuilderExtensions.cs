@@ -3,7 +3,8 @@ using Jalium.UI.Media;
 using Jalium.UI.Media.Imaging;
 using Jalium.UI.Media.Native;
 using Jalium.UI.Media.Pipeline;
-using Jalium.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Jalium.UI;
 

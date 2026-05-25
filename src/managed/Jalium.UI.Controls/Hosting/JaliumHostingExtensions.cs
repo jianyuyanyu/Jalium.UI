@@ -2,12 +2,12 @@ using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using Jalium.UI.Controls;
-using Jalium.Extensions.Configuration;
-using Jalium.Extensions.DependencyInjection;
-using Jalium.Extensions.Diagnostics.Metrics;
-using Jalium.Extensions.Hosting;
-using Jalium.Extensions.Logging;
-using Jalium.Extensions.Options;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Jalium.UI.Hosting;
 

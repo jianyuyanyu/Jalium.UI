@@ -1,6 +1,6 @@
 using System.Diagnostics.CodeAnalysis;
 using Jalium.UI.Controls;
-using Jalium.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Jalium.UI.Hosting;
 

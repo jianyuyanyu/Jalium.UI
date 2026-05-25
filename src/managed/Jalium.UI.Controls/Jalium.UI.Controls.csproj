@@ -8,6 +8,8 @@
 		<PackageId>Jalium.UI.Controls</PackageId>
 		<IsTrimmable>true</IsTrimmable>
 		<IsAotCompatible>true</IsAotCompatible>
+		<!-- Replace reflection-based ConfigurationBinder.Bind with a source-generated, trim/AOT-safe binder. -->
+		<EnableConfigurationBindingGenerator>true</EnableConfigurationBindingGenerator>
 		<!--
 		  Enable Windows Forms so WindowsFormsHost can host System.Windows.Forms controls
 		  inside Jalium.UI windows. UseWindowsForms requires a Windows-targeted TFM, so it is
@@ -59,12 +61,11 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<!-- Hosting / DI / Configuration / Options / Logging / Metrics: 自研实现位于 Hosting/Extensions/, -->
-		<!-- 命名空间 Jalium.Extensions.* (无 console 相关支持). 不再依赖 Microsoft.Extensions.Hosting 包. -->
-		<!-- 视频解码改用平台原生技术（Windows MF / Android MediaCodec），通过 jalium.native.media 暴露 P/Invoke。 -->
-		<!-- QR 码改用 Jalium.UI.Controls.QR 自研编码器，移除 QRCoder 第三方依赖。 -->
-		<PackageReference Include="SoundFlow" Version="1.4.0" />
-		<PackageReference Include="SoundFlow.Codecs.FFMpeg" Version="1.4.0" />
+		<PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.3" />
+		<!-- 视频/音频解码改用平台原生技术(Windows MF / Android MediaCodec / Apple AudioToolbox / Linux GStreamer)+ vendored 单头库 -->
+		<!-- (miniaudio / dr_wav / dr_flac / minimp3 / stb_vorbis),通过 jalium.native.media 暴露 P/Invoke。 -->
+		<!-- QR 码改用 Jalium.UI.Controls.QR 自研编码器,移除 QRCoder 第三方依赖。 -->
+		<!-- 2026-05 起删除 SoundFlow + SoundFlow.Codecs.FFMpeg 包引用,音频栈完全自研。 -->
 	</ItemGroup>
 
 	<!-- ILLink descriptor to preserve types accessed via reflection (AOT/trimming) -->

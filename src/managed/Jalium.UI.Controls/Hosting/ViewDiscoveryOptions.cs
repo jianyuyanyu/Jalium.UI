@@ -1,6 +1,6 @@
 using System.ComponentModel;
 using System.Reflection;
-using Jalium.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Jalium.UI.Hosting;
 
