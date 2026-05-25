@@ -1,4 +1,4 @@
-using Jalium.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Jalium.UI.Hosting;
 
