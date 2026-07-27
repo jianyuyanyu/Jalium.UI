@@ -84,6 +84,16 @@
 // Global State
 // ============================================================================
 
+static constexpr size_t kMaxExternalTransferBytes = 256u * 1024u * 1024u;
+static constexpr size_t kMaxExternalMimeTypes = 4'096u;
+static constexpr size_t kMaxExternalMimeTypeBytes = 4'096u;
+
+static bool CanAppendExternalTransfer(size_t currentSize, size_t incomingSize)
+{
+    return currentSize <= kMaxExternalTransferBytes &&
+           incomingSize <= kMaxExternalTransferBytes - currentSize;
+}
+
 static Display*     g_display = nullptr;
 static int          g_screen = 0;
 static Window       g_rootWindow = 0;
@@ -663,8 +673,27 @@ static std::string JoinXdndMimeNames(const std::vector<Atom>& atoms)
     {
         char* name = XGetAtomName(g_display, atom);
         if (!name) continue;
-        if (!result.empty()) result.push_back('\n');
-        result.append(name);
+        const size_t length = strnlen(name, kMaxExternalMimeTypeBytes + 1u);
+        const size_t separatorBytes = result.empty() ? 0u : 1u;
+        if (length == 0 ||
+            length > kMaxExternalMimeTypeBytes ||
+            memchr(name, '\n', length) ||
+            !CanAppendExternalTransfer(
+                result.size(), separatorBytes + length))
+        {
+            XFree(name);
+            continue;
+        }
+        try
+        {
+            if (separatorBytes != 0) result.push_back('\n');
+            result.append(name, length);
+        }
+        catch (const std::bad_alloc&)
+        {
+            XFree(name);
+            return {};
+        }
         XFree(name);
     }
     return result;
@@ -832,12 +861,21 @@ static bool CompleteXdndDrop(const XSelectionEvent& selection)
     unsigned long remaining = 0;
     unsigned char* value = nullptr;
     const int status = XGetWindowProperty(
-        g_display, window->xwindow, selection.property, 0, 0x1fffffff,
+        g_display, window->xwindow, selection.property, 0,
+        static_cast<long>((kMaxExternalTransferBytes + 3u) / 4u),
         True, AnyPropertyType, &actualType, &actualFormat,
         &itemCount, &remaining, &value);
-    if (status != Success || actualFormat != 8 || actualType == g_incrAtom)
+    if (status != Success ||
+        actualFormat != 8 ||
+        actualType == g_incrAtom ||
+        remaining != 0 ||
+        itemCount > kMaxExternalTransferBytes ||
+        (itemCount != 0 && !value) ||
+        (window->xdndSelectedMime == XA_STRING &&
+         itemCount > kMaxExternalTransferBytes / 2u))
     {
         if (value) XFree(value);
+        XDeleteProperty(g_display, window->xwindow, selection.property);
         SendXdndFinished(window, false);
         ClearXdndTarget(window, false);
         return true;
@@ -1126,43 +1164,45 @@ static std::string Utf16ToUtf8(const JaliumUtf16Char* text)
     return result;
 }
 
+static uint32_t DecodeNextUtf8CodePoint(
+    const char* text, size_t length, size_t& index)
+{
+    const uint8_t first = static_cast<uint8_t>(text[index++]);
+    uint32_t codePoint = 0;
+    size_t continuationCount = 0;
+    if (first < 0x80u) codePoint = first;
+    else if ((first & 0xE0u) == 0xC0u) { codePoint = first & 0x1Fu; continuationCount = 1; }
+    else if ((first & 0xF0u) == 0xE0u) { codePoint = first & 0x0Fu; continuationCount = 2; }
+    else if ((first & 0xF8u) == 0xF0u) { codePoint = first & 0x07u; continuationCount = 3; }
+    else return 0xFFFDu;
+
+    bool valid = continuationCount <= length - index;
+    for (size_t continuation = 0; valid && continuation < continuationCount; ++continuation)
+    {
+        const uint8_t value = static_cast<uint8_t>(text[index + continuation]);
+        if ((value & 0xC0u) != 0x80u) valid = false;
+        else codePoint = (codePoint << 6) | (value & 0x3Fu);
+    }
+    if (!valid) return 0xFFFDu;
+
+    index += continuationCount;
+    const bool overlong = (continuationCount == 1 && codePoint < 0x80u) ||
+                          (continuationCount == 2 && codePoint < 0x800u) ||
+                          (continuationCount == 3 && codePoint < 0x10000u);
+    if (overlong || codePoint > 0x10FFFFu ||
+        (codePoint >= 0xD800u && codePoint <= 0xDFFFu))
+        return 0xFFFDu;
+    return codePoint;
+}
+
 static std::u32string Utf8ToUtf32(const char* text, size_t length)
 {
     std::u32string result;
     if (!text) return result;
     size_t index = 0;
     while (index < length)
-    {
-        const uint8_t first = static_cast<uint8_t>(text[index++]);
-        uint32_t codePoint = 0;
-        size_t continuationCount = 0;
-        if (first < 0x80u) codePoint = first;
-        else if ((first & 0xE0u) == 0xC0u) { codePoint = first & 0x1Fu; continuationCount = 1; }
-        else if ((first & 0xF0u) == 0xE0u) { codePoint = first & 0x0Fu; continuationCount = 2; }
-        else if ((first & 0xF8u) == 0xF0u) { codePoint = first & 0x07u; continuationCount = 3; }
-        else { result.push_back(0xFFFDu); continue; }
-
-        bool valid = index + continuationCount <= length;
-        for (size_t continuation = 0; valid && continuation < continuationCount; ++continuation)
-        {
-            const uint8_t value = static_cast<uint8_t>(text[index + continuation]);
-            if ((value & 0xC0u) != 0x80u) valid = false;
-            else codePoint = (codePoint << 6) | (value & 0x3Fu);
-        }
-        if (!valid)
-        {
-            result.push_back(0xFFFDu);
-            continue;
-        }
-        index += continuationCount;
-        const bool overlong = (continuationCount == 1 && codePoint < 0x80u) ||
-                              (continuationCount == 2 && codePoint < 0x800u) ||
-                              (continuationCount == 3 && codePoint < 0x10000u);
-        if (overlong || codePoint > 0x10FFFFu ||
-            (codePoint >= 0xD800u && codePoint <= 0xDFFFu))
-            codePoint = 0xFFFDu;
-        result.push_back(static_cast<char32_t>(codePoint));
-    }
+        result.push_back(static_cast<char32_t>(
+            DecodeNextUtf8CodePoint(text, length, index)));
     return result;
 }
 
@@ -1196,15 +1236,33 @@ static std::string Utf32ToUtf8(const std::u32string& text)
 
 static JaliumUtf16Char* Utf8ToUtf16Allocated(const std::string& text)
 {
-    const std::u32string codePoints = Utf8ToUtf32(text.data(), text.size());
+    constexpr size_t maxCodeUnits =
+        kMaxExternalTransferBytes / sizeof(JaliumUtf16Char) - 1u;
+    if (text.size() > maxCodeUnits)
+        return nullptr;
+
     size_t codeUnits = 0;
-    for (uint32_t codePoint : codePoints) codeUnits += codePoint > 0xFFFFu ? 2 : 1;
+    size_t index = 0;
+    while (index < text.size())
+    {
+        const uint32_t codePoint =
+            DecodeNextUtf8CodePoint(text.data(), text.size(), index);
+        const size_t increment = codePoint > 0xFFFFu ? 2u : 1u;
+        if (codeUnits > maxCodeUnits - increment)
+            return nullptr;
+        codeUnits += increment;
+    }
+
     auto* result = static_cast<JaliumUtf16Char*>(
         malloc((codeUnits + 1) * sizeof(JaliumUtf16Char)));
     if (!result) return nullptr;
+
     size_t output = 0;
-    for (uint32_t codePoint : codePoints)
+    index = 0;
+    while (index < text.size())
     {
+        uint32_t codePoint =
+            DecodeNextUtf8CodePoint(text.data(), text.size(), index);
         if (codePoint <= 0xFFFFu) result[output++] = static_cast<JaliumUtf16Char>(codePoint);
         else
         {
@@ -2885,7 +2943,24 @@ static void DestroyWaylandOffer(WaylandDataOfferState*& state)
 static void HandleDataOfferMime(void* data, wl_data_offer*, const char* mimeType)
 {
     auto* state = static_cast<WaylandDataOfferState*>(data);
-    if (state && mimeType) state->mimeTypes.emplace_back(mimeType);
+    if (!state || !mimeType ||
+        state->mimeTypes.size() >= kMaxExternalMimeTypes)
+        return;
+
+    const size_t length = strnlen(mimeType, kMaxExternalMimeTypeBytes + 1u);
+    if (length == 0 ||
+        length > kMaxExternalMimeTypeBytes ||
+        memchr(mimeType, '\n', length))
+        return;
+
+    try
+    {
+        state->mimeTypes.emplace_back(mimeType, length);
+    }
+    catch (const std::bad_alloc&)
+    {
+        // Protocol callbacks cannot propagate C++ exceptions through libwayland.
+    }
 }
 static void HandleDataOfferSourceActions(void* data, wl_data_offer*, uint32_t actions)
 {
@@ -2952,10 +3027,21 @@ static std::string JoinWaylandMimeNames(const WaylandDataOfferState* offer)
 {
     std::string result;
     if (!offer) return result;
-    for (const std::string& mime : offer->mimeTypes)
+    try
     {
-        if (!result.empty()) result.push_back('\n');
-        result.append(mime);
+        for (const std::string& mime : offer->mimeTypes)
+        {
+            const size_t separatorBytes = result.empty() ? 0u : 1u;
+            if (!CanAppendExternalTransfer(
+                    result.size(), separatorBytes + mime.size()))
+                break;
+            if (separatorBytes != 0) result.push_back('\n');
+            result.append(mime);
+        }
+    }
+    catch (const std::bad_alloc&)
+    {
+        return {};
     }
     return result;
 }
@@ -3232,7 +3318,26 @@ static bool ReceiveWaylandDragData(std::vector<uint8_t>& bytes)
         {
             uint8_t buffer[8192];
             const ssize_t count = read(descriptors[0], buffer, sizeof(buffer));
-            if (count > 0) bytes.insert(bytes.end(), buffer, buffer + count);
+            if (count > 0)
+            {
+                const size_t incomingSize = static_cast<size_t>(count);
+                if (!CanAppendExternalTransfer(bytes.size(), incomingSize))
+                {
+                    close(descriptors[0]);
+                    bytes.clear();
+                    return false;
+                }
+                try
+                {
+                    bytes.insert(bytes.end(), buffer, buffer + incomingSize);
+                }
+                catch (const std::bad_alloc&)
+                {
+                    close(descriptors[0]);
+                    bytes.clear();
+                    return false;
+                }
+            }
             else if (count == 0) { complete = true; break; }
             else if (errno == EINTR) continue;
             else if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -7798,11 +7903,25 @@ static std::string Utf8ToLatin1(const std::string& text)
 
 static std::string Latin1ToUtf8(const unsigned char* data, size_t length)
 {
-    std::u32string codePoints;
-    codePoints.reserve(length);
+    if (!data || length > kMaxExternalTransferBytes / 2u)
+        return {};
+
+    std::string result;
+    result.reserve(length * 2u);
     for (size_t index = 0; index < length; ++index)
-        codePoints.push_back(static_cast<char32_t>(data[index]));
-    return Utf32ToUtf8(codePoints);
+    {
+        const uint8_t code = data[index];
+        if (code < 0x80u)
+        {
+            result.push_back(static_cast<char>(code));
+        }
+        else
+        {
+            result.push_back(static_cast<char>(0xC0u | (code >> 6)));
+            result.push_back(static_cast<char>(0x80u | (code & 0x3Fu)));
+        }
+    }
+    return result;
 }
 
 static bool IsX11TextTarget(Atom target)
@@ -8048,7 +8167,7 @@ static bool ReadX11Property(Atom& actualType, int& actualFormat,
     unsigned long remaining = 0;
     unsigned char* value = nullptr;
     const int status = XGetWindowProperty(
-        g_display, g_clipboardWindow, g_jaliumClipProp, 0, 0x1fffffff,
+        g_display, g_clipboardWindow, g_jaliumClipProp, 0, 0,
         False, AnyPropertyType, &actualType, &actualFormat,
         &itemCount, &remaining, &value);
     if (status != Success)
@@ -8084,11 +8203,38 @@ static bool ReadX11Property(Atom& actualType, int& actualFormat,
             unsigned long chunkRemaining = 0;
             unsigned char* chunk = nullptr;
             if (XGetWindowProperty(
-                    g_display, g_clipboardWindow, g_jaliumClipProp, 0, 0x1fffffff,
-                    True, AnyPropertyType, &chunkType, &chunkFormat,
+                    g_display, g_clipboardWindow, g_jaliumClipProp, 0, 0,
+                    False, AnyPropertyType, &chunkType, &chunkFormat,
                     &chunkItems, &chunkRemaining, &chunk) != Success)
             {
                 if (chunk) XFree(chunk);
+                return false;
+            }
+            if (chunk) XFree(chunk);
+            chunk = nullptr;
+            if (chunkFormat != 8 ||
+                chunkRemaining > kMaxExternalTransferBytes ||
+                !CanAppendExternalTransfer(
+                    bytes.size(), static_cast<size_t>(chunkRemaining)))
+            {
+                XDeleteProperty(g_display, g_clipboardWindow, g_jaliumClipProp);
+                return false;
+            }
+
+            const Atom expectedChunkType = chunkType;
+            const unsigned long expectedChunkBytes = chunkRemaining;
+            if (XGetWindowProperty(
+                    g_display, g_clipboardWindow, g_jaliumClipProp, 0,
+                    static_cast<long>((expectedChunkBytes + 3u) / 4u),
+                    True, AnyPropertyType, &chunkType, &chunkFormat,
+                    &chunkItems, &chunkRemaining, &chunk) != Success ||
+                chunkType != expectedChunkType ||
+                chunkFormat != 8 ||
+                chunkRemaining != 0 ||
+                chunkItems != expectedChunkBytes)
+            {
+                if (chunk) XFree(chunk);
+                XDeleteProperty(g_display, g_clipboardWindow, g_jaliumClipProp);
                 return false;
             }
             if (chunkItems == 0)
@@ -8098,24 +8244,81 @@ static bool ReadX11Property(Atom& actualType, int& actualFormat,
                 actualFormat = chunkFormat;
                 return true;
             }
-            if (chunkFormat != 8)
+            try
+            {
+                bytes.insert(bytes.end(), chunk, chunk + chunkItems);
+            }
+            catch (const std::bad_alloc&)
             {
                 if (chunk) XFree(chunk);
+                bytes.clear();
                 return false;
             }
-            bytes.insert(bytes.end(), chunk, chunk + chunkItems);
             actualType = chunkType;
             actualFormat = chunkFormat;
             XFree(chunk);
         }
     }
 
-    const size_t bytesPerItem = actualFormat == 32 ? sizeof(unsigned long) :
-                                (actualFormat == 16 ? 2u : 1u);
-    if (value && itemCount)
-        bytes.assign(value, value + itemCount * bytesPerItem);
-    else
+    if (value) XFree(value);
+    value = nullptr;
+    if (actualType == None ||
+        (actualFormat != 8 && actualFormat != 16 && actualFormat != 32))
+    {
+        XDeleteProperty(g_display, g_clipboardWindow, g_jaliumClipProp);
+        return false;
+    }
+
+    const size_t serverBytesPerItem = static_cast<size_t>(actualFormat / 8);
+    const size_t clientBytesPerItem =
+        actualFormat == 32 ? sizeof(unsigned long) : serverBytesPerItem;
+    if (remaining % serverBytesPerItem != 0)
+    {
+        XDeleteProperty(g_display, g_clipboardWindow, g_jaliumClipProp);
+        return false;
+    }
+
+    const size_t expectedItems = static_cast<size_t>(remaining) / serverBytesPerItem;
+    if (expectedItems > kMaxExternalTransferBytes / clientBytesPerItem)
+    {
+        XDeleteProperty(g_display, g_clipboardWindow, g_jaliumClipProp);
+        return false;
+    }
+
+    const Atom expectedType = actualType;
+    const int expectedFormat = actualFormat;
+    unsigned long fetchedRemaining = 0;
+    const int fetchStatus = XGetWindowProperty(
+        g_display, g_clipboardWindow, g_jaliumClipProp, 0,
+        static_cast<long>((remaining + 3u) / 4u),
+        True, AnyPropertyType, &actualType, &actualFormat,
+        &itemCount, &fetchedRemaining, &value);
+    if (fetchStatus != Success ||
+        actualType != expectedType ||
+        actualFormat != expectedFormat ||
+        fetchedRemaining != 0 ||
+        static_cast<size_t>(itemCount) != expectedItems ||
+        (itemCount != 0 && !value))
+    {
+        if (value) XFree(value);
+        XDeleteProperty(g_display, g_clipboardWindow, g_jaliumClipProp);
+        return false;
+    }
+
+    const size_t byteCount = static_cast<size_t>(itemCount) * clientBytesPerItem;
+    try
+    {
+        if (byteCount != 0)
+            bytes.assign(value, value + byteCount);
+        else
+            bytes.clear();
+    }
+    catch (const std::bad_alloc&)
+    {
+        if (value) XFree(value);
         bytes.clear();
+        return false;
+    }
     if (value) XFree(value);
     XDeleteProperty(g_display, g_clipboardWindow, g_jaliumClipProp);
     return true;
@@ -8188,7 +8391,25 @@ static bool ReadWaylandSelectionData(
             char buffer[8192];
             const ssize_t count = read(descriptors[0], buffer, sizeof(buffer));
             if (count > 0)
-                bytes.insert(bytes.end(), buffer, buffer + count);
+            {
+                const size_t incomingSize = static_cast<size_t>(count);
+                if (!CanAppendExternalTransfer(bytes.size(), incomingSize))
+                {
+                    close(descriptors[0]);
+                    bytes.clear();
+                    return false;
+                }
+                try
+                {
+                    bytes.insert(bytes.end(), buffer, buffer + incomingSize);
+                }
+                catch (const std::bad_alloc&)
+                {
+                    close(descriptors[0]);
+                    bytes.clear();
+                    return false;
+                }
+            }
             else if (count == 0) { complete = true; break; }
             else if (errno == EINTR) continue;
             else if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -8223,29 +8444,51 @@ static bool CopyClipboardItems(
     std::vector<OwnedClipboardItem>& result)
 {
     result.clear();
-    result.reserve(itemCount);
-    for (uint32_t index = 0; index < itemCount; ++index)
+    if (!items || itemCount == 0 || itemCount > kMaxExternalMimeTypes)
+        return false;
+
+    size_t totalBytes = 0;
+    try
     {
-        if (!items[index].mimeType || !*items[index].mimeType ||
-            strchr(items[index].mimeType, '\n') ||
-            (!items[index].data && items[index].dataSize != 0))
-            return false;
-
-        OwnedClipboardItem copy;
-        copy.mimeType = items[index].mimeType;
-        if (items[index].dataSize != 0)
-            copy.bytes.assign(
-                items[index].data,
-                items[index].data + items[index].dataSize);
-
-        const auto existing = std::find_if(
-            result.begin(), result.end(),
-            [&copy](const OwnedClipboardItem& item)
+        result.reserve(itemCount);
+        for (uint32_t index = 0; index < itemCount; ++index)
+        {
+            const char* mimeType = items[index].mimeType;
+            const size_t mimeLength = mimeType
+                ? strnlen(mimeType, kMaxExternalMimeTypeBytes + 1u)
+                : 0u;
+            const size_t dataSize = static_cast<size_t>(items[index].dataSize);
+            if (!mimeType ||
+                mimeLength == 0 ||
+                mimeLength > kMaxExternalMimeTypeBytes ||
+                memchr(mimeType, '\n', mimeLength) ||
+                (!items[index].data && dataSize != 0) ||
+                !CanAppendExternalTransfer(totalBytes, dataSize))
             {
-                return item.mimeType == copy.mimeType;
-            });
-        if (existing == result.end()) result.push_back(std::move(copy));
-        else *existing = std::move(copy);
+                result.clear();
+                return false;
+            }
+
+            OwnedClipboardItem copy;
+            copy.mimeType.assign(mimeType, mimeLength);
+            if (dataSize != 0)
+                copy.bytes.assign(items[index].data, items[index].data + dataSize);
+            totalBytes += dataSize;
+
+            const auto existing = std::find_if(
+                result.begin(), result.end(),
+                [&copy](const OwnedClipboardItem& item)
+                {
+                    return item.mimeType == copy.mimeType;
+                });
+            if (existing == result.end()) result.push_back(std::move(copy));
+            else *existing = std::move(copy);
+        }
+    }
+    catch (const std::bad_alloc&)
+    {
+        result.clear();
+        return false;
     }
     return true;
 }
@@ -8254,7 +8497,7 @@ static JaliumResult AllocateClipboardData(
     const std::vector<uint8_t>& bytes, uint8_t** outData,
     uint32_t* outDataSize)
 {
-    if (bytes.size() > static_cast<size_t>(UINT32_MAX))
+    if (bytes.size() > kMaxExternalTransferBytes)
         return JALIUM_ERROR_OUT_OF_MEMORY;
     auto* allocation = static_cast<uint8_t*>(malloc(std::max<size_t>(1, bytes.size())));
     if (!allocation) return JALIUM_ERROR_OUT_OF_MEMORY;
@@ -8267,13 +8510,29 @@ static JaliumResult AllocateClipboardData(
 static JaliumResult AllocateClipboardFormats(
     const std::vector<std::string>& formats, char** outMimeTypes)
 {
+    if (formats.size() > kMaxExternalMimeTypes)
+        return JALIUM_ERROR_OUT_OF_MEMORY;
+
     std::string joined;
     std::unordered_set<std::string> seen;
-    for (const std::string& format : formats)
+    try
     {
-        if (format.empty() || !seen.insert(format).second) continue;
-        if (!joined.empty()) joined.push_back('\n');
-        joined.append(format);
+        for (const std::string& format : formats)
+        {
+            if (format.empty() || format.size() > kMaxExternalMimeTypeBytes ||
+                !seen.insert(format).second)
+                continue;
+            const size_t separatorBytes = joined.empty() ? 0u : 1u;
+            if (!CanAppendExternalTransfer(
+                    joined.size(), separatorBytes + format.size()))
+                return JALIUM_ERROR_OUT_OF_MEMORY;
+            if (separatorBytes != 0) joined.push_back('\n');
+            joined.append(format);
+        }
+    }
+    catch (const std::bad_alloc&)
+    {
+        return JALIUM_ERROR_OUT_OF_MEMORY;
     }
     auto* allocation = static_cast<char*>(malloc(joined.size() + 1));
     if (!allocation) return JALIUM_ERROR_OUT_OF_MEMORY;
@@ -8288,6 +8547,8 @@ JaliumResult jalium_clipboard_get_formats(char** outMimeTypes)
     if (!outMimeTypes) return JALIUM_ERROR_INVALID_ARGUMENT;
     *outMimeTypes = nullptr;
     std::vector<std::string> formats;
+    try
+    {
 
 #ifdef JALIUM_HAS_WAYLAND
     if (g_windowSystem == LinuxWindowSystem::Wayland)
@@ -8325,6 +8586,8 @@ JaliumResult jalium_clipboard_get_formats(char** outMimeTypes)
         {
             const auto* targets = reinterpret_cast<const unsigned long*>(bytes.data());
             const size_t count = bytes.size() / sizeof(unsigned long);
+            if (count > kMaxExternalMimeTypes)
+                return JALIUM_ERROR_OUT_OF_MEMORY;
             formats.reserve(count);
             for (size_t index = 0; index < count; ++index)
             {
@@ -8333,13 +8596,23 @@ JaliumResult jalium_clipboard_get_formats(char** outMimeTypes)
                 char* name = XGetAtomName(g_display, target);
                 if (name)
                 {
-                    formats.emplace_back(name);
+                    const size_t length =
+                        strnlen(name, kMaxExternalMimeTypeBytes + 1u);
+                    if (length != 0 &&
+                        length <= kMaxExternalMimeTypeBytes &&
+                        !memchr(name, '\n', length))
+                        formats.emplace_back(name, length);
                     XFree(name);
                 }
             }
         }
     }
     return AllocateClipboardFormats(formats, outMimeTypes);
+    }
+    catch (const std::bad_alloc&)
+    {
+        return JALIUM_ERROR_OUT_OF_MEMORY;
+    }
 }
 
 JaliumResult jalium_clipboard_get_data(
@@ -8347,10 +8620,19 @@ JaliumResult jalium_clipboard_get_data(
 {
     if (!mimeType || !*mimeType || !outData || !outDataSize)
         return JALIUM_ERROR_INVALID_ARGUMENT;
+    const size_t mimeLength =
+        strnlen(mimeType, kMaxExternalMimeTypeBytes + 1u);
+    if (mimeLength == 0 ||
+        mimeLength > kMaxExternalMimeTypeBytes ||
+        memchr(mimeType, '\n', mimeLength))
+        return JALIUM_ERROR_INVALID_ARGUMENT;
+
     *outData = nullptr;
     *outDataSize = 0;
     std::vector<uint8_t> bytes;
     bool present = false;
+    try
+    {
 
 #ifdef JALIUM_HAS_WAYLAND
     if (g_windowSystem == LinuxWindowSystem::Wayland)
@@ -8405,6 +8687,8 @@ JaliumResult jalium_clipboard_get_data(
         {
             const auto* targets = reinterpret_cast<const unsigned long*>(targetBytes.data());
             const size_t count = targetBytes.size() / sizeof(unsigned long);
+            if (count > kMaxExternalMimeTypes)
+                return JALIUM_ERROR_OUT_OF_MEMORY;
             auto contains = [targets, count](Atom target)
             {
                 return std::find(targets, targets + count,
@@ -8427,12 +8711,19 @@ JaliumResult jalium_clipboard_get_data(
         return JALIUM_OK;
     if (selectedTarget == XA_STRING && IsUtf8ClipboardMime(mimeType))
     {
+        if (selectionBytes.size() > kMaxExternalTransferBytes / 2u)
+            return JALIUM_ERROR_OUT_OF_MEMORY;
         const std::string utf8 = Latin1ToUtf8(selectionBytes.data(), selectionBytes.size());
         bytes.assign(utf8.begin(), utf8.end());
     }
     else
         bytes.assign(selectionBytes.begin(), selectionBytes.end());
     return AllocateClipboardData(bytes, outData, outDataSize);
+    }
+    catch (const std::bad_alloc&)
+    {
+        return JALIUM_ERROR_OUT_OF_MEMORY;
+    }
 }
 
 JaliumResult jalium_clipboard_set_data(
@@ -8526,6 +8817,8 @@ JaliumResult jalium_clipboard_get_text(JaliumUtf16Char** outText)
 {
     if (!outText) return JALIUM_ERROR_INVALID_ARGUMENT;
     *outText = nullptr;
+    try
+    {
 
 #ifdef JALIUM_HAS_WAYLAND
     if (g_windowSystem == LinuxWindowSystem::Wayland)
@@ -8564,6 +8857,8 @@ JaliumResult jalium_clipboard_get_text(JaliumUtf16Char** outText)
     {
         const auto* targets = reinterpret_cast<const unsigned long*>(bytes.data());
         const size_t count = bytes.size() / sizeof(unsigned long);
+        if (count > kMaxExternalMimeTypes)
+            return JALIUM_ERROR_OUT_OF_MEMORY;
         auto contains = [targets, count](Atom target)
         {
             return std::find(targets, targets + count, static_cast<unsigned long>(target)) !=
@@ -8579,56 +8874,98 @@ JaliumResult jalium_clipboard_get_text(JaliumUtf16Char** outText)
     bytes.clear();
     if (!RequestX11Selection(selectedTarget, actualType, actualFormat, bytes) ||
         actualFormat != 8) return JALIUM_OK;
+    if (selectedTarget == XA_STRING &&
+        bytes.size() > kMaxExternalTransferBytes / 2u)
+        return JALIUM_ERROR_OUT_OF_MEMORY;
     const std::string text = selectedTarget == XA_STRING
         ? Latin1ToUtf8(bytes.data(), bytes.size())
         : std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     *outText = Utf8ToUtf16Allocated(text);
     return *outText ? JALIUM_OK : JALIUM_ERROR_OUT_OF_MEMORY;
+    }
+    catch (const std::bad_alloc&)
+    {
+        return JALIUM_ERROR_OUT_OF_MEMORY;
+    }
 }
 
 JaliumResult jalium_clipboard_set_text(const JaliumUtf16Char* text)
 {
     if (!text) return JALIUM_ERROR_INVALID_ARGUMENT;
-    const std::string utf8 = Utf16ToUtf8(text);
-    if (utf8.size() > static_cast<size_t>(UINT32_MAX))
-        return JALIUM_ERROR_OUT_OF_MEMORY;
-    const char* mimeTypes[] = {
-        "text/plain;charset=utf-8", "text/plain", "UTF8_STRING"
-    };
-    JaliumClipboardDataItem items[3]{};
-    for (size_t index = 0; index < std::size(items); ++index)
+    try
     {
-        items[index].mimeType = mimeTypes[index];
-        items[index].data = reinterpret_cast<const uint8_t*>(utf8.data());
-        items[index].dataSize = static_cast<uint32_t>(utf8.size());
+        const std::string utf8 = Utf16ToUtf8(text);
+        if (utf8.size() > kMaxExternalTransferBytes)
+            return JALIUM_ERROR_OUT_OF_MEMORY;
+        const char* mimeTypes[] = {
+            "text/plain;charset=utf-8", "text/plain", "UTF8_STRING"
+        };
+        JaliumClipboardDataItem items[3]{};
+        for (size_t index = 0; index < std::size(items); ++index)
+        {
+            items[index].mimeType = mimeTypes[index];
+            items[index].data = reinterpret_cast<const uint8_t*>(utf8.data());
+            items[index].dataSize = static_cast<uint32_t>(utf8.size());
+        }
+        return jalium_clipboard_set_data(
+            items, static_cast<uint32_t>(std::size(items)));
     }
-    return jalium_clipboard_set_data(items, static_cast<uint32_t>(std::size(items)));
+    catch (const std::bad_alloc&)
+    {
+        return JALIUM_ERROR_OUT_OF_MEMORY;
+    }
 }
 
 // ============================================================================
 // Drag Source API (X11 XDND / Wayland data device)
 // ============================================================================
 
-static std::vector<OwnedDragItem> CopyDragItems(
-    const JaliumDragDataItem* items, uint32_t itemCount)
+static bool CopyDragItems(
+    const JaliumDragDataItem* items, uint32_t itemCount,
+    std::vector<OwnedDragItem>& result)
 {
-    std::vector<OwnedDragItem> result;
-    result.reserve(itemCount);
-    for (uint32_t index = 0; index < itemCount; ++index)
+    result.clear();
+    if (!items || itemCount == 0 || itemCount > kMaxExternalMimeTypes)
+        return false;
+
+    size_t totalBytes = 0;
+    try
     {
-        if (!items[index].mimeType ||
-            (!items[index].data && items[index].dataSize != 0))
-            continue;
-        OwnedDragItem item;
-        item.mimeType = items[index].mimeType;
-        if (items[index].dataSize != 0)
-            item.bytes.assign(items[index].data,
-                              items[index].data + items[index].dataSize);
-        if (g_display)
-            item.x11Atom = XInternAtom(g_display, item.mimeType.c_str(), False);
-        result.push_back(std::move(item));
+        result.reserve(itemCount);
+        for (uint32_t index = 0; index < itemCount; ++index)
+        {
+            const char* mimeType = items[index].mimeType;
+            const size_t mimeLength = mimeType
+                ? strnlen(mimeType, kMaxExternalMimeTypeBytes + 1u)
+                : 0u;
+            const size_t dataSize = static_cast<size_t>(items[index].dataSize);
+            if (!mimeType ||
+                mimeLength == 0 ||
+                mimeLength > kMaxExternalMimeTypeBytes ||
+                memchr(mimeType, '\n', mimeLength) ||
+                (!items[index].data && dataSize != 0) ||
+                !CanAppendExternalTransfer(totalBytes, dataSize))
+            {
+                result.clear();
+                return false;
+            }
+
+            OwnedDragItem item;
+            item.mimeType.assign(mimeType, mimeLength);
+            if (dataSize != 0)
+                item.bytes.assign(items[index].data, items[index].data + dataSize);
+            totalBytes += dataSize;
+            if (g_display)
+                item.x11Atom = XInternAtom(g_display, item.mimeType.c_str(), False);
+            result.push_back(std::move(item));
+        }
     }
-    return result;
+    catch (const std::bad_alloc&)
+    {
+        result.clear();
+        return false;
+    }
+    return !result.empty();
 }
 
 static Window FindXdndTargetAtPointer(int& rootX, int& rootY, unsigned int& mask)
@@ -9219,8 +9556,9 @@ JaliumResult jalium_drag_begin_with_image(
                       JALIUM_DRAG_EFFECT_LINK;
     if (allowedEffects == JALIUM_DRAG_EFFECT_NONE)
         return JALIUM_ERROR_INVALID_ARGUMENT;
-    std::vector<OwnedDragItem> copied = CopyDragItems(items, itemCount);
-    if (copied.empty()) return JALIUM_ERROR_INVALID_ARGUMENT;
+    std::vector<OwnedDragItem> copied;
+    if (!CopyDragItems(items, itemCount, copied))
+        return JALIUM_ERROR_INVALID_ARGUMENT;
     const DragSourceCallbacks callbacks{
         feedbackCallback, queryContinueCallback, callbackUserData };
 
@@ -9268,6 +9606,17 @@ JaliumResult jalium_drag_begin(
 }
 
 #ifdef JALIUM_PLATFORM_TEST_HOOKS
+int32_t jalium_test_external_transfer_fits(
+    uint64_t currentSize, uint64_t incomingSize)
+{
+    if (currentSize > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        incomingSize > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+        return 0;
+    return CanAppendExternalTransfer(
+        static_cast<size_t>(currentSize),
+        static_cast<size_t>(incomingSize)) ? 1 : 0;
+}
+
 int32_t jalium_test_wayland_inject_touch(
     JaliumPlatformWindow* window, JaliumEventType type, int32_t touchId,
     float x, float y)

@@ -512,7 +512,13 @@ internal sealed partial class NativePlatformWindow : IPlatformWindow
 
                     nint bytes = *(nint*)((byte*)data + 40);
                     int length = *(int*)((byte*)data + 48);
-                    if (bytes != nint.Zero && length > 0)
+                    if (length < 0 ||
+                        length > ClipboardPlatform.MaxClipboardPayloadBytes ||
+                        (length > 0 && bytes == nint.Zero))
+                    {
+                        throw new InvalidDataException("Native drag payload length is invalid.");
+                    }
+                    if (length > 0)
                     {
                         evt.DragData = new byte[length];
                         Marshal.Copy(bytes, evt.DragData, 0, length);

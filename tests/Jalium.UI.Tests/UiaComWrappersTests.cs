@@ -316,6 +316,24 @@ public class UiaComWrappersTests
         }
     }
 
+    [Theory]
+    [InlineData(0, -1, true, 0)]
+    [InlineData(-10, 9, true, 20)]
+    [InlineData(int.MinValue, int.MaxValue, false, 0)]
+    [InlineData(0, 1_048_576, false, 0)]
+    [InlineData(10, 8, false, 0)]
+    public void SafeArrayElementCount_RejectsOverflowAndUnreasonablePayloads(
+        int lowerBound,
+        int upperBound,
+        bool expectedSuccess,
+        int expectedCount)
+    {
+        bool success = UiaOleAut.TryGetManagedElementCount(lowerBound, upperBound, out int count);
+
+        Assert.Equal(expectedSuccess, success);
+        Assert.Equal(expectedCount, count);
+    }
+
     [Fact]
     public void TextRange_FindText_Backward_FindsLastOccurrence()
     {

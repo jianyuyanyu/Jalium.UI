@@ -33,6 +33,10 @@ internal static partial class ClipboardPlatform
     // Retry briefly before giving up — the same contention mitigation WPF/WinForms use.
     private const int ClipboardOpenRetryCount = 10;
     private const int ClipboardOpenRetryDelayMs = 10;
+    internal const int MaxClipboardPayloadBytes = 256 * 1024 * 1024;
+    internal const int MaxClipboardImageBytes = 128 * 1024 * 1024;
+    internal const int MaxClipboardFileCount = 65_536;
+    internal const int MaxClipboardPathChars = 32_767;
 
     /// <summary>
     /// Opens the Win32 clipboard, retrying a few times on transient failure. On Windows 11
@@ -57,6 +61,138 @@ internal static partial class ClipboardPlatform
         return false;
     }
 
+    internal static bool TryGetUnicodeClipboardByteCount(int characterCount, out int byteCount)
+    {
+        long required = ((long)characterCount + 1) * sizeof(char);
+        if (characterCount < 0 || required > MaxClipboardPayloadBytes)
+        {
+            byteCount = 0;
+            return false;
+        }
+
+        byteCount = (int)required;
+        return true;
+    }
+
+    internal static unsafe string? DecodeUnicodeClipboardText(nint pointer, nuint byteLength)
+    {
+        if (pointer == nint.Zero ||
+            byteLength < sizeof(char) ||
+            byteLength > MaxClipboardPayloadBytes ||
+            (byteLength & 1) != 0)
+        {
+            return null;
+        }
+
+        int characterCount = (int)(byteLength / sizeof(char));
+        var characters = new ReadOnlySpan<char>((void*)pointer, characterCount);
+        int terminator = characters.IndexOf('\0');
+        return terminator < 0 ? null : new string(characters[..terminator]);
+    }
+
+    internal readonly record struct ClipboardDibLayout(
+        int HeaderOffset,
+        int Width,
+        int Height,
+        int AbsoluteHeight,
+        int BitsPerPixel,
+        int SourceStride,
+        int SourceDataSize,
+        int TargetStride,
+        int TargetDataSize);
+
+    internal static bool TryReadClipboardDibLayout(
+        nint pointer,
+        nuint allocationSize,
+        out ClipboardDibLayout layout)
+    {
+        layout = default;
+        if (pointer == nint.Zero || allocationSize < 40)
+            return false;
+
+        int headerOffset = Marshal.ReadInt32(pointer, 0);
+        int width = Marshal.ReadInt32(pointer, 4);
+        int height = Marshal.ReadInt32(pointer, 8);
+        int bitsPerPixel = Marshal.ReadInt16(pointer, 14);
+        int compression = Marshal.ReadInt32(pointer, 16);
+
+        if (headerOffset < 40 ||
+            width <= 0 ||
+            height == 0 ||
+            height == int.MinValue ||
+            compression != 0 ||
+            (bitsPerPixel != 24 && bitsPerPixel != 32) ||
+            (nuint)headerOffset > allocationSize)
+        {
+            return false;
+        }
+
+        int absoluteHeight = Math.Abs(height);
+        int sourceStride;
+        int sourceDataSize;
+        int targetStride;
+        int targetDataSize;
+        try
+        {
+            int rowBytes = checked(width * (bitsPerPixel / 8));
+            sourceStride = checked((rowBytes + 3) & ~3);
+            sourceDataSize = checked(absoluteHeight * sourceStride);
+            targetStride = bitsPerPixel == 32 ? sourceStride : checked(width * 4);
+            targetDataSize = checked(absoluteHeight * targetStride);
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+
+        if (sourceDataSize > MaxClipboardImageBytes ||
+            targetDataSize > MaxClipboardImageBytes ||
+            (nuint)sourceDataSize > allocationSize - (nuint)headerOffset)
+        {
+            return false;
+        }
+
+        layout = new ClipboardDibLayout(
+            headerOffset,
+            width,
+            height,
+            absoluteHeight,
+            bitsPerPixel,
+            sourceStride,
+            sourceDataSize,
+            targetStride,
+            targetDataSize);
+        return true;
+    }
+
+    internal static bool TryGetFileDropPayloadSize(
+        IReadOnlyList<string> files,
+        out int payloadSize)
+    {
+        payloadSize = 0;
+        if (files == null || files.Count == 0 || files.Count > MaxClipboardFileCount)
+            return false;
+
+        long required = Marshal.SizeOf<DROPFILES>() + sizeof(char);
+        for (int index = 0; index < files.Count; index++)
+        {
+            string? file = files[index];
+            if (string.IsNullOrEmpty(file) ||
+                file.Length > MaxClipboardPathChars ||
+                file.IndexOf('\0') >= 0)
+            {
+                return false;
+            }
+
+            required += ((long)file.Length + 1) * sizeof(char);
+            if (required > MaxClipboardPayloadBytes)
+                return false;
+        }
+
+        payloadSize = (int)required;
+        return true;
+    }
+
     /// <summary>
     /// Gets text from the clipboard.
     /// </summary>
@@ -75,13 +211,21 @@ internal static partial class ClipboardPlatform
             if (handle == nint.Zero)
                 return null;
 
+            nuint byteLength = GlobalSize(handle);
+            if (byteLength < sizeof(char) ||
+                byteLength > MaxClipboardPayloadBytes ||
+                (byteLength & 1) != 0)
+            {
+                return null;
+            }
+
             var ptr = GlobalLock(handle);
             if (ptr == nint.Zero)
                 return null;
 
             try
             {
-                return Marshal.PtrToStringUni(ptr);
+                return DecodeUnicodeClipboardText(ptr, byteLength);
             }
             finally
             {
@@ -104,8 +248,15 @@ internal static partial class ClipboardPlatform
         if (text == null)
             return false;
 
+        if (!TryGetUnicodeClipboardByteCount(text.Length, out int byteCount))
+            return false;
+
         if (!PlatformFactory.IsWindows)
+        {
+            if (Encoding.UTF8.GetByteCount(text) > MaxClipboardPayloadBytes)
+                return false;
             return SetTextCrossPlatform(text);
+        }
 
         if (!OpenClipboardWithRetry())
             return false;
@@ -115,8 +266,6 @@ internal static partial class ClipboardPlatform
             if (!EmptyClipboard())
                 return false;
 
-            // Calculate the number of bytes needed (including null terminator)
-            var byteCount = (text.Length + 1) * sizeof(char);
             var hGlobal = GlobalAlloc(GMEM_MOVEABLE, (nuint)byteCount);
 
             if (hGlobal == nint.Zero)
@@ -240,78 +389,52 @@ internal static partial class ClipboardPlatform
             if (handle == nint.Zero)
                 return null;
 
+            nuint allocationSize = GlobalSize(handle);
+            if (allocationSize < 40)
+                return null;
+
             var ptr = GlobalLock(handle);
             if (ptr == nint.Zero)
                 return null;
 
             try
             {
-                // Read BITMAPINFOHEADER
-                var biSize = Marshal.ReadInt32(ptr, 0);
-                var width = Marshal.ReadInt32(ptr, 4);
-                var height = Marshal.ReadInt32(ptr, 8);
-                var biBitCount = Marshal.ReadInt16(ptr, 14);
-                var biCompression = Marshal.ReadInt32(ptr, 16);
-                nuint allocationSize = GlobalSize(handle);
-
-                // Only support uncompressed 24-bit or 32-bit bitmaps
-                if (biSize < 40 || width <= 0 || height == 0 || height == int.MinValue ||
-                    biCompression != 0 || (biBitCount != 24 && biBitCount != 32))
-                    return null;
-
-                var bytesPerPixel = biBitCount / 8;
-                int absoluteHeight = Math.Abs(height);
-                int sourceStride;
-                int dataSize;
-                try
-                {
-                    sourceStride = checked((width * bytesPerPixel + 3) & ~3);
-                    dataSize = checked(absoluteHeight * sourceStride);
-                }
-                catch (OverflowException)
-                {
-                    return null;
-                }
-
-                // Calculate offset to pixel data
-                var headerOffset = biSize;
-                if ((nuint)headerOffset > allocationSize || (nuint)dataSize > allocationSize - (nuint)headerOffset)
+                if (!TryReadClipboardDibLayout(ptr, allocationSize, out ClipboardDibLayout layout))
                     return null;
 
                 // Copy pixel data
-                var data = new byte[dataSize];
-                Marshal.Copy(ptr + headerOffset, data, 0, dataSize);
+                var data = new byte[layout.SourceDataSize];
+                Marshal.Copy(ptr + layout.HeaderOffset, data, 0, layout.SourceDataSize);
 
                 // DIBs are typically stored bottom-up, convert to top-down
-                if (height > 0)
+                if (layout.Height > 0)
                 {
-                    var flippedData = new byte[dataSize];
-                    for (int y = 0; y < absoluteHeight; y++)
+                    var flippedData = new byte[layout.SourceDataSize];
+                    for (int y = 0; y < layout.AbsoluteHeight; y++)
                     {
-                        var srcOffset = (absoluteHeight - 1 - y) * sourceStride;
-                        var dstOffset = y * sourceStride;
-                        Array.Copy(data, srcOffset, flippedData, dstOffset, sourceStride);
+                        var srcOffset = (layout.AbsoluteHeight - 1 - y) * layout.SourceStride;
+                        var dstOffset = y * layout.SourceStride;
+                        Array.Copy(data, srcOffset, flippedData, dstOffset, layout.SourceStride);
                     }
                     data = flippedData;
                 }
 
-                if (biBitCount == 32)
-                    return (width, absoluteHeight, sourceStride, data);
+                if (layout.BitsPerPixel == 32)
+                    return (layout.Width, layout.AbsoluteHeight, layout.SourceStride, data);
 
-                int targetStride = checked(width * 4);
-                var bgra = new byte[checked(targetStride * absoluteHeight)];
-                for (int y = 0; y < absoluteHeight; y++)
+                var bgra = new byte[layout.TargetDataSize];
+                for (int y = 0; y < layout.AbsoluteHeight; y++)
                 {
-                    for (int x = 0; x < width; x++)
+                    for (int x = 0; x < layout.Width; x++)
                     {
-                        int sourceOffset = checked(y * sourceStride + x * 3);
-                        int targetOffset = checked(y * targetStride + x * 4);
+                        int sourceOffset = y * layout.SourceStride + x * 3;
+                        int targetOffset = y * layout.TargetStride + x * 4;
                         data.AsSpan(sourceOffset, 3).CopyTo(bgra.AsSpan(targetOffset, 3));
                         bgra[targetOffset + 3] = 255;
                     }
                 }
 
-                return (width, absoluteHeight, targetStride, bgra);
+                return (layout.Width, layout.AbsoluteHeight, layout.TargetStride, bgra);
             }
             finally
             {
@@ -344,17 +467,30 @@ internal static partial class ClipboardPlatform
             if (handle == nint.Zero)
                 return null;
 
+            nuint allocationSize = GlobalSize(handle);
+            if (allocationSize < (nuint)Marshal.SizeOf<DROPFILES>() ||
+                allocationSize > MaxClipboardPayloadBytes)
+            {
+                return null;
+            }
+
             var count = DragQueryFileW(handle, 0xFFFFFFFF, null, 0);
-            if (count == 0)
+            if (count == 0 || count > MaxClipboardFileCount)
                 return null;
 
-            var files = new string[count];
+            var files = new string[(int)count];
             for (uint i = 0; i < count; i++)
             {
                 var length = DragQueryFileW(handle, i, null, 0);
+                if (length == 0 || length > MaxClipboardPathChars)
+                    return null;
+
                 var buffer = new char[length + 1];
-                DragQueryFileW(handle, i, buffer, (uint)buffer.Length);
-                files[i] = new string(buffer, 0, (int)length);
+                uint written = DragQueryFileW(handle, i, buffer, (uint)buffer.Length);
+                if (written != length)
+                    return null;
+
+                files[(int)i] = new string(buffer, 0, (int)written);
             }
 
             return files;
@@ -375,6 +511,9 @@ internal static partial class ClipboardPlatform
         if (files == null || files.Length == 0)
             return false;
 
+        if (!TryGetFileDropPayloadSize(files, out _))
+            return false;
+
         if (!PlatformFactory.IsWindows)
             return SetBinaryData(DataFormats.FileDrop, Encoding.UTF8.GetBytes(BuildUriList(files)));
 
@@ -386,56 +525,7 @@ internal static partial class ClipboardPlatform
             if (!EmptyClipboard())
                 return false;
 
-            // Calculate buffer size: DROPFILES structure + null-terminated strings + final null
-            var totalLength = Marshal.SizeOf<DROPFILES>();
-            foreach (var file in files)
-            {
-                totalLength += (file.Length + 1) * sizeof(char);
-            }
-            totalLength += sizeof(char); // Final null terminator
-
-            var hGlobal = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, (nuint)totalLength);
-            if (hGlobal == nint.Zero)
-                return false;
-
-            var ptr = GlobalLock(hGlobal);
-            if (ptr == nint.Zero)
-            {
-                GlobalFree(hGlobal);
-                return false;
-            }
-
-            try
-            {
-                // Write DROPFILES header
-                var dropFiles = new DROPFILES
-                {
-                    pFiles = (uint)Marshal.SizeOf<DROPFILES>(),
-                    fWide = true
-                };
-                Marshal.StructureToPtr(dropFiles, ptr, false);
-
-                // Write file paths
-                var offset = Marshal.SizeOf<DROPFILES>();
-                foreach (var file in files)
-                {
-                    var chars = file.ToCharArray();
-                    Marshal.Copy(chars, 0, ptr + offset, chars.Length);
-                    offset += (file.Length + 1) * sizeof(char);
-                }
-            }
-            finally
-            {
-                GlobalUnlock(hGlobal);
-            }
-
-            if (SetClipboardData(CF_HDROP, hGlobal) == nint.Zero)
-            {
-                GlobalFree(hGlobal);
-                return false;
-            }
-
-            return true;
+            return SetFileDropListInSession(files);
         }
         finally
         {
@@ -675,6 +765,9 @@ internal static partial class ClipboardPlatform
     /// </summary>
     private static bool SetClipboardMemory(uint format, byte[] data)
     {
+        if (data.Length > MaxClipboardPayloadBytes)
+            return false;
+
         int allocationSize = Math.Max(1, data.Length);
         var hGlobal = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, (nuint)allocationSize);
         if (hGlobal == nint.Zero)
@@ -710,12 +803,8 @@ internal static partial class ClipboardPlatform
 
     private static bool SetFileDropListInSession(string[] files)
     {
-        var totalLength = Marshal.SizeOf<DROPFILES>();
-        foreach (var file in files)
-        {
-            totalLength += (file.Length + 1) * sizeof(char);
-        }
-        totalLength += sizeof(char);
+        if (!TryGetFileDropPayloadSize(files, out int totalLength))
+            return false;
 
         var hGlobal = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, (nuint)totalLength);
         if (hGlobal == nint.Zero)
@@ -876,7 +965,7 @@ internal static partial class ClipboardPlatform
             }
 
             var nativeSize = GlobalSize(handle);
-            if (nativeSize == 0 || nativeSize > int.MaxValue)
+            if (nativeSize == 0 || nativeSize > MaxClipboardPayloadBytes)
             {
                 return null;
             }
@@ -909,6 +998,9 @@ internal static partial class ClipboardPlatform
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(format);
         ArgumentNullException.ThrowIfNull(data);
+        if (data.Length > MaxClipboardPayloadBytes)
+            return false;
+
         if (!PlatformFactory.IsWindows)
         {
             byte[] normalized = NormalizeCrossPlatformBytes(format, data);
@@ -981,21 +1073,63 @@ internal static partial class ClipboardPlatform
         out int stride,
         out byte[] pixels)
     {
+        width = image.PixelWidth;
+        height = image.PixelHeight;
+        stride = 0;
+        pixels = [];
+        if (width <= 0 || width > int.MaxValue / 4 ||
+            !TryGetClipboardImageLayout(
+                width,
+                height,
+                width * 4,
+                out stride,
+                out _,
+                out int pixelByteCount))
+        {
+            return false;
+        }
+
         BitmapSource normalized = image.Format == PixelFormat.Bgra32
             ? image
             : new FormatConvertedBitmap(image, PixelFormat.Bgra32, null, 0);
-        width = normalized.PixelWidth;
-        height = normalized.PixelHeight;
-        stride = 0;
-        pixels = [];
-        if (width <= 0 || height <= 0)
-            return false;
-
-        stride = checked(width * 4);
-        pixels = new byte[checked(stride * height)];
+        pixels = new byte[pixelByteCount];
         normalized.CopyPixels(pixels, stride, 0);
 
         return true;
+    }
+
+    internal static bool TryGetClipboardImageLayout(
+        int width,
+        int height,
+        int sourceStride,
+        out int packedStride,
+        out int sourceByteCount,
+        out int packedByteCount)
+    {
+        packedStride = 0;
+        sourceByteCount = 0;
+        packedByteCount = 0;
+        if (width <= 0 || height <= 0 || sourceStride <= 0)
+            return false;
+
+        try
+        {
+            packedStride = checked(width * 4);
+            if (sourceStride < packedStride)
+                return false;
+
+            sourceByteCount = checked(sourceStride * height);
+            packedByteCount = checked(packedStride * height);
+            return sourceByteCount <= MaxClipboardImageBytes &&
+                packedByteCount <= MaxClipboardImageBytes;
+        }
+        catch (OverflowException)
+        {
+            packedStride = 0;
+            sourceByteCount = 0;
+            packedByteCount = 0;
+            return false;
+        }
     }
 
     private const string MimeTextUtf8 = "text/plain;charset=utf-8";
@@ -1436,7 +1570,7 @@ internal static partial class ClipboardPlatform
         try
         {
             if (NativeMethods.ClipboardGetData(mimeType, out dataPointer, out uint dataSize) != 0 ||
-                dataPointer == nint.Zero || dataSize > int.MaxValue)
+                dataPointer == nint.Zero || dataSize > MaxClipboardPayloadBytes)
                 return null;
 
             var data = new byte[(int)dataSize];
@@ -1455,6 +1589,12 @@ internal static partial class ClipboardPlatform
     {
         if (representations.Count == 0)
             return NativeMethods.ClipboardClear() == 0;
+        if (representations.Count > MaxClipboardFileCount ||
+            representations.Any(representation =>
+                representation.Data.Length > MaxClipboardPayloadBytes))
+        {
+            return false;
+        }
 
         using var payload = new NativeClipboardPayload(representations);
         fixed (NativeDragDataItem* items = payload.Items)
@@ -1520,19 +1660,25 @@ internal static partial class ClipboardPlatform
 
     internal static bool TryEncodeBitmapSource(BitmapSource source, out byte[] png)
     {
-        BitmapSource normalized = source.Format == PixelFormat.Bgra32
-            ? source
-            : new FormatConvertedBitmap(source, PixelFormat.Bgra32, null, 0);
-        int width = normalized.PixelWidth;
-        int height = normalized.PixelHeight;
-        if (width <= 0 || height <= 0)
+        int width = source.PixelWidth;
+        int height = source.PixelHeight;
+        if (width <= 0 || width > int.MaxValue / 4 ||
+            !TryGetClipboardImageLayout(
+                width,
+                height,
+                width * 4,
+                out int stride,
+                out _,
+                out int pixelByteCount))
         {
             png = [];
             return false;
         }
 
-        int stride = checked(width * 4);
-        var bgra = new byte[checked(stride * height)];
+        BitmapSource normalized = source.Format == PixelFormat.Bgra32
+            ? source
+            : new FormatConvertedBitmap(source, PixelFormat.Bgra32, null, 0);
+        var bgra = new byte[pixelByteCount];
         normalized.CopyPixels(bgra, stride, 0);
         png = EncodePng(width, height, stride, bgra);
         return true;
@@ -1540,6 +1686,17 @@ internal static partial class ClipboardPlatform
 
     internal static (int Width, int Height, int Stride, byte[] Data)? DecodePng(byte[] png)
     {
+        if (png.Length > MaxClipboardPayloadBytes ||
+            !TryReadPngBgraLayout(
+                png,
+                out int declaredWidth,
+                out int declaredHeight,
+                out int declaredStride,
+                out int declaredByteCount))
+        {
+            return null;
+        }
+
         try
         {
             using var stream = new MemoryStream(png, writable: false);
@@ -1550,21 +1707,20 @@ internal static partial class ClipboardPlatform
             BitmapSource frame = decoder.Frames[0];
             int width = frame.PixelWidth;
             int height = frame.PixelHeight;
-            if (width <= 0 || height <= 0)
+            if (width != declaredWidth || height != declaredHeight)
                 return null;
 
             BitmapSource normalized = frame.Format == PixelFormat.Bgra32
                 ? frame
                 : new FormatConvertedBitmap(frame, PixelFormat.Bgra32, null, 0);
-            int stride = checked(width * 4);
-            var bgra = new byte[checked(stride * height)];
-            normalized.CopyPixels(bgra, stride, 0);
-            return (width, height, stride, bgra);
+            var bgra = new byte[declaredByteCount];
+            normalized.CopyPixels(bgra, declaredStride, 0);
+            return (width, height, declaredStride, bgra);
         }
         catch (Exception exception) when (
             exception is InvalidDataException or NotSupportedException or ArgumentException or
                 InvalidOperationException or DllNotFoundException or EntryPointNotFoundException or
-                BadImageFormatException)
+                BadImageFormatException or OverflowException)
         {
             return null;
         }
@@ -1572,6 +1728,19 @@ internal static partial class ClipboardPlatform
 
     internal static byte[] EncodePng(int width, int height, int stride, byte[] bgraPixels)
     {
+        ArgumentNullException.ThrowIfNull(bgraPixels);
+        if (!TryGetClipboardImageLayout(
+                width,
+                height,
+                stride,
+                out int packedStride,
+                out int sourceByteCount,
+                out _) ||
+            bgraPixels.Length < sourceByteCount)
+        {
+            throw new ArgumentException("The pixel buffer layout is invalid or exceeds the clipboard image limit.", nameof(bgraPixels));
+        }
+
         using var output = new MemoryStream();
         output.Write([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
 
@@ -1587,7 +1756,7 @@ internal static partial class ClipboardPlatform
         {
             using (var zlib = new ZLibStream(buffer, CompressionLevel.Optimal, leaveOpen: true))
             {
-                var rgbaRow = new byte[checked(width * 4)];
+                var rgbaRow = new byte[packedStride];
                 for (int y = 0; y < height; y++)
                 {
                     zlib.WriteByte(0);
@@ -1610,6 +1779,45 @@ internal static partial class ClipboardPlatform
         WritePngChunk(output, "IDAT"u8, compressed);
         WritePngChunk(output, "IEND"u8, []);
         return output.ToArray();
+    }
+
+    internal static bool TryReadPngBgraLayout(
+        ReadOnlySpan<byte> png,
+        out int width,
+        out int height,
+        out int stride,
+        out int byteCount)
+    {
+        width = 0;
+        height = 0;
+        stride = 0;
+        byteCount = 0;
+        if (png.Length < 33 || !IsPng(png) ||
+            BinaryPrimitives.ReadInt32BigEndian(png[8..12]) != 13 ||
+            !png[12..16].SequenceEqual("IHDR"u8))
+        {
+            return false;
+        }
+
+        width = BinaryPrimitives.ReadInt32BigEndian(png[16..20]);
+        height = BinaryPrimitives.ReadInt32BigEndian(png[20..24]);
+        if (width <= 0 || width > int.MaxValue / 4 ||
+            !TryGetClipboardImageLayout(
+                width,
+                height,
+                width * 4,
+                out stride,
+                out _,
+                out byteCount))
+        {
+            width = 0;
+            height = 0;
+            stride = 0;
+            byteCount = 0;
+            return false;
+        }
+
+        return true;
     }
 
     private static bool IsPng(ReadOnlySpan<byte> data) =>

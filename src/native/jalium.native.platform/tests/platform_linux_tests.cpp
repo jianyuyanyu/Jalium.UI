@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +68,21 @@ void TestDragEventAbi()
               offsetof(JaliumPlatformEvent,
                        deleteSurrounding.afterUtf8Bytes) == 20,
           "delete-surrounding event 46 carries stable UTF-8 byte lengths");
+}
+
+void TestExternalTransferPayloadLimit()
+{
+    constexpr uint64_t maxPayload = 256ull * 1024ull * 1024ull;
+    Check(jalium_test_external_transfer_fits(0, maxPayload) == 1,
+          "external transfer accepts exactly the bounded payload limit");
+    Check(jalium_test_external_transfer_fits(maxPayload, 0) == 1,
+          "external transfer accepts an empty final chunk at the limit");
+    Check(jalium_test_external_transfer_fits(maxPayload, 1) == 0,
+          "external transfer rejects a chunk beyond the payload limit");
+    Check(jalium_test_external_transfer_fits(maxPayload - 7, 8) == 0,
+          "external transfer accumulation rejects a one-byte overflow");
+    Check(jalium_test_external_transfer_fits(UINT64_MAX, 1) == 0,
+          "external transfer rejects arithmetic-overflow-sized state");
 }
 
 void TestImeAndShellProtocolAbi()
@@ -1788,6 +1804,7 @@ int RunWaylandSmoke(bool testVulkan)
     Check(jalium_platform_get_current() == JALIUM_PLATFORM_LINUX_WAYLAND,
           "forced Wayland selects the Wayland backend");
     TestDragEventAbi();
+    TestExternalTransferPayloadLimit();
     TestImeAndShellProtocolAbi();
     TestDeleteSurroundingCallbackContract();
     TestTouchCapabilityAbi();
