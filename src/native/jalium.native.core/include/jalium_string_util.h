@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <stdexcept>
 #include <string>
 
 // ============================================================================
@@ -17,6 +18,33 @@
 // ============================================================================
 
 namespace jalium {
+
+// Text crosses a public C ABI as a pointer plus an untrusted 32-bit code-unit
+// count.  Keep conversion and backend layout allocations bounded.  16 Mi UTF-16
+// code units is deliberately far above any UI text run while limiting one
+// converted string to roughly 64 MiB on platforms with 4-byte wchar_t.
+inline constexpr uint32_t kMaxManagedTextCodeUnits = 16u * 1024u * 1024u;
+inline constexpr uint32_t kMaxManagedFontFamilyCodeUnits = 4096u;
+inline constexpr float kMinManagedFontSize = 0.001f;
+inline constexpr float kMaxManagedFontSize = 35791.0f;
+
+// Finds the terminator in a managed UTF-16 string without an unbounded scan.
+// The ABI pointer is UTF-16 on every platform even where wchar_t is 4 bytes.
+inline bool ManagedUtf16LengthBounded(
+    const void* utf16_ptr,
+    uint32_t maxLength,
+    uint32_t* length) noexcept {
+    if (!utf16_ptr || !length) return false;
+    const uint16_t* source = reinterpret_cast<const uint16_t*>(utf16_ptr);
+    for (uint32_t i = 0; i < maxLength; ++i) {
+        if (source[i] == 0) {
+            *length = i;
+            return true;
+        }
+    }
+    *length = 0;
+    return false;
+}
 
 // Copies a null-terminated wide string into a fixed-width UTF-16 ABI buffer.
 // This is a code-unit copy on Windows and a UTF-32 -> UTF-16 conversion on
@@ -156,6 +184,13 @@ inline std::wstring FixedUtf16ToWide(const uint16_t (&source)[N]) {
 // On Windows, wchar_t == uint16_t, so the managed UTF-16 data is already wchar_t.
 inline const wchar_t* ManagedStringPtr(const wchar_t* s) { return s; }
 inline std::wstring ManagedToWString(const wchar_t* s, uint32_t len) {
+    if (len > kMaxManagedTextCodeUnits) {
+        throw std::length_error("managed UTF-16 string exceeds the ABI limit");
+    }
+    if (!s) {
+        if (len == 0) return {};
+        throw std::invalid_argument("null managed UTF-16 string");
+    }
     return std::wstring(s, len);
 }
 
@@ -164,6 +199,13 @@ inline std::wstring ManagedToWString(const wchar_t* s, uint32_t len) {
 // On Linux/Android, wchar_t is 4 bytes. The parameter actually points to
 // packed UTF-16 code units (2 bytes each). Reinterpret and convert.
 inline std::wstring ManagedToWString(const void* utf16_ptr, uint32_t len) {
+    if (len > kMaxManagedTextCodeUnits) {
+        throw std::length_error("managed UTF-16 string exceeds the ABI limit");
+    }
+    if (!utf16_ptr) {
+        if (len == 0) return {};
+        throw std::invalid_argument("null managed UTF-16 string");
+    }
     const uint16_t* s = reinterpret_cast<const uint16_t*>(utf16_ptr);
     std::wstring result;
     result.reserve(len);
@@ -242,9 +284,12 @@ inline uint32_t ManagedWStringIndexToUtf16Index(
 // Convenience for null-terminated strings
 inline std::wstring ManagedToWString(const void* utf16_ptr) {
     if (!utf16_ptr) return {};
-    const uint16_t* s = reinterpret_cast<const uint16_t*>(utf16_ptr);
     uint32_t len = 0;
-    while (s[len]) len++;
+    if (!ManagedUtf16LengthBounded(
+            utf16_ptr, kMaxManagedTextCodeUnits, &len)) {
+        throw std::length_error(
+            "null-terminated managed UTF-16 string exceeds the ABI limit");
+    }
     return ManagedToWString(utf16_ptr, len);
 }
 
