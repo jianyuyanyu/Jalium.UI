@@ -848,8 +848,10 @@ public sealed unsafe class WindowsNotificationBackend : INotificationBackend
     private static Guid DeriveActivatorClsid(string appId)
     {
         Span<byte> hash = stackalloc byte[20];
+#pragma warning disable CA5350 // UUID v5 mandates SHA-1; this is deterministic naming, not cryptographic protection.
         System.Security.Cryptography.SHA1.HashData(
             Encoding.UTF8.GetBytes("Jalium.UI.ToastActivator:" + appId), hash);
+#pragma warning restore CA5350
         Span<byte> guidBytes = stackalloc byte[16];
         hash[..16].CopyTo(guidBytes);
         // RFC 4122 §4.3 — UUID v5 layout.
