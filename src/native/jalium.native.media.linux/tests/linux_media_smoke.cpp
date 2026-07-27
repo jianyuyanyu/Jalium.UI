@@ -1,4 +1,6 @@
 #include "jalium_media.h"
+#include "jalium_media_internal.h"
+#include "and_yuv_simd.h"
 #include "jalium_audio.h"
 #include "jalium_video_surface.h"
 
@@ -9,6 +11,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 static_assert(sizeof(jalium_video_decoder_gpu_descriptor_t) ==
               sizeof(JaliumVideoSurfaceDescriptor));
@@ -329,6 +332,42 @@ int main(int argc, char** argv)
     auto status = jalium_media_initialize();
     if (status != JALIUM_MEDIA_OK) return Fail("initialize", status);
 
+    uint32_t bounded_stride = 0;
+    size_t bounded_size = 0;
+    if (!jalium_media_compute_bgra_layout(
+            4096, 4096, &bounded_stride, &bounded_size) ||
+        bounded_stride != 4096u * 4u ||
+        bounded_size != static_cast<size_t>(4096u) * 4096u * 4u ||
+        jalium_media_compute_bgra_layout(
+            20000, 20000, &bounded_stride, &bounded_size) ||
+        bounded_stride != 0 || bounded_size != 0) {
+        return Fail("bounded pixel buffer layout",
+                    JALIUM_MEDIA_E_DECODE_FAILED);
+    }
+    uint8_t synthetic_plane[8]{};
+    if (!jalium::media::android::IsYuvPlaneReadable(
+            synthetic_plane, 8, 4, 1, 4, 2) ||
+        jalium::media::android::IsYuvPlaneReadable(
+            synthetic_plane, 7, 4, 1, 4, 2) ||
+        jalium::media::android::IsYuvPlaneReadable(
+            synthetic_plane, 8, -1, 1, 4, 2) ||
+        jalium::media::android::IsYuvPlaneReadable(
+            synthetic_plane, 8, 4, 2, 4, 2)) {
+        return Fail("bounded Android YUV plane layout",
+                    JALIUM_MEDIA_E_DECODE_FAILED);
+    }
+    const uint8_t oversized_input_sentinel = 0;
+    jalium_image_t oversized_image{};
+    status = jalium_image_decode_memory(
+        &oversized_input_sentinel,
+        JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES + 1u,
+        JALIUM_PF_BGRA8,
+        &oversized_image);
+    if (status != JALIUM_MEDIA_E_OUT_OF_MEMORY ||
+        oversized_image.pixels != nullptr) {
+        return Fail("bounded encoded image input", status);
+    }
+
     // The descriptor release API is intentionally idempotent: managed and
     // renderer teardown paths can converge after an exception. Prove that the
     // producer lifetime is released exactly once and the descriptor is reset.
@@ -471,6 +510,15 @@ int main(int argc, char** argv)
 
     status = jalium_audio_initialize();
     if (status != JALIUM_MEDIA_OK) return Fail("audio initialize", status);
+    jalium_audio_decoder_t* oversized_audio = nullptr;
+    status = jalium_audio_decoder_open_memory(
+        &oversized_input_sentinel,
+        JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES + 1u,
+        JALIUM_ACODEC_WAV,
+        &oversized_audio);
+    if (status != JALIUM_MEDIA_E_OUT_OF_MEMORY || oversized_audio) {
+        return Fail("bounded encoded audio input", status);
+    }
     jalium_audio_decoder_t* wav = nullptr;
     status = jalium_audio_decoder_open_memory(
         kWav, sizeof(kWav), JALIUM_ACODEC_WAV, &wav);
@@ -491,6 +539,32 @@ int main(int argc, char** argv)
         return Fail("WAV read", status);
     }
     jalium_audio_decoder_close(wav);
+
+    char wav_path[] = "/tmp/jalium-audio-stream-XXXXXX";
+    const int wav_fd = mkstemp(wav_path);
+    if (wav_fd < 0 ||
+        write(wav_fd, kWav, sizeof(kWav)) !=
+            static_cast<ssize_t>(sizeof(kWav))) {
+        if (wav_fd >= 0) close(wav_fd);
+        if (wav_fd >= 0) unlink(wav_path);
+        return Fail("WAV streaming fixture", JALIUM_MEDIA_E_IO);
+    }
+    close(wav_fd);
+    jalium_audio_decoder_t* wav_file = nullptr;
+    status = jalium_audio_decoder_open_file(
+        wav_path, JALIUM_ACODEC_WAV, &wav_file);
+    unlink(wav_path);
+    if (status != JALIUM_MEDIA_OK || !wav_file) {
+        return Fail("WAV streaming file open", status);
+    }
+    wav_frames_read = 0;
+    status = jalium_audio_decoder_read_frames(
+        wav_file, wav_frames, 2, &wav_frames_read);
+    jalium_audio_decoder_close(wav_file);
+    if (status != JALIUM_MEDIA_OK || wav_frames_read == 0) {
+        return Fail("WAV streaming file read", status);
+    }
+
     jalium_audio_shutdown();
 
     jalium_video_decoder_t* decoder = nullptr;

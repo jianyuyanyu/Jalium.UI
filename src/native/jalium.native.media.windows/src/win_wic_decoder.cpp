@@ -63,6 +63,10 @@ jalium_media_status_t DecodeFromBitmapSource(
     jalium_pixel_format_t  requested_format,
     jalium_image_t*        out_image)
 {
+    if (!jalium_media_is_valid_pixel_format(requested_format)) {
+        return JALIUM_MEDIA_E_INVALID_ARG;
+    }
+
     UINT width = 0, height = 0;
     HRESULT hr = source->GetSize(&width, &height);
     if (FAILED(hr) || width == 0 || height == 0) {
@@ -82,8 +86,14 @@ jalium_media_status_t DecodeFromBitmapSource(
         WICBitmapPaletteTypeMedianCut);
     if (FAILED(hr)) return JALIUM_MEDIA_E_DECODE_FAILED;
 
-    const uint32_t stride = jalium_media_compute_stride(width);
-    const size_t   buffer_size = static_cast<size_t>(stride) * height;
+    uint32_t stride = 0;
+    size_t buffer_size = 0;
+    if (!jalium_media_compute_bgra_layout(
+            width, height, &stride, &buffer_size) ||
+        buffer_size > static_cast<size_t>(UINT32_MAX)) {
+        // IWICBitmapSource::CopyPixels accepts the destination size as UINT.
+        return JALIUM_MEDIA_E_DECODE_FAILED;
+    }
 
     auto* pixels = static_cast<uint8_t*>(jalium_media_aligned_alloc(buffer_size));
     if (!pixels) return JALIUM_MEDIA_E_OUT_OF_MEMORY;

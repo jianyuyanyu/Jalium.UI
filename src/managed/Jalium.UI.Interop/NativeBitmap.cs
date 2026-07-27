@@ -1,3 +1,5 @@
+using Jalium.UI.Media.Imaging;
+
 namespace Jalium.UI.Interop;
 
 /// <summary>
@@ -49,17 +51,13 @@ public sealed class NativeBitmap : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
 
+        int minimumStride = PixelBufferLayout.GetMinimumStride(width);
         if (stride <= 0)
         {
-            stride = checked(width * 4);
+            stride = minimumStride;
         }
 
-        if (stride < width * 4)
-        {
-            throw new ArgumentOutOfRangeException(nameof(stride), "Stride must be at least width * 4 bytes.");
-        }
-
-        var requiredBytes = checked(stride * height);
+        var requiredBytes = PixelBufferLayout.GetRequiredByteCount(width, height, stride);
         if (pixelData.Length < requiredBytes)
         {
             throw new ArgumentException("Pixel buffer is smaller than the specified dimensions and stride.", nameof(pixelData));
@@ -140,10 +138,12 @@ public sealed class NativeBitmap : IDisposable
         if (_disposed || _handle == nint.Zero) return false;
         ArgumentNullException.ThrowIfNull(pixelData);
         if (width <= 0 || height <= 0) return false;
-        if (stride <= 0) stride = checked(width * 4);
-        if (stride < width * 4) return false;
+        if (width > int.MaxValue / PixelBufferLayout.BytesPerPixel) return false;
+        int minimumStride = width * PixelBufferLayout.BytesPerPixel;
+        if (stride <= 0) stride = minimumStride;
+        if (stride < minimumStride || height > int.MaxValue / stride) return false;
         if ((uint)width != Width || (uint)height != Height) return false;
-        if (pixelData.Length < checked(stride * height)) return false;
+        if (pixelData.Length < stride * height) return false;
 
         var ok = NativeMethods.BitmapUpdatePixels(_handle, pixelData, (uint)width, (uint)height, (uint)stride);
         return ok != 0;

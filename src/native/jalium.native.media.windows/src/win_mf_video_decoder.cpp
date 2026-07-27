@@ -12,7 +12,9 @@
 #include <d3d11.h>
 #include <d3d11_1.h>
 
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -139,13 +141,27 @@ jalium_media_status_t QueryStreamInfo(IMFSourceReader* reader, jalium_video_deco
     if (FAILED(MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &w, &h)) || w == 0 || h == 0) {
         return JALIUM_MEDIA_E_DECODE_FAILED;
     }
+
+    uint32_t stride = 0;
+    size_t frameSize = 0;
+    if (!jalium_media_compute_bgra_layout(w, h, &stride, &frameSize) ||
+        frameSize > static_cast<size_t>(std::numeric_limits<DWORD>::max())) {
+        return JALIUM_MEDIA_E_DECODE_FAILED;
+    }
+
     dec->width = w;
     dec->height = h;
-    dec->stride_bytes = jalium_media_compute_stride(w);
+    dec->stride_bytes = stride;
+    dec->fps = 0.0;
+    dec->duration_s = 0.0;
+    dec->frame_count = 0;
 
     UINT32 num = 0, den = 0;
     if (SUCCEEDED(MFGetAttributeRatio(currentType.Get(), MF_MT_FRAME_RATE, &num, &den)) && den != 0) {
-        dec->fps = static_cast<double>(num) / static_cast<double>(den);
+        const double fps = static_cast<double>(num) / static_cast<double>(den);
+        if (std::isfinite(fps) && fps > 0.0) {
+            dec->fps = fps;
+        }
     }
 
     PROPVARIANT durationVar;
@@ -157,7 +173,14 @@ jalium_media_status_t QueryStreamInfo(IMFSourceReader* reader, jalium_video_deco
         // 100-ns ticks → seconds.
         dec->duration_s = static_cast<double>(durationVar.uhVal.QuadPart) / 10'000'000.0;
         if (dec->fps > 0.0) {
-            dec->frame_count = static_cast<uint64_t>(dec->duration_s * dec->fps);
+            const long double frameCount =
+                static_cast<long double>(dec->duration_s) *
+                static_cast<long double>(dec->fps);
+            if (std::isfinite(frameCount) &&
+                frameCount <= static_cast<long double>(
+                    std::numeric_limits<uint64_t>::max())) {
+                dec->frame_count = static_cast<uint64_t>(frameCount);
+            }
         }
     }
     PropVariantClear(&durationVar);
@@ -176,18 +199,37 @@ jalium_media_status_t CopySampleToFrame(jalium_video_decoder_t* dec, IMFSample* 
     BYTE* src = nullptr;
     DWORD maxLen = 0, curLen = 0;
     hr = buffer->Lock(&src, &maxLen, &curLen);
-    if (FAILED(hr)) return JALIUM_MEDIA_E_PLATFORM;
+    if (FAILED(hr) || !src) {
+        if (SUCCEEDED(hr)) buffer->Unlock();
+        return JALIUM_MEDIA_E_PLATFORM;
+    }
 
-    const uint32_t dstStride = dec->stride_bytes;
-    const size_t   needed    = static_cast<size_t>(dstStride) * dec->height;
+    uint32_t dstStride = 0;
+    size_t needed = 0;
+    size_t srcStride = 0;
+    if (!jalium_media_validate_bgra_source_layout(
+            dec->width,
+            dec->height,
+            static_cast<size_t>(curLen),
+            &dstStride,
+            &needed,
+            &srcStride) ||
+        dstStride != dec->stride_bytes) {
+        buffer->Unlock();
+        return JALIUM_MEDIA_E_DECODE_FAILED;
+    }
 
     if (dec->frame_buffer_size < needed) {
-        if (dec->frame_buffer) jalium_media_aligned_free(dec->frame_buffer);
-        dec->frame_buffer = static_cast<uint8_t*>(jalium_media_aligned_alloc(needed));
-        if (!dec->frame_buffer) {
+        auto* replacement =
+            static_cast<uint8_t*>(jalium_media_aligned_alloc(needed));
+        if (!replacement) {
             buffer->Unlock();
             return JALIUM_MEDIA_E_OUT_OF_MEMORY;
         }
+        if (dec->frame_buffer) {
+            jalium_media_aligned_free(dec->frame_buffer);
+        }
+        dec->frame_buffer = replacement;
         dec->frame_buffer_size = needed;
     }
 
@@ -195,23 +237,23 @@ jalium_media_status_t CopySampleToFrame(jalium_video_decoder_t* dec, IMFSample* 
     // padded one (curLen > that). When source stride equals destination stride
     // we memcpy in one shot; otherwise row-by-row with the source pitch derived
     // from curLen / height.
-    const uint32_t srcStride = (dec->height > 0)
-        ? static_cast<uint32_t>(curLen / dec->height)
-        : dstStride;
-
-    if (srcStride == dstStride) {
+    if (srcStride == static_cast<size_t>(dstStride)) {
         std::memcpy(dec->frame_buffer, src, needed);
     } else {
         for (uint32_t row = 0; row < dec->height; ++row) {
-            std::memcpy(dec->frame_buffer + row * dstStride,
-                        src + row * srcStride,
+            const size_t destinationOffset =
+                static_cast<size_t>(row) * static_cast<size_t>(dstStride);
+            const size_t sourceOffset = static_cast<size_t>(row) * srcStride;
+            std::memcpy(dec->frame_buffer + destinationOffset,
+                        src + sourceOffset,
                         static_cast<size_t>(dstStride));
         }
     }
 
     // Force alpha = 0xFF (MF RGB32 leaves the X byte undefined).
     for (uint32_t row = 0; row < dec->height; ++row) {
-        uint8_t* p = dec->frame_buffer + row * dstStride + 3;
+        uint8_t* p = dec->frame_buffer +
+                     static_cast<size_t>(row) * dstStride + 3u;
         for (uint32_t col = 0; col < dec->width; ++col) {
             *p = 0xFF;
             p += 4;
@@ -394,7 +436,10 @@ jalium_media_status_t MfVideoDecoderOpenFile(
     jalium_video_decoder_t** out_decoder)
 {
     if (!IsInitialized()) return JALIUM_MEDIA_E_NOT_INITIALIZED;
-    if (!utf8_path || !out_decoder) return JALIUM_MEDIA_E_INVALID_ARG;
+    if (!utf8_path || !out_decoder ||
+        !jalium_media_is_valid_pixel_format(requested_format)) {
+        return JALIUM_MEDIA_E_INVALID_ARG;
+    }
     *out_decoder = nullptr;
 
     auto wpath = Utf8ToWide(utf8_path);
@@ -484,7 +529,8 @@ jalium_media_status_t MfVideoDecoderReadFrame(
 
     if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
         // Re-query stream info — width/height may have changed.
-        QueryStreamInfo(decoder->reader.Get(), decoder);
+        auto status = QueryStreamInfo(decoder->reader.Get(), decoder);
+        if (status != JALIUM_MEDIA_OK) return status;
     }
 
     if (!sample) {
@@ -526,6 +572,10 @@ jalium_media_status_t MfVideoDecoderSeek(
     int64_t                 pts_microseconds)
 {
     if (!decoder || !decoder->reader) return JALIUM_MEDIA_E_INVALID_ARG;
+    if (pts_microseconds < 0 ||
+        pts_microseconds > std::numeric_limits<int64_t>::max() / 10) {
+        return JALIUM_MEDIA_E_INVALID_ARG;
+    }
 
     PROPVARIANT pv;
     PropVariantInit(&pv);

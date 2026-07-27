@@ -10,8 +10,10 @@
 #include <mfobjects.h>
 #include <wrl/client.h>
 
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
@@ -64,6 +66,15 @@ void EnumerateFormats(IMFSourceReader* reader, DeviceFormatList& out)
 
         UINT32 w = 0, h = 0;
         if (SUCCEEDED(MFGetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, &w, &h)) && w > 0 && h > 0) {
+            uint32_t stride = 0;
+            size_t frameSize = 0;
+            if (!jalium_media_compute_bgra_layout(
+                    w, h, &stride, &frameSize) ||
+                frameSize > static_cast<size_t>(
+                    std::numeric_limits<DWORD>::max())) {
+                ++typeIndex;
+                continue;
+            }
             UINT32 num = 0, den = 0;
             double fps = 0.0;
             if (SUCCEEDED(MFGetAttributeRatio(mt.Get(), MF_MT_FRAME_RATE, &num, &den)) && den != 0) {
@@ -218,6 +229,15 @@ jalium_media_status_t SelectFormat(
 
         UINT32 w = 0, h = 0;
         if (SUCCEEDED(MFGetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, &w, &h)) && w > 0 && h > 0) {
+            uint32_t stride = 0;
+            size_t frameSize = 0;
+            if (!jalium_media_compute_bgra_layout(
+                    w, h, &stride, &frameSize) ||
+                frameSize > static_cast<size_t>(
+                    std::numeric_limits<DWORD>::max())) {
+                ++typeIndex;
+                continue;
+            }
             UINT32 num = 0, den = 0;
             double fps = 30.0;
             if (SUCCEEDED(MFGetAttributeRatio(mt.Get(), MF_MT_FRAME_RATE, &num, &den)) && den != 0) {
@@ -275,7 +295,11 @@ jalium_media_status_t MfCameraOpen(
     jalium_camera_source_t** out_source)
 {
     if (!IsInitialized()) return JALIUM_MEDIA_E_NOT_INITIALIZED;
-    if (!device_id || !out_source) return JALIUM_MEDIA_E_INVALID_ARG;
+    if (!device_id || !out_source ||
+        !std::isfinite(requested_fps) || requested_fps < 0.0 ||
+        !jalium_media_is_valid_pixel_format(requested_format)) {
+        return JALIUM_MEDIA_E_INVALID_ARG;
+    }
     *out_source = nullptr;
 
     // Convert UTF-8 device id (MF symbolic link) to wide.
@@ -330,6 +354,16 @@ jalium_media_status_t MfCameraOpen(
         return status;
     }
 
+    uint32_t stride = 0;
+    size_t frameSize = 0;
+    if (!jalium_media_compute_bgra_layout(
+            actualW, actualH, &stride, &frameSize) ||
+        frameSize > static_cast<size_t>(
+            std::numeric_limits<DWORD>::max())) {
+        source->Shutdown();
+        return JALIUM_MEDIA_E_UNSUPPORTED_FORMAT;
+    }
+
     auto* src = new (std::nothrow) jalium_camera_source();
     if (!src) {
         source->Shutdown();
@@ -339,7 +373,7 @@ jalium_media_status_t MfCameraOpen(
     src->reader       = std::move(reader);
     src->width        = actualW;
     src->height       = actualH;
-    src->stride_bytes = jalium_media_compute_stride(actualW);
+    src->stride_bytes = stride;
     src->format       = requested_format;
 
     *out_source = src;
@@ -374,33 +408,57 @@ jalium_media_status_t MfCameraReadFrame(
     BYTE* data = nullptr;
     DWORD maxLen = 0, curLen = 0;
     hr = buffer->Lock(&data, &maxLen, &curLen);
-    if (FAILED(hr)) return JALIUM_MEDIA_E_PLATFORM;
+    if (FAILED(hr) || !data) {
+        if (SUCCEEDED(hr)) buffer->Unlock();
+        return JALIUM_MEDIA_E_PLATFORM;
+    }
 
-    const uint32_t dstStride = src->stride_bytes;
-    const size_t   needed    = static_cast<size_t>(dstStride) * src->height;
+    uint32_t dstStride = 0;
+    size_t needed = 0;
+    size_t sourceStride = 0;
+    if (!jalium_media_validate_bgra_source_layout(
+            src->width,
+            src->height,
+            static_cast<size_t>(curLen),
+            &dstStride,
+            &needed,
+            &sourceStride) ||
+        dstStride != src->stride_bytes) {
+        buffer->Unlock();
+        return JALIUM_MEDIA_E_DECODE_FAILED;
+    }
+
     if (src->frame_buffer_size < needed) {
-        if (src->frame_buffer) jalium_media_aligned_free(src->frame_buffer);
-        src->frame_buffer = static_cast<uint8_t*>(jalium_media_aligned_alloc(needed));
-        if (!src->frame_buffer) {
+        auto* replacement =
+            static_cast<uint8_t*>(jalium_media_aligned_alloc(needed));
+        if (!replacement) {
             buffer->Unlock();
             return JALIUM_MEDIA_E_OUT_OF_MEMORY;
         }
+        if (src->frame_buffer) {
+            jalium_media_aligned_free(src->frame_buffer);
+        }
+        src->frame_buffer = replacement;
         src->frame_buffer_size = needed;
     }
 
-    const uint32_t srcStride = (src->height > 0) ? static_cast<uint32_t>(curLen / src->height) : dstStride;
-    if (srcStride == dstStride) {
+    if (sourceStride == static_cast<size_t>(dstStride)) {
         std::memcpy(src->frame_buffer, data, needed);
     } else {
         for (uint32_t row = 0; row < src->height; ++row) {
-            std::memcpy(src->frame_buffer + row * dstStride,
-                        data + row * srcStride,
+            const size_t destinationOffset =
+                static_cast<size_t>(row) * static_cast<size_t>(dstStride);
+            const size_t sourceOffset =
+                static_cast<size_t>(row) * sourceStride;
+            std::memcpy(src->frame_buffer + destinationOffset,
+                        data + sourceOffset,
                         static_cast<size_t>(dstStride));
         }
     }
 
     for (uint32_t row = 0; row < src->height; ++row) {
-        uint8_t* p = src->frame_buffer + row * dstStride + 3;
+        uint8_t* p = src->frame_buffer +
+                     static_cast<size_t>(row) * dstStride + 3u;
         for (uint32_t col = 0; col < src->width; ++col) {
             *p = 0xFF;
             p += 4;

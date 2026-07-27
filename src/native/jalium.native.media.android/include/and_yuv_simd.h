@@ -1,6 +1,7 @@
 #pragma once
 
 #include "jalium_media.h"
+#include <stddef.h>
 #include <stdint.h>
 
 namespace jalium::media::android {
@@ -10,6 +11,41 @@ enum class ColorMatrix : int {
     Bt601 = 0,  ///< SDTV — most legacy content
     Bt709 = 1,  ///< HD — most modern H.264/HEVC content
 };
+
+/// Validates the last byte touched by a strided plane conversion. Android's
+/// codec/camera APIs expose signed lengths and strides supplied by drivers;
+/// reject truncated, negative, or wrapping layouts before entering SIMD.
+inline bool IsYuvPlaneReadable(
+    const uint8_t* plane,
+    int32_t length,
+    int32_t row_stride,
+    int32_t pixel_stride,
+    uint32_t sample_width,
+    uint32_t sample_height) noexcept
+{
+    if (!plane || length < 0 || row_stride <= 0 || pixel_stride <= 0 ||
+        sample_width == 0 || sample_height == 0) {
+        return false;
+    }
+
+    const size_t pixel_stride_size = static_cast<size_t>(pixel_stride);
+    if (static_cast<size_t>(sample_width - 1u) >
+        (SIZE_MAX - 1u) / pixel_stride_size) {
+        return false;
+    }
+    const size_t row_bytes =
+        static_cast<size_t>(sample_width - 1u) * pixel_stride_size + 1u;
+    const size_t row_stride_size = static_cast<size_t>(row_stride);
+    if (row_stride_size < row_bytes ||
+        static_cast<size_t>(sample_height - 1u) >
+            (SIZE_MAX - row_bytes) / row_stride_size) {
+        return false;
+    }
+    const size_t required =
+        static_cast<size_t>(sample_height - 1u) * row_stride_size +
+        row_bytes;
+    return required <= static_cast<size_t>(length);
+}
 
 /// NV12 (Y plane + interleaved UV plane) -> BGRA8 / RGBA8.
 /// Strides are in bytes. The output buffer must be at least

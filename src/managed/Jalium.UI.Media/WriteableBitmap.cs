@@ -108,12 +108,9 @@ public sealed partial class WriteableBitmap : BitmapSource
         _dpiY = dpiY > 0 ? dpiY : 96.0;
         _format = pixelFormat;
 
-        // Calculate stride (bytes per row, aligned to 4 bytes)
         var bytesPerPixel = GetBytesPerPixel(pixelFormat);
-        _stride = ((pixelWidth * bytesPerPixel) + 3) & ~3;
-
-        // Allocate back buffer
-        _backBuffer = new byte[_stride * pixelHeight];
+        (_stride, var bufferSize) = GetBufferLayout(pixelWidth, pixelHeight, bytesPerPixel);
+        _backBuffer = new byte[bufferSize];
     }
 
     /// <summary>
@@ -124,15 +121,20 @@ public sealed partial class WriteableBitmap : BitmapSource
     {
         if (source == null) throw new ArgumentNullException(nameof(source));
 
-        _pixelWidth = (int)source.Width;
-        _pixelHeight = (int)source.Height;
-        _dpiX = 96.0;
-        _dpiY = 96.0;
-        _format = PixelFormat.Bgra32;
+        _pixelWidth = source.PixelWidth;
+        _pixelHeight = source.PixelHeight;
+        if (_pixelWidth <= 0)
+            throw new ArgumentOutOfRangeException(nameof(source), "Source pixel width must be positive.");
+        if (_pixelHeight <= 0)
+            throw new ArgumentOutOfRangeException(nameof(source), "Source pixel height must be positive.");
 
-        var bytesPerPixel = 4;
-        _stride = ((PixelWidth * bytesPerPixel) + 3) & ~3;
-        _backBuffer = new byte[_stride * _pixelHeight];
+        _dpiX = source.DpiX > 0 ? source.DpiX : 96.0;
+        _dpiY = source.DpiY > 0 ? source.DpiY : 96.0;
+        _format = source.Format;
+
+        var bytesPerPixel = GetBytesPerPixel(_format);
+        (_stride, var bufferSize) = GetBufferLayout(_pixelWidth, _pixelHeight, bytesPerPixel);
+        _backBuffer = new byte[bufferSize];
 
         // Copy pixels from source
         source.CopyPixels(_backBuffer, _stride, 0);
@@ -217,6 +219,9 @@ public sealed partial class WriteableBitmap : BitmapSource
     public void WritePixels(Int32Rect sourceRect, byte[] pixels, int stride, int offset)
     {
         if (pixels == null) throw new ArgumentNullException(nameof(pixels));
+        if ((uint)offset > (uint)pixels.Length)
+            throw new ArgumentOutOfRangeException(nameof(offset));
+
         WritePixels(sourceRect, new ReadOnlySpan<byte>(pixels, offset, pixels.Length - offset), stride);
     }
 
@@ -233,18 +238,23 @@ public sealed partial class WriteableBitmap : BitmapSource
         var width = sourceRect.Width;
         var height = sourceRect.Height;
 
-        if (x < 0 || y < 0 || x + width > _pixelWidth || y + height > _pixelHeight)
+        if (x < 0 || y < 0 || width < 0 || height < 0 ||
+            x > _pixelWidth - width || y > _pixelHeight - height)
+        {
             throw new ArgumentOutOfRangeException(nameof(sourceRect));
+        }
 
         var bytesPerPixel = GetBytesPerPixel(_format);
-        var rowBytes = width * bytesPerPixel;
+        var rowBytes = checked(width * bytesPerPixel);
 
         if (stride <= 0) stride = rowBytes;
         if (rowBytes > stride)
             throw new ArgumentOutOfRangeException(nameof(stride), "Source stride is smaller than the row width.");
 
-        var requiredSrcBytes = stride * (height - 1) + rowBytes;
-        if (height > 0 && pixels.Length < requiredSrcBytes)
+        var requiredSrcBytes = height == 0
+            ? 0L
+            : ((long)stride * (height - 1)) + rowBytes;
+        if (requiredSrcBytes > int.MaxValue || pixels.Length < requiredSrcBytes)
             throw new ArgumentException("Source pixel buffer is smaller than the requested rectangle.", nameof(pixels));
 
         if (x == 0 && y == 0 && width == _pixelWidth && height == _pixelHeight && stride == _stride)
@@ -257,8 +267,8 @@ public sealed partial class WriteableBitmap : BitmapSource
             var dstX = x * bytesPerPixel;
             for (var row = 0; row < height; row++)
             {
-                var srcStart = row * stride;
-                var dstStart = (y + row) * _stride + dstX;
+                var srcStart = checked(row * stride);
+                var dstStart = checked(((y + row) * _stride) + dstX);
                 pixels.Slice(srcStart, rowBytes).CopyTo(new Span<byte>(_backBuffer, dstStart, rowBytes));
             }
         }
@@ -272,6 +282,7 @@ public sealed partial class WriteableBitmap : BitmapSource
     public void WritePixels(Int32Rect sourceRect, nint buffer, int bufferSize, int stride)
     {
         if (buffer == IntPtr.Zero) throw new ArgumentNullException(nameof(buffer));
+        ArgumentOutOfRangeException.ThrowIfNegative(bufferSize);
 
         var pixels = new byte[bufferSize];
         Marshal.Copy(buffer, pixels, 0, bufferSize);
@@ -298,19 +309,38 @@ public sealed partial class WriteableBitmap : BitmapSource
     /// <inheritdoc />
     public override void CopyPixels(Int32Rect sourceRect, byte[] pixels, int stride, int offset)
     {
+        ArgumentNullException.ThrowIfNull(pixels);
+
         var x = sourceRect.X;
         var y = sourceRect.Y;
         var width = sourceRect.Width == 0 ? _pixelWidth : sourceRect.Width;
         var height = sourceRect.Height == 0 ? _pixelHeight : sourceRect.Height;
 
+        if (x < 0 || y < 0 || width < 0 || height < 0 ||
+            x > _pixelWidth - width || y > _pixelHeight - height)
+        {
+            throw new ArgumentOutOfRangeException(nameof(sourceRect));
+        }
+
         var bytesPerPixel = GetBytesPerPixel(_format);
+        var rowBytes = checked(width * bytesPerPixel);
+        if (stride < rowBytes)
+            throw new ArgumentOutOfRangeException(nameof(stride), "Destination stride is smaller than the row width.");
+
+        if (offset < 0)
+            throw new ArgumentOutOfRangeException(nameof(offset));
+
+        var requiredBytes = height == 0
+            ? (long)offset
+            : (long)offset + ((long)(height - 1) * stride) + rowBytes;
+        if (requiredBytes > pixels.Length)
+            throw new ArgumentException("Destination pixel buffer is too small.", nameof(pixels));
 
         for (var row = 0; row < height; row++)
         {
-            var srcOffset = ((y + row) * _stride) + (x * bytesPerPixel);
-            var dstOffset = offset + (row * stride);
-            var bytesToCopy = Math.Min(width * bytesPerPixel, stride);
-            Array.Copy(_backBuffer, srcOffset, pixels, dstOffset, bytesToCopy);
+            var srcOffset = checked(((y + row) * _stride) + (x * bytesPerPixel));
+            var dstOffset = checked(offset + (row * stride));
+            Array.Copy(_backBuffer, srcOffset, pixels, dstOffset, rowBytes);
         }
     }
 
@@ -684,22 +714,31 @@ public sealed partial class WriteableBitmap : BitmapSource
 
     private static int GetBytesPerPixel(PixelFormat format)
     {
-        if (format == PixelFormat.Bgra32 || format == PixelFormat.Rgba32 ||
-            format == PixelFormat.Rgb32 || format == PixelFormat.Pbgra32)
+        var bitsPerPixel = format.BitsPerPixel;
+        if (bitsPerPixel < 8 || (bitsPerPixel & 7) != 0)
         {
-            return 4;
+            throw new NotSupportedException(
+                $"WriteableBitmap does not support packed {bitsPerPixel}-bit pixel format '{format}'.");
         }
 
-        if (format == PixelFormat.Bgr24 || format == PixelFormat.Rgb24)
+        return bitsPerPixel / 8;
+    }
+
+    private static (int Stride, int BufferSize) GetBufferLayout(
+        int pixelWidth,
+        int pixelHeight,
+        int bytesPerPixel)
+    {
+        var rowBytes = (long)pixelWidth * bytesPerPixel;
+        var stride = (rowBytes + 3L) & ~3L;
+        if (stride > int.MaxValue || pixelHeight > int.MaxValue / stride)
         {
-            return 3;
+            throw new ArgumentOutOfRangeException(
+                nameof(pixelWidth),
+                "The requested bitmap exceeds the maximum managed buffer size.");
         }
 
-        if (format == PixelFormat.Gray16)
-        {
-            return 2;
-        }
-
-        return format == PixelFormat.Gray8 ? 1 : 4;
+        var bufferSize = stride * pixelHeight;
+        return ((int)stride, (int)bufferSize);
     }
 }

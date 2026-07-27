@@ -135,19 +135,29 @@ jalium_media_status_t ApplyOutputFormat(jalium_video_decoder_t* d, AMediaFormat*
 
     if (w <= 0 || h <= 0) return JALIUM_MEDIA_E_DECODE_FAILED;
 
-    d->width        = static_cast<uint32_t>(w);
-    d->height       = static_cast<uint32_t>(h);
-    d->stride_bytes = jalium_media_compute_stride(d->width);
+    const uint32_t output_width = static_cast<uint32_t>(w);
+    const uint32_t output_height = static_cast<uint32_t>(h);
+    uint32_t output_stride = 0;
+    size_t needed = 0;
+    if (!jalium_media_compute_bgra_layout(
+            output_width, output_height, &output_stride, &needed)) {
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
+    }
+
+    d->width        = output_width;
+    d->height       = output_height;
+    d->stride_bytes = output_stride;
     d->source_stride = static_cast<uint32_t>(stride > 0 ? stride : w);
     d->source_slice_height = static_cast<uint32_t>(slice_height > 0 ? slice_height : h);
     d->color_format = (color != 0) ? color : COLOR_FormatYUV420Flexible;
     d->color_standard = std_;
 
-    const size_t needed = static_cast<size_t>(d->stride_bytes) * d->height;
     if (d->frame_buffer_size < needed) {
+        auto* replacement = static_cast<uint8_t*>(
+            jalium_media_aligned_alloc(needed));
+        if (!replacement) return JALIUM_MEDIA_E_OUT_OF_MEMORY;
         if (d->frame_buffer) jalium_media_aligned_free(d->frame_buffer);
-        d->frame_buffer = static_cast<uint8_t*>(jalium_media_aligned_alloc(needed));
-        if (!d->frame_buffer) return JALIUM_MEDIA_E_OUT_OF_MEMORY;
+        d->frame_buffer = replacement;
         d->frame_buffer_size = needed;
     }
     return JALIUM_MEDIA_OK;
@@ -177,28 +187,63 @@ jalium_media_status_t ConvertAImageToBgra(jalium_video_decoder_t* d, AImage* img
     if (AImage_getPlaneRowStride(img, 2, &vRowStride)      != AMEDIA_OK) return JALIUM_MEDIA_E_DECODE_FAILED;
     if (AImage_getPlanePixelStride(img, 2, &vPixelStride)  != AMEDIA_OK) vPixelStride = 1;
 
+    const uint32_t chroma_width = d->width / 2u + d->width % 2u;
+    const uint32_t chroma_height = d->height / 2u + d->height % 2u;
+    if (yPixelStride != 1 ||
+        !IsYuvPlaneReadable(
+            yPlane, yLen, yRowStride, yPixelStride,
+            d->width, d->height)) {
+        return JALIUM_MEDIA_E_DECODE_FAILED;
+    }
+
     auto matrix = DeriveColorMatrix(d->color_standard, d->height);
 
     if (uPixelStride == 2 && vPixelStride == 2) {
+        const uintptr_t u_address = reinterpret_cast<uintptr_t>(uPlane);
+        const uintptr_t v_address = reinterpret_cast<uintptr_t>(vPlane);
+        const uintptr_t plane_delta = u_address > v_address
+            ? u_address - v_address
+            : v_address - u_address;
+        if (plane_delta != 1u || chroma_width > UINT32_MAX / 2u) {
+            return JALIUM_MEDIA_E_DECODE_FAILED;
+        }
+        uint8_t* uv_plane = u_address < v_address ? uPlane : vPlane;
+        const int32_t uv_length = u_address < v_address ? uLen : vLen;
+        const int32_t uv_row_stride =
+            u_address < v_address ? uRowStride : vRowStride;
+        if (!IsYuvPlaneReadable(
+                uv_plane, uv_length, uv_row_stride, 1,
+                chroma_width * 2u, chroma_height)) {
+            return JALIUM_MEDIA_E_DECODE_FAILED;
+        }
         // Semi-planar: U and V are interleaved. NV12: U first; NV21: V first.
         // The AImage API gives separate U/V "planes" that are actually views into
         // the same interleaved buffer offset by 1 byte. Detect order by pointer math.
-        if (uPlane > vPlane) {
+        if (u_address > v_address) {
             // V comes first → NV21
             NV21ToBgra(yPlane, static_cast<uint32_t>(yRowStride),
-                       vPlane, static_cast<uint32_t>(vRowStride),
+                       uv_plane, static_cast<uint32_t>(uv_row_stride),
                        d->frame_buffer, d->stride_bytes,
                        d->width, d->height,
                        matrix, d->format);
         } else {
             // U comes first → NV12
             NV12ToBgra(yPlane, static_cast<uint32_t>(yRowStride),
-                       uPlane, static_cast<uint32_t>(uRowStride),
+                       uv_plane, static_cast<uint32_t>(uv_row_stride),
                        d->frame_buffer, d->stride_bytes,
                        d->width, d->height,
                        matrix, d->format);
         }
     } else {
+        if (uPixelStride != 1 || vPixelStride != 1 ||
+            !IsYuvPlaneReadable(
+                uPlane, uLen, uRowStride, uPixelStride,
+                chroma_width, chroma_height) ||
+            !IsYuvPlaneReadable(
+                vPlane, vLen, vRowStride, vPixelStride,
+                chroma_width, chroma_height)) {
+            return JALIUM_MEDIA_E_DECODE_FAILED;
+        }
         // Planar I420.
         I420ToBgra(yPlane, static_cast<uint32_t>(yRowStride),
                    uPlane, static_cast<uint32_t>(uRowStride),
@@ -231,23 +276,37 @@ jalium_media_status_t ConvertOutputBufferToBgra(
         return JALIUM_MEDIA_E_DECODE_FAILED;
     }
 
-    const size_t output_size = static_cast<size_t>(d->stride_bytes) * d->height;
+    uint32_t output_stride = 0;
+    size_t output_size = 0;
+    if (!jalium_media_compute_bgra_layout(
+            d->width, d->height, &output_stride, &output_size) ||
+        output_stride != d->stride_bytes) {
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
+    }
     if (d->frame_buffer_size < output_size) {
+        auto* replacement = static_cast<uint8_t*>(
+            jalium_media_aligned_alloc(output_size));
+        if (!replacement) return JALIUM_MEDIA_E_OUT_OF_MEMORY;
         if (d->frame_buffer) jalium_media_aligned_free(d->frame_buffer);
-        d->frame_buffer = static_cast<uint8_t*>(jalium_media_aligned_alloc(output_size));
-        if (!d->frame_buffer) {
-            d->frame_buffer_size = 0;
-            return JALIUM_MEDIA_E_OUT_OF_MEMORY;
-        }
+        d->frame_buffer = replacement;
         d->frame_buffer_size = output_size;
     }
 
+    if (static_cast<size_t>(slice_height) >
+        SIZE_MAX / static_cast<size_t>(y_stride)) {
+        return JALIUM_MEDIA_E_DECODE_FAILED;
+    }
     const size_t y_size = static_cast<size_t>(y_stride) * slice_height;
     const uint32_t chroma_rows = (slice_height + 1u) / 2u;
     auto matrix = DeriveColorMatrix(d->color_standard, d->height);
 
     if (IsNV12Format(d->color_format)) {
-        const size_t required = y_size + static_cast<size_t>(y_stride) * chroma_rows;
+        if (static_cast<size_t>(chroma_rows) >
+            (SIZE_MAX - y_size) / static_cast<size_t>(y_stride)) {
+            return JALIUM_MEDIA_E_DECODE_FAILED;
+        }
+        const size_t required =
+            y_size + static_cast<size_t>(y_stride) * chroma_rows;
         if (size < required) return JALIUM_MEDIA_E_DECODE_FAILED;
 
         NV12ToBgra(data, y_stride,
@@ -261,6 +320,9 @@ jalium_media_status_t ConvertOutputBufferToBgra(
     if (IsI420Format(d->color_format)) {
         const uint32_t chroma_stride = (y_stride + 1u) / 2u;
         const size_t chroma_size = static_cast<size_t>(chroma_stride) * chroma_rows;
+        if (chroma_size > (SIZE_MAX - y_size) / 2u) {
+            return JALIUM_MEDIA_E_DECODE_FAILED;
+        }
         const size_t required = y_size + chroma_size * 2u;
         if (size < required) return JALIUM_MEDIA_E_DECODE_FAILED;
 
@@ -288,6 +350,8 @@ jalium_media_status_t VideoDecoderOpenFile(
 {
     if (!IsInitialized()) return JALIUM_MEDIA_E_NOT_INITIALIZED;
     if (!utf8_path || !out_decoder) return JALIUM_MEDIA_E_INVALID_ARG;
+    if (!jalium_media_is_valid_pixel_format(requested_format))
+        return JALIUM_MEDIA_E_INVALID_ARG;
     *out_decoder = nullptr;
 
     int fd = open(utf8_path, O_RDONLY | O_CLOEXEC);

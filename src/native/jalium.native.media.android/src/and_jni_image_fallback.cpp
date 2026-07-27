@@ -192,7 +192,14 @@ jalium_media_status_t DecodeImageMemoryViaJni(
     const uint32_t width  = info.width;
     const uint32_t height = info.height;
     const uint32_t stride = info.stride;
-    const size_t   size_bytes = static_cast<size_t>(stride) * height;
+    size_t size_bytes = 0;
+    if (!jalium_media_compute_bgra_buffer_layout(
+            width, height, stride, &size_bytes)) {
+        AndroidBitmap_unlockPixels(env, bitmap);
+        env->CallVoidMethod(bitmap, g_recycleMethod);
+        env->DeleteLocalRef(bitmap);
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
+    }
 
     auto* pixels = static_cast<uint8_t*>(jalium_media_aligned_alloc(size_bytes));
     if (!pixels) {

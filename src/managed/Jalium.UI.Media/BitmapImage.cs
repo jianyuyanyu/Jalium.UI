@@ -164,12 +164,13 @@ public sealed partial class BitmapImage : BitmapSource, IDisposable, IReclaimabl
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
 
+        int minimumStride = PixelBufferLayout.GetMinimumStride(width);
         if (stride <= 0)
         {
-            stride = checked(width * 4);
+            stride = minimumStride;
         }
 
-        var minimumBytes = checked(stride * height);
+        var minimumBytes = PixelBufferLayout.GetRequiredByteCount(width, height, stride);
         if (pixels.Length < minimumBytes)
         {
             throw new ArgumentException("Pixel buffer is smaller than the specified dimensions and stride.", nameof(pixels));

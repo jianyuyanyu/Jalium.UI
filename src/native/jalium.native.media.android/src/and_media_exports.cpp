@@ -36,6 +36,8 @@ JALIUM_MEDIA_API jalium_media_status_t jalium_image_decode_memory(
     jalium_image_t*       out_image)
 {
     if (!data || size == 0 || !out_image) return JALIUM_MEDIA_E_INVALID_ARG;
+    if (size > JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES)
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
     return jalium::media::android::DecodeImageMemory(data, size, requested_format, out_image);
 }
 
@@ -55,6 +57,8 @@ JALIUM_MEDIA_API jalium_media_status_t jalium_image_read_dimensions(
     uint32_t*      out_height)
 {
     if (!data || size == 0 || !out_width || !out_height) return JALIUM_MEDIA_E_INVALID_ARG;
+    if (size > JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES)
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
     return jalium::media::android::ReadImageDimensions(data, size, out_width, out_height);
 }
 
@@ -68,6 +72,21 @@ JALIUM_MEDIA_API jalium_media_status_t jalium_image_read_frame_count(
     // to the single-frame decode path; once we wire up a real animated GIF
     // decoder (or ImageDecoder.decodeDrawable) replace this stub.
     if (!data || size == 0 || !out_frame_count) return JALIUM_MEDIA_E_INVALID_ARG;
+    *out_frame_count = 0;
+    if (size > JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES)
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    const auto status = jalium::media::android::ReadImageDimensions(
+        data, size, &width, &height);
+    uint32_t stride = 0;
+    size_t pixel_size = 0;
+    if (status != JALIUM_MEDIA_OK ||
+        !jalium_media_compute_bgra_layout(
+            width, height, &stride, &pixel_size)) {
+        return status == JALIUM_MEDIA_OK
+            ? JALIUM_MEDIA_E_OUT_OF_MEMORY : status;
+    }
     *out_frame_count = 1;
     return JALIUM_MEDIA_OK;
 }
@@ -81,6 +100,8 @@ JALIUM_MEDIA_API jalium_media_status_t jalium_image_decode_frame(
     uint32_t*             out_delay_ms)
 {
     if (!data || size == 0 || !out_image) return JALIUM_MEDIA_E_INVALID_ARG;
+    if (size > JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES)
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
     if (frame_index != 0) return JALIUM_MEDIA_E_INVALID_ARG;
     if (out_delay_ms) *out_delay_ms = 0;
     return jalium::media::android::DecodeImageMemory(data, size, requested_format, out_image);

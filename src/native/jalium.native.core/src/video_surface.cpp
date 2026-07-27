@@ -38,18 +38,25 @@ JALIUM_API JaliumVideoSurface* jalium_video_surface_create(
     uint32_t       height,
     uint32_t       format_hint)
 {
-    if (!ctx || width == 0 || height == 0) {
+    jalium::PackedBgraLayout layout{};
+    if (!ctx ||
+        !jalium::TryComputeTightlyPackedBgraLayout(width, height, layout)) {
         return nullptr;
     }
-    auto backend = jalium::GetBackendFromContext(ctx);
-    if (!backend) {
+
+    try {
+        auto backend = jalium::GetBackendFromContext(ctx);
+        if (!backend) {
+            return nullptr;
+        }
+        auto* surface = backend->CreateVideoSurface(width, height, format_hint);
+        if (surface) {
+            g_stats.surfacesCreated.fetch_add(1, std::memory_order_relaxed);
+        }
+        return reinterpret_cast<JaliumVideoSurface*>(surface);
+    } catch (...) {
         return nullptr;
     }
-    auto* surface = backend->CreateVideoSurface(width, height, format_hint);
-    if (surface) {
-        g_stats.surfacesCreated.fetch_add(1, std::memory_order_relaxed);
-    }
-    return reinterpret_cast<JaliumVideoSurface*>(surface);
 }
 
 JALIUM_API JaliumVideoSurface* jalium_video_surface_wrap_external(
@@ -59,18 +66,23 @@ JALIUM_API JaliumVideoSurface* jalium_video_surface_wrap_external(
     if (!ctx || !desc || desc->width == 0 || desc->height == 0) {
         return nullptr;
     }
-    auto backend = jalium::GetBackendFromContext(ctx);
-    if (!backend) {
+    try {
+        auto backend = jalium::GetBackendFromContext(ctx);
+        if (!backend) {
+            return nullptr;
+        }
+        auto* surface = backend->WrapExternalVideoSurface(desc);
+        if (surface) {
+            g_stats.surfacesCreated.fetch_add(1, std::memory_order_relaxed);
+            g_stats.externalImports.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_stats.externalImportFails.fetch_add(1, std::memory_order_relaxed);
+        }
+        return reinterpret_cast<JaliumVideoSurface*>(surface);
+    } catch (...) {
+        g_stats.externalImportFails.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
-    auto* surface = backend->WrapExternalVideoSurface(desc);
-    if (surface) {
-        g_stats.surfacesCreated.fetch_add(1, std::memory_order_relaxed);
-        g_stats.externalImports.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        g_stats.externalImportFails.fetch_add(1, std::memory_order_relaxed);
-    }
-    return reinterpret_cast<JaliumVideoSurface*>(surface);
 }
 
 JALIUM_API int32_t jalium_video_surface_lock(
@@ -83,8 +95,14 @@ JALIUM_API int32_t jalium_video_surface_lock(
     if (!s || !out_ptr || !out_stride) {
         return 0;
     }
-    auto* impl = reinterpret_cast<jalium::VideoSurface*>(s);
-    return impl->Lock(out_ptr, out_stride) ? 1 : 0;
+    try {
+        auto* impl = reinterpret_cast<jalium::VideoSurface*>(s);
+        return impl->Lock(out_ptr, out_stride) ? 1 : 0;
+    } catch (...) {
+        *out_ptr = nullptr;
+        *out_stride = 0;
+        return 0;
+    }
 }
 
 JALIUM_API int32_t jalium_video_surface_unlock(
@@ -92,40 +110,60 @@ JALIUM_API int32_t jalium_video_surface_unlock(
     const JaliumVideoSurfaceDirtyRect*   dirty_rect_or_null)
 {
     if (!s) return 0;
-    auto* impl = reinterpret_cast<jalium::VideoSurface*>(s);
-    const bool ok = impl->Unlock(dirty_rect_or_null);
-    if (ok) {
-        // Optimistic count: per-surface upload byte count is what the backend
-        // can measure precisely; here we just bump a generic Unlock counter.
-        // Stage 2 D3D12 / Software impls will fill in cpuUploadBytes.
-        g_stats.cpuUploads.fetch_add(1, std::memory_order_relaxed);
+    try {
+        auto* impl = reinterpret_cast<jalium::VideoSurface*>(s);
+        const bool ok = impl->Unlock(dirty_rect_or_null);
+        if (ok) {
+            // Optimistic count: per-surface upload byte count is what the backend
+            // can measure precisely; here we just bump a generic Unlock counter.
+            // Stage 2 D3D12 / Software impls will fill in cpuUploadBytes.
+            g_stats.cpuUploads.fetch_add(1, std::memory_order_relaxed);
+        }
+        return ok ? 1 : 0;
+    } catch (...) {
+        return 0;
     }
-    return ok ? 1 : 0;
 }
 
 JALIUM_API uint32_t jalium_video_surface_get_width(JaliumVideoSurface* s)
 {
     if (!s) return 0;
-    return reinterpret_cast<jalium::VideoSurface*>(s)->GetWidth();
+    try {
+        return reinterpret_cast<jalium::VideoSurface*>(s)->GetWidth();
+    } catch (...) {
+        return 0;
+    }
 }
 
 JALIUM_API uint32_t jalium_video_surface_get_height(JaliumVideoSurface* s)
 {
     if (!s) return 0;
-    return reinterpret_cast<jalium::VideoSurface*>(s)->GetHeight();
+    try {
+        return reinterpret_cast<jalium::VideoSurface*>(s)->GetHeight();
+    } catch (...) {
+        return 0;
+    }
 }
 
 JALIUM_API JaliumVideoSurfaceKind jalium_video_surface_get_kind(JaliumVideoSurface* s)
 {
     if (!s) return JALIUM_VS_KIND_BGRA8_CPU;
-    return reinterpret_cast<jalium::VideoSurface*>(s)->GetKind();
+    try {
+        return reinterpret_cast<jalium::VideoSurface*>(s)->GetKind();
+    } catch (...) {
+        return JALIUM_VS_KIND_BGRA8_CPU;
+    }
 }
 
 JALIUM_API void jalium_video_surface_destroy(JaliumVideoSurface* s)
 {
     if (!s) return;
     g_stats.surfacesDestroyed.fetch_add(1, std::memory_order_relaxed);
-    reinterpret_cast<jalium::VideoSurface*>(s)->Release();
+    try {
+        reinterpret_cast<jalium::VideoSurface*>(s)->Release();
+    } catch (...) {
+        // C++ exceptions must never cross the public C ABI.
+    }
 }
 
 JALIUM_API void jalium_render_target_draw_video_surface(
@@ -136,9 +174,13 @@ JALIUM_API void jalium_render_target_draw_video_surface(
     int32_t scaling_mode)
 {
     if (!rt || !s) return;
-    auto* target  = reinterpret_cast<jalium::RenderTarget*>(rt);
-    auto* surface = reinterpret_cast<jalium::VideoSurface*>(s);
-    target->DrawVideoSurface(surface, x, y, w, h, opacity, scaling_mode);
+    try {
+        auto* target  = reinterpret_cast<jalium::RenderTarget*>(rt);
+        auto* surface = reinterpret_cast<jalium::VideoSurface*>(s);
+        target->DrawVideoSurface(surface, x, y, w, h, opacity, scaling_mode);
+    } catch (...) {
+        // Rendering failures are reported by the backend/device-status path.
+    }
 }
 
 JALIUM_API void jalium_query_video_surface_stats(JaliumVideoSurfaceStats* out)

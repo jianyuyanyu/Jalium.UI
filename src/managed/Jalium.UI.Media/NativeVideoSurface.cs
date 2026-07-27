@@ -1,4 +1,5 @@
 using Jalium.UI.Media.Native;
+using Jalium.UI.Media.Imaging;
 
 namespace Jalium.UI.Media;
 
@@ -66,8 +67,8 @@ public sealed class NativeVideoSurface : IDisposable
     public static NativeVideoSurface CreateBgra8(nint context, int width, int height)
     {
         if (context == nint.Zero) throw new ArgumentException("Native context is null.", nameof(context));
-        if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width));
-        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height));
+        int stride = PixelBufferLayout.GetMinimumStride(width);
+        _ = PixelBufferLayout.GetRequiredByteCount(width, height, stride);
 
         var handle = NativeVideoSurfaceInterop.Create(
             context, (uint)width, (uint)height, (uint)NativeVideoSurfaceFormat.Bgra8);
@@ -113,7 +114,11 @@ public sealed class NativeVideoSurface : IDisposable
         nint context,
         in NativeMediaInterop.NativeVideoDecoderGpuDescriptor source)
     {
-        if (context == nint.Zero || source.Width == 0 || source.Height == 0)
+        if (context == nint.Zero ||
+            source.Width == 0 ||
+            source.Height == 0 ||
+            source.Width > int.MaxValue ||
+            source.Height > int.MaxValue)
             return null;
 
         static NativeVideoSurfaceInterop.NativeVideoSurfacePlaneDescriptor Convert(
@@ -175,9 +180,28 @@ public sealed class NativeVideoSurface : IDisposable
                 throw new InvalidOperationException(
                     "jalium_video_surface_lock failed — surface kind doesn't support CPU staging or backend stub.");
             }
-            int byteCount = checked((int)stride * _height);
+            int strideAsInt;
+            int byteCount;
+            try
+            {
+                strideAsInt = checked((int)stride);
+                byteCount = PixelBufferLayout.GetRequiredByteCount(
+                    _width, _height, strideAsInt);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                NativeVideoSurfaceInterop.Unlock(_handle, nint.Zero);
+                throw new InvalidOperationException(
+                    "jalium_video_surface_lock returned an invalid BGRA8 pixel layout.");
+            }
+            catch (OverflowException)
+            {
+                NativeVideoSurfaceInterop.Unlock(_handle, nint.Zero);
+                throw new InvalidOperationException(
+                    "jalium_video_surface_lock returned a stride that exceeds managed limits.");
+            }
             var span = new Span<byte>(ptr, byteCount);
-            return new LockedFrame(this, span, (int)stride);
+            return new LockedFrame(this, span, strideAsInt);
         }
     }
 

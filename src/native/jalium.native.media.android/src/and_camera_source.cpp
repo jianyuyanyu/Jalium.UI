@@ -260,6 +260,8 @@ jalium_media_status_t CameraOpen(
 {
     if (!IsInitialized()) return JALIUM_MEDIA_E_NOT_INITIALIZED;
     if (!device_id || !out_source) return JALIUM_MEDIA_E_INVALID_ARG;
+    if (!jalium_media_is_valid_pixel_format(requested_format))
+        return JALIUM_MEDIA_E_INVALID_ARG;
     *out_source = nullptr;
 
     auto* src = new (std::nothrow) jalium_camera_source();
@@ -284,9 +286,16 @@ jalium_media_status_t CameraOpen(
     }
     ACameraMetadata_free(meta);
 
+    uint32_t selected_stride = 0;
+    size_t selected_size = 0;
+    if (!jalium_media_compute_bgra_layout(
+            selW, selH, &selected_stride, &selected_size)) {
+        CameraClose(src);
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
+    }
     src->width        = selW;
     src->height       = selH;
-    src->stride_bytes = jalium_media_compute_stride(selW);
+    src->stride_bytes = selected_stride;
     src->format       = requested_format;
 
     constexpr int32_t YUV_420_888 = 0x23;
@@ -355,58 +364,107 @@ jalium_media_status_t CameraReadFrame(
     media_status_t rc = AImageReader_acquireLatestImage(src->reader, &img);
     if (rc == AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE) return JALIUM_MEDIA_E_DECODE_FAILED;
     if (rc != AMEDIA_OK || !img) return JALIUM_MEDIA_E_DECODE_FAILED;
+    const auto reject_image = [&](jalium_media_status_t status) {
+        AImage_delete(img);
+        return status;
+    };
 
     int32_t imgW = 0, imgH = 0;
-    AImage_getWidth(img, &imgW);
-    AImage_getHeight(img, &imgH);
-    if (imgW > 0 && imgH > 0 &&
-        (static_cast<uint32_t>(imgW) != src->width || static_cast<uint32_t>(imgH) != src->height)) {
-        src->width = static_cast<uint32_t>(imgW);
-        src->height = static_cast<uint32_t>(imgH);
-        src->stride_bytes = jalium_media_compute_stride(src->width);
+    if (AImage_getWidth(img, &imgW) != AMEDIA_OK ||
+        AImage_getHeight(img, &imgH) != AMEDIA_OK ||
+        imgW <= 0 || imgH <= 0) {
+        return reject_image(JALIUM_MEDIA_E_DECODE_FAILED);
+    }
+    const uint32_t frame_width = static_cast<uint32_t>(imgW);
+    const uint32_t frame_height = static_cast<uint32_t>(imgH);
+    uint32_t frame_stride = 0;
+    size_t needed = 0;
+    if (!jalium_media_compute_bgra_layout(
+            frame_width, frame_height, &frame_stride, &needed)) {
+        return reject_image(JALIUM_MEDIA_E_OUT_OF_MEMORY);
     }
 
-    const size_t needed = static_cast<size_t>(src->stride_bytes) * src->height;
     if (src->frame_buffer_size < needed) {
+        auto* replacement = static_cast<uint8_t*>(
+            jalium_media_aligned_alloc(needed));
+        if (!replacement)
+            return reject_image(JALIUM_MEDIA_E_OUT_OF_MEMORY);
         if (src->frame_buffer) jalium_media_aligned_free(src->frame_buffer);
-        src->frame_buffer = static_cast<uint8_t*>(jalium_media_aligned_alloc(needed));
-        if (!src->frame_buffer) {
-            AImage_delete(img);
-            return JALIUM_MEDIA_E_OUT_OF_MEMORY;
-        }
+        src->frame_buffer = replacement;
         src->frame_buffer_size = needed;
     }
+    src->width = frame_width;
+    src->height = frame_height;
+    src->stride_bytes = frame_stride;
 
     // Read planes (Y, U, V) — same layout as MediaCodec output.
     uint8_t *yPlane = nullptr, *uPlane = nullptr, *vPlane = nullptr;
     int32_t  yLen = 0, uLen = 0, vLen = 0;
     int32_t  yRowStride = 0, uRowStride = 0, vRowStride = 0;
-    int32_t  uPixelStride = 0, vPixelStride = 0;
+    int32_t  yPixelStride = 0, uPixelStride = 0, vPixelStride = 0;
 
-    AImage_getPlaneData(img, 0, &yPlane, &yLen);
-    AImage_getPlaneRowStride(img, 0, &yRowStride);
-    AImage_getPlaneData(img, 1, &uPlane, &uLen);
-    AImage_getPlaneRowStride(img, 1, &uRowStride);
-    AImage_getPlanePixelStride(img, 1, &uPixelStride);
-    AImage_getPlaneData(img, 2, &vPlane, &vLen);
-    AImage_getPlaneRowStride(img, 2, &vRowStride);
-    AImage_getPlanePixelStride(img, 2, &vPixelStride);
+    if (AImage_getPlaneData(img, 0, &yPlane, &yLen) != AMEDIA_OK ||
+        AImage_getPlaneRowStride(img, 0, &yRowStride) != AMEDIA_OK ||
+        AImage_getPlanePixelStride(img, 0, &yPixelStride) != AMEDIA_OK ||
+        AImage_getPlaneData(img, 1, &uPlane, &uLen) != AMEDIA_OK ||
+        AImage_getPlaneRowStride(img, 1, &uRowStride) != AMEDIA_OK ||
+        AImage_getPlanePixelStride(img, 1, &uPixelStride) != AMEDIA_OK ||
+        AImage_getPlaneData(img, 2, &vPlane, &vLen) != AMEDIA_OK ||
+        AImage_getPlaneRowStride(img, 2, &vRowStride) != AMEDIA_OK ||
+        AImage_getPlanePixelStride(img, 2, &vPixelStride) != AMEDIA_OK) {
+        return reject_image(JALIUM_MEDIA_E_DECODE_FAILED);
+    }
+
+    const uint32_t chroma_width = src->width / 2u + src->width % 2u;
+    const uint32_t chroma_height = src->height / 2u + src->height % 2u;
+    if (yPixelStride != 1 ||
+        !IsYuvPlaneReadable(
+            yPlane, yLen, yRowStride, yPixelStride,
+            src->width, src->height)) {
+        return reject_image(JALIUM_MEDIA_E_DECODE_FAILED);
+    }
 
     auto matrix = (src->height <= 576) ? ColorMatrix::Bt601 : ColorMatrix::Bt709;
 
     if (uPixelStride == 2 && vPixelStride == 2) {
-        if (uPlane > vPlane) {
+        const uintptr_t u_address = reinterpret_cast<uintptr_t>(uPlane);
+        const uintptr_t v_address = reinterpret_cast<uintptr_t>(vPlane);
+        const uintptr_t plane_delta = u_address > v_address
+            ? u_address - v_address
+            : v_address - u_address;
+        if (plane_delta != 1u || chroma_width > UINT32_MAX / 2u) {
+            return reject_image(JALIUM_MEDIA_E_DECODE_FAILED);
+        }
+        uint8_t* uv_plane = u_address < v_address ? uPlane : vPlane;
+        const int32_t uv_length = u_address < v_address ? uLen : vLen;
+        const int32_t uv_row_stride =
+            u_address < v_address ? uRowStride : vRowStride;
+        if (!IsYuvPlaneReadable(
+                uv_plane, uv_length, uv_row_stride, 1,
+                chroma_width * 2u, chroma_height)) {
+            return reject_image(JALIUM_MEDIA_E_DECODE_FAILED);
+        }
+        if (u_address > v_address) {
             NV21ToBgra(yPlane, static_cast<uint32_t>(yRowStride),
-                       vPlane, static_cast<uint32_t>(vRowStride),
+                       uv_plane, static_cast<uint32_t>(uv_row_stride),
                        src->frame_buffer, src->stride_bytes,
                        src->width, src->height, matrix, src->format);
         } else {
             NV12ToBgra(yPlane, static_cast<uint32_t>(yRowStride),
-                       uPlane, static_cast<uint32_t>(uRowStride),
+                       uv_plane, static_cast<uint32_t>(uv_row_stride),
                        src->frame_buffer, src->stride_bytes,
                        src->width, src->height, matrix, src->format);
         }
     } else {
+        if (uPixelStride != 1 || vPixelStride != 1 ||
+            !IsYuvPlaneReadable(
+                uPlane, uLen, uRowStride, uPixelStride,
+                chroma_width, chroma_height) ||
+            !IsYuvPlaneReadable(
+                vPlane, vLen, vRowStride, vPixelStride,
+                chroma_width, chroma_height)) {
+            return reject_image(JALIUM_MEDIA_E_DECODE_FAILED);
+        }
         I420ToBgra(yPlane, static_cast<uint32_t>(yRowStride),
                    uPlane, static_cast<uint32_t>(uRowStride),
                    vPlane, static_cast<uint32_t>(vRowStride),

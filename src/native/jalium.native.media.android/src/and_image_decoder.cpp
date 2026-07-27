@@ -145,10 +145,20 @@ jalium_media_status_t DecodeWithDecoder(
     }
 
     size_t stride = api.getMinimumStride(decoder);
-    if (stride < static_cast<size_t>(width) * 4u) {
-        stride = static_cast<size_t>(width) * 4u;
+    const uint32_t minimum_stride =
+        jalium_media_compute_stride(static_cast<uint32_t>(width));
+    if (minimum_stride == 0) return JALIUM_MEDIA_E_OUT_OF_MEMORY;
+    if (stride < minimum_stride) stride = minimum_stride;
+
+    size_t buffer_size = 0;
+    if (stride > UINT32_MAX ||
+        !jalium_media_compute_bgra_buffer_layout(
+            static_cast<uint32_t>(width),
+            static_cast<uint32_t>(height),
+            stride,
+            &buffer_size)) {
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
     }
-    size_t buffer_size = stride * static_cast<size_t>(height);
 
     auto* pixels = static_cast<uint8_t*>(jalium_media_aligned_alloc(buffer_size));
     if (!pixels) return JALIUM_MEDIA_E_OUT_OF_MEMORY;

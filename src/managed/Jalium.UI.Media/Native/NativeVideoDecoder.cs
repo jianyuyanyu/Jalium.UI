@@ -79,12 +79,36 @@ public sealed class NativeVideoDecoder : INativeVideoDecoder, INativeGpuVideoDec
         if (status == NativeMediaStatus.EndOfStream) return false;
         NativeMediaException.ThrowIfFailed(status, "jalium_video_decoder_read_frame");
 
+        if (native.Pixels == nint.Zero ||
+            native.Width > int.MaxValue ||
+            native.Height > int.MaxValue ||
+            native.StrideBytes > int.MaxValue)
+        {
+            throw new NativeMediaException(
+                NativeMediaStatus.DecodeFailed,
+                "jalium_video_decoder_read_frame (invalid native frame)");
+        }
+
+        int width = (int)native.Width;
+        int height = (int)native.Height;
+        int stride = (int)native.StrideBytes;
+        int size;
+        try
+        {
+            size = PixelBufferLayout.GetRequiredByteCount(width, height, stride);
+        }
+        catch (ArgumentOutOfRangeException ex)
+        {
+            throw new NativeMediaException(
+                NativeMediaStatus.DecodeFailed,
+                $"jalium_video_decoder_read_frame (invalid pixel layout: {ex.Message})");
+        }
+
         // 帧缓冲由解码器拥有，仅在下次 read_frame / close 之前有效。
         // 这里复制到池化 MediaFrame，调用方拿到的是独立缓冲，可异步消费。
         var pts = TimeSpan.FromMicroseconds(native.PtsMicroseconds);
-        frame = _pool.Rent((int)native.Width, (int)native.Height, (int)native.StrideBytes, pts,
+        frame = _pool.Rent(width, height, stride, pts,
             NativeMediaInterop.FromNative(native.Format));
-        var size = checked((int)native.StrideBytes * (int)native.Height);
         unsafe
         {
             fixed (byte* dst = frame.Pixels.Span)
@@ -103,7 +127,8 @@ public sealed class NativeVideoDecoder : INativeVideoDecoder, INativeGpuVideoDec
         {
             throw new InvalidOperationException("Open must be called before Seek.");
         }
-        var status = NativeMediaInterop.jalium_video_decoder_seek_microseconds(_handle, (long)position.TotalMicroseconds);
+        long microseconds = position <= TimeSpan.Zero ? 0L : position.Ticks / 10L;
+        var status = NativeMediaInterop.jalium_video_decoder_seek_microseconds(_handle, microseconds);
         NativeMediaException.ThrowIfFailed(status, "jalium_video_decoder_seek_microseconds");
     }
 

@@ -36,6 +36,8 @@ JALIUM_MEDIA_API jalium_media_status_t jalium_image_decode_memory(
     jalium_image_t*       out_image)
 {
     if (!data || size == 0 || !out_image) return JALIUM_MEDIA_E_INVALID_ARG;
+    if (size > JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES)
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
     return jalium::media::win::WicDecodeMemory(data, size, requested_format, out_image);
 }
 
@@ -55,6 +57,8 @@ JALIUM_MEDIA_API jalium_media_status_t jalium_image_read_dimensions(
     uint32_t*      out_height)
 {
     if (!data || size == 0 || !out_width || !out_height) return JALIUM_MEDIA_E_INVALID_ARG;
+    if (size > JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES)
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
     return jalium::media::win::WicReadDimensions(data, size, out_width, out_height);
 }
 
@@ -64,6 +68,8 @@ JALIUM_MEDIA_API jalium_media_status_t jalium_image_read_frame_count(
     uint32_t*      out_frame_count)
 {
     if (!data || size == 0 || !out_frame_count) return JALIUM_MEDIA_E_INVALID_ARG;
+    if (size > JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES)
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
     return jalium::media::win::WicReadFrameCount(data, size, out_frame_count);
 }
 
@@ -76,6 +82,8 @@ JALIUM_MEDIA_API jalium_media_status_t jalium_image_decode_frame(
     uint32_t*             out_delay_ms)
 {
     if (!data || size == 0 || !out_image) return JALIUM_MEDIA_E_INVALID_ARG;
+    if (size > JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES)
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
     return jalium::media::win::WicDecodeFrame(
         data, size, frame_index, requested_format, out_image, out_delay_ms);
 }

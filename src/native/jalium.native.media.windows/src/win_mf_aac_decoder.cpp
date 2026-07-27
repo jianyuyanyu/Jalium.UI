@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <string>
 #include <vector>
@@ -140,6 +141,9 @@ struct MfAacDecoderImpl final : jalium::audio::audio_decoder_impl {
     {
         if (!reader) return JALIUM_MEDIA_E_INVALID_ARG;
         if (position_us < 0) position_us = 0;
+        if (position_us > std::numeric_limits<int64_t>::max() / 10) {
+            return JALIUM_MEDIA_E_INVALID_ARG;
+        }
 
         // MF positions are 100-ns ticks (LONGLONG).
         PROPVARIANT pos;
@@ -242,6 +246,15 @@ jalium::audio::audio_decoder_impl* MfAacDecoderOpenFile(
             nativeType->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &nativeSampleRate);
             nativeType->Release();
         }
+    }
+
+    if (nativeChannels == 0 ||
+        nativeChannels > UINT32_MAX / 4u ||
+        nativeSampleRate == 0 ||
+        nativeSampleRate > UINT32_MAX / (4u * nativeChannels)) {
+        reader->Release();
+        outStatus = JALIUM_MEDIA_E_UNSUPPORTED_FORMAT;
+        return nullptr;
     }
 
     // Configure output media type as IEEE float PCM at the native rate.

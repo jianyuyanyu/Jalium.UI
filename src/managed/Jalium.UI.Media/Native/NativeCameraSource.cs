@@ -50,10 +50,34 @@ public sealed class NativeCameraSource : INativeCameraSource
         if (status == NativeMediaStatus.EndOfStream) return false;
         NativeMediaException.ThrowIfFailed(status, "jalium_camera_read_frame");
 
+        if (native.Pixels == nint.Zero ||
+            native.Width > int.MaxValue ||
+            native.Height > int.MaxValue ||
+            native.StrideBytes > int.MaxValue)
+        {
+            throw new NativeMediaException(
+                NativeMediaStatus.DecodeFailed,
+                "jalium_camera_read_frame (invalid native frame)");
+        }
+
+        int width = (int)native.Width;
+        int height = (int)native.Height;
+        int stride = (int)native.StrideBytes;
+        int size;
+        try
+        {
+            size = PixelBufferLayout.GetRequiredByteCount(width, height, stride);
+        }
+        catch (ArgumentOutOfRangeException ex)
+        {
+            throw new NativeMediaException(
+                NativeMediaStatus.DecodeFailed,
+                $"jalium_camera_read_frame (invalid pixel layout: {ex.Message})");
+        }
+
         var pts = TimeSpan.FromMicroseconds(native.PtsMicroseconds);
-        frame = _pool.Rent((int)native.Width, (int)native.Height, (int)native.StrideBytes, pts,
+        frame = _pool.Rent(width, height, stride, pts,
             NativeMediaInterop.FromNative(native.Format));
-        var size = checked((int)native.StrideBytes * (int)native.Height);
         unsafe
         {
             fixed (byte* dst = frame.Pixels.Span)
