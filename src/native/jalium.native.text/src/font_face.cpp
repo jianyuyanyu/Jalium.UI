@@ -4,6 +4,7 @@
 #include "cff_charstring.h"
 
 #include <algorithm>
+#include <exception>
 
 namespace jalium {
 
@@ -14,15 +15,33 @@ using font::SfntTables;
 static constexpr uint16_t kFsSelUseTypoMetrics = 0x0080;
 
 std::unique_ptr<FontFace> FontFace::Parse(std::vector<uint8_t> bytes, int faceIndex) {
-    return Parse(std::make_shared<const std::vector<uint8_t>>(std::move(bytes)), faceIndex);
+    if (bytes.size() < 12 || bytes.size() > kMaxFontFileBytes) return nullptr;
+    try {
+        return Parse(
+            std::make_shared<const std::vector<uint8_t>>(std::move(bytes)),
+            faceIndex);
+    } catch (const std::exception&) {
+        // Parsing is a rejection boundary: allocation/standard-library
+        // failures must not escape to C ABI callers.
+        return nullptr;
+    }
 }
 
 std::unique_ptr<FontFace> FontFace::Parse(std::shared_ptr<const std::vector<uint8_t>> bytes, int faceIndex) {
-    if (!bytes || bytes->size() < 12) return nullptr;
-    auto face = std::unique_ptr<FontFace>(new FontFace());
-    face->bytes_ = std::move(bytes);
-    if (!face->ParseInternal(faceIndex) || !face->valid_) return nullptr;
-    return face;
+    if (!bytes || bytes->size() < 12 ||
+        bytes->size() > kMaxFontFileBytes) {
+        return nullptr;
+    }
+    try {
+        auto face = std::unique_ptr<FontFace>(new FontFace());
+        face->bytes_ = std::move(bytes);
+        if (!face->ParseInternal(faceIndex) || !face->valid_) return nullptr;
+        return face;
+    } catch (const std::exception&) {
+        // The documented parser contract is noexcept-by-result for malformed
+        // or resource-exhausting input.
+        return nullptr;
+    }
 }
 
 FontFace::~FontFace() = default;

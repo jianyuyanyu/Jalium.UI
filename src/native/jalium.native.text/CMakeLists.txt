@@ -135,4 +135,36 @@ if(JALIUM_TEXT_BUILD_TESTS AND UNIX AND NOT APPLE AND NOT ANDROID)
              COMMAND jalium.native.text.tests)
     set_tests_properties(jalium.native.text.pixel-and-fallback PROPERTIES
         SKIP_RETURN_CODE 77)
+
+    add_executable(jalium.native.string-util.tests
+        tests/string_util_tests.cpp)
+    target_include_directories(jalium.native.string-util.tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../jalium.native.core/include)
+    add_test(NAME jalium.native.core.string-util-bounds
+             COMMAND jalium.native.string-util.tests)
+
+    add_executable(jalium.native.abi-guard.tests
+        tests/abi_guard_tests.cpp)
+    target_include_directories(jalium.native.abi-guard.tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../jalium.native.core/include)
+    add_test(NAME jalium.native.core.abi-guard
+             COMMAND jalium.native.abi-guard.tests)
+
+    add_executable(jalium.native.geometry-safety.tests
+        tests/geometry_safety_tests.cpp)
+    target_include_directories(jalium.native.geometry-safety.tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../jalium.native.core/include)
+    add_test(NAME jalium.native.core.geometry-safety
+             COMMAND jalium.native.geometry-safety.tests)
+
+    add_executable(jalium.native.font-parser-fuzz.tests
+        tests/font_parser_fuzz_tests.cpp)
+    target_include_directories(jalium.native.font-parser-fuzz.tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../jalium.native.core/include)
+    target_link_libraries(jalium.native.font-parser-fuzz.tests PRIVATE
+        jalium.native.text.test-support
+        jalium.native.core)
+    add_test(NAME jalium.native.text.font-parser-boundaries
+             COMMAND jalium.native.font-parser-fuzz.tests)
 endif()

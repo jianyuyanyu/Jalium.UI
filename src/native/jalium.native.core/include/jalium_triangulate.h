@@ -872,15 +872,32 @@ inline void FlattenCubicBezier(float p0x, float p0y, float p1x, float p1y,
                                 float p2x, float p2y, float p3x, float p3y,
                                 std::vector<float>& outPoints, float tolerance = 1.0f,
                                 int depth = 0) {
+    constexpr int kMaxDepth = 16;
+    const auto appendFiniteEndpoint = [&] {
+        if (std::isfinite(p3x) && std::isfinite(p3y)) {
+            outPoints.push_back(p3x);
+            outPoints.push_back(p3y);
+        }
+    };
+    if (!std::isfinite(p0x) || !std::isfinite(p0y) ||
+        !std::isfinite(p1x) || !std::isfinite(p1y) ||
+        !std::isfinite(p2x) || !std::isfinite(p2y) ||
+        !std::isfinite(p3x) || !std::isfinite(p3y)) {
+        appendFiniteEndpoint();
+        return;
+    }
+    if (!std::isfinite(tolerance) || tolerance <= 0.0f) {
+        tolerance = 1.0f;
+    }
+
     // Check if the curve is flat enough by measuring control point deviation
     float dx = p3x - p0x;
     float dy = p3y - p0y;
     float len2 = dx * dx + dy * dy;
 
-    if (len2 < 1e-6f || depth >= 32) {
+    if (!std::isfinite(len2) || len2 < 1e-6f || depth >= kMaxDepth) {
         // Degenerate or max depth reached: output endpoint
-        outPoints.push_back(p3x);
-        outPoints.push_back(p3y);
+        appendFiniteEndpoint();
         return;
     }
 
@@ -891,20 +908,23 @@ inline void FlattenCubicBezier(float p0x, float p0y, float p1x, float p1y,
     float d1 = std::abs(nx * (p1x - p0x) + ny * (p1y - p0y));
     float d2 = std::abs(nx * (p2x - p0x) + ny * (p2y - p0y));
 
-    if (d1 + d2 <= tolerance) {
+    if (!std::isfinite(d1) || !std::isfinite(d2) ||
+        !std::isfinite(d1 + d2) || d1 + d2 <= tolerance) {
         // Flat enough - output endpoint
-        outPoints.push_back(p3x);
-        outPoints.push_back(p3y);
+        appendFiniteEndpoint();
         return;
     }
 
     // Subdivide at t=0.5
-    float m01x = (p0x + p1x) * 0.5f, m01y = (p0y + p1y) * 0.5f;
-    float m12x = (p1x + p2x) * 0.5f, m12y = (p1y + p2y) * 0.5f;
-    float m23x = (p2x + p3x) * 0.5f, m23y = (p2y + p3y) * 0.5f;
-    float m012x = (m01x + m12x) * 0.5f, m012y = (m01y + m12y) * 0.5f;
-    float m123x = (m12x + m23x) * 0.5f, m123y = (m12y + m23y) * 0.5f;
-    float midx = (m012x + m123x) * 0.5f, midy = (m012y + m123y) * 0.5f;
+    const auto midpoint = [](float a, float b) {
+        return a * 0.5f + b * 0.5f;
+    };
+    float m01x = midpoint(p0x, p1x), m01y = midpoint(p0y, p1y);
+    float m12x = midpoint(p1x, p2x), m12y = midpoint(p1y, p2y);
+    float m23x = midpoint(p2x, p3x), m23y = midpoint(p2y, p3y);
+    float m012x = midpoint(m01x, m12x), m012y = midpoint(m01y, m12y);
+    float m123x = midpoint(m12x, m23x), m123y = midpoint(m12y, m23y);
+    float midx = midpoint(m012x, m123x), midy = midpoint(m012y, m123y);
 
     FlattenCubicBezier(p0x, p0y, m01x, m01y, m012x, m012y, midx, midy, outPoints, tolerance, depth + 1);
     FlattenCubicBezier(midx, midy, m123x, m123y, m23x, m23y, p3x, p3y, outPoints, tolerance, depth + 1);
@@ -919,15 +939,29 @@ inline void FlattenQuadraticBezier(float p0x, float p0y, float p1x, float p1y,
                                     std::vector<float>& outPoints, float tolerance = 1.0f,
                                     int depth = 0) {
     constexpr int kMaxDepth = 16;
+    const auto appendFiniteEndpoint = [&] {
+        if (std::isfinite(p2x) && std::isfinite(p2y)) {
+            outPoints.push_back(p2x);
+            outPoints.push_back(p2y);
+        }
+    };
+    if (!std::isfinite(p0x) || !std::isfinite(p0y) ||
+        !std::isfinite(p1x) || !std::isfinite(p1y) ||
+        !std::isfinite(p2x) || !std::isfinite(p2y)) {
+        appendFiniteEndpoint();
+        return;
+    }
+    if (!std::isfinite(tolerance) || tolerance <= 0.0f) {
+        tolerance = 1.0f;
+    }
 
     // Measure distance of control point from chord (p0→p2)
     float dx = p2x - p0x;
     float dy = p2y - p0y;
     float len2 = dx * dx + dy * dy;
 
-    if (len2 < 1e-6f || depth >= kMaxDepth) {
-        outPoints.push_back(p2x);
-        outPoints.push_back(p2y);
+    if (!std::isfinite(len2) || len2 < 1e-6f || depth >= kMaxDepth) {
+        appendFiniteEndpoint();
         return;
     }
 
@@ -936,16 +970,18 @@ inline void FlattenQuadraticBezier(float p0x, float p0y, float p1x, float p1y,
     float ny = dx * invLen;
     float dist = std::abs(nx * (p1x - p0x) + ny * (p1y - p0y));
 
-    if (dist <= tolerance) {
-        outPoints.push_back(p2x);
-        outPoints.push_back(p2y);
+    if (!std::isfinite(dist) || dist <= tolerance) {
+        appendFiniteEndpoint();
         return;
     }
 
     // De Casteljau subdivision at t=0.5
-    float m01x = (p0x + p1x) * 0.5f, m01y = (p0y + p1y) * 0.5f;
-    float m12x = (p1x + p2x) * 0.5f, m12y = (p1y + p2y) * 0.5f;
-    float midx = (m01x + m12x) * 0.5f, midy = (m01y + m12y) * 0.5f;
+    const auto midpoint = [](float a, float b) {
+        return a * 0.5f + b * 0.5f;
+    };
+    float m01x = midpoint(p0x, p1x), m01y = midpoint(p0y, p1y);
+    float m12x = midpoint(p1x, p2x), m12y = midpoint(p1y, p2y);
+    float midx = midpoint(m01x, m12x), midy = midpoint(m01y, m12y);
 
     FlattenQuadraticBezier(p0x, p0y, m01x, m01y, midx, midy, outPoints, tolerance, depth + 1);
     FlattenQuadraticBezier(midx, midy, m12x, m12y, p2x, p2y, outPoints, tolerance, depth + 1);
