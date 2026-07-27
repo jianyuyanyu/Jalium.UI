@@ -46,6 +46,8 @@ namespace ja = jalium::audio;
 
 namespace {
 
+constexpr size_t kMaxBufferedAudioBytes = 512u * 1024u * 1024u;
+
 inline audio_decoder_impl* AsImpl(jalium_audio_decoder_t* d) noexcept
 {
     return reinterpret_cast<audio_decoder_impl*>(d);
@@ -92,7 +94,13 @@ bool ReadFileToBytes(const char* utf8Path,
         outStatus = JALIUM_MEDIA_E_INVALID_ARG;
         return false;
     }
-    std::wstring wpath(static_cast<size_t>(wlen), L'\0');
+    std::wstring wpath;
+    try {
+        wpath.assign(static_cast<size_t>(wlen), L'\0');
+    } catch (...) {
+        outStatus = JALIUM_MEDIA_E_OUT_OF_MEMORY;
+        return false;
+    }
     MultiByteToWideChar(CP_UTF8, 0, utf8Path, -1, wpath.data(), wlen);
     if (!wpath.empty() && wpath.back() == L'\0') wpath.pop_back();
     if (_wfopen_s(&fp, wpath.c_str(), L"rb") != 0 || !fp) {
@@ -113,14 +121,25 @@ bool ReadFileToBytes(const char* utf8Path,
         return false;
     }
     const long size = std::ftell(fp);
-    if (size < 0) {
+    if (size < 0 || static_cast<uint64_t>(size) > kMaxBufferedAudioBytes) {
+        std::fclose(fp);
+        outStatus = size < 0 ? JALIUM_MEDIA_E_IO
+                             : JALIUM_MEDIA_E_OUT_OF_MEMORY;
+        return false;
+    }
+    if (std::fseek(fp, 0, SEEK_SET) != 0) {
         std::fclose(fp);
         outStatus = JALIUM_MEDIA_E_IO;
         return false;
     }
-    std::fseek(fp, 0, SEEK_SET);
 
-    out.resize(static_cast<size_t>(size));
+    try {
+        out.resize(static_cast<size_t>(size));
+    } catch (...) {
+        std::fclose(fp);
+        outStatus = JALIUM_MEDIA_E_OUT_OF_MEMORY;
+        return false;
+    }
     const size_t got = (size == 0) ? 0 : std::fread(out.data(), 1, out.size(), fp);
     std::fclose(fp);
     if (got != out.size()) {
@@ -241,6 +260,30 @@ audio_decoder_impl* DecoderOpenFile(const char* utf8Path,
         return impl;
     }
 
+#if !defined(_WIN32)
+    // POSIX codec file APIs already accept UTF-8 paths. Keep them streaming
+    // instead of duplicating the complete WAV/FLAC/MP3/Vorbis payload in RAM.
+    auto* direct_impl = DispatchOpenFile(utf8Path, codec, outStatus);
+    if (!direct_impl && outStatus == JALIUM_MEDIA_OK) {
+        outStatus = JALIUM_MEDIA_E_DECODE_FAILED;
+    }
+    return direct_impl;
+#else
+    // The bundled Windows codec file APIs use the active ANSI code page.
+    // ASCII paths are lossless through those APIs and can retain streaming;
+    // only non-ASCII paths need the wide-file memory bridge below.
+    const bool ascii_path = std::all_of(
+        utf8Path,
+        utf8Path + std::strlen(utf8Path),
+        [](unsigned char value) { return value < 0x80u; });
+    if (ascii_path) {
+        auto* direct_impl = DispatchOpenFile(utf8Path, codec, outStatus);
+        if (!direct_impl && outStatus == JALIUM_MEDIA_OK) {
+            outStatus = JALIUM_MEDIA_E_DECODE_FAILED;
+        }
+        return direct_impl;
+    }
+
     // For every other codec (WAV / FLAC / MP3 / Vorbis) the single-header
     // libs go through libc fopen() under the hood. On Windows that uses the
     // ANSI codepage and silently fails on any UTF-8 path with CJK / accented
@@ -264,6 +307,7 @@ audio_decoder_impl* DecoderOpenFile(const char* utf8Path,
     // codec remains valid after this assignment.
     impl->owned_bytes = std::move(bytes);
     return impl;
+#endif
 }
 
 audio_decoder_impl* DecoderOpenMemory(const uint8_t* data,
@@ -273,6 +317,10 @@ audio_decoder_impl* DecoderOpenMemory(const uint8_t* data,
 {
     if (!data || size == 0) {
         outStatus = JALIUM_MEDIA_E_INVALID_ARG;
+        return nullptr;
+    }
+    if (size > kMaxBufferedAudioBytes) {
+        outStatus = JALIUM_MEDIA_E_OUT_OF_MEMORY;
         return nullptr;
     }
     jalium_audio_codec_t codec = (hint != JALIUM_ACODEC_AUTO)

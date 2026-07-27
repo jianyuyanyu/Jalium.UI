@@ -144,7 +144,7 @@ public sealed class NativeAudioDecoder : INativeAudioDecoder, INativeAudioTrackS
         if (_disposed) throw new System.ObjectDisposedException(nameof(NativeAudioDecoder));
         if (_handle == nint.Zero) throw new System.InvalidOperationException("Decoder is not open.");
 
-        long us = position < System.TimeSpan.Zero ? 0L : (long)(position.TotalMilliseconds * 1000.0);
+        long us = position <= System.TimeSpan.Zero ? 0L : position.Ticks / 10L;
         var st = NativeAudioInterop.jalium_audio_decoder_seek_us(_handle, us);
         NativeMediaException.ThrowIfFailed(st, "jalium_audio_decoder_seek_us");
     }
