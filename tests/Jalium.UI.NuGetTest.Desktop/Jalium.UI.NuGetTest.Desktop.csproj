@@ -5,10 +5,11 @@
     <OutputType>Exe</OutputType>
     <RootNamespace>Jalium.UI.NuGetTest.Desktop</RootNamespace>
     <IsPackable>false</IsPackable>
+    <JaliumPackageVersion Condition="'$(JaliumPackageVersion)' == ''">$(Version)</JaliumPackageVersion>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Jalium.UI.Desktop" Version="26.9.10" />
+    <PackageReference Include="Jalium.UI.Desktop" Version="$(JaliumPackageVersion)" />
   </ItemGroup>
 
 </Project>

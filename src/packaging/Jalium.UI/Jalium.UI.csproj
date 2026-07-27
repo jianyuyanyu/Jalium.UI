@@ -14,6 +14,10 @@
     <IncludeBuildOutput>false</IncludeBuildOutput>
     <IncludeSymbols>false</IncludeSymbols>
     <SuppressDependenciesWhenPacking>false</SuppressDependenciesWhenPacking>
+    <!-- This is intentionally a dependency-only metapackage. NuGet's
+         framework/lib parity analyzer otherwise reports NU5128 because
+         there is no Jalium.UI implementation assembly in the nupkg. -->
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
 
     <!--
       元包没有任何 .cs 源文件,不应生成 reference assembly。
@@ -44,13 +48,16 @@
   <ItemGroup>
     <ProjectReference Include="..\..\managed\Jalium.UI.Build\Jalium.UI.Build.csproj" ReferenceOutputAssembly="false" PrivateAssets="none" />
     <ProjectReference Include="..\..\managed\Jalium.UI.Xaml.SourceGenerator\Jalium.UI.Xaml.SourceGenerator.csproj"
+                      BuildReference="false"
+                      ReferenceOutputAssembly="false"
                       PrivateAssets="none"
-                      UndefineProperties="PublishAot;PublishTrimmed;PublishSingleFile;PublishReadyToRun;SelfContained;RuntimeIdentifier;RuntimeIdentifiers" />
+                      UndefineProperties="PublishAot;PublishTrimmed;PublishSingleFile;PublishReadyToRun;SelfContained;RuntimeIdentifier;RuntimeIdentifiers;IsTrimmable;IsAotCompatible" />
   </ItemGroup>
 
   <!-- Ensure Jalium.UI.Build appears as a NuGet dependency (DevelopmentDependency suppresses it by default) -->
   <ItemGroup>
     <PackageReference Include="Jalium.UI.Build" Version="$(Version)" PrivateAssets="none" />
+    <PackageReference Include="Jalium.UI.Xaml.SourceGenerator" Version="$(Version)" PrivateAssets="none" />
   </ItemGroup>
 
 </Project>
