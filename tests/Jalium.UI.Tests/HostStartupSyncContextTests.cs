@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Jalium.UI;
 using Jalium.UI.Threading;
 
@@ -18,8 +19,9 @@ public class HostStartupSyncContextTests
     {
         // Reproduce JaliumApp.Run's host-start state on a dedicated worker thread: a
         // DispatcherSynchronizationContext is Current and there is NO running message pump. The
-        // awaited work captures the context two different ways — Task.Yield posts on this thread,
-        // Task.Delay's timer posts from a pool thread — and both must resume off the (idle) pump.
+        // awaited work captures the current context, then resumes from a dedicated OS thread. This
+        // preserves the deadlock reproduction without making the test depend on shared ThreadPool
+        // availability while the rest of the suite is running in parallel.
         Exception? workerError = null;
         SynchronizationContext? installedContext = null;
         SynchronizationContext? restoredContext = null;
@@ -35,8 +37,7 @@ public class HostStartupSyncContextTests
 
                 JaliumApp.RunHostOperationBlocking(async () =>
                 {
-                    await Task.Yield();
-                    await Task.Delay(20);
+                    await new DedicatedThreadContextYieldAwaitable();
                 });
 
                 restoredContext = SynchronizationContext.Current;
@@ -66,5 +67,49 @@ public class HostStartupSyncContextTests
 
         // The prior context is restored after the blocking call (finally block), not left null.
         Assert.Same(installedContext, restoredContext);
+    }
+
+    private readonly struct DedicatedThreadContextYieldAwaitable
+    {
+        public Awaiter GetAwaiter() => default;
+
+        public readonly struct Awaiter : INotifyCompletion
+        {
+            public bool IsCompleted => false;
+
+            public void GetResult()
+            {
+            }
+
+            public void OnCompleted(Action continuation)
+            {
+                ArgumentNullException.ThrowIfNull(continuation);
+
+                // Capture exactly what Task.Yield would observe at the await boundary. With the
+                // production fix this is null, so the continuation runs directly on this private
+                // thread. Without the fix it posts to the idle DispatcherSynchronizationContext
+                // and the outer finite wait reports the original deadlock.
+                SynchronizationContext? capturedContext = SynchronizationContext.Current;
+                var continuationThread = new Thread(() =>
+                {
+                    if (capturedContext is null)
+                    {
+                        continuation();
+                    }
+                    else
+                    {
+                        capturedContext.Post(
+                            static state => ((Action)state!).Invoke(),
+                            continuation);
+                    }
+                })
+                {
+                    IsBackground = true,
+                    Name = "HostStartupSyncContextTests.Continuation",
+                };
+
+                continuationThread.Start();
+            }
+        }
     }
 }
