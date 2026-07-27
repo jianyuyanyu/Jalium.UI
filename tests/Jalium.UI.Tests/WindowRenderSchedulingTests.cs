@@ -912,7 +912,16 @@ public class WindowRenderSchedulingTests
         protected override Size MeasureOverride(Size availableSize)
         {
             _window.AddDirtyRect(UiThreadRect);
-            Task.Run(() => _window.AddDirtyRect(BackgroundRect)).GetAwaiter().GetResult();
+            var backgroundThread = new Thread(() => _window.AddDirtyRect(BackgroundRect))
+            {
+                IsBackground = true,
+                Name = "WindowRenderSchedulingTests.DirtyRect",
+            };
+            backgroundThread.Start();
+            if (!backgroundThread.Join(TimeSpan.FromSeconds(5)))
+            {
+                throw new TimeoutException("Background dirty-rect thread did not exit.");
+            }
             return new Size(100, 100);
         }
     }
