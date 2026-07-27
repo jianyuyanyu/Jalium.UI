@@ -44,6 +44,53 @@ template <typename T>
 void SafeRelease(T*& p) {
     if (p) { p->Release(); p = nullptr; }
 }
+
+HMODULE LoadSiblingLibrary(const wchar_t* libraryName) noexcept {
+    static const unsigned char moduleAnchor = 0;
+    HMODULE module = nullptr;
+    if (!::GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&moduleAnchor),
+            &module)) {
+        return nullptr;
+    }
+
+    wchar_t modulePath[32768] = {};
+    const DWORD length = ::GetModuleFileNameW(
+        module,
+        modulePath,
+        static_cast<DWORD>(sizeof(modulePath) / sizeof(modulePath[0])));
+    if (length == 0 ||
+        length >= sizeof(modulePath) / sizeof(modulePath[0])) {
+        ::SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return nullptr;
+    }
+
+    size_t directoryLength = length;
+    while (directoryLength > 0 &&
+           modulePath[directoryLength - 1] != L'\\' &&
+           modulePath[directoryLength - 1] != L'/') {
+        --directoryLength;
+    }
+    const size_t libraryNameLength = wcslen(libraryName);
+    if (directoryLength == 0 ||
+        directoryLength + libraryNameLength >=
+            sizeof(modulePath) / sizeof(modulePath[0])) {
+        ::SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return nullptr;
+    }
+
+    std::memcpy(
+        modulePath + directoryLength,
+        libraryName,
+        (libraryNameLength + 1) * sizeof(wchar_t));
+    return ::LoadLibraryExW(
+        modulePath,
+        nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+}
 #endif
 
 } // namespace
@@ -62,7 +109,7 @@ bool VulkanShaderCompiler::EnsureLoaded() {
     if (attempted_) return available_;
     attempted_ = true;
 
-    HMODULE mod = ::LoadLibraryW(L"dxcompiler.dll");
+    HMODULE mod = LoadSiblingLibrary(L"dxcompiler.dll");
     if (!mod) {
         ::OutputDebugStringA(
             "[Jalium Vulkan] dxcompiler.dll not found — runtime HLSL "

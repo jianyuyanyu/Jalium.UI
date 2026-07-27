@@ -5,6 +5,26 @@ using Xunit.Abstractions;
 namespace Jalium.UI.Tests.DeviceLost;
 
 /// <summary>
+/// Reports the real-GPU child-process tests as skipped when their optional
+/// harness project is not present in a source/package snapshot. When the
+/// harness exists, the tests run unchanged.
+/// </summary>
+internal sealed class RequiresDeviceLostHarnessFactAttribute : FactAttribute
+{
+    public RequiresDeviceLostHarnessFactAttribute()
+    {
+        try
+        {
+            _ = DeviceRemovalInjectionTests.LocateHarness();
+        }
+        catch (FileNotFoundException ex)
+        {
+            Skip = ex.Message;
+        }
+    }
+}
+
+/// <summary>
 /// Real-GPU runtime verification for the GPU-switch (mid-frame DEVICE_REMOVED)
 /// hardening. Each test drives tests/Jalium.UI.DeviceLostHarness as a child
 /// process, with the device removed via the official debug trigger
@@ -39,7 +59,7 @@ public sealed class DeviceRemovalInjectionTests
 
     public DeviceRemovalInjectionTests(ITestOutputHelper output) => _output = output;
 
-    [Fact]
+    [RequiresDeviceLostHarnessFact]
     public void MidFrameRemoval_RecoversAndReRealizesRetainedLayers()
         => RunScenario(
             "midframe",
@@ -56,7 +76,7 @@ public sealed class DeviceRemovalInjectionTests
                 "SCENARIO midframe complete",
             ]);
 
-    [Fact]
+    [RequiresDeviceLostHarnessFact]
     public void MidEffectCaptureRemoval_RecoversWithoutWedgingCaptureState()
         => RunScenario(
             "capture",
@@ -70,7 +90,7 @@ public sealed class DeviceRemovalInjectionTests
                 "SCENARIO capture complete",
             ]);
 
-    [Fact]
+    [RequiresDeviceLostHarnessFact]
     public void EscapedRetainedLayer_RefusedByGenerationGuard_ReleasedNotLeaked()
         => RunScenario(
             "escapedhandle",
@@ -86,7 +106,7 @@ public sealed class DeviceRemovalInjectionTests
                 "SCENARIO escapedhandle complete",
             ]);
 
-    [Fact]
+    [RequiresDeviceLostHarnessFact]
     public void MultiWindow_StaggeredRecovery_OrphanVsGraveyardDiscrimination()
         => RunScenario(
             "multiwindow",
@@ -102,7 +122,7 @@ public sealed class DeviceRemovalInjectionTests
                 "SCENARIO multiwindow complete",
             ]);
 
-    [Fact]
+    [RequiresDeviceLostHarnessFact]
     public void RenderThread_SingleMarshaledRecovery_NoBackendDowngrade()
         => RunScenario(
             "renderthread",
@@ -123,7 +143,7 @@ public sealed class DeviceRemovalInjectionTests
     /// not downgrade. This is the same scenario the Vulkan variant below runs — the
     /// portable subset that does not touch retained layers or the #921 hooks.
     /// </summary>
-    [Fact]
+    [RequiresDeviceLostHarnessFact]
     public void DeviceLost_D3D12_RecoversWithFreshDeviceNoDowngrade()
         => RunScenario(
             "devicelost",
@@ -150,7 +170,7 @@ public sealed class DeviceRemovalInjectionTests
     /// instead of only via a physical GPU TDR. Skips (exit 2) when the Vulkan
     /// backend is unavailable in this environment (no Vulkan runtime / DLL).
     /// </summary>
-    [Fact]
+    [RequiresDeviceLostHarnessFact]
     public void DeviceLost_Vulkan_RecoversWithFreshDeviceNoDowngrade()
         => RunScenario(
             "devicelost",
@@ -180,7 +200,7 @@ public sealed class DeviceRemovalInjectionTests
     /// that drops the AbortFrame leaves the list open (listClosed=0) and, under the
     /// D3D12 debug layer, trips OBJECT_DELETED_WHILE_STILL_IN_USE / a crash.
     /// </summary>
-    [Fact]
+    [RequiresDeviceLostHarnessFact]
     public void SameThreadLeakedCommandListResize_ClosesListBeforeFreeingBackBuffers()
         => RunScenario(
             "leakedresize",
@@ -212,7 +232,7 @@ public sealed class DeviceRemovalInjectionTests
     /// under the debug layer, trips OBJECT_DELETED_WHILE_STILL_IN_USE). The survival
     /// signal is debug-layer-independent, the same way leakedresize asserts listClosed.
     /// </summary>
-    [Fact]
+    [RequiresDeviceLostHarnessFact]
     public void VelloOutputTextureOrphan_RetiredOnFenceGatedList_NotFreedWhileReferenced()
         => RunScenario(
             "vellooutputorphan",
@@ -228,6 +248,111 @@ public sealed class DeviceRemovalInjectionTests
                 "BACKEND_OK d3d12",
                 "SCENARIO vellooutputorphan complete",
             ]);
+
+    [RequiresDeviceLostHarnessFact]
+    public Task BackendLoader_DoesNotLoadBackendFromCurrentWorkingDirectory()
+        => RunIsolatedLoaderProbe(
+            "jalium.native.software.dll",
+            "backend-load-probe",
+            "BACKEND_LOAD_BLOCKED");
+
+    [RequiresDeviceLostHarnessFact]
+    public Task BrowserLoader_DoesNotLoadWebView2LoaderFromCurrentWorkingDirectory()
+        => RunIsolatedLoaderProbe(
+            "WebView2Loader.dll",
+            "browser-load-probe",
+            "BROWSER_LOADER_BLOCKED");
+
+    private async Task RunIsolatedLoaderProbe(
+        string payloadFileName,
+        string scenario,
+        string expectedMarker)
+    {
+        string harness = LocateHarness();
+        string harnessDirectory = Path.GetDirectoryName(harness)!;
+        string temporaryRoot = Path.Combine(
+            Path.GetTempPath(),
+            "Jalium.UI.BackendLoader." + Guid.NewGuid().ToString("N"));
+        string applicationDirectory = Path.Combine(temporaryRoot, "app");
+        string workingDirectory = Path.Combine(temporaryRoot, "working");
+        Directory.CreateDirectory(applicationDirectory);
+        Directory.CreateDirectory(workingDirectory);
+
+        try
+        {
+            foreach (string source in Directory.EnumerateFiles(
+                         harnessDirectory, "*", SearchOption.TopDirectoryOnly))
+            {
+                if (string.Equals(
+                        Path.GetFileName(source),
+                        payloadFileName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                File.Copy(
+                    source,
+                    Path.Combine(applicationDirectory, Path.GetFileName(source)));
+            }
+
+            string backendSource = Path.Combine(
+                harnessDirectory, payloadFileName);
+            Assert.True(
+                File.Exists(backendSource),
+                $"backend-loader probe requires {backendSource}");
+            File.Copy(
+                backendSource,
+                Path.Combine(workingDirectory, payloadFileName));
+
+            string isolatedHarness = Path.Combine(
+                applicationDirectory, Path.GetFileName(harness));
+            var startInfo = new ProcessStartInfo(
+                isolatedHarness, scenario)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8,
+                UseShellExecute = false,
+                WorkingDirectory = workingDirectory,
+            };
+            startInfo.Environment.Remove("JALIUM_RENDER_BACKEND");
+
+            using var process = new Process { StartInfo = startInfo };
+            Assert.True(process.Start(), $"failed to start {isolatedHarness}");
+            Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync();
+            Task<string> stderrTask = process.StandardError.ReadToEndAsync();
+            using var timeout = new CancellationTokenSource(
+                TimeSpan.FromSeconds(30));
+            try
+            {
+                await process.WaitForExitAsync(timeout.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                try { process.Kill(entireProcessTree: true); }
+                catch (InvalidOperationException) { }
+                Assert.Fail("backend-loader probe timed out");
+            }
+
+            string[] output = await Task.WhenAll(stdoutTask, stderrTask);
+            string transcript = output[0] + output[1];
+            _output.WriteLine(transcript);
+            Assert.Equal(0, process.ExitCode);
+            Assert.Contains(
+                expectedMarker,
+                transcript,
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (Directory.Exists(temporaryRoot))
+            {
+                Directory.Delete(temporaryRoot, recursive: true);
+            }
+        }
+    }
 
     private void RunScenario(string scenario, bool renderThread, string[] requiredMarkers, string backend = "d3d12")
     {
@@ -293,7 +418,7 @@ public sealed class DeviceRemovalInjectionTests
         string Snapshot() { lock (transcript) return transcript.ToString(); }
     }
 
-    private static string LocateHarness()
+    internal static string LocateHarness()
     {
         // AppContext.BaseDirectory = tests/Jalium.UI.Tests/bin/<Config>/<tfm>/
         // The harness (a ProjectReference with ReferenceOutputAssembly=false, so

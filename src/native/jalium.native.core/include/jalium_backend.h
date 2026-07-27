@@ -4,10 +4,75 @@
 #include "jalium_api.h"  // JALIUM_API export/import decorator for TextFormat helpers
 #include "jalium_video_surface.h"  // JaliumVideoSurfaceKind / Descriptor / DirtyRect
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 
 namespace jalium {
+
+struct PackedBgraLayout {
+    size_t rowBytes = 0;
+    size_t packedBytes = 0;
+};
+
+/// Validates a 32-bpp source layout without allowing uint32_t arithmetic to
+/// wrap. The packed representation is capped at UINT32_MAX because the shared
+/// bitmap ABI and the D3D12 bitmap storage size are both 32-bit.
+inline bool TryComputePackedBgraLayout(
+    uint32_t width,
+    uint32_t height,
+    uint32_t stride,
+    PackedBgraLayout& layout) noexcept
+{
+    layout = {};
+    if (width == 0 || height == 0) {
+        return false;
+    }
+
+    const uint64_t rowBytes64 = static_cast<uint64_t>(width) * 4u;
+    if (rowBytes64 > stride ||
+        rowBytes64 > std::numeric_limits<size_t>::max()) {
+        return false;
+    }
+
+    const size_t rowBytes = static_cast<size_t>(rowBytes64);
+    if (height > std::numeric_limits<uint32_t>::max() / rowBytes) {
+        return false;
+    }
+
+    const size_t packedBytes = rowBytes * static_cast<size_t>(height);
+    if (height > 1) {
+        const size_t rowsBeforeLast = static_cast<size_t>(height - 1);
+        if (rowsBeforeLast >
+            (std::numeric_limits<size_t>::max() - rowBytes) / stride) {
+            return false;
+        }
+    }
+
+    layout.rowBytes = rowBytes;
+    layout.packedBytes = packedBytes;
+    return true;
+}
+
+inline bool TryComputeTightlyPackedBgraLayout(
+    uint32_t width,
+    uint32_t height,
+    PackedBgraLayout& layout) noexcept
+{
+    const uint64_t rowBytes64 = static_cast<uint64_t>(width) * 4u;
+    if (rowBytes64 > std::numeric_limits<uint32_t>::max()) {
+        layout = {};
+        return false;
+    }
+
+    return TryComputePackedBgraLayout(
+        width,
+        height,
+        static_cast<uint32_t>(rowBytes64),
+        layout);
+}
 
 // Forward declarations
 class RenderTarget;

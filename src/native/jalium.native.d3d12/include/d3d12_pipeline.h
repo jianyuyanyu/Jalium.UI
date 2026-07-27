@@ -2,6 +2,7 @@
 
 #include "d3d12_backend.h"
 #include <d3dcompiler.h>
+#include <array>
 #include <unordered_map>
 #include <vector>
 #include <stack>
@@ -139,27 +140,34 @@ struct PipelinePSO {
     bool isCompute = false;
 };
 
-/// Extract the underlying ID3D12Resource* from a handle that may be
-/// a PipelineBuffer*, PipelineTexture*, or raw ID3D12Resource*.
-/// Uses a tagged-pointer scheme: PipelineBuffer/PipelineTexture have a known
-/// 32-bit tag as their first member. Raw COM pointers (from jalium_get_device
-/// interop) have vtable pointers that won't match these specific tags.
-/// Tag values are chosen to avoid collision with typical vtable addresses.
+inline PipelineBuffer* TryGetPipelineBuffer(void* handle) {
+    if (!handle ||
+        *static_cast<const uint32_t*>(handle) != RESOURCE_TAG_BUFFER) {
+        return nullptr;
+    }
+
+    return static_cast<PipelineBuffer*>(handle);
+}
+
+inline PipelineTexture* TryGetPipelineTexture(void* handle) {
+    if (!handle ||
+        *static_cast<const uint32_t*>(handle) != RESOURCE_TAG_TEXTURE) {
+        return nullptr;
+    }
+
+    return static_cast<PipelineTexture*>(handle);
+}
+
+/// Extract the underlying ID3D12Resource* from a tagged pipeline resource.
+/// Unknown handles are rejected rather than treated as arbitrary COM objects.
 inline ID3D12Resource* ExtractD3D12Resource(void* handle) {
-    if (!handle) return nullptr;
-    auto tag = *static_cast<const uint32_t*>(handle);
-    if (tag == RESOURCE_TAG_BUFFER) {
-        auto* buf = static_cast<PipelineBuffer*>(handle);
+    if (auto* buf = TryGetPipelineBuffer(handle)) {
         return buf->resource.Get();
     }
-    if (tag == RESOURCE_TAG_TEXTURE) {
-        auto* tex = static_cast<PipelineTexture*>(handle);
+    if (auto* tex = TryGetPipelineTexture(handle)) {
         return tex->resource.Get();
     }
-    // Assume raw ID3D12Resource* (e.g. from jalium_get_device interop).
-    // The tag values (0x4A42'5546, 0x4A54'4558) are ASCII strings unlikely to
-    // collide with vtable pointers (which are high addresses in 64-bit mode).
-    return static_cast<ID3D12Resource*>(handle);
+    return nullptr;
 }
 
 // ============================================================================
@@ -230,6 +238,8 @@ private:
     UINT srvDescriptorSize_ = 0;
     int  nextSrvIndex_ = 0;
     std::stack<int> srvFreeList_;  // recycled SRV descriptor indices
+    std::array<bool, kPipelineMaxSrvDescriptors> srvAllocated_ = {};
+    std::mutex srvAllocationMutex_;
 
     // RTV descriptor heap (CPU-only)
     ComPtr<ID3D12DescriptorHeap> rtvHeap_;

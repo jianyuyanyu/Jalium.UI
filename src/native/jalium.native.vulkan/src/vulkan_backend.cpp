@@ -311,12 +311,14 @@ Bitmap* VulkanBackend::CreateBitmapFromMemory(const uint8_t* data, uint32_t data
 
 Bitmap* VulkanBackend::CreateBitmapFromPixels(const uint8_t* pixels, uint32_t width, uint32_t height, uint32_t stride)
 {
-    if (!Initialize() || !pixels || width == 0 || height == 0 || stride < width * 4u) {
+    PackedBgraLayout layout{};
+    if (!Initialize() || !pixels ||
+        !TryComputePackedBgraLayout(width, height, stride, layout)) {
         return nullptr;
     }
 
-    const size_t rowBytes = static_cast<size_t>(width) * 4u;
-    std::vector<uint8_t> packedPixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 0);
+    const size_t rowBytes = layout.rowBytes;
+    std::vector<uint8_t> packedPixels(layout.packedBytes, 0);
     for (uint32_t row = 0; row < height; ++row) {
         const auto* sourceRow = pixels + static_cast<size_t>(row) * stride;
         auto* destRow = packedPixels.data() + static_cast<size_t>(row) * rowBytes;

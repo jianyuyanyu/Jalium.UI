@@ -709,14 +709,15 @@ Bitmap* D3D12Backend::CreateBitmapFromPixels(const uint8_t* pixels, uint32_t wid
     if (!initialized_ && !Initialize()) {
         return nullptr;
     }
-    if (!pixels || width == 0 || height == 0 || stride < width * 4u) {
+    PackedBgraLayout layout{};
+    if (!pixels || !TryComputePackedBgraLayout(width, height, stride, layout)) {
         return nullptr;
     }
 
     // Pack the input pixels (which may have padding beyond width*4) into a tight BGRA8 buffer.
-    const size_t rowBytes = static_cast<size_t>(width) * 4u;
-    std::vector<uint8_t> packed(rowBytes * height);
-    if (stride == rowBytes) {
+    const size_t rowBytes = layout.rowBytes;
+    std::vector<uint8_t> packed(layout.packedBytes);
+    if (static_cast<size_t>(stride) == rowBytes) {
         std::memcpy(packed.data(), pixels, packed.size());
     } else {
         for (uint32_t row = 0; row < height; ++row) {
@@ -731,7 +732,7 @@ Bitmap* D3D12Backend::CreateBitmapFromPixels(const uint8_t* pixels, uint32_t wid
     // semi-transparent edges correctly (matching the encoded WIC 32bppPBGRA
     // path in CreateBitmapFromMemory). Managed callers no longer premultiply —
     // the whole framework now hands us straight pixels regardless of backend.
-    PremultiplyBgraInPlace(packed.data(), static_cast<size_t>(width) * height);
+    PremultiplyBgraInPlace(packed.data(), layout.packedBytes / 4u);
 
     auto bitmap = new D3D12Bitmap(this, width, height);
     bitmap->SetBitmapData(packed.data(), static_cast<uint32_t>(packed.size()));

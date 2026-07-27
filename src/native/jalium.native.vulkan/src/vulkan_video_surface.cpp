@@ -23,6 +23,15 @@ namespace jalium {
 
 namespace {
 
+std::vector<uint8_t> CreateVideoPixelBuffer(uint32_t width, uint32_t height)
+{
+    PackedBgraLayout layout{};
+    if (!TryComputeTightlyPackedBgraLayout(width, height, layout)) {
+        return {};
+    }
+    return std::vector<uint8_t>(layout.packedBytes, 0);
+}
+
 constexpr uint32_t DrmFourcc(char a, char b, char c, char d)
 {
     return static_cast<uint32_t>(static_cast<uint8_t>(a)) |
@@ -62,8 +71,8 @@ T LoadVideoInstanceProc(
 } // namespace
 
 VulkanVideoSurface::VulkanVideoSurface(uint32_t width, uint32_t height)
-    : bitmap(width, height, std::vector<uint8_t>(static_cast<size_t>(width) * height * 4u, 0))
-    , staging(static_cast<size_t>(width) * height * 4u, 0)
+    : bitmap(width, height, CreateVideoPixelBuffer(width, height))
+    , staging(CreateVideoPixelBuffer(width, height))
 {
 }
 
@@ -72,7 +81,8 @@ bool VulkanVideoSurface::Lock(uint8_t** outPtr, uint32_t* outStride)
     if (!outPtr || !outStride) return false;
     if (staging.empty()) return false;
     *outPtr    = staging.data();
-    *outStride = bitmap.GetWidth() * 4u;
+    *outStride = static_cast<uint32_t>(
+        static_cast<uint64_t>(bitmap.GetWidth()) * 4u);
     return true;
 }
 
@@ -84,7 +94,8 @@ bool VulkanVideoSurface::Unlock(const JaliumVideoSurfaceDirtyRect* /*dirty*/)
     // completes and drops its ref — see [[project_vulkan_bitmap_shared_ptr_cow]].
     bitmap.UpdatePackedPixels(staging.data(),
                               bitmap.GetWidth(), bitmap.GetHeight(),
-                              bitmap.GetWidth() * 4u);
+                              static_cast<uint32_t>(
+                                  static_cast<uint64_t>(bitmap.GetWidth()) * 4u));
     return true;
 }
 
@@ -351,7 +362,8 @@ bool VulkanImportedVideoSurface::DeviceLost() const
 VideoSurface* VulkanBackend::CreateVideoSurface(uint32_t width, uint32_t height,
                                                  uint32_t /*formatHint*/)
 {
-    if (width == 0 || height == 0) return nullptr;
+    PackedBgraLayout layout{};
+    if (!TryComputeTightlyPackedBgraLayout(width, height, layout)) return nullptr;
     return new VulkanVideoSurface(width, height);
 }
 

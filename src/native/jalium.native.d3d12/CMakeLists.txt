@@ -31,6 +31,7 @@ set(SOURCES
     src/d3d12_ink_layer.cpp
     src/d3d12_init.cpp
     src/d3d12_path_pipeline.cpp
+    src/d3d12_pipeline.cpp
     src/d3d12_render_target.cpp
     src/d3d12_text.cpp
     src/d3d12_video_surface.cpp

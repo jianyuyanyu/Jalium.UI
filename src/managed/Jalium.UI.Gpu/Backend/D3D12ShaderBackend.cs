@@ -25,13 +25,19 @@ public sealed class D3D12ShaderBackend : IRenderBackendEx, IDisposable
     /// </summary>
     public D3D12ShaderBackend(nint nativeContext, string? shaderCacheDir = null)
     {
+        if (nativeContext == nint.Zero)
+            throw new ArgumentNullException(nameof(nativeContext));
+
         _nativeContext = nativeContext;
         _shaderCompiler = new ShaderCompiler(shaderCacheDir);
 
         // 初始化 shader pipeline native 层
         var hr = NativeD3D12Pipeline.jalium_pipeline_init(_nativeContext);
         if (hr < 0)
+        {
+            _shaderCompiler.Dispose();
             throw new InvalidOperationException($"Failed to initialize D3D12 shader pipeline: 0x{hr:X8}");
+        }
     }
 
     #region IRenderBackend (基础接口 - 委托给现有 native 层)
@@ -58,8 +64,23 @@ public sealed class D3D12ShaderBackend : IRenderBackendEx, IDisposable
         NativeD3D12Pipeline.jalium_buffer_create(
             _nativeContext, data, data.Length, (int)BufferUsage.Uniform);
 
-    public void UpdateBuffer(nint buffer, int offset, ReadOnlySpan<byte> data) =>
-        NativeD3D12Pipeline.jalium_buffer_update(_nativeContext, buffer, offset, data, data.Length);
+    public void UpdateBuffer(nint buffer, int offset, ReadOnlySpan<byte> data)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (buffer == nint.Zero)
+            throw new ArgumentNullException(nameof(buffer));
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+
+        if (!data.IsEmpty)
+        {
+            NativeD3D12Pipeline.jalium_buffer_update(
+                _nativeContext,
+                buffer,
+                offset,
+                data,
+                data.Length);
+        }
+    }
 
     public void DestroyBuffer(nint buffer)
     {
@@ -138,6 +159,10 @@ public sealed class D3D12ShaderBackend : IRenderBackendEx, IDisposable
 
     public nint CompileShader(string source, string entryPoint, ShaderStage stage)
     {
+        ThrowIfDisposed();
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
+        ArgumentException.ThrowIfNullOrWhiteSpace(entryPoint);
+
         var target = stage switch
         {
             ShaderStage.Vertex => "vs_5_1",
@@ -146,15 +171,48 @@ public sealed class D3D12ShaderBackend : IRenderBackendEx, IDisposable
             _ => throw new ArgumentOutOfRangeException(nameof(stage))
         };
 
-        NativeD3D12Pipeline.jalium_shader_compile(
-            System.Text.Encoding.UTF8.GetBytes(source),
-            source.Length, entryPoint, target,
+        var sourceBytes = System.Text.Encoding.UTF8.GetBytes(source);
+        var result = NativeD3D12Pipeline.jalium_shader_compile(
+            sourceBytes,
+            sourceBytes.Length, entryPoint, target,
             Shaders.ShaderCompileFlags.OptimizationLevel3,
             out var bytecodePtr, out var bytecodeSize,
             out var errorPtr, out var errorSize);
 
+        string? diagnostic = null;
         if (errorPtr != nint.Zero)
-            NativeD3D12Pipeline.jalium_shader_free_blob(errorPtr);
+        {
+            try
+            {
+                diagnostic = Marshal.PtrToStringUTF8(errorPtr, errorSize)?.TrimEnd('\0');
+            }
+            finally
+            {
+                NativeD3D12Pipeline.jalium_shader_free_blob(errorPtr);
+            }
+        }
+
+        if (result < 0)
+        {
+            if (bytecodePtr != nint.Zero)
+            {
+                NativeD3D12Pipeline.jalium_shader_free_blob(bytecodePtr);
+            }
+
+            throw new InvalidOperationException(
+                $"Shader compilation failed with HRESULT 0x{result:X8}: {diagnostic ?? "No compiler diagnostic was returned."}");
+        }
+
+        if (bytecodePtr == nint.Zero || bytecodeSize <= 0)
+        {
+            if (bytecodePtr != nint.Zero)
+            {
+                NativeD3D12Pipeline.jalium_shader_free_blob(bytecodePtr);
+            }
+
+            throw new InvalidOperationException(
+                "Shader compilation succeeded without returning bytecode.");
+        }
 
         return bytecodePtr;
     }
@@ -207,17 +265,48 @@ public sealed class D3D12ShaderBackend : IRenderBackendEx, IDisposable
             NativeD3D12Pipeline.jalium_root_signature_destroy(_nativeContext, rootSig);
     }
 
-    public nint CreateBuffer(int size, BufferUsage usage) =>
-        NativeD3D12Pipeline.jalium_buffer_create_empty(_nativeContext, size, (int)usage);
+    public nint CreateBuffer(int size, BufferUsage usage)
+    {
+        ThrowIfDisposed();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(size);
 
-    public nint GetBufferMappedPointer(nint buffer) =>
-        NativeD3D12Pipeline.jalium_buffer_get_mapped_ptr(_nativeContext, buffer);
+        return NativeD3D12Pipeline.jalium_buffer_create_empty(
+            _nativeContext,
+            size,
+            (int)usage);
+    }
 
-    public nint CreateTexture2D(int width, int height, TextureFormat format, TextureUsage usage) =>
-        NativeD3D12Pipeline.jalium_texture_create_2d(_nativeContext, width, height, (int)format, (int)usage);
+    public nint GetBufferMappedPointer(nint buffer)
+    {
+        ThrowIfDisposed();
+        if (buffer == nint.Zero)
+            throw new ArgumentNullException(nameof(buffer));
+
+        return NativeD3D12Pipeline.jalium_buffer_get_mapped_ptr(
+            _nativeContext,
+            buffer);
+    }
+
+    public nint CreateTexture2D(int width, int height, TextureFormat format, TextureUsage usage)
+    {
+        ThrowIfDisposed();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
+
+        return NativeD3D12Pipeline.jalium_texture_create_2d(
+            _nativeContext,
+            width,
+            height,
+            (int)format,
+            (int)usage);
+    }
 
     public DescriptorHandle CreateSrv(nint resource)
     {
+        ThrowIfDisposed();
+        if (resource == nint.Zero)
+            throw new ArgumentNullException(nameof(resource));
+
         var index = NativeD3D12Pipeline.jalium_descriptor_create_srv(_nativeContext, resource);
         if (index < 0)
             throw new InvalidOperationException($"Failed to create SRV descriptor: native returned error code {index}");
@@ -226,6 +315,25 @@ public sealed class D3D12ShaderBackend : IRenderBackendEx, IDisposable
 
     public DescriptorHandle CreateCbv(nint buffer, int offset, int size)
     {
+        ThrowIfDisposed();
+        if (buffer == nint.Zero)
+            throw new ArgumentNullException(nameof(buffer));
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(size);
+        if ((offset & 255) != 0)
+        {
+            throw new ArgumentException(
+                "Constant-buffer offsets must be 256-byte aligned.",
+                nameof(offset));
+        }
+        if (size > 65_536)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(size),
+                size,
+                "Constant-buffer views cannot exceed 64 KiB.");
+        }
+
         var index = NativeD3D12Pipeline.jalium_descriptor_create_cbv(_nativeContext, buffer, offset, size);
         if (index < 0)
             throw new InvalidOperationException($"Failed to create CBV descriptor: native returned error code {index}");
@@ -234,6 +342,10 @@ public sealed class D3D12ShaderBackend : IRenderBackendEx, IDisposable
 
     public DescriptorHandle CreateUav(nint resource)
     {
+        ThrowIfDisposed();
+        if (resource == nint.Zero)
+            throw new ArgumentNullException(nameof(resource));
+
         var index = NativeD3D12Pipeline.jalium_descriptor_create_uav(_nativeContext, resource);
         if (index < 0)
             throw new InvalidOperationException($"Failed to create UAV descriptor: native returned error code {index}");
@@ -242,6 +354,14 @@ public sealed class D3D12ShaderBackend : IRenderBackendEx, IDisposable
 
     public void FreeDescriptor(DescriptorHandle handle)
     {
+        ThrowIfDisposed();
+        if (!handle.IsValid || handle.Type != DescriptorType.SrvCbvUav)
+        {
+            throw new ArgumentException(
+                "A valid SRV/CBV/UAV descriptor is required.",
+                nameof(handle));
+        }
+
         NativeD3D12Pipeline.jalium_descriptor_free(_nativeContext, (int)handle.HeapIndex);
     }
 
@@ -322,6 +442,11 @@ public sealed class D3D12ShaderBackend : IRenderBackendEx, IDisposable
 
         _shaderCompiler.Dispose();
         NativeD3D12Pipeline.jalium_pipeline_shutdown(_nativeContext);
+    }
+
+    private void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
     }
 }
 

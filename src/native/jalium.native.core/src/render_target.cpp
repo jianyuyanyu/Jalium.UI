@@ -1,4 +1,5 @@
 #include "jalium_internal.h"
+#include "jalium_abi_guard.h"
 #include "jalium_string_util.h"
 #include <cstdlib>
 #ifdef _WIN32
@@ -479,9 +480,13 @@ JALIUM_API void jalium_fill_ellipse_batch(
     const float* data,
     uint32_t count)
 {
-    if (rt && data && count > 0) {
-        reinterpret_cast<jalium::RenderTarget*>(rt)->FillEllipseBatch(data, count);
+    if (!rt || !data || count == 0 ||
+        count > jalium::kMaxEllipseBatchCount) {
+        return;
     }
+    auto* target = reinterpret_cast<jalium::RenderTarget*>(rt);
+    jalium::InvokeWithOptionalTransformNoexcept(
+        target, nullptr, [&] { target->FillEllipseBatch(data, count); });
 }
 
 JALIUM_API void jalium_draw_ellipse(
@@ -519,12 +524,18 @@ JALIUM_API void jalium_fill_polygon(
     JaliumBrush* brush,
     int32_t fillRule)
 {
-    if (rt && brush && points && pointCount >= 3) {
-        reinterpret_cast<jalium::RenderTarget*>(rt)->FillPolygon(
+    if (!rt || !brush || !points || pointCount < 3 ||
+        pointCount > jalium::kMaxPathFloatCount / 2u) {
+        return;
+    }
+    auto* target = reinterpret_cast<jalium::RenderTarget*>(rt);
+    jalium::InvokeWithOptionalTransformNoexcept(
+        target, nullptr, [&] {
+        target->FillPolygon(
             points, pointCount,
             reinterpret_cast<jalium::Brush*>(brush),
             fillRule);
-    }
+    });
 }
 
 JALIUM_API void jalium_draw_polygon(
@@ -537,13 +548,19 @@ JALIUM_API void jalium_draw_polygon(
     int32_t lineJoin,
     float miterLimit)
 {
-    if (rt && brush && points && pointCount >= 2) {
-        reinterpret_cast<jalium::RenderTarget*>(rt)->DrawPolygon(
+    if (!rt || !brush || !points || pointCount < 2 ||
+        pointCount > jalium::kMaxPathFloatCount / 2u) {
+        return;
+    }
+    auto* target = reinterpret_cast<jalium::RenderTarget*>(rt);
+    jalium::InvokeWithOptionalTransformNoexcept(
+        target, nullptr, [&] {
+        target->DrawPolygon(
             points, pointCount,
             reinterpret_cast<jalium::Brush*>(brush),
             strokeWidth,
             closed != 0, lineJoin, miterLimit);
-    }
+    });
 }
 
 // ─── EdgeMode signal: trailing int32_t edgeMode parameter on every path
@@ -560,12 +577,18 @@ JALIUM_API void jalium_fill_path(
     int32_t fillRule,
     int32_t edgeMode)
 {
-    if (rt && brush && commands && commandLength > 0) {
-        reinterpret_cast<jalium::RenderTarget*>(rt)->FillPath(
+    if (!rt || !brush || !commands || commandLength == 0 ||
+        commandLength > jalium::kMaxPathFloatCount) {
+        return;
+    }
+    auto* target = reinterpret_cast<jalium::RenderTarget*>(rt);
+    jalium::InvokeWithOptionalTransformNoexcept(
+        target, nullptr, [&] {
+        target->FillPath(
             startX, startY, commands, commandLength,
             reinterpret_cast<jalium::Brush*>(brush),
             fillRule, edgeMode);
-    }
+    });
 }
 
 JALIUM_API void jalium_stroke_path(
@@ -584,13 +607,21 @@ JALIUM_API void jalium_stroke_path(
     float dashOffset,
     int32_t edgeMode)
 {
-    if (rt && brush && commands && commandLength > 0) {
-        reinterpret_cast<jalium::RenderTarget*>(rt)->StrokePath(
+    if (!rt || !brush || !commands || commandLength == 0 ||
+        commandLength > jalium::kMaxPathFloatCount ||
+        dashCount > jalium::kMaxDashFloatCount ||
+        (dashCount > 0 && !dashPattern)) {
+        return;
+    }
+    auto* target = reinterpret_cast<jalium::RenderTarget*>(rt);
+    jalium::InvokeWithOptionalTransformNoexcept(
+        target, nullptr, [&] {
+        target->StrokePath(
             startX, startY, commands, commandLength,
             reinterpret_cast<jalium::Brush*>(brush),
             strokeWidth, closed != 0, lineJoin, miterLimit, lineCap,
             dashPattern, dashCount, dashOffset, edgeMode);
-    }
+    });
 }
 
 // ─── fill_path_at / stroke_path_at: applies (offsetX, offsetY) as an
@@ -611,20 +642,22 @@ JALIUM_API void jalium_fill_path_at(
     int32_t fillRule,
     int32_t edgeMode)
 {
-    if (!rt || !brush || !commands || commandLength == 0) return;
+    if (!rt || !brush || !commands || commandLength == 0 ||
+        commandLength > jalium::kMaxPathFloatCount) {
+        return;
+    }
     auto* nrt = reinterpret_cast<jalium::RenderTarget*>(rt);
     bool hasOffset = (offsetX != 0.0f || offsetY != 0.0f);
-    if (hasOffset) {
-        const float mat[6] = { 1.0f, 0.0f, 0.0f, 1.0f, offsetX, offsetY };
-        nrt->PushTransform(mat);
-    }
-    nrt->FillPath(
-        startX, startY, commands, commandLength,
-        reinterpret_cast<jalium::Brush*>(brush),
-        fillRule, edgeMode);
-    if (hasOffset) {
-        nrt->PopTransform();
-    }
+    const float mat[6] = {
+        1.0f, 0.0f, 0.0f, 1.0f, offsetX, offsetY
+    };
+    jalium::InvokeWithOptionalTransformNoexcept(
+        nrt, hasOffset ? mat : nullptr, [&] {
+            nrt->FillPath(
+                startX, startY, commands, commandLength,
+                reinterpret_cast<jalium::Brush*>(brush),
+                fillRule, edgeMode);
+        });
 }
 
 JALIUM_API void jalium_stroke_path_at(
@@ -644,21 +677,25 @@ JALIUM_API void jalium_stroke_path_at(
     float dashOffset,
     int32_t edgeMode)
 {
-    if (!rt || !brush || !commands || commandLength == 0) return;
+    if (!rt || !brush || !commands || commandLength == 0 ||
+        commandLength > jalium::kMaxPathFloatCount ||
+        dashCount > jalium::kMaxDashFloatCount ||
+        (dashCount > 0 && !dashPattern)) {
+        return;
+    }
     auto* nrt = reinterpret_cast<jalium::RenderTarget*>(rt);
     bool hasOffset = (offsetX != 0.0f || offsetY != 0.0f);
-    if (hasOffset) {
-        const float mat[6] = { 1.0f, 0.0f, 0.0f, 1.0f, offsetX, offsetY };
-        nrt->PushTransform(mat);
-    }
-    nrt->StrokePath(
-        startX, startY, commands, commandLength,
-        reinterpret_cast<jalium::Brush*>(brush),
-        strokeWidth, closed != 0, lineJoin, miterLimit, lineCap,
-        dashPattern, dashCount, dashOffset, edgeMode);
-    if (hasOffset) {
-        nrt->PopTransform();
-    }
+    const float mat[6] = {
+        1.0f, 0.0f, 0.0f, 1.0f, offsetX, offsetY
+    };
+    jalium::InvokeWithOptionalTransformNoexcept(
+        nrt, hasOffset ? mat : nullptr, [&] {
+            nrt->StrokePath(
+                startX, startY, commands, commandLength,
+                reinterpret_cast<jalium::Brush*>(brush),
+                strokeWidth, closed != 0, lineJoin, miterLimit, lineCap,
+                dashPattern, dashCount, dashOffset, edgeMode);
+        });
 }
 
 
@@ -795,10 +832,25 @@ JALIUM_API JaliumBrushShader* jalium_brush_shader_create(
     JaliumContext* ctx, const char* shaderKey, const char* brushMainHlsl, int32_t blendMode)
 {
     if (!ctx || !brushMainHlsl) return nullptr;
-    auto* backend = jalium::GetBackendFromContext(ctx);
-    if (!backend) return nullptr;
-    void* native = backend->CreateBrushShader(shaderKey, brushMainHlsl, blendMode);
-    return reinterpret_cast<JaliumBrushShader*>(WrapShaderHandle(backend, native));
+    uint32_t sourceLength = 0;
+    uint32_t keyLength = 0;
+    if (!jalium::CStringLengthBounded(
+            brushMainHlsl, jalium::kMaxShaderSourceBytes, &sourceLength) ||
+        (shaderKey &&
+         !jalium::CStringLengthBounded(
+             shaderKey, jalium::kMaxShaderKeyBytes, &keyLength))) {
+        return nullptr;
+    }
+    try {
+        auto* backend = jalium::GetBackendFromContext(ctx);
+        if (!backend) return nullptr;
+        void* native =
+            backend->CreateBrushShader(shaderKey, brushMainHlsl, blendMode);
+        return reinterpret_cast<JaliumBrushShader*>(
+            WrapShaderHandle(backend, native));
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 JALIUM_API void jalium_brush_shader_destroy(JaliumBrushShader* shader)
@@ -818,7 +870,13 @@ JALIUM_API int32_t jalium_ink_layer_bitmap_dispatch_brush(
     const void*           extraParams,
     int32_t               extraParamsSize)
 {
-    if (!bitmap || !shader || !strokePoints || !constants || pointCount < 2) return -1;
+    if (!bitmap || !shader || !strokePoints || !constants ||
+        pointCount < 2 || pointCount > jalium::kMaxInkPointCount ||
+        extraParamsSize < 0 ||
+        extraParamsSize > jalium::kMaxInkExtraParameterBytes ||
+        (extraParamsSize > 0 && !extraParams)) {
+        return -1;
+    }
     auto* bh = reinterpret_cast<BackendOwnedHandle*>(bitmap);
     auto* sh = reinterpret_cast<BackendOwnedHandle*>(shader);
     if (!bh->backend || !bh->native || !sh->backend || !sh->native) return -2;
@@ -828,9 +886,14 @@ JALIUM_API int32_t jalium_ink_layer_bitmap_dispatch_brush(
     // the other's command list is native type/device confusion.
     if (bh->backend != sh->backend) return JALIUM_INK_DISPATCH_ERROR_STALE_CONTEXT;
     uint32_t extraSize = (extraParams && extraParamsSize > 0) ? (uint32_t)extraParamsSize : 0;
-    return bh->backend->DispatchBrush(
-        bh->native, sh->native, strokePoints, (uint32_t)pointCount, constants,
-        extraParams, extraSize);
+    try {
+        return bh->backend->DispatchBrush(
+            bh->native, sh->native, strokePoints,
+            static_cast<uint32_t>(pointCount), constants,
+            extraParams, extraSize);
+    } catch (...) {
+        return -3;
+    }
 }
 
 JALIUM_API void jalium_draw_content_border(
@@ -857,7 +920,11 @@ JALIUM_API void jalium_draw_text(
     float x, float y, float width, float height,
     JaliumBrush* brush)
 {
-    if (rt && text && format && brush) {
+    if (!rt || !text || !format || !brush ||
+        textLength > jalium::kMaxManagedTextCodeUnits) {
+        return;
+    }
+    try {
 #if defined(_WIN32)
         reinterpret_cast<jalium::RenderTarget*>(rt)->RenderText(
             text, textLength,
@@ -865,7 +932,6 @@ JALIUM_API void jalium_draw_text(
             x, y, width, height,
             reinterpret_cast<jalium::Brush*>(brush));
 #else
-        // Managed code sends UTF-16 data but wchar_t is 4 bytes on Linux/Android.
         auto wstr = jalium::ManagedToWString(text, textLength);
         reinterpret_cast<jalium::RenderTarget*>(rt)->RenderText(
             wstr.c_str(), static_cast<uint32_t>(wstr.size()),
@@ -873,6 +939,9 @@ JALIUM_API void jalium_draw_text(
             x, y, width, height,
             reinterpret_cast<jalium::Brush*>(brush));
 #endif
+    } catch (...) {
+        // Drawing is best-effort and has no result channel.  Drop this run
+        // rather than allowing a backend/allocation exception across the ABI.
     }
 }
 
@@ -899,27 +968,45 @@ JALIUM_API void jalium_draw_text_with_inverse_transform(
     JaliumBrush* brush,
     const float* inverseMatrix)
 {
-    if (!rt || !text || !format || !brush || !inverseMatrix) return;
+    if (!rt || !text || !format || !brush || !inverseMatrix ||
+        textLength > jalium::kMaxManagedTextCodeUnits) {
+        return;
+    }
 
     auto* target = reinterpret_cast<jalium::RenderTarget*>(rt);
-    target->PushTransform(inverseMatrix);
-
+    bool transformPushed = false;
+    try {
+        // Convert before mutating renderer state: allocation failure then
+        // cannot leave a transient inverse transform on the target.
 #if defined(_WIN32)
-    target->RenderText(
-        text, textLength,
-        reinterpret_cast<jalium::TextFormat*>(format),
-        x, y, width, height,
-        reinterpret_cast<jalium::Brush*>(brush));
+        target->PushTransform(inverseMatrix);
+        transformPushed = true;
+        target->RenderText(
+            text, textLength,
+            reinterpret_cast<jalium::TextFormat*>(format),
+            x, y, width, height,
+            reinterpret_cast<jalium::Brush*>(brush));
 #else
-    auto wstr = jalium::ManagedToWString(text, textLength);
-    target->RenderText(
-        wstr.c_str(), static_cast<uint32_t>(wstr.size()),
-        reinterpret_cast<jalium::TextFormat*>(format),
-        x, y, width, height,
-        reinterpret_cast<jalium::Brush*>(brush));
+        auto wstr = jalium::ManagedToWString(text, textLength);
+        target->PushTransform(inverseMatrix);
+        transformPushed = true;
+        target->RenderText(
+            wstr.c_str(), static_cast<uint32_t>(wstr.size()),
+            reinterpret_cast<jalium::TextFormat*>(format),
+            x, y, width, height,
+            reinterpret_cast<jalium::Brush*>(brush));
 #endif
-
-    target->PopTransform();
+    } catch (...) {
+        // Keep the C ABI non-throwing; cleanup below restores renderer state.
+    }
+    if (transformPushed) {
+        try {
+            target->PopTransform();
+        } catch (...) {
+            // Pop implementations are non-allocating, but preserve the ABI
+            // boundary even if a third-party backend violates that contract.
+        }
+    }
 }
 
 JALIUM_API void jalium_push_transform(JaliumRenderTarget* rt, const float* matrix) {
@@ -1328,10 +1415,19 @@ JALIUM_API void jalium_draw_shader_effect(
     const float* constants,
     uint32_t constantFloatCount)
 {
-    if (rt && w > 0 && h > 0 && shaderBytecode && shaderBytecodeSize > 0) {
-        reinterpret_cast<jalium::RenderTarget*>(rt)->DrawShaderEffect(
-            x, y, w, h, shaderBytecode, shaderBytecodeSize, constants, constantFloatCount);
+    if (!rt || w <= 0 || h <= 0 || !shaderBytecode ||
+        shaderBytecodeSize == 0 ||
+        shaderBytecodeSize > jalium::kMaxShaderBytecodeBytes ||
+        constantFloatCount > jalium::kMaxShaderConstantFloatCount ||
+        (constantFloatCount > 0 && !constants)) {
+        return;
     }
+    auto* target = reinterpret_cast<jalium::RenderTarget*>(rt);
+    jalium::InvokeWithOptionalTransformNoexcept(
+        target, nullptr, [&] {
+        target->DrawShaderEffect(
+            x, y, w, h, shaderBytecode, shaderBytecodeSize, constants, constantFloatCount);
+    });
 }
 
 // HLSL-source custom shader effect — the cross-backend path. Both backends
@@ -1349,10 +1445,21 @@ JALIUM_API void jalium_draw_shader_effect_hlsl(
     const float* constants,
     uint32_t constantFloatCount)
 {
-    if (rt && w > 0 && h > 0 && hlslSource && hlslSource[0] != '\0') {
-        reinterpret_cast<jalium::RenderTarget*>(rt)->DrawShaderEffectFromSource(
-            x, y, w, h, hlslSource, constants, constantFloatCount);
+    uint32_t sourceLength = 0;
+    if (!rt || w <= 0 || h <= 0 || !hlslSource ||
+        !jalium::CStringLengthBounded(
+            hlslSource, jalium::kMaxShaderSourceBytes, &sourceLength) ||
+        sourceLength == 0 ||
+        constantFloatCount > jalium::kMaxShaderConstantFloatCount ||
+        (constantFloatCount > 0 && !constants)) {
+        return;
     }
+    auto* target = reinterpret_cast<jalium::RenderTarget*>(rt);
+    jalium::InvokeWithOptionalTransformNoexcept(
+        target, nullptr, [&] {
+        target->DrawShaderEffectFromSource(
+            x, y, w, h, hlslSource, constants, constantFloatCount);
+    });
 }
 
 JALIUM_API void jalium_draw_liquid_glass(
@@ -1371,15 +1478,22 @@ JALIUM_API void jalium_draw_liquid_glass(
     float fusionRadius,
     const float* neighborData)
 {
-    if (rt) {
-        reinterpret_cast<jalium::RenderTarget*>(rt)->DrawLiquidGlass(
+    if (!rt || neighborCount < 0 ||
+        neighborCount > jalium::kMaxLiquidGlassNeighborCount ||
+        (neighborCount > 0 && !neighborData)) {
+        return;
+    }
+    auto* target = reinterpret_cast<jalium::RenderTarget*>(rt);
+    jalium::InvokeWithOptionalTransformNoexcept(
+        target, nullptr, [&] {
+        target->DrawLiquidGlass(
             x, y, w, h, cornerRadius, blurRadius,
             refractionAmount, chromaticAberration,
             tintR, tintG, tintB, tintOpacity,
             lightX, lightY, highlightBoost,
             shapeType, shapeExponent,
             neighborCount, fusionRadius, neighborData);
-    }
+    });
 }
 
 } // extern "C"

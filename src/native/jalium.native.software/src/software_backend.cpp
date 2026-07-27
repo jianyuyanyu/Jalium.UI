@@ -4323,13 +4323,16 @@ Bitmap* SoftwareBackend::CreateBitmapFromPixels(
     uint32_t height,
     uint32_t stride)
 {
-    if (!pixels || width == 0 || height == 0) return nullptr;
+    PackedBgraLayout layout{};
+    if (!pixels || !TryComputePackedBgraLayout(width, height, stride, layout)) {
+        return nullptr;
+    }
 
-    std::vector<uint8_t> pixelData(width * height * 4);
+    std::vector<uint8_t> pixelData(layout.packedBytes);
     for (uint32_t y = 0; y < height; y++) {
-        std::memcpy(pixelData.data() + y * width * 4,
-                    pixels + y * stride,
-                    width * 4);
+        std::memcpy(pixelData.data() + static_cast<size_t>(y) * layout.rowBytes,
+                    pixels + static_cast<size_t>(y) * stride,
+                    layout.rowBytes);
     }
 
     return new SoftwareBitmap(width, height, std::move(pixelData));
@@ -4338,7 +4341,8 @@ Bitmap* SoftwareBackend::CreateBitmapFromPixels(
 VideoSurface* SoftwareBackend::CreateVideoSurface(uint32_t width, uint32_t height,
                                                   uint32_t /*formatHint*/)
 {
-    if (width == 0 || height == 0) return nullptr;
+    PackedBgraLayout layout{};
+    if (!TryComputeTightlyPackedBgraLayout(width, height, layout)) return nullptr;
     return new SoftwareVideoSurface(width, height);
 }
 
