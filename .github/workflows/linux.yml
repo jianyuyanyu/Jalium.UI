@@ -544,16 +544,23 @@ jobs:
               audio_filter="FullyQualifiedName=Jalium.UI.Tests.MiniAudioDeviceTests.PlaybackEnded_FiresAfterSubmitAndSignal"
               # Headless Alpine also uses miniaudio's timer-driven null backend.
               # Preserve the callback assertion as a mandatory, isolated gate.
-              timeout 30s dotnet test tests/Jalium.UI.Linux.Tests/Jalium.UI.Linux.Tests.csproj \
-                -c Release --no-build --no-restore --disable-build-servers -m:1 \
-                -p:JaliumBuildRoot="$managed_root" \
-                -p:GeneratePackageOnBuild=false \
-                --filter "$audio_filter" \
-                --blame-crash --blame-crash-dump-type mini \
-                --diag "$managed_results/vstest-audio-${{ matrix.rid }}.log" \
-                --results-directory "$managed_results" \
-                --logger "trx;LogFileName=linux-audio-${{ matrix.rid }}.trx" \
-                --logger "console;verbosity=detailed"
+              # Invoke the built assembly directly: Alpine's second project-level
+              # `dotnet test --no-build` launch can lose its MSBuild target path.
+              test_output="$managed_root/bin/Jalium.UI.Linux.Tests/Release/net10.0"
+              test_assembly="$test_output/Jalium.UI.Tests.dll"
+              dotnet_root="$(dirname "$(readlink -f "$(command -v dotnet)")")"
+              vstest_console="$(find "$dotnet_root/sdk" -mindepth 2 -maxdepth 2 \
+                -name vstest.console.dll -print | sort -V | tail -n 1)"
+              test -f "$test_assembly"
+              test -f "$vstest_console"
+              timeout 30s dotnet "$vstest_console" "$test_assembly" \
+                --TestAdapterPath:"$test_output" \
+                --TestCaseFilter:"$audio_filter" \
+                "--Blame:CollectDump;DumpType=mini" \
+                --Diag:"$managed_results/vstest-audio-${{ matrix.rid }}.log" \
+                --ResultsDirectory:"$managed_results" \
+                --Logger:"trx;LogFileName=linux-audio-${{ matrix.rid }}.trx" \
+                --Logger:"console;verbosity=detailed"
 
               # Theme and Splash lifecycle coverage already runs in the
               # software suite above; keep this gate Vulkan-specific.
