@@ -33,7 +33,7 @@ public sealed class MetricsPage : Page
             meterText.Text = $"Meter: {vm.MeterName} ({(vm.MeterRunning ? "running" : "stopped")})";
         };
 
-        NavigatedFrom += (_, _) => vm.Dispose();
+        Unloaded += (_, _) => vm.Dispose();
 
         Content = PageLayout.Build(
             "Metrics · JaliumMeter",

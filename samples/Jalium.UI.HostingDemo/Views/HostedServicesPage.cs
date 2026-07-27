@@ -32,7 +32,7 @@ public sealed class HostedServicesPage : Page
             }
         };
 
-        NavigatedFrom += (_, _) => vm.Dispose();
+        Unloaded += (_, _) => vm.Dispose();
 
         Content = PageLayout.Build(
             "IHostedService · BackgroundService",

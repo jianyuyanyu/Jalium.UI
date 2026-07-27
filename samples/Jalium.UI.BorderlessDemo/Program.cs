@@ -12,13 +12,13 @@ internal static class Program
     private static int Main(string[] args)
     {
         // WPF 风格：子类化 Application、重写 OnStartup/OnExit/OnSessionEnding。
-        // AppBuilder.UseApplication<T>() 负责在 Build() 时通过无参构造创建实例。
+        // JaliumApp.UseApplication<T>() 负责在 Run() 前通过无参构造创建实例。
         var builder = AppBuilder.CreateBuilder(args);
         //builder.UseJaliumMetrics();
-        builder.UseApplication<BorderlessDemoApp>();
 
-        using var host = builder.Build();
-        return host.Run();
+        using var app = builder.Build();
+        app.UseApplication<BorderlessDemoApp>();
+        return app.Run();
     }
 }
 
