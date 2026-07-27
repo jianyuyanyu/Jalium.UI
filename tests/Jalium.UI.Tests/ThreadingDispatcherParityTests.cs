@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using WpfDispatcher = Jalium.UI.Threading.Dispatcher;
 using WpfDispatcherObject = Jalium.UI.Threading.DispatcherObject;
 using WpfPriority = Jalium.UI.Threading.DispatcherPriority;
@@ -12,31 +13,69 @@ public sealed class ThreadingDispatcherParityTests
     [Fact]
     public void CanonicalDispatcherOwnsTheEstablishedPerThreadQueue()
     {
-        WpfDispatcher dispatcher = WpfDispatcher.CurrentDispatcher;
+        RunOnFreshDispatcherThread(dispatcher =>
+        {
+            Assert.Same(dispatcher, WpfDispatcher.CurrentDispatcher);
+            Assert.Same(dispatcher, WpfDispatcher.FromThread(Thread.CurrentThread));
+            Assert.Same(Thread.CurrentThread, dispatcher.Thread);
+            Assert.True(dispatcher.CheckAccess());
 
-        Assert.Same(dispatcher, WpfDispatcher.CurrentDispatcher);
-        Assert.Same(dispatcher, WpfDispatcher.FromThread(Thread.CurrentThread));
-        Assert.Same(Thread.CurrentThread, dispatcher.Thread);
-        Assert.True(dispatcher.CheckAccess());
+            var order = new List<string>();
+            Jalium.UI.Threading.DispatcherOperation background = dispatcher.InvokeAsync(
+                () => order.Add("background"),
+                WpfPriority.Background);
+            Jalium.UI.Threading.DispatcherOperation normal = dispatcher.InvokeAsync(
+                () => order.Add("normal"),
+                WpfPriority.Normal);
 
-        dispatcher.ProcessQueue();
-        var order = new List<string>();
-        Jalium.UI.Threading.DispatcherOperation background = dispatcher.InvokeAsync(
-            () => order.Add("background"),
-            WpfPriority.Background);
-        Jalium.UI.Threading.DispatcherOperation normal = dispatcher.InvokeAsync(
-            () => order.Add("normal"),
-            WpfPriority.Normal);
+            Assert.Equal(Jalium.UI.Threading.DispatcherOperationStatus.Pending, background.Status);
+            Assert.Equal(Jalium.UI.Threading.DispatcherOperationStatus.Pending, normal.Status);
 
-        Assert.Equal(Jalium.UI.Threading.DispatcherOperationStatus.Pending, background.Status);
-        Assert.Equal(Jalium.UI.Threading.DispatcherOperationStatus.Pending, normal.Status);
+            dispatcher.ProcessQueue();
 
-        dispatcher.ProcessQueue();
+            Assert.Equal(new[] { "normal", "background" }, order);
+            Assert.True(background.Task.IsCompletedSuccessfully);
+            Assert.True(normal.Task.IsCompletedSuccessfully);
+            Assert.Same(dispatcher, background.Dispatcher);
+        });
+    }
 
-        Assert.Equal(new[] { "normal", "background" }, order);
-        Assert.True(background.Task.IsCompletedSuccessfully);
-        Assert.True(normal.Task.IsCompletedSuccessfully);
-        Assert.Same(dispatcher, background.Dispatcher);
+    // xUnit reuses worker threads, whose dispatcher may retain work posted by a prior test.
+    // This contract needs a controlled two-item queue to assert exact priority order.
+    private static void RunOnFreshDispatcherThread(Action<WpfDispatcher> action)
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            WpfDispatcher? dispatcher = null;
+            try
+            {
+                dispatcher = WpfDispatcher.CurrentDispatcher;
+                action(dispatcher);
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+            }
+            finally
+            {
+                dispatcher?.DisposeCore();
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "ThreadingDispatcherParityTests.Queue",
+        };
+
+        thread.Start();
+        Assert.True(
+            thread.Join(TimeSpan.FromSeconds(5)),
+            "Fresh dispatcher test thread did not exit within the timeout.");
+
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
     }
 
     [Fact]
