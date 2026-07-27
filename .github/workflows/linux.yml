@@ -542,9 +542,9 @@ jobs:
                   --logger "trx;LogFileName=linux-${{ matrix.rid }}.trx"
 
               audio_filter="FullyQualifiedName=Jalium.UI.Tests.MiniAudioDeviceTests.PlaybackEnded_FiresAfterSubmitAndSignal"
-              # Headless Alpine also uses miniaudio's timer-driven null backend.
+              # Headless Alpine also uses the timer-driven miniaudio null backend.
               # Preserve the callback assertion as a mandatory, isolated gate.
-              # Invoke the built assembly directly: Alpine's second project-level
+              # Invoke the built assembly directly: a second Alpine project-level
               # `dotnet test --no-build` launch can lose its MSBuild target path.
               test_output="$managed_root/bin/Jalium.UI.Linux.Tests/Release/net10.0"
               test_assembly="$test_output/Jalium.UI.Tests.dll"
