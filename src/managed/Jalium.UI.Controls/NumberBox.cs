@@ -349,7 +349,7 @@ public class NumberBox : TextBoxBase, IImeSupport
     /// </summary>
     public NumberBox()
     {
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
 
         // Set IBeam cursor for text input
         Cursor = Jalium.UI.Input.Cursors.IBeam;

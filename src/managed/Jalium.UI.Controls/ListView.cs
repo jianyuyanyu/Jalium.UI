@@ -47,7 +47,7 @@ public class ListView : ListBox
     /// </summary>
     public ListView()
     {
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
     }
 
     /// <inheritdoc />
@@ -254,7 +254,7 @@ public class ListViewItem : ListBoxItem
     /// </summary>
     public ListViewItem()
     {
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
     }
 
     /// <inheritdoc />

@@ -481,7 +481,8 @@ public sealed class MultiBindingExpression : BindingExpressionBase
                 TargetProperty.PropertyType,
                 _multiBinding.ConverterCulture ?? CultureInfo.CurrentCulture);
 
-            Target.SetValue(TargetProperty, targetValue);
+            if (!TrySetTargetValue(targetValue))
+                return;
         }
         finally
         {
@@ -511,27 +512,40 @@ public sealed class MultiBindingExpression : BindingExpressionBase
         return BindingMode.OneWay;
     }
 
-    // Shadow properties are per-instance to avoid collisions between multiple MultiBindings
-    private static int s_nextInstanceId;
-    private readonly int _instanceId = Interlocked.Increment(ref s_nextInstanceId);
+    // A target can have at most one binding expression for a given dependency property. Keying shadow
+    // properties by that target-property identity plus child index therefore prevents collisions on the
+    // same object while allowing every equivalent MultiBinding on other objects (including recycled
+    // virtualized containers) to reuse the same registered DP. The former per-expression key registered
+    // process-lifetime dependency properties forever and grew without bound during virtualization.
     private static readonly Dictionary<long, DependencyProperty> _shadowProperties = new();
     private static readonly object _shadowPropertyLock = new();
 
     private DependencyProperty CreateShadowProperty(int index)
     {
-        long key = ((long)_instanceId << 32) | (uint)index;
+        long key = ((long)TargetProperty.GlobalIndex << 32) | (uint)index;
         lock (_shadowPropertyLock)
         {
             if (!_shadowProperties.TryGetValue(key, out var property))
             {
                 property = DependencyProperty.RegisterAttached(
-                    $"_MultiBindingShadow_{_instanceId}_{index}",
+                    $"_MultiBindingShadow_{TargetProperty.GlobalIndex}_{index}",
                     typeof(object),
                     typeof(MultiBindingExpression),
                     new PropertyMetadata(null));
                 _shadowProperties[key] = property;
             }
             return property;
+        }
+    }
+
+    internal static int ShadowPropertyCacheCount
+    {
+        get
+        {
+            lock (_shadowPropertyLock)
+            {
+                return _shadowProperties.Count;
+            }
         }
     }
 }

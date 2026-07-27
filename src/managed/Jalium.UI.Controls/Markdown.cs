@@ -150,7 +150,7 @@ public class Markdown : Control
     public Markdown()
     {
         Focusable = true;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         AddHandler(MouseDownEvent, new MouseButtonEventHandler(OnSelectionMouseDown));
         AddHandler(MouseMoveEvent, new MouseEventHandler(OnSelectionMouseMove));
         AddHandler(MouseUpEvent, new MouseButtonEventHandler(OnSelectionMouseUp));

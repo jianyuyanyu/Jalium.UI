@@ -491,7 +491,7 @@ internal static class DynamicResourceBindingOperations
             return;
         }
 
-        if (resolved != null)
+        if (resolved != null && IsValidResourceValue(property, resolved))
         {
             if (ReferenceEquals(currentValue, resolved) || Equals(currentValue, resolved))
             {
@@ -573,7 +573,7 @@ internal static class DynamicResourceBindingOperations
             return;
 
         var resolved = ResourceLookup.FindResource(subscription.Host, subscription.ResourceKey);
-        if (resolved != null)
+        if (resolved != null && IsValidResourceValue(property, resolved))
         {
             target.SetValue(property, resolved);
         }
@@ -581,5 +581,10 @@ internal static class DynamicResourceBindingOperations
         {
             target.ClearValue(property);
         }
+    }
+
+    private static bool IsValidResourceValue(DependencyProperty property, object value)
+    {
+        return property.IsValidType(value) && property.IsValidValue(value);
     }
 }

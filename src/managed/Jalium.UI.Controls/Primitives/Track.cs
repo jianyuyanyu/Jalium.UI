@@ -77,7 +77,7 @@ public class Track : FrameworkElement
     /// </summary>
     public Track()
     {
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
     }
 
     #endregion

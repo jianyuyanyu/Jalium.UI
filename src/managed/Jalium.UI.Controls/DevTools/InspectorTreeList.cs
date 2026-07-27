@@ -82,7 +82,7 @@ internal sealed class InspectorRowContainer : ListBoxItem
 
     public InspectorRowContainer()
     {
-        SetCurrentValue(TransitionPropertyProperty, "None");
+        SetCurrentValue(TransitionPropertyProperty, TransitionPropertyCollection.None());
         MinHeight = 0;
         Padding = new Thickness(0);
         ClipToBounds = true; // clips the reveal slide (content translated up) to the row's slot
@@ -246,7 +246,7 @@ internal sealed class InspectorTreeList : ListBox
 
     public InspectorTreeList()
     {
-        SetCurrentValue(TransitionPropertyProperty, "None");
+        SetCurrentValue(TransitionPropertyProperty, TransitionPropertyCollection.None());
     }
 
     /// <summary>Publishes the reveal range and per-index progress function for the in-flight

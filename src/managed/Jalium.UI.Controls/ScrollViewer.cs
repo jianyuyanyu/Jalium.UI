@@ -549,7 +549,7 @@ public partial class ScrollViewer : ContentControl
     /// </summary>
     public ScrollViewer()
     {
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         _verticalScrollBar = CreateScrollBar(Orientation.Vertical);
         _horizontalScrollBar = CreateScrollBar(Orientation.Horizontal);
         AddVisualChild(_verticalScrollBar);

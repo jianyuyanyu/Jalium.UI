@@ -61,6 +61,7 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
         EventManager.RegisterClassHandler(typeof(UIElement), MouseWheelEvent, new MouseWheelEventHandler((s, e) => ((UIElement)s).OnMouseWheel(e)));
 
         // Touch
+        TouchDevice.CaptureChanged += OnTouchDeviceCaptureChanged;
         EventManager.RegisterClassHandler(typeof(UIElement), PreviewTouchDownEvent, new TouchEventHandler((s, e) => ((UIElement)s).OnPreviewTouchDown(e)));
         EventManager.RegisterClassHandler(typeof(UIElement), TouchDownEvent, new TouchEventHandler((s, e) => ((UIElement)s).OnTouchDown(e)));
         EventManager.RegisterClassHandler(typeof(UIElement), PreviewTouchMoveEvent, new TouchEventHandler((s, e) => ((UIElement)s).OnPreviewTouchMove(e)));
@@ -5585,29 +5586,17 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
         if (!IsEnabled || Visibility != Visibility.Visible)
             return false;
 
-        if (s_touchCaptures.TryGetValue(touchDevice.Id, out var previous))
-        {
-            if (ReferenceEquals(previous.Element, this))
-                return true;
-            previous.Element.RemoveCapturedTouchInternal(touchDevice);
-        }
-
-        s_touchCaptures[touchDevice.Id] = new CaptureRecord(this, touchDevice);
-        AddCapturedTouchInternal(touchDevice);
-        touchDevice.Capture(this);
-        return true;
+        return touchDevice.Capture(this);
     }
 
     /// <summary>Releases a previously captured touch contact from this element.</summary>
     public bool ReleaseTouchCapture(TouchDevice touchDevice)
     {
         ArgumentNullException.ThrowIfNull(touchDevice);
-        if (!s_touchCaptures.TryGetValue(touchDevice.Id, out var record) || !ReferenceEquals(record.Element, this))
+        if (!ReferenceEquals(touchDevice.Captured, this))
             return false;
-        s_touchCaptures.Remove(touchDevice.Id);
-        RemoveCapturedTouchInternal(touchDevice);
-        touchDevice.Capture(null);
-        return true;
+
+        return touchDevice.Capture(null);
     }
 
     /// <summary>Releases all touch contacts captured by this element.</summary>
@@ -5634,12 +5623,42 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     {
         if (s_touchCaptures.Count == 0) return;
         var snapshot = s_touchCaptures.ToArray();
-        s_touchCaptures.Clear();
         foreach (var pair in snapshot)
         {
             CaptureRecord record = pair.Value;
-            record.Element.RemoveCapturedTouchInternal(record.Device);
-            record.Device.Capture(null);
+            if (ReferenceEquals(record.Device.Captured, record.Element))
+            {
+                record.Device.Capture(null);
+            }
+            else
+            {
+                OnTouchDeviceCaptureChanged(record.Device, record.Element, null);
+            }
+        }
+    }
+
+    private static void OnTouchDeviceCaptureChanged(
+        TouchDevice device,
+        IInputElement? previous,
+        IInputElement? current)
+    {
+        _ = previous;
+
+        if (s_touchCaptures.TryGetValue(device.Id, out CaptureRecord existing) &&
+            (!ReferenceEquals(existing.Device, device) ||
+             !ReferenceEquals(existing.Element, current)))
+        {
+            s_touchCaptures.Remove(device.Id);
+            existing.Element.RemoveCapturedTouchInternal(existing.Device);
+        }
+
+        if (current is UIElement element &&
+            (!s_touchCaptures.TryGetValue(device.Id, out existing) ||
+             !ReferenceEquals(existing.Device, device) ||
+             !ReferenceEquals(existing.Element, element)))
+        {
+            s_touchCaptures[device.Id] = new CaptureRecord(element, device);
+            element.AddCapturedTouchInternal(device);
         }
     }
 
@@ -5710,7 +5729,6 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
 
     private const string TransitionAllValue = "All";
     private const string TransitionNoneValue = "None";
-    private const string DefaultTransitionPropertyValue = TransitionNoneValue;
     private static readonly TimeSpan s_defaultTransitionDuration = TimeSpan.FromMilliseconds(180);
 
     private Dictionary<string, bool>? _transitionPropertyLookup;
@@ -5738,7 +5756,7 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Behavior)]
     public static readonly DependencyProperty TransitionPropertyProperty =
         DependencyProperty.Register(nameof(TransitionProperty), typeof(TransitionPropertyCollection), typeof(UIElement),
-            new PropertyMetadata(DefaultTransitionPropertyValue, OnTransitionConfigurationChanged));
+            new PropertyMetadata(null, OnTransitionConfigurationChanged));
 
     /// <summary>
     /// Identifies the TransitionDuration dependency property.
@@ -5762,7 +5780,19 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Behavior)]
     public TransitionPropertyCollection TransitionProperty
     {
-        get => TransitionPropertyCollection.FromRawValue(GetValue(TransitionPropertyProperty));
+        get
+        {
+            var rawValue = GetValue(TransitionPropertyProperty);
+            if (rawValue is TransitionPropertyCollection collection)
+                return collection;
+
+            // Collection dependency-property defaults cannot be a shared mutable instance. Materialize
+            // a per-element value on first access while retaining the Default base source so a later
+            // style/template contribution can still take precedence.
+            collection = TransitionPropertyCollection.FromRawValue(rawValue);
+            SetCurrentValue(TransitionPropertyProperty, collection);
+            return collection;
+        }
         set => SetValue(TransitionPropertyProperty, value ?? TransitionPropertyCollection.None());
     }
 

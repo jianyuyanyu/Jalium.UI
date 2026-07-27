@@ -1,4 +1,4 @@
-﻿using Jalium.UI.Controls.Themes;
+using Jalium.UI.Controls.Themes;
 using Jalium.UI.Media;
 
 namespace Jalium.UI.Controls;
@@ -47,7 +47,7 @@ public class DockLayout : ContentControl
     public DockLayout()
     {
         ClipToBounds = true;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         DockManager.Register(this);
         Loaded += (_, _) => DockManager.Register(this);
         Unloaded += (_, _) => DockManager.Unregister(this);

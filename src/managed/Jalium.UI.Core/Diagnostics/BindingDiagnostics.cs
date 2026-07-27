@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using Jalium.UI.Data;
 using Jalium.UI.Media;
 
@@ -60,30 +61,9 @@ public static class BindingDiagnostics
     private const int MaxEntries = 512;
     private static int s_recording;
     private static readonly ConcurrentQueue<BindingEventEntry> s_entries = new();
-    private static readonly ConcurrentDictionary<BindingKey, BindingCounters> s_counters = new();
-
-    private readonly record struct BindingKey(WeakRefKey Target, DependencyProperty Property);
-
-    private readonly struct WeakRefKey : IEquatable<WeakRefKey>
-    {
-        private readonly WeakReference<DependencyObject> _ref;
-        private readonly int _hash;
-
-        public WeakRefKey(DependencyObject target)
-        {
-            _ref = new WeakReference<DependencyObject>(target);
-            _hash = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(target);
-        }
-
-        public override int GetHashCode() => _hash;
-        public override bool Equals(object? obj) => obj is WeakRefKey other && Equals(other);
-        public bool Equals(WeakRefKey other)
-        {
-            if (!_ref.TryGetTarget(out var a) || !other._ref.TryGetTarget(out var b))
-                return false;
-            return ReferenceEquals(a, b);
-        }
-    }
+    private static readonly ConditionalWeakTable<
+        DependencyObject,
+        ConcurrentDictionary<DependencyProperty, BindingCounters>> s_counters = new();
 
     public sealed class BindingCounters
     {
@@ -118,12 +98,21 @@ public static class BindingDiagnostics
 
     public static BindingCounters? GetCounters(DependencyObject target, DependencyProperty property)
     {
-        return s_counters.TryGetValue(new BindingKey(new WeakRefKey(target), property), out var c) ? c : null;
+        ArgumentNullException.ThrowIfNull(target);
+        ArgumentNullException.ThrowIfNull(property);
+
+        return s_counters.TryGetValue(target, out var properties) &&
+               properties.TryGetValue(property, out var counters)
+            ? counters
+            : null;
     }
 
     private static BindingCounters GetOrCreateCounters(DependencyObject target, DependencyProperty property)
     {
-        return s_counters.GetOrAdd(new BindingKey(new WeakRefKey(target), property), _ => new BindingCounters());
+        var properties = s_counters.GetValue(
+            target,
+            static _ => new ConcurrentDictionary<DependencyProperty, BindingCounters>());
+        return properties.GetOrAdd(property, static _ => new BindingCounters());
     }
 
     private static bool IsIgnored(BindingExpressionBase expression)
@@ -138,21 +127,21 @@ public static class BindingDiagnostics
 
     internal static void NotifyUpdateTarget(BindingExpressionBase expression, string? message = null)
     {
+        if (Volatile.Read(ref s_recording) == 0) return;
         if (IsIgnored(expression)) return;
         var counters = GetOrCreateCounters(expression.Target, expression.TargetProperty);
         Interlocked.Increment(ref counters.UpdateTargetCount);
         counters.LastUpdate = DateTime.Now;
-        if (Volatile.Read(ref s_recording) == 0) return;
         Push(new BindingEventEntry(expression, BindingEventKind.UpdateTarget, message));
     }
 
     internal static void NotifyUpdateSource(BindingExpressionBase expression, string? message = null)
     {
+        if (Volatile.Read(ref s_recording) == 0) return;
         if (IsIgnored(expression)) return;
         var counters = GetOrCreateCounters(expression.Target, expression.TargetProperty);
         Interlocked.Increment(ref counters.UpdateSourceCount);
         counters.LastUpdate = DateTime.Now;
-        if (Volatile.Read(ref s_recording) == 0) return;
         Push(new BindingEventEntry(expression, BindingEventKind.UpdateSource, message));
     }
 
@@ -166,10 +155,17 @@ public static class BindingDiagnostics
     internal static void NotifyError(BindingExpressionBase expression, string message)
     {
         if (IsIgnored(expression)) return;
-        var counters = GetOrCreateCounters(expression.Target, expression.TargetProperty);
-        Interlocked.Increment(ref counters.ErrorCount);
-        counters.LastError = message;
-        counters.LastUpdate = DateTime.Now;
+
+        if (Volatile.Read(ref s_recording) != 0)
+        {
+            var counters = GetOrCreateCounters(expression.Target, expression.TargetProperty);
+            Interlocked.Increment(ref counters.ErrorCount);
+            counters.LastError = message;
+            counters.LastUpdate = DateTime.Now;
+        }
+
+        // Binding failures remain observable even when timeline recording is
+        // disabled. The queue is bounded and its expression reference is weak.
         Push(new BindingEventEntry(expression, BindingEventKind.Error, message));
 
         var eventArgs = new BindingFailedEventArgs(

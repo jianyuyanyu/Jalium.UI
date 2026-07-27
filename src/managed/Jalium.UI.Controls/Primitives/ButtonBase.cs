@@ -139,7 +139,7 @@ public abstract class ButtonBase : ContentControl, ICommandSource
     {
         // Use ControlTemplate for visual appearance instead of direct content
         UseTemplateContentManagement();
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         Focusable = true;
 
         // Touch ripple is on by default for buttons — apps can opt out via

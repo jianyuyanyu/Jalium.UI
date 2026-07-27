@@ -1,4 +1,4 @@
-﻿using System.Reflection;
+using System.Reflection;
 using Jalium.UI;
 using System.Diagnostics;
 using Jalium.UI.Controls;
@@ -235,6 +235,99 @@ public class ThemeRuntimeSwitchTests
             Assert.Equal("Consolas", ThemeManager.CurrentMonospaceFontFamily);
             Assert.Equal("Calibri", textBlock.FontFamily.Source);
             Assert.Equal("Calibri", button.FontFamily.Source);
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Theory]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    [InlineData(double.NegativeInfinity)]
+    [InlineData(0.0)]
+    [InlineData(-1.0)]
+    public void ApplyTypography_InvalidBodyFontSize_UsesFiniteDefault(double bodyFontSize)
+    {
+        ResetApplicationState();
+        ThemeLoader.Initialize();
+        var app = new Application();
+
+        try
+        {
+            ThemeManager.ApplyTypography("Georgia", "Calibri", "Consolas", bodyFontSize);
+
+            Assert.Equal(FrameworkElement.DefaultFontSize, ThemeManager.CurrentBodyFontSize);
+            Assert.Equal(
+                FrameworkElement.DefaultFontSize,
+                Assert.IsType<double>(app.Resources["BodyFontSize"]));
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Fact]
+    public void ApplyTheme_InvalidVariant_ThrowsWithoutMutatingThemeState()
+    {
+        ResetApplicationState();
+        ThemeLoader.Initialize();
+        _ = new Application();
+
+        try
+        {
+            ThemeVariant themeBefore = ThemeManager.CurrentTheme;
+            object? keyBefore = ResourceDictionary.CurrentThemeKey;
+            int versionBefore = ThemeManager.CurrentThemeVersion;
+
+            Assert.Throws<ArgumentOutOfRangeException>(
+                () => ThemeManager.ApplyTheme((ThemeVariant)int.MaxValue));
+
+            Assert.Equal(themeBefore, ThemeManager.CurrentTheme);
+            Assert.Equal(keyBefore, ResourceDictionary.CurrentThemeKey);
+            Assert.Equal(versionBefore, ThemeManager.CurrentThemeVersion);
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Fact]
+    public void Reset_DetachesOnlyThemeManagedDictionaries_AndAllowsCleanReinitialize()
+    {
+        ResetApplicationState();
+        ThemeLoader.Initialize();
+        var app = new Application();
+        var userDictionary = new ResourceDictionary();
+        app.Resources.MergedDictionaries.Insert(0, userDictionary);
+        ResourceDictionary[] managedDictionaries = app.Resources.MergedDictionaries
+            .Where(dictionary => !ReferenceEquals(dictionary, userDictionary))
+            .ToArray();
+
+        try
+        {
+            Assert.NotEmpty(managedDictionaries);
+
+            ThemeManager.Reset();
+
+            Assert.False(ThemeManager.IsInitialized);
+            Assert.Single(app.Resources.MergedDictionaries);
+            Assert.Same(userDictionary, app.Resources.MergedDictionaries[0]);
+            foreach (ResourceDictionary dictionary in managedDictionaries)
+            {
+                Assert.DoesNotContain(
+                    app.Resources.MergedDictionaries,
+                    candidate => ReferenceEquals(candidate, dictionary));
+            }
+
+            ThemeManager.Initialize(app);
+
+            Assert.True(ThemeManager.IsInitialized);
+            Assert.Contains(userDictionary, app.Resources.MergedDictionaries);
+            Assert.Equal(managedDictionaries.Length + 1, app.Resources.MergedDictionaries.Count);
         }
         finally
         {

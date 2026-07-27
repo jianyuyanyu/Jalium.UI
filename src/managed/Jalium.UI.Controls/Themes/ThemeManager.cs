@@ -1,4 +1,4 @@
-﻿using System.Diagnostics.CodeAnalysis;
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using Jalium.UI.Media;
 
@@ -293,6 +293,11 @@ public static class ThemeManager
     /// </summary>
     public static void ApplyTheme(ThemeVariant theme)
     {
+        if (!Enum.IsDefined(theme))
+        {
+            throw new ArgumentOutOfRangeException(nameof(theme), theme, "Unsupported theme variant.");
+        }
+
         var themeChanged = CurrentTheme != theme;
         CurrentTheme = theme;
 
@@ -353,7 +358,9 @@ public static class ThemeManager
         CurrentDisplayFontFamily = NormalizeFontFamily(display, FrameworkElement.DefaultFontFamilyName);
         CurrentBodyFontFamily = NormalizeFontFamily(body, FrameworkElement.DefaultFontFamilyName);
         CurrentMonospaceFontFamily = NormalizeFontFamily(mono, "Cascadia Code");
-        CurrentBodyFontSize = bodyFontSize > 0 ? bodyFontSize : FrameworkElement.DefaultFontSize;
+        CurrentBodyFontSize = double.IsFinite(bodyFontSize) && bodyFontSize > 0
+            ? bodyFontSize
+            : FrameworkElement.DefaultFontSize;
 
         if (_application == null)
             return;
@@ -494,6 +501,7 @@ public static class ThemeManager
     internal static void Reset()
     {
         DynamicResourceBindingOperations.ResetRegistryForTesting();
+        DetachManagedDictionaries(_application);
 
         if (_genericThemeDictionary != null)
         {

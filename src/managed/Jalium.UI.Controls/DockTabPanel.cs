@@ -246,7 +246,7 @@ public class DockTabPanel : Selector
 
     public DockTabPanel()
     {
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         MinWidth = 100;
         MinHeight = 100;
         ClipToBounds = true;

@@ -53,7 +53,11 @@ public abstract class TextElement : FrameworkContentElement
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Typography)]
     public static readonly DependencyProperty FontSizeProperty =
         DependencyProperty.RegisterAttached("FontSize", typeof(double), typeof(TextElement),
-            new PropertyMetadata(14.0, null, null, inherits: true));
+            new PropertyMetadata(14.0, null, null, inherits: true),
+            static value => value is double size &&
+                            double.IsFinite(size) &&
+                            size > 0.001 &&
+                            size <= 35791.0);
 
     /// <summary>
     /// Identifies the FontWeight dependency property.

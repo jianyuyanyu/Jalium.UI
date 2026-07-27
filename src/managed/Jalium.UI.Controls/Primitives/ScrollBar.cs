@@ -1,4 +1,4 @@
-﻿using Jalium.UI.Data;
+using Jalium.UI.Data;
 using Jalium.UI.Input;
 using Jalium.UI.Input.Internal.Gestures;
 using Jalium.UI.Controls.Themes;
@@ -246,7 +246,7 @@ public class ScrollBar : RangeBase
     public ScrollBar()
     {
         // Set default values for range base
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         Maximum = 100;
         SmallChange = 1;
         LargeChange = 10;
@@ -396,7 +396,7 @@ public class ScrollBar : RangeBase
             // and Arrange invalidation on every pointer move.
             HandlesThumbDragInternally = false
         };
-        _track.SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        _track.SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         _track.Thumb = new Thumb
         {
             Style = s_internalThumbStyle,
@@ -408,7 +408,7 @@ public class ScrollBar : RangeBase
             Width = double.NaN,
             Height = double.NaN
         };
-        _track.Thumb.SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        _track.Thumb.SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         _track.Thumb.Cursor = Jalium.UI.Input.Cursors.Arrow;
         _track.Thumb.DragStarted += OnThumbDragStarted;
         _track.Thumb.DragDelta += OnThumbDragDelta;

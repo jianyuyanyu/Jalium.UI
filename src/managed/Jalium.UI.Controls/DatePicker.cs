@@ -281,7 +281,7 @@ public class DatePicker : Control
         SynchronizeCalendarConfiguration();
 
         Focusable = true;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
 
         AddHandler(MouseDownEvent, new MouseButtonEventHandler(OnMouseDownHandler));
         AddHandler(KeyDownEvent, new KeyEventHandler(OnKeyDownHandler));

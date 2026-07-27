@@ -250,7 +250,8 @@ public sealed class PriorityBindingExpression : BindingExpressionBase
                 activeValue,
                 TargetProperty.PropertyType,
                 CultureInfo.CurrentCulture);
-            Target.SetValue(TargetProperty, activeValue);
+            if (!TrySetTargetValue(activeValue))
+                return;
         }
         finally
         {

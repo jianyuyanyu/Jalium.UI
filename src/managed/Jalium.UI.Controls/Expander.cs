@@ -121,7 +121,7 @@ public class Expander : HeaderedContentControl
     public Expander()
     {
         Focusable = true;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         UseTemplateContentManagement();
 
         // Register keyboard handler

@@ -833,6 +833,35 @@ public abstract class BindingExpressionBase : Expression, IWeakEventListener
         _attachedBindingGroup?.RemoveBindingExpression(this);
         _attachedBindingGroup = null;
     }
+
+    /// <summary>
+    /// Writes a binding result only when it can be represented by the target dependency property.
+    /// A failed conversion is a binding error, not permission to corrupt the property store.
+    /// </summary>
+    protected bool TrySetTargetValue(object? value)
+    {
+        // Preserve the framework's compatibility behavior for null flowing into a non-nullable
+        // value-type DP: DependencyObject.SetValue drops that local contribution and exposes the
+        // metadata/default value. All non-null mismatches must fail closed.
+        var isLegacyNullValueTypeWrite =
+            value is null &&
+            TargetProperty.PropertyType.IsValueType &&
+            Nullable.GetUnderlyingType(TargetProperty.PropertyType) is null;
+
+        if ((!isLegacyNullValueTypeWrite && !TargetProperty.IsValidType(value)) ||
+            !TargetProperty.IsValidValue(value))
+        {
+            Status = BindingStatus.UpdateTargetError;
+            BindingDiagnostics.NotifyStatus(
+                this,
+                $"Converted value type is incompatible with {TargetProperty.OwnerType.Name}.{TargetProperty.Name}.");
+            return false;
+        }
+
+        Target.SetValue(TargetProperty, value);
+        Status = BindingStatus.Active;
+        return true;
+    }
 }
 
 /// <summary>
@@ -1394,7 +1423,8 @@ public sealed class BindingExpression : BindingExpressionBase
                 TargetProperty.PropertyType,
                 _binding.ConverterCulture ?? CultureInfo.CurrentCulture);
 
-            Target.SetValue(TargetProperty, targetValue);
+            if (!TrySetTargetValue(targetValue))
+                return;
 
             // Validate data errors for the target update
             if (_binding.ValidatesOnNotifyDataErrors && _notifyDataErrorInfo != null)

@@ -358,12 +358,11 @@ public class DependencyObject : DispatcherObject
 
     private static void ValidateValueOrThrow(DependencyProperty dp, object? value)
     {
-        // Mirrors WPF: the per-property ValidateValueCallback (registered via the
-        // Register/RegisterAttached overloads that take a validator) gates every
-        // public write of the value. Enum-typed attached properties such as
-        // TextOptions.TextRenderingMode use it to reject out-of-range members so an
-        // illegal value never reaches the render pipeline.
-        if (!dp.IsValidValue(value))
+        // Keep the established null-to-non-nullable-value-type degradation semantics, but reject every
+        // non-null type mismatch at the public API boundary. Otherwise an untyped SetValue can publish,
+        // for example, object into a Thickness property and defer the InvalidCastException until layout.
+        var isLegacyNullValueTypeWrite = IsNullForNonNullableValueType(dp, value);
+        if ((!isLegacyNullValueTypeWrite && !dp.IsValidType(value)) || !dp.IsValidValue(value))
         {
             throw new ArgumentException(
                 $"Value '{value ?? "<null>"}' is not valid for dependency property '{dp.OwnerType.Name}.{dp.Name}'.",
@@ -640,7 +639,9 @@ public class DependencyObject : DispatcherObject
             // property falls through to its synthesized/registered default instead of unbox-crashing at
             // layout. The local was already removed above, so skipping the write degrades to default; the
             // change notification below still fires for the null -> default transition.
-            if (!IsNullForNonNullableValueType(dp, localValue))
+            if (!IsNullForNonNullableValueType(dp, localValue) &&
+                dp.IsValidType(localValue) &&
+                dp.IsValidValue(localValue))
             {
                 switch (source)
                 {
@@ -1202,17 +1203,17 @@ public class DependencyObject : DispatcherObject
     private void SetLayerValueCore(DependencyProperty dp, object? value, LayerValueSource source)
     {
         // Central backstop (WPF parity, mirroring StyleHelper's "if (!IsValidValue) value = UnsetValue"):
-        // never pin a null into a non-nullable value-type layer. No legitimate writer needs to — doing
-        // so shadows the registered default and crashes on unbox — so degrade it to "no contribution":
-        // drop any existing value at this layer and let resolution fall through to a valid
-        // lower-precedence value / the default. This guards every caller that funnels a LAYER write
-        // through here — template-binding transfers, Style setters/triggers, {DynamicResource}, and the
-        // SetCurrentValue re-dispatch for layer base-sources — and runs before the auto-transition path
-        // ever snapshots a value-type base value, so the animator never interpolates to/from null.
+        // never pin a null or any other invalid value into a layer. Drop the contribution and let
+        // resolution fall through to a valid lower-precedence value / the default. This guards every
+        // caller that funnels a LAYER write through here — template-binding transfers, Style
+        // setters/triggers, {DynamicResource}, and SetCurrentValue re-dispatch for layer base-sources —
+        // and runs before the auto-transition path snapshots the value.
         // (SetCurrentValue's Default/Inherited/Local branches write _currentValues/_localValues directly,
         // bypassing this method; that null is caught at the SetCurrentValue entry instead. Local promotion
         // is guarded in PromoteLocalValuesToLayer.)
-        if (IsNullForNonNullableValueType(dp, value))
+        if (IsNullForNonNullableValueType(dp, value) ||
+            !dp.IsValidType(value) ||
+            !dp.IsValidValue(value))
         {
             ClearLayerValueCore(dp, source);
             return;

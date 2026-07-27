@@ -392,7 +392,7 @@ public class ComboBox : Selector
     {
         MinWidth = 120;
         Focusable = true;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         SizeChanged += OnComboBoxSizeChanged;
 
         // Initialize SelectionBoxItem with placeholder
@@ -1789,7 +1789,7 @@ public class ComboBoxItem : ListBoxItem
     {
         // Use ControlTemplate-based rendering (defined in SelectionControls.jalxaml)
         UseTemplateContentManagement();
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         // Set up mouse event handlers for click behavior and hover tracking
         AddHandler(MouseDownEvent, new MouseButtonEventHandler(OnMouseDownHandler), handledEventsToo: true);
         AddHandler(MouseUpEvent, new MouseButtonEventHandler(OnMouseUpHandler), handledEventsToo: true);

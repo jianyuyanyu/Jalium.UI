@@ -152,7 +152,7 @@ public class TimePicker : Control
     public TimePicker()
     {
         Focusable = true;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
 
         AddHandler(MouseDownEvent, new MouseButtonEventHandler(OnMouseDownHandler));
         AddHandler(KeyDownEvent, new KeyEventHandler(OnKeyDownHandler));

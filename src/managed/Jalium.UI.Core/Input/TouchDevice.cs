@@ -45,6 +45,7 @@ public abstract class TouchDevice : InputDevice, IManipulator
     public event EventHandler? Activated;
     public event EventHandler? Deactivated;
     public event EventHandler? Updated;
+    internal static event Action<TouchDevice, IInputElement?, IInputElement?>? CaptureChanged;
 
     public abstract TouchPoint GetTouchPoint(IInputElement? relativeTo);
     public abstract TouchPointCollection GetIntermediateTouchPoints(IInputElement? relativeTo);
@@ -72,6 +73,7 @@ public abstract class TouchDevice : InputDevice, IManipulator
         _captured = element;
         _captureMode = captureMode;
         _directlyOver = ResolveDirectlyOver(_rawDirectlyOver);
+        CaptureChanged?.Invoke(this, previous, element);
         OnCapture(element, captureMode);
 
         if (previous is not null)

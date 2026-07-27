@@ -11,6 +11,7 @@ namespace Jalium.UI.Input;
 /// </summary>
 public static class Touch
 {
+    private static readonly object _touchDevicesGate = new();
     private static readonly Dictionary<int, TouchDevice> _touchDevices = new();
     private static TouchCapabilities? _cachedCapabilities;
     private static TouchCapabilities? _overrideCapabilities;
@@ -27,10 +28,24 @@ public static class Touch
     public static event TouchFrameEventHandler? FrameReported;
 
     /// <summary>Gets the collection of active touch devices.</summary>
-    public static IReadOnlyCollection<TouchDevice> ActiveDevices => _touchDevices.Values;
+    public static IReadOnlyCollection<TouchDevice> ActiveDevices
+    {
+        get
+        {
+            lock (_touchDevicesGate)
+                return _touchDevices.Values.ToArray();
+        }
+    }
 
     /// <summary>Gets the number of active touch points.</summary>
-    public static int TouchPointCount => _touchDevices.Count;
+    public static int TouchPointCount
+    {
+        get
+        {
+            lock (_touchDevicesGate)
+                return _touchDevices.Count;
+        }
+    }
 
     /// <summary>Gets a value indicating whether touch input is present on this system.</summary>
     public static bool IsTouchAvailable => GetTouchCapabilities().TouchPresent;
@@ -155,18 +170,32 @@ public static class Touch
     /// <summary>Registers a new touch contact.</summary>
     public static TouchDevice RegisterTouchPoint(int pointerId, Point position, UIElement? target)
     {
-        if (_touchDevices.Remove(pointerId, out TouchDevice? previous))
-            previous.DeactivateForManager();
-        var device = new PointerTouchDevice(pointerId, target);
-        device.UpdatePosition(position);
-        _touchDevices[pointerId] = device;
-        return device;
+        while (true)
+        {
+            TouchDevice? previous;
+            lock (_touchDevicesGate)
+            {
+                if (!_touchDevices.Remove(pointerId, out previous))
+                {
+                    var device = new PointerTouchDevice(pointerId, target);
+                    device.UpdatePosition(position);
+                    _touchDevices.Add(pointerId, device);
+                    return device;
+                }
+            }
+
+            previous!.DeactivateForManager();
+        }
     }
 
     /// <summary>Updates the position of an existing touch contact.</summary>
     public static void UpdateTouchPoint(int pointerId, Point position)
     {
-        if (_touchDevices.TryGetValue(pointerId, out var device))
+        TouchDevice? device;
+        lock (_touchDevicesGate)
+            _touchDevices.TryGetValue(pointerId, out device);
+
+        if (device is not null)
         {
             device.UpdatePosition(position);
         }
@@ -175,14 +204,20 @@ public static class Touch
     /// <summary>Removes a touch contact from the active set.</summary>
     public static void UnregisterTouchPoint(int pointerId)
     {
-        if (_touchDevices.Remove(pointerId, out TouchDevice? device))
+        TouchDevice? device;
+        lock (_touchDevicesGate)
+            _touchDevices.Remove(pointerId, out device);
+
+        if (device is not null)
             device.DeactivateForManager();
     }
 
     /// <summary>Looks up an active touch contact by id, or returns null.</summary>
     public static TouchDevice? GetDevice(int pointerId)
     {
-        _touchDevices.TryGetValue(pointerId, out var device);
+        TouchDevice? device;
+        lock (_touchDevicesGate)
+            _touchDevices.TryGetValue(pointerId, out device);
         return device;
     }
 }

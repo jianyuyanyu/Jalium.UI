@@ -96,6 +96,38 @@ public sealed class DiagnosticsParityTests
     }
 
     [Fact]
+    public void BindingDiagnosticsDoNotAllocateCountersWhileRecordingIsDisabled()
+    {
+        BindingDiagnostics.StopRecording();
+        BindingDiagnostics.Reset();
+
+        try
+        {
+            var model = new NumericModel { Value = 10 };
+            var target = new Border { DataContext = model };
+            var binding = new Binding(nameof(NumericModel.Value));
+
+            BindingOperations.SetBinding(target, FrameworkElement.TagProperty, binding);
+            model.Value = 20;
+            target.GetBindingExpression(FrameworkElement.TagProperty)!.UpdateTarget();
+
+            Assert.Null(BindingDiagnostics.GetCounters(target, FrameworkElement.TagProperty));
+
+            BindingDiagnostics.StartRecording();
+            target.GetBindingExpression(FrameworkElement.TagProperty)!.UpdateTarget();
+
+            Assert.Equal(
+                1,
+                BindingDiagnostics.GetCounters(target, FrameworkElement.TagProperty)!.UpdateTargetCount);
+        }
+        finally
+        {
+            BindingDiagnostics.StopRecording();
+            BindingDiagnostics.Reset();
+        }
+    }
+
+    [Fact]
     public void VisualTreeNotificationsReportAddAndRemoveWithWpfChildIndexes()
     {
         var parent = new TestVisual();
