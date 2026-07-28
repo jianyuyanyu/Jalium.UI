@@ -141,23 +141,23 @@ public sealed class ThreadingDispatcherParityTests
     }
 
     [Fact]
-    public async Task GenericInvokeAsyncCarriesTypedResultTaskAndAwaiter()
+    public void GenericInvokeAsyncCarriesTypedResultTaskAndAwaiter()
     {
-        WpfDispatcher dispatcher = WpfDispatcher.CurrentDispatcher;
-        dispatcher.ProcessQueue();
+        RunOnFreshDispatcherThread(dispatcher =>
+        {
+            Jalium.UI.Threading.DispatcherOperation<int> operation = dispatcher.InvokeAsync(
+                () => 42,
+                WpfPriority.Background);
 
-        Jalium.UI.Threading.DispatcherOperation<int> operation = dispatcher.InvokeAsync(
-            () => 42,
-            WpfPriority.Background);
+            _ = Assert.IsAssignableFrom<Task<int>>(operation.Task);
+            Assert.False(operation.Task.IsCompleted);
 
-        _ = Assert.IsAssignableFrom<Task<int>>(operation.Task);
-        Assert.False(operation.Task.IsCompleted);
+            dispatcher.ProcessQueue();
 
-        dispatcher.ProcessQueue();
-
-        Assert.Equal(42, operation.Result);
-        Assert.Equal(42, await operation);
-        Assert.True(operation.Task.IsCompletedSuccessfully);
+            Assert.Equal(42, operation.Result);
+            Assert.Equal(42, operation.GetAwaiter().GetResult());
+            Assert.True(operation.Task.IsCompletedSuccessfully);
+        });
     }
 
     [Fact]
