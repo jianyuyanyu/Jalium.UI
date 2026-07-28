@@ -28,6 +28,9 @@ public sealed partial class BitmapImage : BitmapSource, IDisposable, IReclaimabl
     private int _pixelStride;
     private CancellationTokenSource? _httpCts;
     private bool _isDownloading;
+    // Serializes TryRestorePixelData so concurrent renderers don't each pay a
+    // decode for the same reclaimed image.
+    private readonly object _pixelRestoreLock = new();
 
     /// <summary>
     /// Occurs when the image has been loaded from a remote source.
@@ -745,6 +748,63 @@ public sealed partial class BitmapImage : BitmapSource, IDisposable, IReclaimabl
         if (_imageData != null)
         {
             _rawPixelData = null;
+        }
+    }
+
+    /// <summary>
+    /// Re-decodes <see cref="ImageData"/> back into the BGRA8 pixel buffer that
+    /// <see cref="ReclaimIdleResources"/> dropped, so a reclaimed image returns
+    /// to the cheap upload path instead of paying a full native decode on every
+    /// subsequent GPU cache miss. No-op when pixels are already present, and
+    /// returns false when there is no encoded source to rebuild from.
+    /// </summary>
+    /// <remarks>
+    /// Only refills the decode cache — it deliberately does NOT raise
+    /// <c>OnImageLoaded</c>, because nothing about the image changed from a
+    /// consumer's point of view; replaying the load event would re-trigger
+    /// layout for what is purely an internal cache restore.
+    /// </remarks>
+    internal bool TryRestorePixelData()
+    {
+        if (_rawPixelData != null)
+        {
+            return true;
+        }
+
+        var encoded = _imageData;
+        if (encoded == null || encoded.Length == 0)
+        {
+            return false;
+        }
+
+        lock (_pixelRestoreLock)
+        {
+            if (_rawPixelData != null)
+            {
+                return true;
+            }
+
+            try
+            {
+                var decoded = ResolveDecoder().Decode(encoded);
+                var span = decoded.Pixels.Span;
+                var copy = new byte[span.Length];
+                span.CopyTo(copy);
+
+                _width = decoded.Width;
+                _height = decoded.Height;
+                _pixelStride = decoded.Stride;
+                _rawPixelData = copy;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                // The encoded bytes decoded once already, so a failure here is
+                // exceptional; fall back to the caller's native decode path.
+                System.Diagnostics.Debug.WriteLine(
+                    $"[BitmapImage] Failed to restore reclaimed pixels: {ex.Message}");
+                return false;
+            }
         }
     }
 

@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using Jalium.UI.Input;
 using Jalium.UI.Interop;
 using Jalium.UI.Interop.Win32;

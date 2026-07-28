@@ -1,5 +1,7 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
+using System.Runtime.CompilerServices;
+using Jalium.UI;
 using Jalium.UI.Controls;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -7,22 +9,25 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 namespace Jalium.UI.Hosting;
 
 /// <summary>
-/// Reflective scanner that turns a set of assemblies into DI registrations —
-/// the moral equivalent of <c>AddControllersWithViews</c> in ASP.NET Core MVC.
+/// Turns a set of assemblies into DI registrations from source-generated type
+/// catalogs, with reflection discovery retained for non-trimmed legacy callers.
 /// </summary>
 /// <remarks>
-/// Scanning uses <see cref="Assembly.GetExportedTypes"/> and simple name-suffix
-/// rules (see <see cref="ViewDiscoveryOptions"/>). The scan is <em>not</em>
-/// trimmer/AOT friendly — consuming it from a trimmed app is allowed but the
-/// types referenced must be preserved by the caller (typically via
-/// <c>DynamicDependency</c> on the entry point or by keeping the project
-/// non-trimmed at the entry layer). Use the explicit
-/// <see cref="JaliumHostingExtensions.AddView{TView,TViewModel}"/> API instead
-/// for trim-safe registration.
+/// The JALXAML source generator populates <see cref="AotTypeRegistry"/> before
+/// application startup. NativeAOT therefore never needs
+/// <see cref="Assembly.GetExportedTypes"/> to discover application Views and
+/// ViewModels. Simple name-suffix rules are still controlled by
+/// <see cref="ViewDiscoveryOptions"/>.
 /// </remarks>
 internal static class ViewDiscovery
 {
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("ViewDiscovery enumerates exported types via Assembly.GetExportedTypes; see remarks for trim-safe alternatives.")]
+    [UnconditionalSuppressMessage(
+        "Trimming",
+        "IL2072:UnrecognizedReflectionPattern",
+        Justification =
+            "Every generated catalog entry flows from AotTypeRegistry.Register(Type), " +
+            "whose generic parameter preserves public constructors. The JIT-only " +
+            "reflection fallback is intentionally excluded from trimmed builds.")]
     public static ViewDiscoveryResult Discover(IServiceCollection services, ViewDiscoveryOptions options)
     {
         ArgumentNullException.ThrowIfNull(services);
@@ -130,7 +135,6 @@ internal static class ViewDiscovery
         return result;
     }
 
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Defers to Discover which enumerates exported types via Assembly.GetExportedTypes.")]
     public static ViewDiscoveryResult DiscoverViewsOnly(IServiceCollection services, ViewDiscoveryOptions options)
     {
         var originalAutoPair = options.AutoPair;
@@ -147,7 +151,13 @@ internal static class ViewDiscovery
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("ViewDiscovery enumerates exported types via Assembly.GetExportedTypes.")]
+    [UnconditionalSuppressMessage(
+        "Trimming",
+        "IL2072:UnrecognizedReflectionPattern",
+        Justification =
+            "Every generated catalog entry flows from AotTypeRegistry.Register(Type), " +
+            "whose generic parameter preserves public constructors. The JIT-only " +
+            "reflection fallback is intentionally excluded from trimmed builds.")]
     public static ViewDiscoveryResult DiscoverViewModelsOnly(IServiceCollection services, ViewDiscoveryOptions options)
     {
         ArgumentNullException.ThrowIfNull(services);
@@ -238,9 +248,28 @@ internal static class ViewDiscovery
         return false;
     }
 
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Enumerates exported types via Assembly.GetExportedTypes; types may be trimmed.")]
+    [UnconditionalSuppressMessage(
+        "Trimming",
+        "IL2026:RequiresUnreferencedCode",
+        Justification =
+            "NativeAOT uses the source-generated AotTypeRegistry branch. " +
+            "Assembly.GetExportedTypes is only the compatibility fallback for " +
+            "JIT assemblies that were built without the Jalium source generator.")]
     private static IEnumerable<Type> GetExportedTypesSafe(Assembly assembly)
     {
+        if (AotTypeRegistry.TryGetTypes(assembly, out var generatedTypes))
+        {
+            return generatedTypes.Where(static type => type.IsVisible);
+        }
+
+        if (!RuntimeFeature.IsDynamicCodeSupported)
+        {
+            throw new InvalidOperationException(
+                $"Assembly '{assembly.GetName().Name}' has no Jalium AOT type " +
+                "catalog. Ensure Jalium.UI.Xaml.SourceGenerator is enabled for " +
+                "the project that declares its Views and ViewModels.");
+        }
+
         try
         {
             return assembly.GetExportedTypes();

@@ -138,8 +138,8 @@ public sealed class DeviceRemovalInjectionTests
 
     /// <summary>
     /// Backend-agnostic device-lost core on D3D12: mid-frame device removal, then
-    /// recovery replaced the render target, brought up a fresh device (pointer
-    /// changed on the first incident), stayed on D3D12, and a second incident did
+    /// recovery replaced the render target, advanced to a fresh context generation,
+    /// stayed on D3D12, and a second incident did
     /// not downgrade. This is the same scenario the Vulkan variant below runs — the
     /// portable subset that does not touch retained layers or the #921 hooks.
     /// </summary>
@@ -153,7 +153,7 @@ public sealed class DeviceRemovalInjectionTests
             [
                 "FIRST_FRAME window=A backend=D3D12",
                 "INJECTED window=A ok=1 midframe=true",
-                "DEVICELOST_RECOVERED round=1 before=", // ... changed=1 asserted in-harness
+                "DEVICELOST_RECOVERED round=1 before=", // generation advance is asserted in-harness
                 "BACKEND_OK d3d12",
                 "DEVICELOST_RECOVERED round=2 before=",
                 "SCENARIO devicelost complete backend=d3d12",
@@ -378,25 +378,44 @@ public sealed class DeviceRemovalInjectionTests
         psi.Environment.Remove("JALIUM_DISABLE_RETAINED_LAYERS");
         psi.Environment.Remove("JALIUM_D3D12_FORCE_WARP");
 
-        var transcript = new StringBuilder();
         using var process = new Process { StartInfo = psi };
-        process.OutputDataReceived += (_, e) => { if (e.Data is not null) lock (transcript) transcript.AppendLine(e.Data); };
-        process.ErrorDataReceived += (_, e) => { if (e.Data is not null) lock (transcript) transcript.AppendLine("[stderr] " + e.Data); };
 
         Assert.True(process.Start(), $"failed to start harness: {exe}");
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
+        Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync();
+        Task<string> stderrTask = process.StandardError.ReadToEndAsync();
 
-        if (!process.WaitForExit(HarnessTimeoutMs))
+        bool exited = process.WaitForExit(HarnessTimeoutMs);
+        if (!exited)
         {
             try { process.Kill(entireProcessTree: true); } catch { /* already gone */ }
-            process.WaitForExit(10_000);
-            Assert.Fail($"harness '{scenario}' timed out after {HarnessTimeoutMs / 1000}s.\n{Snapshot()}");
+            Assert.True(process.WaitForExit(10_000), $"harness '{scenario}' did not exit after it was killed");
         }
-        process.WaitForExit(); // drain the async output readers
+
+        // BeginOutputReadLine dispatches callbacks through Process.AsyncStreamReader.
+        // After several GPU child processes that callback queue could outlive the
+        // Process and crash the long-running full-suite host. Read both pipes to
+        // completion instead; the two tasks still prevent either pipe from filling.
+        Assert.True(
+            Task.WaitAll([stdoutTask, stderrTask], 10_000),
+            $"harness '{scenario}' output pipes did not drain after process exit");
+
+        var transcript = new StringBuilder(stdoutTask.GetAwaiter().GetResult());
+        string stderr = stderrTask.GetAwaiter().GetResult();
+        foreach (string line in stderr.Replace("\r\n", "\n").Split('\n'))
+        {
+            if (line.Length > 0)
+            {
+                transcript.AppendLine("[stderr] " + line);
+            }
+        }
+
+        string all = transcript.ToString();
+        if (!exited)
+        {
+            Assert.Fail($"harness '{scenario}' timed out after {HarnessTimeoutMs / 1000}s.\n{all}");
+        }
 
         int exitCode = process.ExitCode;
-        string all = Snapshot();
         _output.WriteLine(all);
 
         if (exitCode == 2)
@@ -415,7 +434,6 @@ public sealed class DeviceRemovalInjectionTests
                 $"the scenario did not exercise what this test claims.\n{all}");
         }
 
-        string Snapshot() { lock (transcript) return transcript.ToString(); }
     }
 
     internal static string LocateHarness()

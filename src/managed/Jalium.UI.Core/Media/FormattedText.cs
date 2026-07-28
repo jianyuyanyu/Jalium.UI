@@ -1,4 +1,4 @@
-using Jalium.UI.Media.Animation;
+﻿using Jalium.UI.Media.Animation;
 using Jalium.UI;
 using System.ComponentModel;
 using System.Globalization;

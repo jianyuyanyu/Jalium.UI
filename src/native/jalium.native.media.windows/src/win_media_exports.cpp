@@ -232,4 +232,48 @@ JALIUM_MEDIA_API void jalium_camera_close(jalium_camera_source_t* source)
     jalium::media::win::MfCameraClose(source);
 }
 
+// ----- Linux-only media extensions --------------------------------------
+//
+// NativeAOT resolves every reachable DirectPInvoke at link time. A Windows
+// application can retain the managed subtitle decoder metadata even though
+// the Linux-only runtime path is never executed, so the Windows archive must
+// still provide the public ABI. Keep these exports as explicit unsupported
+// stubs instead of making the final link depend on trimmer implementation
+// details.
+
+JALIUM_MEDIA_API jalium_media_status_t jalium_subtitle_decoder_open(
+    const char*                 utf8_path_or_uri,
+    uint32_t                    track_index,
+    jalium_subtitle_decoder_t** out_decoder)
+{
+    if (!utf8_path_or_uri || !out_decoder) return JALIUM_MEDIA_E_INVALID_ARG;
+    (void)track_index;
+    *out_decoder = nullptr;
+    return JALIUM_MEDIA_E_NOT_IMPLEMENTED;
+}
+
+JALIUM_MEDIA_API jalium_media_status_t jalium_subtitle_decoder_read_cue(
+    jalium_subtitle_decoder_t* decoder,
+    jalium_subtitle_cue_t*     out_cue)
+{
+    if (!decoder || !out_cue) return JALIUM_MEDIA_E_INVALID_ARG;
+    std::memset(out_cue, 0, sizeof(*out_cue));
+    return JALIUM_MEDIA_E_NOT_IMPLEMENTED;
+}
+
+JALIUM_MEDIA_API jalium_media_status_t jalium_subtitle_decoder_seek_us(
+    jalium_subtitle_decoder_t* decoder,
+    int64_t                    position_us)
+{
+    if (!decoder) return JALIUM_MEDIA_E_INVALID_ARG;
+    (void)position_us;
+    return JALIUM_MEDIA_E_NOT_IMPLEMENTED;
+}
+
+JALIUM_MEDIA_API void jalium_subtitle_decoder_close(
+    jalium_subtitle_decoder_t* decoder)
+{
+    (void)decoder;
+}
+
 } // extern "C"

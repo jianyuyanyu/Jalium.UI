@@ -1623,7 +1623,7 @@ public sealed class BindingExpression : BindingExpressionBase
     }
 
     [UnconditionalSuppressMessage("Trimming", "IL2026:RequiresUnreferencedCode",
-        Justification = "PropertyAccessorRegistry.TryReadProperty/TryGetPropertyInfo are the binding engine's reflection fallback for unregistered user view-model types. Per their RUC message — \"Register typed accessors via Register() to opt out of reflection\" — preserving these properties is the documented consumer responsibility for trim/AOT (the SourceGenerator emits Register<T>()/DynamicDependency for jalxaml DataType bindings; see project_trim_view_model_binding). Suppressing here keeps the RUC contract declared at the PropertyAccessorRegistry surface rather than cascading it onto every DependencyObject.SetValue caller of the binding engine.")]
+        Justification = "The JALXAML source generator registers application-local binding types through AotTypeRegistry.Register(Type), whose DAM contract preserves their public properties. PropertyAccessorRegistry keeps reflection only as the lookup mechanism for that preserved metadata or for explicitly registered external accessors.")]
     private void ResolveSourceProperty()
     {
         _effectiveSource = null;
@@ -1655,7 +1655,7 @@ public sealed class BindingExpression : BindingExpressionBase
     }
 
     [UnconditionalSuppressMessage("Trimming", "IL2026:RequiresUnreferencedCode",
-        Justification = "PropertyAccessorRegistry.TryReadProperty is the binding engine's reflection fallback for unregistered user view-model types. Per its RUC message — \"Register typed accessors via Register() to opt out of reflection\" — preserving these properties is the documented consumer responsibility for trim/AOT (the SourceGenerator emits Register<T>()/DynamicDependency for jalxaml DataType bindings; see project_trim_view_model_binding). Suppressing here keeps the RUC contract declared at the PropertyAccessorRegistry surface rather than cascading it onto every binding consumer.")]
+        Justification = "The JALXAML source generator registers application-local binding types through AotTypeRegistry.Register(Type), whose DAM contract preserves their public properties. PropertyAccessorRegistry keeps reflection only as the lookup mechanism for that preserved metadata or for explicitly registered external accessors.")]
     private object? GetSourceValue()
     {
         if (ResolvedSource == null)
@@ -1965,8 +1965,8 @@ public sealed class BindingExpression : BindingExpressionBase
         }
     }
 
-    [UnconditionalSuppressMessage("Trimming", "IL2075:UnrecognizedReflectionPattern",
-        Justification = "current.GetType().GetProperty(segment) reflects the runtime type of an intermediate value-object on the binding path to walk it for INotifyPropertyChanged subscriptions. The source is object.GetType() and cannot carry DynamicallyAccessedMembers. The property being reflected is the same property the binding engine already reads via PropertyAccessorRegistry, whose RUC contract — \"Register typed accessors via Register() to opt out of reflection\" — documents that consumers must preserve their bound view-model properties for trim/AOT (the SourceGenerator emits Register<T>()/DynamicDependency for jalxaml DataType bindings; see project_trim_view_model_binding). This is the same documented consumer responsibility, surfaced here as IL2075 because the walk is a direct reflection site.")]
+    [UnconditionalSuppressMessage("Trimming", "IL2026:RequiresUnreferencedCode",
+        Justification = "Intermediate path segments use the same application-local types registered by the JALXAML source generator through AotTypeRegistry.Register(Type); that DAM contract preserves public property metadata for this subscription walk.")]
     private void SubscribeToIntermediates()
     {
         UnsubscribeFromIntermediates();
@@ -1985,10 +1985,14 @@ public sealed class BindingExpression : BindingExpressionBase
         for (int i = 0; i < segments.Length - 1; i++)
         {
             if (current == null) break;
-            var prop = current.GetType().GetProperty(segments[i]);
-            if (prop == null) break;
+            if (!PropertyAccessorRegistry.TryReadProperty(
+                    current,
+                    segments[i],
+                    out var intermediateObj))
+            {
+                break;
+            }
 
-            var intermediateObj = prop.GetValue(current);
             if (intermediateObj is INotifyPropertyChanged inpc)
             {
                 // Subscribe to this intermediate object for property changes

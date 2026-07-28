@@ -53,6 +53,23 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
         DependencyProperty.Register(nameof(VerticalSpacing), typeof(double), typeof(VirtualizingWrapPanel),
             new PropertyMetadata(0.0, OnLayoutPropertyChanged));
 
+    /// <summary>
+    /// Identifies the UseAncestorScrollViewer dependency property.
+    /// </summary>
+    /// <remarks>
+    /// Enable this when the items control participates in a page-level, physical
+    /// <see cref="ScrollViewer"/> instead of owning an internal scroll viewport.
+    /// The panel keeps reporting its full extent to that ancestor while realizing
+    /// only the rows intersecting the ancestor's viewport.
+    /// </remarks>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Behavior)]
+    public static readonly DependencyProperty UseAncestorScrollViewerProperty =
+        DependencyProperty.Register(
+            nameof(UseAncestorScrollViewer),
+            typeof(bool),
+            typeof(VirtualizingWrapPanel),
+            new PropertyMetadata(false, OnUseAncestorScrollViewerChanged));
+
     #endregion
 
     #region CLR Properties
@@ -97,6 +114,17 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
         set => SetValue(VerticalSpacingProperty, value);
     }
 
+    /// <summary>
+    /// Gets or sets whether virtualization follows the nearest ancestor
+    /// <see cref="ScrollViewer"/>'s physical viewport.
+    /// </summary>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Behavior)]
+    public bool UseAncestorScrollViewer
+    {
+        get => (bool)(GetValue(UseAncestorScrollViewerProperty) ?? false);
+        set => SetValue(UseAncestorScrollViewerProperty, value);
+    }
+
     /// <summary>Virtualization mode (Standard / Recycling).</summary>
     public VirtualizationMode VirtualizationMode
     {
@@ -130,6 +158,14 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
     private double _correctiveMeasureCrossAxis = double.NaN;
     private double _correctiveArrangeCrossAxis = double.NaN;
     private readonly List<int> _recycleBuffer = new();
+    private ScrollViewer? _ancestorScrollViewer;
+    private double _ancestorPanelStart = double.NaN;
+    // Scroll-axis viewport the last MeasureOverride actually used to size its
+    // realization window, and the arrange viewport a recovery pass was already
+    // requested for. The latter is a one-shot latch: without it a panel that can
+    // never satisfy its viewport would ping-pong measure and arrange forever.
+    private double _measuredViewportAxis = double.NaN;
+    private double _viewportRecoveryArrangeAxis = double.NaN;
 
     // Per-frame realize budget — large scroll jumps (dragging the thumb,
     // wheel bursts spanning many rows, PageUp/PageDown) used to realize the
@@ -143,6 +179,12 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
     private bool _deferredCatchUpPending;
 
     #endregion
+
+    /// <summary>Initializes a new instance of the panel.</summary>
+    public VirtualizingWrapPanel()
+    {
+        Unloaded += OnPanelUnloaded;
+    }
 
     #region IScrollInfo Implementation
 
@@ -217,7 +259,13 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
         // estimated extent, and clamps the active offset. The owning ScrollViewer's viewport is
         // the stable cross-axis constraint; the raw measure size still governs the scroll axis.
         var layoutSize = StabilizeCrossAxisMeasureSize(availableSize);
-        _viewport = CoerceViewport(layoutSize);
+        _viewport = UseAncestorScrollViewer
+            ? GetAncestorViewport(layoutSize)
+            : CoerceViewport(layoutSize);
+        if (UseAncestorScrollViewer)
+        {
+            _scrollOffset = GetAncestorViewportOffset();
+        }
 
         if (itemCount == 0)
         {
@@ -242,6 +290,23 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
         var rowSize = GetAxisStride();
 
         var viewportAxisSize = GetViewportAxisSize();
+
+        // Remember what this pass believed the viewport was. Measure can legitimately
+        // run before anyone knows it — a first frame, an unbounded constraint, a star
+        // row that has not been resolved — and a zero viewport collapses the whole
+        // realization window (cache included) to a single row. Arrange is the first
+        // moment a real size is known, and it compares against this.
+        _measuredViewportAxis = viewportAxisSize;
+        if (IsUsableCrossAxis(_viewportRecoveryArrangeAxis) &&
+            viewportAxisSize >= _viewportRecoveryArrangeAxis - 0.5)
+        {
+            // Release the one-shot latch only when measure actually adopted
+            // the arrange viewport that requested recovery. A smaller finite
+            // constraint is still a valid measure, but clearing the latch for
+            // it would make an incompatible parent ping-pong forever.
+            _viewportRecoveryArrangeAxis = double.NaN;
+        }
+
         var owner = GetOwner();
         var cache = GetCacheLength(owner);
         var cacheUnit = GetCacheLengthUnit(owner);
@@ -348,7 +413,20 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
         }
 
         var measuredCrossAxis = Orientation == Orientation.Horizontal ? _viewport.Width : _viewport.Height;
-        _viewport = CoerceViewport(finalSize);
+        _viewport = UseAncestorScrollViewer
+            ? GetAncestorViewport(finalSize)
+            : CoerceViewport(finalSize);
+        if (UseAncestorScrollViewer)
+        {
+            UpdateAncestorPanelStartFromLayout();
+            var itemCount = GetItemCount();
+            var totalRows = _itemsPerRow <= 0
+                ? 0
+                : (itemCount + _itemsPerRow - 1) / _itemsPerRow;
+            _scrollOffset = CoerceOffset(
+                GetAncestorViewportOffset(),
+                totalRows);
+        }
         var arrangedCrossAxis = Orientation == Orientation.Horizontal ? _viewport.Width : _viewport.Height;
         _arrangedCrossAxis = arrangedCrossAxis;
         if (IsUsableCrossAxis(_correctiveArrangeCrossAxis) &&
@@ -401,11 +479,13 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
             if (Orientation == Orientation.Horizontal)
             {
                 x = col * (_itemWidth + GetCrossSpacing());
-                y = row * GetAxisStride() - _scrollOffset;
+                y = row * GetAxisStride() -
+                    (UseAncestorScrollViewer ? 0 : _scrollOffset);
             }
             else
             {
-                x = row * GetAxisStride() - _scrollOffset;
+                x = row * GetAxisStride() -
+                    (UseAncestorScrollViewer ? 0 : _scrollOffset);
                 y = col * (_itemHeight + GetCrossSpacing());
             }
 
@@ -413,7 +493,59 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
             child.Visibility = Visibility.Visible;
         }
 
+        // Arrange is where a real viewport finally shows up. If measure sized its
+        // realization window against a smaller (or absent) one, the items it skipped
+        // will never be created on their own: with a zero viewport both the forward
+        // and backward ranges come out empty, which reads as "everything is realized"
+        // and stops the catch-up machinery. Queue one more measure so the window is
+        // recomputed against the size we actually got.
+        var arrangeViewportAxis = GetViewportAxisSize();
+        if (ShouldRequestViewportRecovery(arrangeViewportAxis))
+        {
+            _viewportRecoveryArrangeAxis = arrangeViewportAxis;
+            // Only queue it. Measuring here would violate the rule that arrange must
+            // never measure the subtree.
+            InvalidateMeasure();
+        }
+
         return finalSize;
+    }
+
+    /// <summary>
+    /// Decides whether the viewport revealed by arrange is enough bigger than the one
+    /// measure used to justify one more measure pass.
+    /// </summary>
+    /// <remarks>
+    /// Latched on the arrange viewport so this can fire at most once per size:
+    /// content that genuinely cannot fill its viewport must not bounce between
+    /// measure and arrange forever.
+    /// </remarks>
+    private bool ShouldRequestViewportRecovery(double arrangeViewportAxis)
+    {
+        if (!ShouldVirtualize() || !IsUsableCrossAxis(arrangeViewportAxis))
+        {
+            return false;
+        }
+
+        // Already asked for this exact viewport — the pending measure will handle it.
+        if (AreClose(_viewportRecoveryArrangeAxis, arrangeViewportAxis))
+        {
+            return false;
+        }
+
+        // Measure had a usable viewport that was at least as large: its window is
+        // already correct and re-running would be pure waste.
+        if (IsUsableCrossAxis(_measuredViewportAxis) &&
+            _measuredViewportAxis >= arrangeViewportAxis - 0.5)
+        {
+            // The current measure already covers this (possibly smaller)
+            // viewport. Drop any stale latch so a later growth can request a
+            // fresh recovery.
+            _viewportRecoveryArrangeAxis = double.NaN;
+            return false;
+        }
+
+        return true;
     }
 
     #endregion
@@ -432,6 +564,15 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
         double rowStart = row * rowSize;
         double rowEnd = rowStart + itemAxisSize;
         double viewportAxis = GetViewportAxisSize();
+
+        if (UseAncestorScrollViewer &&
+            TryBringExternalRowIntoView(
+                rowStart,
+                rowEnd,
+                viewportAxis))
+        {
+            return;
+        }
 
         if (rowStart < _scrollOffset)
         {
@@ -693,6 +834,16 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
 
     private bool IsViewportRealized(double offset)
     {
+        return IsOffsetWindowRealized(offset, includeCache: false);
+    }
+
+    private bool IsRealizationWindowRealized(double offset)
+    {
+        return IsOffsetWindowRealized(offset, includeCache: true);
+    }
+
+    private bool IsOffsetWindowRealized(double offset, bool includeCache)
+    {
         if (!ShouldVirtualize())
         {
             return true;
@@ -707,9 +858,30 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
         }
 
         var totalRows = (itemCount + _itemsPerRow - 1) / _itemsPerRow;
-        var firstRow = Math.Clamp((int)Math.Floor(offset / rowSize), 0, totalRows - 1);
+        var windowStart = offset;
+        var windowEnd = offset + viewportAxisSize;
+        if (includeCache)
+        {
+            var owner = GetOwner();
+            var cache = GetCacheLength(owner);
+            var cacheUnit = GetCacheLengthUnit(owner);
+            windowStart = Math.Max(
+                0,
+                offset - ToCachePixels(
+                    cache.CacheBeforeViewport,
+                    cacheUnit,
+                    viewportAxisSize,
+                    rowSize));
+            windowEnd += ToCachePixels(
+                cache.CacheAfterViewport,
+                cacheUnit,
+                viewportAxisSize,
+                rowSize);
+        }
+
+        var firstRow = Math.Clamp((int)Math.Floor(windowStart / rowSize), 0, totalRows - 1);
         var lastRow = Math.Clamp(
-            (int)Math.Floor((offset + viewportAxisSize) / rowSize),
+            (int)Math.Floor(windowEnd / rowSize),
             firstRow,
             totalRows - 1);
         var firstIndex = firstRow * _itemsPerRow;
@@ -781,6 +953,289 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
         double.IsNaN(value) || double.IsInfinity(value) || value < 0 ? 0 : value;
 
     private static bool AreClose(double left, double right) => Math.Abs(left - right) <= 0.01;
+
+    private Size GetAncestorViewport(Size layoutSize)
+    {
+        EnsureAncestorScrollViewer();
+
+        var crossAxis = Orientation == Orientation.Horizontal
+            ? CoerceFinite(layoutSize.Width, _viewport.Width)
+            : CoerceFinite(layoutSize.Height, _viewport.Height);
+        var viewportAxis = GetAncestorViewportAxisSize(layoutSize);
+
+        return Orientation == Orientation.Horizontal
+            ? new Size(crossAxis, viewportAxis)
+            : new Size(viewportAxis, crossAxis);
+    }
+
+    private double GetAncestorViewportAxisSize(Size layoutSize)
+    {
+        var viewport = 0.0;
+        if (_ancestorScrollViewer != null)
+        {
+            viewport = Orientation == Orientation.Horizontal
+                ? _ancestorScrollViewer.ViewportHeight
+                : _ancestorScrollViewer.ViewportWidth;
+            if (!IsUsableCrossAxis(viewport))
+            {
+                viewport = Orientation == Orientation.Horizontal
+                    ? _ancestorScrollViewer.ActualHeight
+                    : _ancestorScrollViewer.ActualWidth;
+            }
+            if (!IsUsableCrossAxis(viewport))
+            {
+                viewport = Orientation == Orientation.Horizontal
+                    ? _ancestorScrollViewer.Height
+                    : _ancestorScrollViewer.Width;
+            }
+        }
+
+        if (!IsUsableCrossAxis(viewport) &&
+            Window.GetWindow(this) is { } window)
+        {
+            viewport = Orientation == Orientation.Horizontal
+                ? window.ActualHeight
+                : window.ActualWidth;
+            if (!IsUsableCrossAxis(viewport))
+            {
+                viewport = Orientation == Orientation.Horizontal
+                    ? window.Height
+                    : window.Width;
+            }
+        }
+
+        var availableAxis = Orientation == Orientation.Horizontal
+            ? layoutSize.Height
+            : layoutSize.Width;
+        if (!IsUsableCrossAxis(viewport) &&
+            IsUsableCrossAxis(availableAxis))
+        {
+            viewport = availableAxis;
+        }
+
+        var previousAxis = Orientation == Orientation.Horizontal
+            ? _viewport.Height
+            : _viewport.Width;
+        if (!IsUsableCrossAxis(viewport) &&
+            IsUsableCrossAxis(previousAxis))
+        {
+            viewport = previousAxis;
+        }
+
+        // A panel can be measured before its Window/ScrollViewer has completed
+        // the first arrange. Realizing a modest viewport here prevents both an
+        // empty first frame and accidental realization of the entire extent.
+        return IsUsableCrossAxis(viewport) ? viewport : 600;
+    }
+
+    private double GetAncestorViewportOffset()
+    {
+        EnsureAncestorScrollViewer();
+        var owner = _ancestorScrollViewer;
+        if (owner == null)
+        {
+            return 0;
+        }
+
+        var ownerOffset = Orientation == Orientation.Horizontal
+            ? owner.VerticalOffset
+            : owner.HorizontalOffset;
+        UpdateAncestorPanelStartFromLayout();
+
+        return double.IsNaN(_ancestorPanelStart)
+            ? 0
+            : Math.Max(0, ownerOffset - _ancestorPanelStart);
+    }
+
+    private void UpdateAncestorPanelStartFromLayout()
+    {
+        var owner = _ancestorScrollViewer;
+        if (owner == null)
+        {
+            _ancestorPanelStart = double.NaN;
+            return;
+        }
+
+        try
+        {
+            // Resolve against the ScrollViewer's content root whenever
+            // possible. Unlike the owner's coordinate space, this coordinate
+            // is unaffected by the physical -offset translation applied
+            // during scrolling, so it is stable both before and after the
+            // ancestor's Arrange pass.
+            var contentRoot = owner.Content as Visual;
+            var origin = contentRoot != null
+                ? TransformToAncestor(contentRoot)
+                : TransformToAncestor(owner);
+            var axisOrigin = Orientation == Orientation.Horizontal
+                ? origin.Y
+                : origin.X;
+            var ownerOffset = Orientation == Orientation.Horizontal
+                ? owner.VerticalOffset
+                : owner.HorizontalOffset;
+            _ancestorPanelStart = contentRoot != null
+                ? axisOrigin
+                : ownerOffset + axisOrigin;
+        }
+        catch (InvalidOperationException)
+        {
+            _ancestorPanelStart = double.NaN;
+        }
+    }
+
+    private bool TryBringExternalRowIntoView(
+        double rowStart,
+        double rowEnd,
+        double viewportAxis)
+    {
+        EnsureAncestorScrollViewer();
+        var owner = _ancestorScrollViewer;
+        if (owner == null)
+        {
+            return false;
+        }
+
+        var currentOffset = Orientation == Orientation.Horizontal
+            ? owner.VerticalOffset
+            : owner.HorizontalOffset;
+        UpdateAncestorPanelStartFromLayout();
+        if (double.IsNaN(_ancestorPanelStart))
+        {
+            return false;
+        }
+
+        var panelStart = _ancestorPanelStart;
+        var targetStart = panelStart + rowStart;
+        var targetEnd = panelStart + rowEnd;
+        var targetOffset = currentOffset;
+
+        if (targetStart < currentOffset)
+        {
+            targetOffset = targetStart;
+        }
+        else if (targetEnd > currentOffset + viewportAxis)
+        {
+            targetOffset = targetEnd - viewportAxis;
+        }
+
+        targetOffset = Math.Max(0, targetOffset);
+        if (Orientation == Orientation.Horizontal)
+        {
+            owner.ScrollToVerticalOffset(targetOffset);
+        }
+        else
+        {
+            owner.ScrollToHorizontalOffset(targetOffset);
+        }
+
+        return true;
+    }
+
+    private void EnsureAncestorScrollViewer()
+    {
+        if (!UseAncestorScrollViewer)
+        {
+            DetachAncestorScrollViewer();
+            return;
+        }
+
+        ScrollViewer? discovered = null;
+        for (var current = VisualParent;
+             current != null;
+             current = current.VisualParent)
+        {
+            if (current is ScrollViewer viewer)
+            {
+                discovered = viewer;
+                break;
+            }
+        }
+
+        if (ReferenceEquals(discovered, _ancestorScrollViewer))
+        {
+            return;
+        }
+
+        DetachAncestorScrollViewer();
+        _ancestorScrollViewer = discovered;
+        _ancestorPanelStart = double.NaN;
+        if (_ancestorScrollViewer != null)
+        {
+            _ancestorScrollViewer.ScrollChanged +=
+                OnAncestorScrollViewerScrollChanged;
+            _ancestorScrollViewer.SizeChanged +=
+                OnAncestorScrollViewerSizeChanged;
+        }
+    }
+
+    private void DetachAncestorScrollViewer()
+    {
+        if (_ancestorScrollViewer == null)
+        {
+            return;
+        }
+
+        _ancestorScrollViewer.ScrollChanged -=
+            OnAncestorScrollViewerScrollChanged;
+        _ancestorScrollViewer.SizeChanged -=
+            OnAncestorScrollViewerSizeChanged;
+        _ancestorScrollViewer = null;
+        _ancestorPanelStart = double.NaN;
+    }
+
+    private void OnAncestorScrollViewerScrollChanged(
+        object sender,
+        ScrollChangedEventArgs args)
+    {
+        if (UseAncestorScrollViewer)
+        {
+            var itemCount = GetItemCount();
+            var totalRows = _itemsPerRow <= 0
+                ? 0
+                : (itemCount + _itemsPerRow - 1) / _itemsPerRow;
+            var newOffset = CoerceOffset(
+                GetAncestorViewportOffset(),
+                totalRows);
+            if (AreClose(newOffset, _scrollOffset))
+            {
+                return;
+            }
+
+            _scrollOffset = newOffset;
+
+            // The ancestor ScrollViewer performs the physical content
+            // translation. This panel's children stay at full-extent
+            // coordinates, so a smooth-scroll tick needs no panel layout while
+            // every row entering the viewport is already realized. Re-measure
+            // only at the realization frontier; the cache then advances and
+            // recycling continues normally.
+            // Keep the configured cache window advancing ahead of the physical
+            // viewport. Waiting until an unrealized row is already visible turns
+            // template creation and image binding into an on-screen hitch,
+            // especially when a width breakpoint adds a second or third column.
+            // This still invalidates at most once per row frontier rather than at
+            // every sub-pixel smooth-scroll sample.
+            if (!IsRealizationWindowRealized(_scrollOffset))
+            {
+                InvalidateMeasure();
+            }
+        }
+    }
+
+    private void OnAncestorScrollViewerSizeChanged(
+        object sender,
+        SizeChangedEventArgs args)
+    {
+        if (UseAncestorScrollViewer)
+        {
+            InvalidateMeasure();
+        }
+    }
+
+    private void OnPanelUnloaded(
+        object? sender,
+        RoutedEventArgs args) =>
+        DetachAncestorScrollViewer();
 
     private Size CoerceViewport(Size availableSize)
     {
@@ -1055,6 +1510,25 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
             }
             panel.InvalidateMeasure();
         }
+    }
+
+    private static void OnUseAncestorScrollViewerChanged(
+        DependencyObject dependencyObject,
+        DependencyPropertyChangedEventArgs args)
+    {
+        if (dependencyObject is not VirtualizingWrapPanel panel)
+        {
+            return;
+        }
+
+        if (args.NewValue is not true)
+        {
+            panel.DetachAncestorScrollViewer();
+            panel._scrollOffset = 0;
+        }
+
+        panel.InvalidateMeasure();
+        panel.InvalidateArrange();
     }
 
     #endregion

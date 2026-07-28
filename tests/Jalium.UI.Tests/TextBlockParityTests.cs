@@ -89,6 +89,75 @@ public sealed class TextBlockParityTests
     }
 
     [Fact]
+    public void WrappedTextRemainsConstrainedInsideMobileNavigationScrollHost()
+    {
+        const double viewportWidth = 306;
+        var subtitle = new TextBlock
+        {
+            Text = "Shared color, type, spacing, shape, and motion decisions used throughout the Gallery.",
+            FontSize = 15,
+            TextWrapping = TextWrapping.Wrap,
+        };
+        var heading = new StackPanel();
+        heading.Children.Add(new TextBlock { Text = "FOUNDATIONS", FontSize = 12.5 });
+        heading.Children.Add(new TextBlock { Text = "Design Tokens", FontSize = 28 });
+        heading.Children.Add(subtitle);
+
+        var actions = new StackPanel { Orientation = Orientation.Horizontal };
+        actions.Children.Add(new Button
+        {
+            Content = "Light",
+            Width = 74,
+            Height = 34,
+            Margin = new Thickness(0, 0, 6, 0),
+        });
+        actions.Children.Add(new Button
+        {
+            Content = "Dark",
+            Width = 74,
+            Height = 34,
+        });
+
+        var header = new Grid();
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Star });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.Children.Add(heading);
+        Grid.SetColumn(actions, 1);
+        header.Children.Add(actions);
+
+        var page = new StackPanel();
+        page.Children.Add(header);
+        // A later token section contains fixed-width rows/cards. Those may overflow
+        // locally, but a ScrollViewer with horizontal scrolling disabled must not
+        // use that desired width to stretch every sibling (including wrapped text).
+        page.Children.Add(new Border
+        {
+            Width = 440,
+            Height = 40,
+        });
+        var frame = new Border
+        {
+            Padding = new Thickness(14, 16, 14, 24),
+            Child = page,
+        };
+        var scrollViewer = new ScrollViewer
+        {
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            Content = frame,
+        };
+        scrollViewer.Measure(new Size(viewportWidth, 800));
+        scrollViewer.Arrange(new Rect(0, 0, viewportWidth, 800));
+
+        Assert.True(header.ActualWidth > 0);
+        Assert.InRange(header.ActualWidth, 0, viewportWidth - frame.Padding.TotalWidth);
+        Assert.InRange(subtitle.ActualWidth, 0, header.ActualWidth);
+        Assert.True(
+            subtitle.ActualHeight > 40,
+            $"Expected wrapped mobile text, got {subtitle.ActualWidth}x{subtitle.ActualHeight}.");
+    }
+
+    [Fact]
     public void WrapWithOverflowKeepsAnUnbreakableWordOnOneLine()
     {
         const string longWord = "supercalifragilisticexpialidocious";

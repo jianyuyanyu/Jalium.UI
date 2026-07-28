@@ -1,4 +1,4 @@
-using Jalium.UI.Data;
+﻿using Jalium.UI.Data;
 using Jalium.UI.Input;
 using Jalium.UI.Input.Internal.Gestures;
 using Jalium.UI.Controls.Themes;
@@ -12,6 +12,18 @@ namespace Jalium.UI.Controls.Primitives;
 /// </summary>
 public class ScrollBar : RangeBase
 {
+    /// <summary>
+    /// Set by a host that creates this bar and lays it out at a rectangle it derives
+    /// itself, without consulting this bar's DesiredSize (see
+    /// <see cref="ScrollViewer"/>). Such a bar cannot affect its host's layout, so
+    /// its invalidations — including the ones the auto-hide animation raises by
+    /// toggling the line buttons — are not propagated past the host.
+    /// </summary>
+    internal bool IsHostOwnedLayout { get; init; }
+
+    /// <inheritdoc />
+    internal override bool IsLayoutIsolated => IsHostOwnedLayout;
+
     public static readonly RoutedCommand LineUpCommand = new("LineUp", typeof(ScrollBar));
     public static readonly RoutedCommand LineDownCommand = new("LineDown", typeof(ScrollBar));
     public static readonly RoutedCommand LineLeftCommand = new("LineLeft", typeof(ScrollBar));

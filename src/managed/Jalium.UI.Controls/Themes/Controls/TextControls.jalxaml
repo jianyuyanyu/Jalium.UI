@@ -9,6 +9,7 @@
          inserts its TextBoxContentHost for text rendering. -->
     <Style TargetType="TextBox">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="10,7,10,7" />
@@ -62,6 +63,7 @@
     <!-- TextBlock Style -->
     <!-- ============================================== -->
     <Style TargetType="TextBlock">
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="FontFamily" Value="{ThemeResource BodyFontFamily}" />
     </Style>
 
@@ -71,6 +73,7 @@
     <!-- PasswordBox uses direct rendering (doesn't extend TextBoxBase for security reasons) -->
     <Style TargetType="PasswordBox">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="10,7,10,7" />
@@ -105,6 +108,7 @@
     <!-- ============================================== -->
     <Style TargetType="NumberBox">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="10,7,10,7" />
@@ -206,6 +210,7 @@
     <!-- ============================================== -->
     <Style TargetType="AutoCompleteBox">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="10,7,10,7" />
@@ -281,6 +286,7 @@
     <!-- ============================================== -->
     <Style TargetType="RichTextBox">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="4" />

@@ -33,7 +33,11 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
     private const int MaxBrushCacheSize = 256;
     private const int MaxTextFormatCacheSize = 64;
-    private const int MaxBitmapCacheSize = 64;
+    // Entry count, not bytes, is what evicts in practice: a catalog page with a
+    // hundred-odd thumbnails blew past 64 and thrashed the LRU while sitting far
+    // under the byte budget below (114 cards x 312 KiB is only ~35 MB). Keep the
+    // count high enough that the byte ceiling is the real limit.
+    private const int MaxBitmapCacheSize = 192;
     // GPU texture-cache byte budget (hard ceiling). This is VRAM usage and must NOT
     // be throttled by the managed process WorkingSet: doing so collapsed the budget
     // to 32MB under any real IDE memory footprint, forcing currently-visible card
@@ -1393,9 +1397,11 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         int n = figures.Count;
         if (n < 2) return false;
 
-        var bounds = new Rect[n];
+        Span<Rect> bounds = n <= 32
+            ? stackalloc Rect[n]
+            : new Rect[n];
         for (int i = 0; i < n; i++)
-            bounds[i] = SingleFigureBounds(figures[i]);
+            bounds[i] = PathGeometry.GetFigureBounds(figures[i]);
 
         for (int i = 0; i < n; i++)
         {
@@ -1407,14 +1413,6 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             }
         }
         return false;
-    }
-
-    /// <summary>Computes the tight bounding box of a single path figure.</summary>
-    private static Rect SingleFigureBounds(PathFigure figure)
-    {
-        var pg = new PathGeometry();
-        pg.Figures.Add(figure);
-        return pg.Bounds;
     }
 
     private void DrawPathGeometry(Brush? brush, Pen? pen, PathGeometry pathGeom)
@@ -4246,6 +4244,16 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         {
             try
             {
+                // An image whose pixels the idle reclaimer dropped still has its
+                // encoded bytes: restore the decoded buffer once rather than
+                // letting every GPU cache miss re-run a full native decode on
+                // this thread (and bypass the downscale cache, which requires
+                // RawPixelData). Cheap no-op when the pixels are still present.
+                if (bitmapImage.RawPixelData == null)
+                {
+                    bitmapImage.TryRestorePixelData();
+                }
+
                 if (bitmapImage.RawPixelData != null &&
                     bitmapImage.PixelWidth > 0 &&
                     bitmapImage.PixelHeight > 0)

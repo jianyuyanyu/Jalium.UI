@@ -1,4 +1,4 @@
-using Jalium.UI.Controls.Themes;
+﻿using Jalium.UI.Controls.Themes;
 using Jalium.UI.Input;
 using Jalium.UI.Media;
 

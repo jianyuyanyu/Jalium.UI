@@ -11,9 +11,11 @@ namespace Jalium.UI;
 /// <para>
 /// All lookups also fall back to <c>Type.GetProperty</c> reflection so the
 /// engine still works for types that have not opted in to typed accessors.
-/// Trim/AOT-safe usage requires applications to register accessors for every
-/// view-model bound from XAML — this is enforced at the lookup boundary
-/// (this class) so callers do not need their own DAM annotations.
+/// The JALXAML source generator preserves public binding members through
+/// <see cref="AotTypeRegistry"/>, so application-local ViewModels and item
+/// models remain available to this reflection fallback after trimming.
+/// Explicit accessors remain useful for runtime-generated or external types
+/// that were not compiled with Jalium's source generator.
 /// </para>
 /// </summary>
 public static class PropertyAccessorRegistry
@@ -63,8 +65,8 @@ public static class PropertyAccessorRegistry
     /// </summary>
     /// <remarks>
     /// The reflection fallback is annotated with <see cref="RequiresUnreferencedCodeAttribute"/>:
-    /// trim-safe applications must register accessors via <see cref="Register"/> for every
-    /// type they bind from XAML.
+    /// source-generated application types are preserved automatically, while
+    /// external/runtime-generated types can opt in through <see cref="Register"/>.
     /// </remarks>
     [RequiresUnreferencedCode("PropertyAccessorRegistry falls back to Type.GetProperty when no accessor is registered. Register typed accessors via Register() to opt out of reflection.")]
     public static bool TryReadProperty(object source, string propertyName, out object? value)

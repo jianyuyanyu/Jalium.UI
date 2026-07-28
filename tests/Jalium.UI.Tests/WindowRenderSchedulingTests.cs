@@ -17,6 +17,7 @@ public class WindowRenderSchedulingTests
 {
     private const int RenderFlag_Scheduled = 1 << 0;
     private const int RenderFlag_Rendering = 1 << 1;
+    private const int RenderFlag_Requested = 1 << 2;
     private const int RenderFlag_DirtyBetween = 1 << 3;
 
     [Fact]
@@ -542,6 +543,26 @@ public class WindowRenderSchedulingTests
     }
 
     [Fact]
+    public void Window_ExitSizeMove_UsesAuthoritativePhysicalSizeAtFractionalDpi()
+    {
+        var window = new Window { Width = 300, Height = 200 };
+        SetPrivateField(window, "_dpiScale", 1.75);
+        SetPrivateField(window, "_isSizing", true);
+
+        // 115 physical pixels is a lossy DIP round-trip at 175%:
+        // (115 / 1.75) * 1.75 evaluates just below 115 on binary floating point.
+        InvokePrivateMethod(window, "OnSizeChanged", 115, 201);
+
+        // Model the frame boundary having already committed this notification,
+        // so EXITSIZEMOVE takes the non-pending branch.
+        SetPrivateField(window, "_hasPendingResize", false);
+        var finalSize = InvokePrivateMethod<(int Width, int Height)>(
+            window, "GetFinalPhysicalResizeSize");
+
+        Assert.Equal((115, 201), finalSize);
+    }
+
+    [Fact]
     public void Window_ReentrantResize_KeepsLatestRequestForNextSafePoint()
     {
         var window = new Window { Width = 300, Height = 200 };
@@ -643,6 +664,54 @@ public class WindowRenderSchedulingTests
     }
 
     [Fact]
+    public void Window_ReentrantResize_EarlyFrameExitSchedulesPendingRequest()
+    {
+        var window = new Window { Width = 300, Height = 200 };
+        SetPrivateField(window, "_dispatcher", Dispatcher.GetForCurrentThread());
+        SetPrivateField(window, "<Handle>k__BackingField", new nint(0x2127));
+        var native = new RenderTargetTestNative();
+        using var renderTarget = CreateRenderTarget(native, 300, 200, new nint(0x2127));
+        SetPrivateProperty(window, "RenderTarget", renderTarget);
+        SetPrivateField(window, "_isSizing", true);
+
+        try
+        {
+            // Queue the first WM_SIZE, then model the frame-clock operation that
+            // consumed its DirtyBetween/Scheduled flags and entered RenderFrame.
+            InvokePrivateMethod(window, "OnSizeChanged", 320, 220);
+            SetPrivateField(window, "_renderState", 0);
+
+            native.OnResize = (_, _) =>
+            {
+                native.OnResize = null;
+
+                // ResizeBuffers can pump a sent WM_SIZE. Because RenderFrame owns
+                // RenderFlag_Rendering, this newer size can only set Requested.
+                InvokePrivateMethod(window, "OnSizeChanged", 360, 240);
+
+                // Force the post-flush target-validation early return. Every real
+                // early exit must still turn Requested into another frame.
+                SetPrivateProperty(window, "RenderTarget", null);
+            };
+
+            window.ForceRenderFrame();
+
+            Assert.Equal(new[] { (320, 220) }, native.ResizeSizes);
+            Assert.True(GetPrivateField<bool>(window, "_hasPendingResize"));
+            Assert.Equal(360, GetPrivateField<int>(window, "_pendingResizeWidth"));
+            Assert.Equal(240, GetPrivateField<int>(window, "_pendingResizeHeight"));
+            Assert.False(HasRenderFlag(window, RenderFlag_Rendering));
+            Assert.False(HasRenderFlag(window, RenderFlag_Requested));
+            Assert.True(HasRenderFlag(window, RenderFlag_DirtyBetween));
+        }
+        finally
+        {
+            SetPrivateField(window, "<Handle>k__BackingField", nint.Zero);
+            SetPrivateField(window, "_renderState", 0);
+        }
+    }
+
+    [Fact]
     public void Window_FullLayout_ElidesOnlyUiThreadArrangeRectsWithinScope()
     {
         var window = new Window { Width = 300, Height = 200 };
@@ -688,6 +757,46 @@ public class WindowRenderSchedulingTests
         Assert.False(Window.RequiresBackBufferConvergence(RenderBackend.D3D12, supportsPartialPresentation: false));
         Assert.False(Window.RequiresBackBufferConvergence(RenderBackend.Vulkan, supportsPartialPresentation: true));
         Assert.False(Window.RequiresBackBufferConvergence(RenderBackend.Software, supportsPartialPresentation: true));
+    }
+
+    [Fact]
+    public void Window_FinalConvergenceFlush_ClearsStaleDirtyHistory()
+    {
+        var window = new Window { Width = 300, Height = 200 };
+        var native = new RenderTargetTestNative();
+        using var renderTarget = CreateRenderTarget(native, 300, 200, new nint(0x2130));
+        SetPrivateProperty(window, "RenderTarget", renderTarget);
+
+        var history = window.DirtyHistoryForTests;
+        history[0] = [new Rect(0, 0, 300, 200)];
+        history[1] = [new Rect(20, 30, 40, 50)];
+        SetPrivateField(window, "_dirtyHistoryIndex", 1);
+        SetPrivateField(window, "_partialPresentsToFlush", 1);
+
+        InvokePrivateMethod(window, "HandlePresentedFrameFlush", true);
+
+        Assert.Equal(0, GetPrivateField<int>(window, "_partialPresentsToFlush"));
+        Assert.Equal(0, window.DirtyHistoryIndexForTests);
+        Assert.All(history, Assert.Null);
+    }
+
+    [Fact]
+    public void Window_IntermediateConvergenceFlush_RetainsHistoryForRemainingBuffer()
+    {
+        var window = new Window { Width = 300, Height = 200 };
+        var native = new RenderTargetTestNative();
+        using var renderTarget = CreateRenderTarget(native, 300, 200, new nint(0x2131));
+        SetPrivateProperty(window, "RenderTarget", renderTarget);
+
+        var fullWindow = new[] { new Rect(0, 0, 300, 200) };
+        var history = window.DirtyHistoryForTests;
+        history[0] = fullWindow;
+        SetPrivateField(window, "_partialPresentsToFlush", 2);
+
+        InvokePrivateMethod(window, "HandlePresentedFrameFlush", true);
+
+        Assert.Equal(1, GetPrivateField<int>(window, "_partialPresentsToFlush"));
+        Assert.Same(fullWindow, history[0]);
     }
 
     private static RenderTarget CreateRenderTarget(RenderTargetTestNative native, int width, int height, nint hwnd)

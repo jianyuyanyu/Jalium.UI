@@ -16,6 +16,44 @@
 
 namespace jalium {
 
+namespace {
+
+DWORD GetFrameLatencyWaitTimeoutMs(HWND hwnd)
+{
+    constexpr DWORD kFallbackTimeoutMs = 25;
+    if (!hwnd) return kFallbackTimeoutMs;
+
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!monitor) return kFallbackTimeoutMs;
+
+    MONITORINFOEXW monitorInfo = {};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (!GetMonitorInfoW(monitor, &monitorInfo))
+        return kFallbackTimeoutMs;
+
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    if (!EnumDisplaySettingsW(
+            monitorInfo.szDevice,
+            ENUM_CURRENT_SETTINGS,
+            &mode))
+        return kFallbackTimeoutMs;
+
+    DWORD refreshHz = mode.dmDisplayFrequency;
+    if (refreshHz < 24 || refreshHz > 1000)
+        return kFallbackTimeoutMs;
+
+    // Wait for one physical refresh plus enough reserve for Windows timer
+    // quantisation, DWM scheduling and hybrid-GPU presentation routing.
+    DWORD framePeriodMs = (1000u + refreshHz - 1u) / refreshHz;
+    return std::clamp<DWORD>(
+        framePeriodMs + static_cast<DWORD>(8),
+        static_cast<DWORD>(12),
+        static_cast<DWORD>(50));
+}
+
+} // namespace
+
 // ============================================================================
 // Construction / Destruction
 // ============================================================================
@@ -27,6 +65,7 @@ D3D12RenderTarget::D3D12RenderTarget(D3D12Backend* backend, void* hwnd, int32_t 
 {
     width_ = width;
     height_ = height;
+    frameLatencyWaitTimeoutMs_ = GetFrameLatencyWaitTimeoutMs(hwnd_);
     // Default engine: Auto → Vello on D3D12 (highest performance)
     activeEngine_ = ResolveRenderingEngine(JALIUM_ENGINE_AUTO, JALIUM_BACKEND_D3D12);
     pendingEngine_ = activeEngine_;
@@ -151,6 +190,10 @@ JaliumResult D3D12RenderTarget::QueryGpuStats(JaliumGpuStats* out) const {
         // Bitmap textures are per-frame but the count is indicative of load.
         out->textureCount = directRenderer_->GetBitmapBatchTextureCount();
         out->textureBytes = directRenderer_->GetBitmapBatchTextureBytes();
+        // PathBytes includes the shared stencil/MSAA scratch allocation. Unlike
+        // pathEntries (the current encoded batch count), this exposes retained
+        // GPU working-set size and catches resize high-water regressions.
+        out->pathBytes = directRenderer_->GetPathScratchBytes();
         // Add the glyph atlas texture itself to the texture pool.
         if (auto* atlas = directRenderer_->GetGlyphAtlas()) {
             out->textureCount += 1;
@@ -415,15 +458,11 @@ bool D3D12RenderTarget::CreateSwapChain() {
         if (FAILED(hr)) return false;
         factory->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
 
-        // Pathological-display-environment guard. The render adapter is app-selectable
-        // (we already skip WARP / 0-VRAM virtual adapters), but the PRESENT destination
-        // is not: DXGI must deliver every frame to whichever adapter drives the monitor
-        // this window sits on. If that adapter is a software / virtual one (display GPU
-        // disabled in Device Manager, or a streaming tool's Indirect-Display-Driver owns
-        // the desktop), every Present becomes a software cross-adapter copy — the app
-        // pins that adapter at ~100% and drops to single-digit fps NO MATTER which real
-        // GPU renders. The renderer cannot route around it, so detect it and warn loudly
-        // instead of letting it masquerade as an app performance bug.
+        // Keep render-adapter selection distinct from the monitor's presentation
+        // route. During a hybrid/MUX transition DXGI can temporarily report the
+        // physical monitor through Microsoft Basic even though the usable renderer
+        // is the AMD iGPU. Record that distinction without overriding the adapter
+        // selected by D3D12Backend.
         [&]() {
             HMONITOR mon = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
             if (!mon) return;
@@ -439,18 +478,17 @@ bool D3D12RenderTarget::CreateSwapChain() {
                     if (FAILED(o->GetDesc(&od)) || od.Monitor != mon) continue;
                     // This is the adapter that drives the window's monitor.
                     const bool softwareDisplay =
-                        (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || d.DedicatedVideoMemory == 0;
+                        (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
+                        (d.VendorId == 0x1414 && d.DedicatedVideoMemory == 0);
                     if (softwareDisplay) {
                         fwprintf(stderr,
-                            L"[Jalium.D3D12] WARNING: this window's monitor is driven by the software/"
-                            L"virtual adapter '%ls' (0 VRAM). Every Present is a software cross-adapter "
-                            L"copy: expect single-digit fps and 100%% load on that adapter regardless of "
-                            L"the render GPU. Re-enable the display GPU in Device Manager and/or remove "
-                            L"virtual-display (IDD) drivers.\n",
+                            L"[Jalium.D3D12] display-route=\"%ls\". DXGI reports this route "
+                            L"separately from the selected render adapter; this can be transitional "
+                            L"while a hybrid/MUX GPU switch is being applied.\n",
                             d.Description);
                         OutputDebugStringW(
-                            L"[Jalium.D3D12] WARNING: monitor driven by software/virtual adapter — "
-                            L"Present is a software cross-adapter copy (environment problem, not the app).\n");
+                            L"[Jalium.D3D12] DXGI presentation route is Microsoft Basic; "
+                            L"render adapter selection remains independent.\n");
                     }
                     return;
                 }
@@ -582,6 +620,7 @@ JaliumResult D3D12RenderTarget::Resize(int32_t width, int32_t height) {
 
     width_ = width;
     height_ = height;
+    frameLatencyWaitTimeoutMs_ = GetFrameLatencyWaitTimeoutMs(hwnd_);
     frameIndex_ = swapChain_->GetCurrentBackBufferIndex();
 
     // Re-apply maximum frame latency after ResizeBuffers — the HANDLE itself
@@ -640,9 +679,11 @@ JaliumResult D3D12RenderTarget::BeginDraw() {
         }
     }
 
-    // Block on the swap-chain frame-latency waitable (16 ms timeout). On a
-    // healthy swap chain it signals within ~one vsync; the managed Window retry
-    // path pumps the dispatcher between attempts so input/animation get a turn.
+    // Block on the swap-chain frame-latency waitable for one nominal refresh
+    // plus a small scheduler/driver reserve. A fixed 16 ms timeout is shorter
+    // than a 60 Hz frame (16.67 ms), so it periodically reports a healthy
+    // Present as GPU-busy and drops the next interaction frame. The managed
+    // Window retry path still pumps the dispatcher if this bounded wait expires.
     // (Earlier this was SKIPPED on iGPU+vsync to "move the wait into Present" —
     // measured to be pointless: the per-frame DWM flip-release cost is fixed and
     // just reappears in the fence wait instead. Reverted to the uniform path.)
@@ -662,7 +703,10 @@ JaliumResult D3D12RenderTarget::BeginDraw() {
     if (frameLatencyWaitable_ && !externalPresentPacing_) {
         LARGE_INTEGER waitStart;
         QueryPerformanceCounter(&waitStart);
-        DWORD waitResult = WaitForSingleObjectEx(frameLatencyWaitable_, 16, FALSE);
+        DWORD waitResult = WaitForSingleObjectEx(
+            frameLatencyWaitable_,
+            frameLatencyWaitTimeoutMs_,
+            FALSE);
         LARGE_INTEGER waitEnd;
         QueryPerformanceCounter(&waitEnd);
         LARGE_INTEGER freq;

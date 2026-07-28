@@ -13,6 +13,7 @@
     <!-- InfoBar Style -->
     <!-- ============================================== -->
     <Style TargetType="InfoBar">
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="Padding" Value="14,10,14,10" />
         <Setter Property="CornerRadius" Value="12" />
         <Setter Property="MinHeight" Value="52" />
@@ -40,6 +41,7 @@
     <!-- ============================================== -->
     <Style TargetType="ScrollViewer">
         <Setter Property="Background" Value="Transparent" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
     </Style>
 
     <!-- ============================================== -->
@@ -80,6 +82,7 @@
     <!-- ============================================== -->
     <Style TargetType="GroupBox">
         <Setter Property="Background" Value="{ThemeResource LayerFillColorAltBrush}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="16,14,16,14" />
@@ -123,6 +126,7 @@
     <!-- ============================================== -->
     <Style TargetType="Expander">
         <Setter Property="Background" Value="{ThemeResource LayerFillColorAltBrush}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="14" />
@@ -199,6 +203,7 @@
     <!-- ============================================== -->
     <Style TargetType="GridSplitter">
         <Setter Property="Background" Value="{ThemeResource ControlBorder}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="Template">
             <ControlTemplate TargetType="GridSplitter">
                 <Border Name="PART_Root"

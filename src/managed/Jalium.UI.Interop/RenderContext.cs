@@ -116,6 +116,7 @@ public sealed class RenderContext : IDisposable
         RenderingEngine renderingEngine = RenderingEngine.Auto)
     {
         backend = NormalizeRequestedBackend(backend);
+        gpuPreference = NormalizeGpuPreference(gpuPreference);
 
         // Lazy load the chosen backend's native DLL right before we ask the
         // native registry to materialize a context. This is the single point
@@ -139,6 +140,18 @@ public sealed class RenderContext : IDisposable
         }
 
         Backend = NativeMethods.ContextGetBackend(_handle);
+        int gpuPreferenceResult =
+            NativeGpuMethods.ContextSetGpuPreference(_handle, gpuPreference);
+        if (Backend == RenderBackend.D3D12 && gpuPreferenceResult != 0)
+        {
+            nint failedHandle = _handle;
+            _handle = nint.Zero;
+            NativeMethods.ContextDestroy(failedHandle);
+            throw new InvalidOperationException(
+                $"The D3D12 backend rejected GPU preference {gpuPreference} " +
+                $"before device creation (result {gpuPreferenceResult}).");
+        }
+
         GpuPreference = gpuPreference;
         Generation = Interlocked.Increment(ref _generationCounter);
         _current ??= this;
@@ -217,7 +230,9 @@ public sealed class RenderContext : IDisposable
 
         var current = _current;
         if (!forceReplace && current != null && current.IsValid &&
-            (!enforceBackend || current.Backend == backend))
+            (!enforceBackend || current.Backend == backend) &&
+            (gpuPreference == GpuPreference.Auto ||
+             current.GpuPreference == gpuPreference))
         {
             return current;
         }
@@ -229,7 +244,9 @@ public sealed class RenderContext : IDisposable
         {
             current = _current;
             if (!forceReplace && current != null && current.IsValid &&
-                (!enforceBackend || current.Backend == backend))
+                (!enforceBackend || current.Backend == backend) &&
+                (gpuPreference == GpuPreference.Auto ||
+                 current.GpuPreference == gpuPreference))
             {
                 return current;
             }
@@ -247,7 +264,10 @@ public sealed class RenderContext : IDisposable
             if (previous != null &&
                 previous.IsValid &&
                 !ReferenceEquals(previous, context) &&
-                (forceReplace || (enforceBackend && previous.Backend != backend)))
+                (forceReplace ||
+                 (enforceBackend && previous.Backend != backend) ||
+                 (gpuPreference != GpuPreference.Auto &&
+                  previous.GpuPreference != gpuPreference)))
             {
                 previous._retireRequested = true;
                 _retiredContexts.Add(previous);

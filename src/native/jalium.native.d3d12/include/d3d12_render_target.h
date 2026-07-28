@@ -445,6 +445,10 @@ private:
     // closed in the destructor. nullptr means "feature unavailable" — the
     // BeginFrame path still works through the fence wait fallback.
     HANDLE frameLatencyWaitable_ = nullptr;
+    // One nominal refresh period plus scheduler/driver slack. A fixed 16 ms
+    // timeout is shorter than a 60 Hz frame (16.67 ms) and periodically
+    // misclassifies a healthy swap chain as GPU-busy.
+    DWORD frameLatencyWaitTimeoutMs_ = 25;
 
     // Frame-pacing: waitable wait time, accumulated across every BeginDraw
     // attempt for one logical frame and flushed when the first successful

@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Reflection;
 using Jalium.UI;
 using Jalium.UI.Data;
 
@@ -336,6 +337,37 @@ public class MultiDataTriggerTests
         Assert.Equal(1.0, element2.GetValue(TestElement.TestOpacityProperty)); // Default
     }
 
+    [Fact]
+    public void SharedMultiDataTrigger_ReusesConditionShadowPropertiesAcrossElements()
+    {
+        var trigger = new MultiDataTrigger();
+        trigger.Conditions.Add(new Condition(new Binding("IsEnabled"), true));
+        trigger.Conditions.Add(new Condition(new Binding("Status"), "Active"));
+        trigger.Setters.Add(new Setter(TestElement.TestOpacityProperty, 0.5));
+
+        var warmup = new TestElement
+        {
+            DataContext = new TestViewModel { IsEnabled = true, Status = "Active" }
+        };
+        trigger.AttachForTest(warmup);
+        trigger.DetachForTest(warmup);
+        var registeredAfterWarmup = GetRegisteredDependencyPropertyCount();
+
+        for (var index = 0; index < 128; index++)
+        {
+            var element = new TestElement
+            {
+                DataContext = new TestViewModel { IsEnabled = true, Status = "Active" }
+            };
+            trigger.AttachForTest(element);
+            trigger.DetachForTest(element);
+        }
+
+        Assert.Equal(
+            registeredAfterWarmup,
+            GetRegisteredDependencyPropertyCount());
+    }
+
     #endregion
 
     #region Test Helpers
@@ -351,6 +383,15 @@ public class MultiDataTriggerTests
             get => (double)(GetValue(TestOpacityProperty) ?? 1.0);
             set => SetValue(TestOpacityProperty, value);
         }
+    }
+
+    private static int GetRegisteredDependencyPropertyCount()
+    {
+        var field = typeof(DependencyProperty).GetField(
+            "_globalIndex",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        return Assert.IsType<int>(field!.GetValue(null));
     }
 
     private class TestViewModel : INotifyPropertyChanged

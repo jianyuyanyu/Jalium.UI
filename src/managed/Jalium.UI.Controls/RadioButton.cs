@@ -27,6 +27,7 @@ public class RadioButton : ToggleButton
     /// Tracks RadioButtons by group name for mutual exclusion.
     /// </summary>
     private static readonly Dictionary<string, List<WeakReference<RadioButton>>> _groupMap = new();
+    private static readonly object _groupMapGate = new();
 
     #endregion
 
@@ -103,29 +104,36 @@ public class RadioButton : ToggleButton
     {
         var effectiveGroup = string.IsNullOrEmpty(groupName) ? GetDefaultGroupName() : groupName;
 
-        if (!_groupMap.TryGetValue(effectiveGroup, out var list))
+        lock (_groupMapGate)
         {
-            list = new List<WeakReference<RadioButton>>();
-            _groupMap[effectiveGroup] = list;
-        }
+            if (!_groupMap.TryGetValue(effectiveGroup, out var list))
+            {
+                list = new List<WeakReference<RadioButton>>();
+                _groupMap[effectiveGroup] = list;
+            }
 
-        // Clean up dead references and add ourselves
-        list.RemoveAll(wr => !wr.TryGetTarget(out _));
-        list.Add(new WeakReference<RadioButton>(this));
-        _registeredGroup = effectiveGroup;
+            // Clean up dead references and add ourselves.
+            list.RemoveAll(wr => !wr.TryGetTarget(out _));
+            list.Add(new WeakReference<RadioButton>(this));
+            _registeredGroup = effectiveGroup;
+        }
     }
 
     private void UnregisterFromGroup(string groupName)
     {
-        if (_groupMap.TryGetValue(groupName, out var list))
+        lock (_groupMapGate)
         {
-            list.RemoveAll(wr => !wr.TryGetTarget(out var target) || target == this);
-            if (list.Count == 0)
+            if (_groupMap.TryGetValue(groupName, out var list))
             {
-                _groupMap.Remove(groupName);
+                list.RemoveAll(wr => !wr.TryGetTarget(out var target) || target == this);
+                if (list.Count == 0)
+                {
+                    _groupMap.Remove(groupName);
+                }
             }
+
+            _registeredGroup = null;
         }
-        _registeredGroup = null;
     }
 
     private string GetDefaultGroupName()
@@ -137,16 +145,36 @@ public class RadioButton : ToggleButton
     private void UncheckOthersInGroup()
     {
         var effectiveGroup = string.IsNullOrEmpty(GroupName) ? GetDefaultGroupName() : GroupName;
+        List<RadioButton>? checkedPeers = null;
 
-        if (_groupMap.TryGetValue(effectiveGroup, out var list))
+        lock (_groupMapGate)
         {
-            foreach (var wr in list)
+            if (_groupMap.TryGetValue(effectiveGroup, out var list))
             {
-                if (wr.TryGetTarget(out var radioButton) && radioButton != this && radioButton.IsChecked == true)
+                for (var index = list.Count - 1; index >= 0; index--)
                 {
-                    radioButton.IsChecked = false;
+                    if (!list[index].TryGetTarget(out var radioButton))
+                    {
+                        list.RemoveAt(index);
+                        continue;
+                    }
+
+                    if (!ReferenceEquals(radioButton, this) && radioButton.IsChecked == true)
+                    {
+                        (checkedPeers ??= []).Add(radioButton);
+                    }
                 }
             }
+        }
+
+        // Do not hold the global map lock while changing dependency properties: their
+        // callbacks can raise events and re-enter group management.
+        if (checkedPeers == null)
+            return;
+
+        foreach (var radioButton in checkedPeers)
+        {
+            radioButton.IsChecked = false;
         }
     }
 

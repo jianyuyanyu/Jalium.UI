@@ -7,6 +7,7 @@
     <!-- ============================================== -->
     <Style TargetType="DataGrid">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="RowHeight" Value="30" />
@@ -96,6 +97,7 @@
     <!-- ============================================== -->
     <Style TargetType="DataGridRow">
         <Setter Property="Background" Value="Transparent" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="Template">
             <ControlTemplate TargetType="DataGridRow">
                 <Border Name="PART_RowBorder"
@@ -127,6 +129,7 @@
     <!-- ============================================== -->
     <Style TargetType="DataGridCell">
         <Setter Property="Background" Value="Transparent" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="Padding" Value="10,5,10,5" />
         <Setter Property="Template">
             <ControlTemplate TargetType="DataGridCell">
@@ -146,6 +149,7 @@
     <!-- ============================================== -->
     <Style TargetType="DataGridColumnHeader">
         <Setter Property="Background" Value="{ThemeResource LayerFillColorAltBrush}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="Padding" Value="10,7,6,7" />
         <Setter Property="Template">
             <ControlTemplate TargetType="DataGridColumnHeader">

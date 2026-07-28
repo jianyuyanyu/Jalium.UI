@@ -13,18 +13,6 @@
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "windowscodecs.lib")
 
-// Hybrid-graphics dGPU request. On systems where the monitor is driven by the discrete
-// GPU (e.g. desktop with the display plugged into an NVIDIA/AMD dGPU) but Windows
-// defaults apps to the integrated GPU, rendering on the iGPU forces a per-frame
-// cross-adapter copy to the display GPU — which pins the display GPU at ~100% during
-// any hover/animation. These well-known exported symbols ask the NVIDIA Optimus / AMD
-// PowerXpress drivers to run this process on the high-performance dGPU, so it renders on
-// the same adapter that scans out the display (no cross-adapter present).
-extern "C" {
-    __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
-    __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
-}
-
 namespace jalium {
 
 namespace {
@@ -117,6 +105,32 @@ bool AdapterDrivesMonitor(IDXGIAdapter1* adapter, HMONITOR monitor)
     }
 
     return false;
+}
+
+bool IsSoftwareAdapter(const DXGI_ADAPTER_DESC1& desc)
+{
+    return (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
+        (desc.VendorId == 0x1414 && desc.DedicatedVideoMemory == 0);
+}
+
+bool IsGpuSelectionTraceEnabled()
+{
+    wchar_t* value = nullptr;
+    size_t valueLength = 0;
+    if (_wdupenv_s(&value, &valueLength, L"JALIUM_GPU_SELECTION_TRACE") != 0 ||
+        !value || *value == L'\0') {
+        if (value) {
+            free(value);
+        }
+        return false;
+    }
+
+    bool enabled = _wcsicmp(value, L"1") == 0
+        || _wcsicmp(value, L"true") == 0
+        || _wcsicmp(value, L"yes") == 0
+        || _wcsicmp(value, L"on") == 0;
+    free(value);
+    return enabled;
 }
 
 } // namespace
@@ -243,21 +257,38 @@ JaliumResult D3D12Backend::CheckDeviceStatus() {
     return JALIUM_ERROR_DEVICE_LOST;
 }
 
+JaliumResult D3D12Backend::SetGpuPreference(JaliumGpuPreference gpuPreference)
+{
+    if (gpuPreference < JALIUM_GPU_PREFERENCE_AUTO ||
+        gpuPreference > JALIUM_GPU_PREFERENCE_MINIMUM_POWER) {
+        return JALIUM_ERROR_INVALID_ARGUMENT;
+    }
+    if (initialized_ || device_) {
+        return JALIUM_ERROR_INVALID_STATE;
+    }
+
+    gpuPreference_ = gpuPreference;
+    gpuPreferenceWasSet_ = true;
+    return JALIUM_OK;
+}
+
 bool D3D12Backend::Initialize(void* preferredWindow) {
     if (initialized_) return true;
 
-    // Read GPU preference from environment variable (zero ABI change approach)
-    gpuPrefFromEnv_ = JALIUM_GPU_PREFERENCE_AUTO;
-    {
+    // Native-only hosts can still configure adapter selection through the
+    // environment. Managed hosts call SetGpuPreference before device creation,
+    // so an API request always wins.
+    if (!gpuPreferenceWasSet_) {
+        gpuPreference_ = JALIUM_GPU_PREFERENCE_AUTO;
         wchar_t* val = nullptr;
         size_t len = 0;
         if (_wdupenv_s(&val, &len, L"JALIUM_GPU_PREFERENCE") == 0 && val && *val != L'\0') {
             if (_wcsicmp(val, L"integrated") == 0 || _wcsicmp(val, L"igpu") == 0
                 || _wcsicmp(val, L"low") == 0 || _wcsicmp(val, L"minimum_power") == 0) {
-                gpuPrefFromEnv_ = JALIUM_GPU_PREFERENCE_MINIMUM_POWER;
+                gpuPreference_ = JALIUM_GPU_PREFERENCE_MINIMUM_POWER;
             } else if (_wcsicmp(val, L"discrete") == 0 || _wcsicmp(val, L"high") == 0
                 || _wcsicmp(val, L"high_performance") == 0) {
-                gpuPrefFromEnv_ = JALIUM_GPU_PREFERENCE_HIGH_PERFORMANCE;
+                gpuPreference_ = JALIUM_GPU_PREFERENCE_HIGH_PERFORMANCE;
             }
         }
         if (val) free(val);
@@ -347,7 +378,12 @@ bool D3D12Backend::CreateD3D12Device(void* preferredWindow) {
         return true;
     };
 
-    auto tryCreateDeviceForAdapter = [this](IDXGIAdapter1* adapter, bool requireDedicatedVram) -> bool {
+    const wchar_t* selectedStrategy = L"none";
+    auto tryCreateDeviceForAdapter =
+        [this, &selectedStrategy](
+            IDXGIAdapter1* adapter,
+            bool requireDedicatedVram,
+            const wchar_t* strategy) -> bool {
         if (!adapter) {
             return false;
         }
@@ -360,11 +396,7 @@ bool D3D12Backend::CreateD3D12Device(void* preferredWindow) {
         // Skip software adapters (WARP fallback can be added later if needed).
         // Check both the explicit flag AND the Microsoft vendor + zero VRAM heuristic,
         // because some GPU-switching configurations expose WARP without the SOFTWARE flag.
-        bool isSoftwareAdapter = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
-        if (!isSoftwareAdapter && desc.VendorId == 0x1414 && desc.DedicatedVideoMemory == 0) {
-            isSoftwareAdapter = true; // Microsoft Basic Render Driver without SOFTWARE flag
-        }
-        if (isSoftwareAdapter) {
+        if (IsSoftwareAdapter(desc)) {
             return false;
         }
 
@@ -397,13 +429,14 @@ bool D3D12Backend::CreateD3D12Device(void* preferredWindow) {
         // the right thing under hybrid graphics).
         adapterDesc_ = desc;
         adapterDescValid_ = true;
+        selectedStrategy = strategy;
         return true;
     };
 
     // Map JaliumGpuPreference to DXGI_GPU_PREFERENCE for adapter enumeration.
     DXGI_GPU_PREFERENCE dxgiPref = DXGI_GPU_PREFERENCE_UNSPECIFIED;
     bool hasExplicitPreference = false;
-    switch (gpuPrefFromEnv_) {
+    switch (gpuPreference_) {
     case JALIUM_GPU_PREFERENCE_HIGH_PERFORMANCE:
         dxgiPref = DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE;
         hasExplicitPreference = true;
@@ -419,38 +452,25 @@ bool D3D12Backend::CreateD3D12Device(void* preferredWindow) {
 
     // Strategy 0: Explicit WARP fallback (software D3D12 device).
     if (IsWarpForced() && tryCreateWarpDevice()) {
+        selectedStrategy = L"forced-warp";
         OutputDebugStringA("[D3D12Backend] Using forced WARP adapter.\n");
     }
 
-    // Strategy 0.7: prefer a discrete / high-performance GPU. On hybrid systems the
-    // discrete GPU usually drives the primary display, so rendering there avoids a
-    // cross-adapter present — otherwise the app renders on the iGPU and every frame
-    // is copied to the display GPU, pinning THAT GPU at 100% during hover/interaction
-    // (observed here: render on AMD iGPU is cheap, but the display GPU 0x15276 sits at
-    // 100% the whole time you hover). EnumAdapterByGpuPreference(HIGH_PERFORMANCE) can
-    // surface a discrete GPU that plain EnumAdapters1 hides under hybrid graphics.
-    {
-        ComPtr<IDXGIFactory6> factoryHp;
-        if (!device_ && SUCCEEDED(dxgiFactory_.As(&factoryHp))) {
-            for (UINT adapterIndex = 0;; ++adapterIndex) {
-                ComPtr<IDXGIAdapter1> adapter;
-                if (FAILED(factoryHp->EnumAdapterByGpuPreference(
-                        adapterIndex, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter)))) {
-                    break;
-                }
-                if (tryCreateDeviceForAdapter(adapter.Get(), true)) {
-                    break;
-                }
-            }
-        }
-    }
-
     // Strategy 1: Monitor-associated adapter selection.
-    // Only used when no explicit GPU preference is set.
+    // Auto follows the adapter that owns the target monitor. Explicit
+    // HighPerformance / MinimumPower requests bypass monitor affinity.
+    bool monitorRouteIsSoftware = false;
     if (!device_ && !hasExplicitPreference) {
         HMONITOR preferredMonitor = nullptr;
         if (preferredWindow != nullptr) {
             preferredMonitor = MonitorFromWindow(static_cast<HWND>(preferredWindow), MONITOR_DEFAULTTONEAREST);
+        } else {
+            // Text measurement or another off-screen resource can initialize
+            // the backend before the first HWND reaches CreateRenderTarget.
+            // Use the primary monitor so that early initialization still
+            // follows the current hybrid/MUX display mode.
+            POINT primaryPoint{ 0, 0 };
+            preferredMonitor = MonitorFromPoint(primaryPoint, MONITOR_DEFAULTTOPRIMARY);
         }
 
         if (preferredMonitor) {
@@ -465,27 +485,47 @@ bool D3D12Backend::CreateD3D12Device(void* preferredWindow) {
                     continue;
                 }
 
-                if (tryCreateDeviceForAdapter(adapter.Get(), true)) {
+                DXGI_ADAPTER_DESC1 desc{};
+                if (SUCCEEDED(adapter->GetDesc1(&desc)) && IsSoftwareAdapter(desc)) {
+                    // A hybrid/MUX transition can temporarily expose the
+                    // physical monitor through Microsoft Basic while the iGPU
+                    // remains the only usable hardware renderer.
+                    monitorRouteIsSoftware = true;
+                    continue;
+                }
+
+                if (tryCreateDeviceForAdapter(adapter.Get(), true, L"monitor")) {
                     break;
                 }
             }
         }
     }
 
-    // Strategy 2: GPU preference ordering via DXGI 1.6.
+    // Strategy 2: GPU preference ordering via DXGI 1.6. A Basic display
+    // route in Auto mode means the monitor cannot identify a hardware adapter;
+    // minimum-power ordering selects the active iGPU after a MUX switch.
+    DXGI_GPU_PREFERENCE effectivePreference =
+        !hasExplicitPreference && monitorRouteIsSoftware
+            ? DXGI_GPU_PREFERENCE_MINIMUM_POWER
+            : dxgiPref;
     ComPtr<IDXGIFactory6> factory6;
     if (!device_ && SUCCEEDED(dxgiFactory_.As(&factory6))) {
         for (UINT adapterIndex = 0;; ++adapterIndex) {
             ComPtr<IDXGIAdapter1> adapter;
             HRESULT hrEnum = factory6->EnumAdapterByGpuPreference(
                 adapterIndex,
-                dxgiPref,
+                effectivePreference,
                 IID_PPV_ARGS(&adapter));
             if (FAILED(hrEnum)) {
                 break;
             }
 
-            if (tryCreateDeviceForAdapter(adapter.Get(), true)) {
+            if (tryCreateDeviceForAdapter(
+                    adapter.Get(),
+                    true,
+                    monitorRouteIsSoftware
+                        ? L"software-display-minimum-power"
+                        : L"gpu-preference")) {
                 break;
             }
         }
@@ -500,7 +540,7 @@ bool D3D12Backend::CreateD3D12Device(void* preferredWindow) {
                 break;
             }
 
-            if (tryCreateDeviceForAdapter(adapter.Get(), true)) {
+            if (tryCreateDeviceForAdapter(adapter.Get(), true, L"legacy")) {
                 break;
             }
         }
@@ -508,20 +548,20 @@ bool D3D12Backend::CreateD3D12Device(void* preferredWindow) {
 
     // Strategy 3b: no adapter with dedicated VRAM could be used — relax the
     // requireDedicatedVram gate so a genuine zero-VRAM integrated GPU (rare, reports
-    // 0 DedicatedVideoMemory) still gets picked. Order by HIGH_PERFORMANCE so a real
-    // (i)GPU is enumerated before any leftover virtual/IDD adapter that also has 0 VRAM.
+    // 0 DedicatedVideoMemory) still gets picked. Keep the effective preference
+    // so iGPU-only mode cannot be reversed by the last hardware fallback.
     if (!device_ && factory6) {
         for (UINT adapterIndex = 0;; ++adapterIndex) {
             ComPtr<IDXGIAdapter1> adapter;
             HRESULT hrEnum = factory6->EnumAdapterByGpuPreference(
                 adapterIndex,
-                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                effectivePreference,
                 IID_PPV_ARGS(&adapter));
             if (FAILED(hrEnum)) {
                 break;
             }
 
-            if (tryCreateDeviceForAdapter(adapter.Get(), false)) {
+            if (tryCreateDeviceForAdapter(adapter.Get(), false, L"zero-vram-fallback")) {
                 break;
             }
         }
@@ -529,11 +569,26 @@ bool D3D12Backend::CreateD3D12Device(void* preferredWindow) {
 
     // Strategy 4: Final WARP fallback when no hardware adapter can be created.
     if (!device_ && tryCreateWarpDevice()) {
+        selectedStrategy = L"warp-fallback";
         OutputDebugStringA("[D3D12Backend] Falling back to WARP adapter.\n");
     }
 
     if (!device_) {
         return false;
+    }
+
+    if (IsGpuSelectionTraceEnabled() && adapterDescValid_) {
+        fwprintf(
+            stderr,
+            L"[Jalium.D3D12] adapter=\"%ls\" vendor=0x%04X device=0x%04X "
+            L"preference=%d strategy=%ls softwareDisplay=%d\n",
+            adapterDesc_.Description,
+            adapterDesc_.VendorId,
+            adapterDesc_.DeviceId,
+            static_cast<int>(gpuPreference_),
+            selectedStrategy,
+            monitorRouteIsSoftware ? 1 : 0);
+        fflush(stderr);
     }
 
 #if defined(_DEBUG)

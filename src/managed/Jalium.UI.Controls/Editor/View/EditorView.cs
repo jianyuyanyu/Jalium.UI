@@ -693,6 +693,150 @@ internal sealed class EditorView
         }
     }
 
+    internal void RenderSyntaxHighlightedPreviewLine(
+        DrawingContext dc,
+        int lineNumber,
+        string prefix,
+        string previewText,
+        Point origin,
+        string fontFamily,
+        double fontSize,
+        Brush defaultForeground)
+    {
+        string displayLine = prefix + previewText;
+        if (displayLine.Length == 0)
+            return;
+
+        if (prefix.Length > 0)
+        {
+            DrawPreviewTextRange(
+                dc,
+                displayLine,
+                0,
+                prefix.Length,
+                origin,
+                fontFamily,
+                fontSize,
+                defaultForeground);
+        }
+
+        if (previewText.Length == 0)
+            return;
+
+        if (Document == null || Highlighter == null || lineNumber < 1 || lineNumber > Document.LineCount)
+        {
+            DrawPreviewTextRange(
+                dc,
+                displayLine,
+                prefix.Length,
+                previewText.Length,
+                origin,
+                fontFamily,
+                fontSize,
+                defaultForeground);
+            return;
+        }
+
+        var documentLine = Document.GetLineByNumber(lineNumber);
+        string sourceText = Document.GetLineText(lineNumber);
+        var cachedLine = GetOrCreateLineCacheEntry(lineNumber, documentLine);
+        var highlighted = GetOrComputeHighlightedLine(cachedLine, lineNumber, sourceText);
+
+        int renderedThrough = 0;
+        foreach (var token in highlighted.Tokens)
+        {
+            if (token.Length <= 0 || token.StartOffset >= previewText.Length)
+                continue;
+
+            int tokenStart = Math.Clamp(token.StartOffset, renderedThrough, previewText.Length);
+            if (tokenStart > renderedThrough)
+            {
+                DrawPreviewTextRange(
+                    dc,
+                    displayLine,
+                    prefix.Length + renderedThrough,
+                    tokenStart - renderedThrough,
+                    origin,
+                    fontFamily,
+                    fontSize,
+                    defaultForeground);
+            }
+
+            int tokenEnd = Math.Clamp(token.StartOffset + token.Length, tokenStart, previewText.Length);
+            if (tokenEnd <= tokenStart)
+                continue;
+
+            var tokenBrush = ResolveBrushForClassification(token.Classification, defaultForeground);
+            DrawPreviewTextRange(
+                dc,
+                displayLine,
+                prefix.Length + tokenStart,
+                tokenEnd - tokenStart,
+                origin,
+                fontFamily,
+                fontSize,
+                tokenBrush);
+            renderedThrough = tokenEnd;
+        }
+
+        if (renderedThrough < previewText.Length)
+        {
+            DrawPreviewTextRange(
+                dc,
+                displayLine,
+                prefix.Length + renderedThrough,
+                previewText.Length - renderedThrough,
+                origin,
+                fontFamily,
+                fontSize,
+                defaultForeground);
+        }
+    }
+
+    private static void DrawPreviewTextRange(
+        DrawingContext dc,
+        string displayLine,
+        int startIndex,
+        int length,
+        Point origin,
+        string fontFamily,
+        double fontSize,
+        Brush foreground)
+    {
+        int rangeStart = Math.Clamp(startIndex, 0, displayLine.Length);
+        int rangeEnd = Math.Clamp(startIndex + length, rangeStart, displayLine.Length);
+        if (rangeEnd <= rangeStart)
+            return;
+
+        string text = displayLine.Substring(rangeStart, rangeEnd - rangeStart);
+        if (string.IsNullOrWhiteSpace(text))
+            return;
+
+        double x = MeasurePreviewTextPosition(displayLine, rangeStart, fontFamily, fontSize);
+        var formatted = new FormattedText(text, fontFamily, fontSize)
+        {
+            Foreground = foreground
+        };
+        dc.DrawText(formatted, new Point(origin.X + x, origin.Y));
+    }
+
+    private static double MeasurePreviewTextPosition(string text, int textPosition, string fontFamily, double fontSize)
+    {
+        int position = Math.Clamp(textPosition, 0, text.Length);
+        if (position <= 0)
+            return 0;
+
+        if (position < text.Length &&
+            TextMeasurement.HitTestTextPosition(text, fontFamily, fontSize, (uint)position, false, out var hitResult))
+        {
+            return Math.Max(0, hitResult.CaretX);
+        }
+
+        var prefix = new FormattedText(text[..position], fontFamily, fontSize);
+        TextMeasurement.MeasureText(prefix);
+        return Math.Max(0, prefix.WidthIncludingTrailingWhitespace);
+    }
+
     private EditorViewLine GetOrCreateLineCacheEntry(int lineNumber, DocumentLine line)
     {
         if (!_lineCache.TryGetValue(lineNumber, out var cached))

@@ -7,6 +7,7 @@
     <!-- ============================================== -->
     <Style TargetType="Button">
         <Setter Property="Background" Value="{ThemeResource ControlBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="14,7,14,7" />
@@ -84,6 +85,7 @@
     <!-- ============================================== -->
     <Style TargetType="SplitButton">
         <Setter Property="Background" Value="{ThemeResource ControlBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="14,7,14,7" />
@@ -166,6 +168,7 @@
     <!-- ============================================== -->
     <Style TargetType="RepeatButton">
         <Setter Property="Background" Value="{ThemeResource ControlBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="10,5,10,5" />

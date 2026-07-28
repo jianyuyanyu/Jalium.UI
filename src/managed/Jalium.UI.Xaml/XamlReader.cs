@@ -392,7 +392,8 @@ public partial class XamlReader
                     elementType,
                     reader.LocalName,
                     reader.Prefix,
-                    reader.Value);
+                    reader.Value,
+                    reader.NamespaceURI);
             }
 
             reader.MoveToElement();
@@ -869,7 +870,8 @@ public partial class XamlReader
                 currentInstance.GetType(),
                 attrName,
                 prefix,
-                attrValue);
+                attrValue,
+                attrNamespaceUri);
 
             // Handle x: directives
             if (prefix == "x")
@@ -937,33 +939,20 @@ public partial class XamlReader
         var ownerTypeName = parts[0];
         var propertyName = parts[1];
 
-        // Prefer the attribute's own namespace, set when the author used an explicit prefix
-        // (e.g. `b:AnimatedBg.StartWindow` where `b` maps to a clr-namespace URI).
-        Type? ownerType = null;
-        if (!string.IsNullOrEmpty(attributeNamespaceUri))
-        {
-            ownerType = context.ResolveType(attributeNamespaceUri, ownerTypeName);
-        }
+        var ownerType = ResolveAttachedPropertyOwnerType(
+            context,
+            ownerTypeName,
+            attributeNamespaceUri,
+            elementNamespaceUri);
 
-        // Unprefixed attached properties (e.g. `Grid.Row`) inherit XML's no-namespace rule,
-        // so look them up under the host element's xmlns instead.
-        if (ownerType == null && !string.IsNullOrEmpty(elementNamespaceUri))
-        {
-            ownerType = context.ResolveType(elementNamespaceUri, ownerTypeName);
-        }
-
-        // Fall back to the AOT-safe simple-name registry as a last resort.
-        if (ownerType == null)
-        {
-            ownerType = FindTypeByName(ownerTypeName);
-        }
-
-        ownerType = context.FilterRestrictiveType(ownerType, ownerTypeName);
         if (ownerType == null)
         {
             throw new XamlParseException($"Cannot resolve attached property owner type: {ownerTypeName}");
         }
 
+        var attachedProperty = instance is DependencyObject
+            ? DependencyProperty.FromName(ownerType, propertyName)
+            : null;
 
         // Find the Set method (e.g., Grid.SetRow)
         var setMethod = ownerType.GetMethod($"Set{propertyName}", BindingFlags.Public | BindingFlags.Static);
@@ -975,7 +964,27 @@ public partial class XamlReader
                 var targetType = parameters[1].ParameterType;
                 object? convertedValue = null;
 
-                if (ownerType == typeof(Grid) &&
+                if (MarkupExtensionParser.TryParseAttachedProperty(
+                        value,
+                        instance,
+                        attachedProperty,
+                        context,
+                        out var extensionResult))
+                {
+                    if (extensionResult is BindingExpressionBase)
+                        return;
+
+                    if (extensionResult is BindingBase)
+                    {
+                        throw new XamlParseException(
+                            $"Attached binding '{ownerTypeName}.{propertyName}' requires a registered DependencyProperty.");
+                    }
+
+                    convertedValue = ConvertAttachedPropertyValue(
+                        extensionResult,
+                        targetType);
+                }
+                else if (ownerType == typeof(Grid) &&
                     instance is UIElement element &&
                     targetType == typeof(int) &&
                     (propertyName == "Row" || propertyName == "Column"))
@@ -1013,15 +1022,79 @@ public partial class XamlReader
         }
 
         // Try DependencyProperty directly via the AOT-safe registry.
-        var dp = DependencyProperty.FromName(ownerType, propertyName);
-        if (dp != null && instance is DependencyObject depObj)
+        if (attachedProperty != null &&
+            instance is DependencyObject depObj)
         {
-            var convertedValue = TypeConverterRegistry.ConvertValue(value, dp.PropertyType);
-            depObj.SetValue(dp, convertedValue);
+            object? convertedValue;
+            if (MarkupExtensionParser.TryParseAttachedProperty(
+                    value,
+                    instance,
+                    attachedProperty,
+                    context,
+                    out var extensionResult))
+            {
+                if (extensionResult is BindingExpressionBase)
+                    return;
+
+                convertedValue = ConvertAttachedPropertyValue(
+                    extensionResult,
+                    attachedProperty.PropertyType);
+            }
+            else
+            {
+                convertedValue = TypeConverterRegistry.ConvertValue(
+                    value,
+                    attachedProperty.PropertyType);
+            }
+
+            depObj.SetValue(attachedProperty, convertedValue);
             return;
         }
 
         throw new XamlParseException($"Cannot find attached property setter for: {propertyPath}");
+    }
+
+    private static Type? ResolveAttachedPropertyOwnerType(
+        XamlParserContext context,
+        string ownerTypeName,
+        string attributeNamespaceUri,
+        string elementNamespaceUri)
+    {
+        // Prefer the attribute's own namespace, set when the author used an
+        // explicit prefix (for example b:AnimatedBg.StartWindow).
+        Type? ownerType = null;
+        if (!string.IsNullOrEmpty(attributeNamespaceUri))
+        {
+            ownerType = context.ResolveType(
+                attributeNamespaceUri,
+                ownerTypeName);
+        }
+
+        // Unprefixed attached properties (for example Grid.Row) inherit the
+        // host element's namespace.
+        if (ownerType == null &&
+            !string.IsNullOrEmpty(elementNamespaceUri))
+        {
+            ownerType = context.ResolveType(
+                elementNamespaceUri,
+                ownerTypeName);
+        }
+
+        return context.FilterRestrictiveType(
+            ownerType ?? FindTypeByName(ownerTypeName),
+            ownerTypeName);
+    }
+
+    private static object? ConvertAttachedPropertyValue(
+        object? value,
+        Type targetType)
+    {
+        if (value == null || targetType.IsInstanceOfType(value))
+            return value;
+
+        return value is string text
+            ? TypeConverterRegistry.ConvertValue(text, targetType)
+            : value;
     }
 
     [return: DynamicallyAccessedMembers(
@@ -3466,6 +3539,53 @@ public partial class XamlReader
             BuilderSetProperty(target, propertyName, result, context);
     }
 
+    /// <summary>
+    /// Apply a SourceGenerator-lowered binding to an attached dependency
+    /// property. The owner type supplies the dependency-property identity while
+    /// the binding target remains the element carrying the attached property.
+    /// </summary>
+    [RequiresUnreferencedCode("Resolves the attached owner type and binding parameters, which may use reflection.")]
+    internal static void BuilderApplyCompiledAttachedBinding(
+        object target,
+        string ownerTypeName,
+        string propertyName,
+        string? positionalPath,
+        string[] names,
+        string[] values,
+        XamlParserContext context,
+        string elementNamespaceUri)
+    {
+        var ownerType = ResolveAttachedPropertyOwnerType(
+            context,
+            ownerTypeName,
+            elementNamespaceUri,
+            elementNamespaceUri)
+            ?? throw new XamlParseException(
+                $"Cannot resolve attached property owner type: {ownerTypeName}");
+        var targetProperty =
+            DependencyProperty.FromName(ownerType, propertyName)
+            ?? throw new XamlParseException(
+                $"Attached binding '{ownerTypeName}.{propertyName}' requires a registered DependencyProperty.");
+
+        var extension = MarkupExtensionParser.BuildBindingExtension(
+            positionalPath,
+            names,
+            values,
+            context);
+        var result =
+            MarkupExtensionParser.ProvideExtensionValueForDependencyProperty(
+                extension,
+                target,
+                targetProperty,
+                context);
+
+        if (result is not BindingExpressionBase)
+        {
+            throw new XamlParseException(
+                $"Unable to attach binding to '{ownerTypeName}.{propertyName}'.");
+        }
+    }
+
     [RequiresUnreferencedCode("XamlBuilder.SetAttachedProperty resolves the static SetXxx method via reflection on the owner type.")]
     internal static void BuilderSetAttachedProperty(
         object instance,
@@ -4386,7 +4506,7 @@ internal sealed class XamlParserContext : IAmbientResourceProvider
     [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage("Trimming", "IL2026:RequiresUnreferencedCode",
         Justification = "This is the user-defined-type fallback of the runtime XAML reader, reached only after the AOT-safe XamlTypeRegistry (which preserves every framework type) misses. Resolving a user type named in jalxaml via Assembly.GetType is the documented consumer responsibility under AOT — the RUC contract is already declared at the public XamlReader.Load/Parse boundary (see the class-level RequiresUnreferencedCode), and user code-behind types reachable from XAML are preserved via XamlTypeRegistry registration / the SourceGenerator's DynamicDependency emission.")]
     [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage("Trimming", "IL2073:DynamicallyAccessedMembers",
-        Justification = "The [return: DynamicallyAccessedMembers] promises preserved members on the resolved type so downstream reflective construction is safe. For the registry hit path that guarantee holds (registered types carry the DAM annotation on Register<T>/RegisterType<T>). For this Assembly.GetType fallback the resolved user type is a runtime-discovered token that cannot carry DAM statically; its preservation is the documented consumer responsibility (XamlReader.Load/Parse RUC contract + SourceGenerator DynamicDependency), so the return annotation is satisfied by the consumer-side preservation rather than a static flow.")]
+        Justification = "The [return: DynamicallyAccessedMembers] promises preserved members on the resolved type so downstream reflective construction is safe. For the registry hit path that guarantee holds (registered types carry the DAM annotation on Register<T>/RegisterType). For this Assembly.GetType fallback the resolved user type is a runtime-discovered token that cannot carry DAM statically; its preservation is the documented consumer responsibility (XamlReader.Load/Parse RUC contract + SourceGenerator DynamicDependency), so the return annotation is satisfied by the consumer-side preservation rather than a static flow.")]
     [return: DynamicallyAccessedMembers(
         DynamicallyAccessedMemberTypes.PublicConstructors |
         DynamicallyAccessedMemberTypes.PublicProperties |
@@ -4795,7 +4915,7 @@ public static class XamlTypeRegistry
     /// Gets a type by its simple name.
     /// </summary>
     [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage("Trimming", "IL2073:DynamicallyAccessedMembers",
-        Justification = "The _types dictionary is populated exclusively by the DAM-annotated Register<T>/RegisterType<T> generics (each carries the same PublicConstructors|PublicProperties|PublicFields|PublicMethods|NonPublicFields annotation on T), so every stored Type already has those members preserved. The trimmer cannot propagate DAM through the Dictionary<string,Type> value type, so it cannot statically prove the returned token satisfies the [return: DAM] promise; the promise is in fact upheld by those registration generics.")]
+        Justification = "The _types dictionary is populated by DAM-annotated Register<T>/RegisterType entry points (each carries the same PublicConstructors|PublicProperties|PublicFields|PublicMethods|NonPublicFields contract), so every stored Type already has those members preserved. The trimmer cannot propagate DAM through the Dictionary<string,Type> value type, so it cannot statically prove the returned token satisfies the [return: DAM] promise; the promise is upheld by those registration entry points.")]
     [return: DynamicallyAccessedMembers(
         DynamicallyAccessedMemberTypes.PublicConstructors |
         DynamicallyAccessedMemberTypes.PublicProperties |
@@ -4814,6 +4934,22 @@ public static class XamlTypeRegistry
     /// <summary>
     /// Registers a custom type for XAML parsing.
     /// Call this for any custom types used in XAML.
+    /// </summary>
+    public static void RegisterType(
+        [DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicConstructors |
+            DynamicallyAccessedMemberTypes.PublicProperties |
+            DynamicallyAccessedMemberTypes.PublicFields |
+            DynamicallyAccessedMemberTypes.PublicMethods |
+            DynamicallyAccessedMemberTypes.NonPublicFields)]
+        Type type)
+    {
+        ArgumentNullException.ThrowIfNull(type);
+        _types[type.Name] = type;
+    }
+
+    /// <summary>
+    /// Registers a custom non-static type for XAML parsing.
     /// </summary>
     public static void RegisterType<[DynamicallyAccessedMembers(
         DynamicallyAccessedMemberTypes.PublicConstructors |

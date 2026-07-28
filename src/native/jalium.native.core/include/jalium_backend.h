@@ -97,6 +97,15 @@ public:
     /// Returns JALIUM_OK if the device is healthy, non-zero if device is lost.
     virtual JaliumResult CheckDeviceStatus() { return JALIUM_OK; }
 
+    /// Sets the adapter preference before the backend creates its GPU device.
+    /// Backends that do not expose multiple hardware adapters may keep the
+    /// default NOT_SUPPORTED result.
+    virtual JaliumResult SetGpuPreference(JaliumGpuPreference gpuPreference)
+    {
+        (void)gpuPreference;
+        return JALIUM_ERROR_NOT_SUPPORTED;
+    }
+
     /// Fills <paramref name="out"/> with the currently selected GPU adapter's
     /// description (name, type, VRAM, vendor / device IDs). Used by host apps
     /// to show "current GPU" in status bars / Help/About dialogs and to

@@ -7,6 +7,7 @@
     <!-- ============================================== -->
     <Style TargetType="TabControl">
         <Setter Property="Background" Value="{ThemeResource TabContentBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource TabStripBorder}" />
         <Setter Property="BorderThickness" Value="0" />
         <Setter Property="TabStripBackground" Value="{ThemeResource TabStripBackground}" />

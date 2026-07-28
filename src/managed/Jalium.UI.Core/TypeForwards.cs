@@ -866,6 +866,7 @@ using System.Runtime.CompilerServices;
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.PointConverter))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.PowerLineStatus))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.PresentationSource))]
+[assembly: TypeForwardedTo(typeof(global::Jalium.UI.AotTypeRegistry))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.PropertyAccessorRegistry))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.PropertyChangedCallback))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.PropertyMetadata))]

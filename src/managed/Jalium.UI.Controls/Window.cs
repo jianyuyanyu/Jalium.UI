@@ -90,6 +90,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     private readonly LayoutManager _layoutManager = new();
     private readonly WindowInputDispatcher _inputDispatcher;
     private double _dpiScale = 1.0;
+    private nint _refreshRateMonitor;
     private Dispatcher? _dispatcher; // UI thread Dispatcher, captured in Show()
 
     // Android platform state
@@ -376,6 +377,11 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     // buffer.
     private int _lastSwapBufferCount = 2;
     private long _lastRenderTicks;          // Timestamp of last completed render (for rate-limiting)
+    // Monotonic count of frames that reached a successful Present. Unlike
+    // _lastRenderTicks it cannot alias when two fast frames finish in the same
+    // millisecond, so startup can prove that the hidden first-frame render
+    // populated the swap chain before making the native window visible.
+    private long _successfulPresentCount;
     private Timer? _renderThrottleTimer;    // Deferred render when rate-limited or waiting for the GPU
     private long _suppressEscapeUntilTick;
 
@@ -1762,13 +1768,26 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
 
         if (canResize)
         {
-            // ScreenToClient reports native non-client frame coordinates outside
-            // the half-open client rect. Keep resize hits in that outer frame so
-            // controls next to a window edge never acquire a resize cursor.
-            isLeft = x < 0 && x >= -resizeBorder;
-            isRight = x >= windowWidth && x < windowWidth + resizeBorder;
-            isTop = y < 0 && y >= -resizeBorder;
-            isBottom = y >= windowHeight && y < windowHeight + resizeBorder;
+            // A custom title bar extends the client rect to the outer top edge, so
+            // ScreenToClient reports the top resize strip at y >= 0. A completely
+            // borderless window owns every edge in the same way. Framed edges that
+            // remain native are still reported outside the half-open client rect.
+            bool clientOwnsAllResizeEdges = WindowStyle == WindowStyle.None;
+            bool clientOwnsTopResizeEdge =
+                clientOwnsAllResizeEdges || TitleBarStyle == WindowTitleBarStyle.Custom;
+
+            isLeft = clientOwnsAllResizeEdges
+                ? x >= 0 && x < resizeBorder
+                : x < 0 && x >= -resizeBorder;
+            isRight = clientOwnsAllResizeEdges
+                ? x >= windowWidth - resizeBorder && x < windowWidth
+                : x >= windowWidth && x < windowWidth + resizeBorder;
+            isTop = clientOwnsTopResizeEdge
+                ? y >= -resizeBorder && y < resizeBorder
+                : y < 0 && y >= -resizeBorder;
+            isBottom = clientOwnsAllResizeEdges
+                ? y >= windowHeight - resizeBorder && y < windowHeight
+                : y >= windowHeight && y < windowHeight + resizeBorder;
 
             if (isTop && isLeft)
             {
@@ -1839,6 +1858,12 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         }
 
         return HTCLIENT;
+    }
+
+    private static bool IsResizeHitTestResult(int hit)
+    {
+        return hit is HTLEFT or HTRIGHT or HTTOP or HTTOPLEFT or HTTOPRIGHT
+            or HTBOTTOM or HTBOTTOMLEFT or HTBOTTOMRIGHT;
     }
 
     private bool IsTitleBarVisible()
@@ -2583,8 +2608,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         }
 
         // Detect monitor refresh rate and update CompositionTarget for adaptive frame rate
-        var refreshRate = DetectMonitorRefreshRate();
-        CompositionTarget.UpdateRefreshRate(refreshRate);
+        UpdateRefreshRateForCurrentMonitor(force: true);
 
         // Apply startup location before showing
         ApplyWindowStartupLocation();
@@ -2604,25 +2628,44 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             try { WindowState = desiredState; }
             finally { _isSyncingWindowState = false; }
         }
-        // Two-phase startup display:
-        //   1) Pre-size the swap chain to the target monitor for Maximized/FullScreen
-        //      so we don't pay a second full-render after ShowWindow's WM_SIZE.
-        //   2) Present a single ClearBackground frame to the swap chain BEFORE the
-        //      HWND becomes visible — the back-buffer is no longer the
-        //      uninitialized memory that DWM commonly shows as white during the
-        //      window-visible-but-content-not-yet-rendered gap.
-        //   3) ShowWindow — DWM picks up the cleared back-buffer immediately, so
-        //      the user sees the window appear with its final background color
-        //      (no white flash, no delayed window).
-        //   4) ForceRenderFrame — the full first frame is rendered synchronously
-        //      AFTER the window is on-screen.  The user perceives "window opens
-        //      instantly, content paints a moment later" instead of "window
-        //      doesn't appear for 400 ms" or "window opens white for 500 ms".
+        // First-frame-atomic startup:
+        //   1) Pre-size the swap chain to the target monitor for
+        //      Maximized/FullScreen.
+        //   2) Layout, draw, and Present the initial visual tree while the HWND
+        //      is hidden.
+        //   3) ShowWindow only after that Present succeeds. DWM's first visible
+        //      surface is the real UI, never a solid-background placeholder.
+        //   4) Raise Loaded after ShowWindow, preserving the established event
+        //      contract. Applications can keep the first tree lightweight and
+        //      populate expensive regions from Loaded without exposing an
+        //      unpainted native surface.
+        //
+        // PlatformWindow surfaces remain on the legacy show-then-render path:
+        // an unmapped X11/Android/macOS surface is not universally presentable.
         PrepareInitialRenderTargetSize(desiredState);
 
-        using (StartupDiagnostics.Begin("Window.InitialBackgroundFrame", blocksUiThread: true))
+        bool canPreRenderFirstFrame =
+            _platformWindow == null &&
+            desiredState != WindowState.Minimized;
+        bool initialFramePresented = false;
+
+        if (canPreRenderFirstFrame)
         {
-            PaintInitialBackgroundFrame();
+            using (StartupDiagnostics.Begin("Window.InitialLayoutAndRender", blocksUiThread: true))
+            {
+                initialFramePresented = TryRenderInitialFrame();
+            }
+        }
+
+        if (!initialFramePresented)
+        {
+            // Best-effort fallback for a target which cannot Present while its
+            // native surface is hidden. It still avoids uninitialized swap-chain
+            // memory; the complete frame is retried immediately after ShowWindow.
+            using (StartupDiagnostics.Begin("Window.InitialBackgroundFrame", blocksUiThread: true))
+            {
+                PaintInitialBackgroundFrame();
+            }
         }
 
         using (StartupDiagnostics.Begin("Window.NativeShow", blocksUiThread: true))
@@ -2657,15 +2700,18 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         _nativeWindowHidden = false;
         UpdateRenderableRegistration();
 
-        // First full frame — runs AFTER the window is visible so the user
-        // perceives an instant "window opens" rather than a delayed launch.
-        // The UI thread blocks here for the visual tree's measure/arrange
-        // and full render, but the window is already on screen showing the
-        // pre-show background frame, so the wait reads as "content appearing"
-        // rather than "app stuck loading".
-        using (StartupDiagnostics.Begin("Window.InitialLayoutAndRender", blocksUiThread: true))
+        // Hidden startup suppresses asynchronous present owners so the initial
+        // frame has one synchronous owner. Start steady-state scheduling only
+        // after the native surface is visible.
+        StartRenderThreadIfSupported();
+        StartExternalPresentPacingIfSupported();
+
+        if (!initialFramePresented)
         {
-            TryRenderInitialFrame();
+            using (StartupDiagnostics.Begin("Window.InitialLayoutAndRender", blocksUiThread: true))
+            {
+                initialFramePresented = TryRenderInitialFrame();
+            }
         }
         if (isMainWindow)
             StartupDiagnostics.Mark("MainWindowInitialRenderReturned", blocksUiThread: true);
@@ -2674,9 +2720,14 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         // (combined with DPI adjustment), so no additional call is needed here.
         // Removing the duplicate saves a DWM roundtrip (~10-50ms).
 
-        using (StartupDiagnostics.Begin("Window.LoadedTree", blocksUiThread: true))
+        // Cross-platform/minimized fallback: those paths did not raise Loaded
+        // during the hidden Windows pre-render sequence.
+        if (!IsLoaded)
         {
-            SetLoadedState(true);
+            using (StartupDiagnostics.Begin("Window.LoadedTree", blocksUiThread: true))
+            {
+                SetLoadedState(true);
+            }
         }
 
         if (!_contentRendered)
@@ -2830,32 +2881,26 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     }
 
     /// <summary>
-    /// Renders the first full visual-tree frame.  Called AFTER ShowWindow so the
-    /// window is already on-screen (showing the pre-show ClearBackground frame
-    /// painted by <see cref="PaintInitialBackgroundFrame"/>) — the synchronous
-    /// layout + render + Present blocks the UI thread, but to the user this
-    /// reads as "content appearing" rather than "the app froze on launch".
-    /// Wrapped for the cross-platform PlatformWindow path because some
-    /// surfaces (e.g. unmapped X11, unattached Android SurfaceView) may have
-    /// edge-case Present failures.
+    /// Renders the first full visual-tree frame and reports whether it reached a
+    /// successful Present. Windows calls this while the HWND is still hidden;
+    /// cross-platform surfaces use it immediately after their native show call.
     /// </summary>
-    private void TryRenderInitialFrame()
+    private bool TryRenderInitialFrame()
     {
-        if (_platformWindow != null)
-        {
-            try
-            {
-                ForceRenderFrame();
-            }
-            catch (RenderPipelineException ex)
-            {
-                Console.Error.WriteLine($"[Show] post-show ForceRenderFrame failed on platform window: {ex.Message}");
-            }
-        }
-        else
+        long presentedBefore = Interlocked.Read(ref _successfulPresentCount);
+        try
         {
             ForceRenderFrame();
         }
+        catch (RenderPipelineException ex)
+        {
+            // Some hidden native surfaces reject Present. Show() falls back to
+            // a known background and retries after the surface becomes visible.
+            Console.Error.WriteLine($"[Show] initial ForceRenderFrame failed: {ex.Message}");
+            return false;
+        }
+
+        return Interlocked.Read(ref _successfulPresentCount) > presentedBefore;
     }
 
     /// <summary>
@@ -3082,7 +3127,10 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     // (SW_HIDE) outside the Visibility DP path. WPF-style Hide() does not
     // mutate Visibility, so we cannot rely on the DP alone to know whether
     // the surface is presentable.
-    private bool _nativeWindowHidden;
+    // Native windows are created hidden. Keeping this true until ShowWindow
+    // prevents the global frame clock and asynchronous present owners from
+    // racing the synchronous hidden first-frame render.
+    private bool _nativeWindowHidden = true;
 
     /// <summary>
     /// Synchronises this window's renderability state with
@@ -4239,7 +4287,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             case PlatformEventType.MonitorsChanged:
                 SystemParameters.NotifyStaticPropertyChanged(null);
                 RaisePlatformSystemSettingsChanged();
-                CompositionTarget.UpdateRefreshRate(DetectMonitorRefreshRate());
+                UpdateRefreshRateForCurrentMonitor(force: true);
                 break;
 
             case PlatformEventType.MouseLeave:
@@ -4259,7 +4307,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     _isSyncingPosition = false;
                 }
                 OnLocationChanged(EventArgs.Empty);
-                CompositionTarget.UpdateRefreshRate(DetectMonitorRefreshRate());
+                UpdateRefreshRateForCurrentMonitor(force: false);
                 break;
             }
 
@@ -5429,7 +5477,6 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         var requestedBackend = _renderBackendOverride != RenderBackend.Auto
             ? _renderBackendOverride
             : RenderBackend.Auto;
-
         RenderContext context;
         using (StartupDiagnostics.Begin("Window.RenderContextWaitOrCreate", blocksUiThread: true))
         {
@@ -6542,20 +6589,24 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     }
                     if (window.TitleBarStyle == WindowTitleBarStyle.Custom)
                     {
-                        // Let DWM first have a chance to resolve the NC hit. This is
-                        // what primes the Windows 11 Snap Layouts state machine — DWM
-                        // uses this pass to notice HTMAXBUTTON in subsequent NC mouse
-                        // messages and arm the flyout timer. Without this call, the
-                        // flyout never appears even when we return HTMAXBUTTON. If
-                        // DWM claims the hit (typical for caption resize handles),
-                        // honor its result; otherwise fall through to our custom
-                        // button / caption / client logic.
+                        var customHitResult = window.HandleNcHitTest(lParam);
+
+                        // WM_NCCALCSIZE deliberately extends a custom title bar into
+                        // the native top frame. Resolve our client-owned resize strip
+                        // before DWM can classify those pixels as caption or client.
+                        if (IsResizeHitTestResult(customHitResult))
+                        {
+                            return customHitResult;
+                        }
+
+                        // DWM still gets the non-resize hit before our custom result.
+                        // This primes the Windows 11 Snap Layouts state machine for
+                        // HTMAXBUTTON and preserves native caption-button behavior.
                         if (DwmDefWindowProc(hWnd, msg, wParam, lParam, out nint dwmHit) && dwmHit != nint.Zero)
                         {
                             return dwmHit;
                         }
 
-                        var customHitResult = window.HandleNcHitTest(lParam);
                         if (customHitResult != HTNOWHERE)
                         {
                             return customHitResult;
@@ -6730,14 +6781,17 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                         }
                     }
                     window.OnLocationChanged(EventArgs.Empty);
-                    // Re-detect refresh rate (window may have moved to a different monitor)
-                    CompositionTarget.UpdateRefreshRate(window.DetectMonitorRefreshRate());
+                    // A left/top resize also emits WM_MOVE even though the window
+                    // remains on the same display. Re-querying on every such message
+                    // lets transient hybrid-GPU display data globally downgrade all
+                    // frame-paced scrolling. Refresh only when the monitor changed.
+                    window.UpdateRefreshRateForCurrentMonitor(force: false);
                     return nint.Zero;
                 }
 
                 case WM_DISPLAYCHANGE:
                     // Display settings changed (resolution, refresh rate, etc.)
-                    CompositionTarget.UpdateRefreshRate(window.DetectMonitorRefreshRate());
+                    window.UpdateRefreshRateForCurrentMonitor(force: true);
                     return nint.Zero;
 
                 case WM_DPICHANGED:
@@ -6766,7 +6820,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     window.UpdateCustomTitleBarFrameMargins();
 
                     // Re-detect refresh rate (different monitor may have different rate)
-                    CompositionTarget.UpdateRefreshRate(window.DetectMonitorRefreshRate());
+                    window.UpdateRefreshRateForCurrentMonitor(force: true);
 
                     window.OnDpiChanged(new DpiChangedEventArgs(
                         new DpiScale(oldDpiScale, oldDpiScale),
@@ -6845,12 +6899,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     // Width/Height and layout were already updated by WM_SIZE; calling
                     // OnSizeChanged again would invalidate the whole layout tree once
                     // more at mouse-up.
-                    int finalPhysW = window._hasPendingResize
-                        ? window._pendingResizeWidth
-                        : (int)(window.Width * window._dpiScale);
-                    int finalPhysH = window._hasPendingResize
-                        ? window._pendingResizeHeight
-                        : (int)(window.Height * window._dpiScale);
+                    var (finalPhysW, finalPhysH) = window.GetFinalPhysicalResizeSize();
                     window.TryResizeRenderTarget(finalPhysW, finalPhysH, "ExitSizeMove");
                     // 强制重画一帧 _isSizing=false 的正常帧。拖拽期间每帧画的是 _isSizing=true 的
                     // backdrop 降级帧（折射型特效被简化/跳过），松手时 _isSizing 刚变 false，但
@@ -7145,6 +7194,12 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             return;
         }
 
+        // Preserve the authoritative physical client size. Reconstructing it
+        // later from DIPs is lossy at fractional DPI scales (for example,
+        // (115 / 1.75) * 1.75 can evaluate to 114.999... and truncate to 114).
+        _latestPhysicalClientWidth = physicalWidth;
+        _latestPhysicalClientHeight = physicalHeight;
+
         var previousWidth = Width;
         var previousHeight = Height;
 
@@ -7198,6 +7253,27 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     private int _pendingResizeWidth;
     private int _pendingResizeHeight;
     private long _pendingResizeVersion;
+    private int _latestPhysicalClientWidth;
+    private int _latestPhysicalClientHeight;
+
+    private (int Width, int Height) GetFinalPhysicalResizeSize()
+    {
+        if (_hasPendingResize)
+        {
+            return (_pendingResizeWidth, _pendingResizeHeight);
+        }
+
+        if (_latestPhysicalClientWidth > 0 && _latestPhysicalClientHeight > 0)
+        {
+            return (_latestPhysicalClientWidth, _latestPhysicalClientHeight);
+        }
+
+        // Defensive startup fallback for a window that enters/exits a move loop
+        // before receiving its first non-zero WM_SIZE.
+        return (
+            Math.Max(1, (int)Math.Round(Width * _dpiScale, MidpointRounding.AwayFromZero)),
+            Math.Max(1, (int)Math.Round(Height * _dpiScale, MidpointRounding.AwayFromZero)));
+    }
 
     private void QueueLatestRenderTargetResize(int physicalWidth, int physicalHeight)
     {
@@ -8040,6 +8116,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         JaliumResult endResult = renderTarget.TryEndDraw();
         if (endResult == JaliumResult.Ok)
         {
+            Interlocked.Increment(ref _successfulPresentCount);
             _debugHud.OnEndDraw();
             // This frame's BeginDraw blocking wait (swap-chain frame-latency
             // waitable + GPU fence) in ns — peeled out of the "BeginDraw"
@@ -8525,6 +8602,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     private void StartRenderThreadIfSupported()
     {
         if (!EnableRenderThread || _renderThread != null) return;
+        if (_nativeWindowHidden) return;
         if (_renderThreadDisabledForSchemaGap) return;  // latched off after un-recordable content — don't flap back on RT recreate
         // The render thread is Windows/HWND-only by design (it owns the swap-chain
         // present). On non-Windows _platformWindow drives rendering, and
@@ -8793,6 +8871,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             ended = endResult == JaliumResult.Ok;
             if (ended)
             {
+                Interlocked.Increment(ref _successfulPresentCount);
                 // Interlocked + plain bool store — safe from this worker (see
                 // ResetEndDrawInvalidStateTracking for the ordering argument).
                 ResetEndDrawInvalidStateTracking();
@@ -9124,6 +9203,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         }
 
         StopExternalPresentPacing();   // RT 重建路径：刷新句柄 + 重置状态
+        if (_nativeWindowHidden) { Trace("skip: nativeWindowHidden"); return; }
         // Cross-platform host (Android 等)：无 user32、无 DXGI waitable，且下面的
         // ShouldUseCompositionRenderTarget 会 P/Invoke user32（StartRenderThreadIfSupported
         // 规避过的同一个陷阱）。
@@ -10118,17 +10198,23 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                 ClearRenderFlag(RenderFlag_Rendering);
             }
             CompletePendingManagedTeardown();
+
+            // A pending resize must survive every intentional early return
+            // (target replacement, empty frame, render-thread publish). Hand its
+            // reentrant WM_SIZE request to the frame clock after releasing
+            // RenderFlag_Rendering, otherwise _hasPendingResize is stranded until
+            // unrelated input. Limit this finally-path hand-off to resize work:
+            // GPU-busy frame retries already own a back-off timer and must not be
+            // bypassed by an immediate frame-clock request.
+            if (_hasPendingResize && HasRenderFlag(RenderFlag_Requested))
+            {
+                ClearRenderFlag(RenderFlag_Requested);
+                InvalidateWindow();
+            }
         }
 
-        // If something requested a render during our rendering
-        // (e.g., UpdateLayout triggered further invalidation, or rapid mouse-move
-        // events arrived mid-frame), schedule another render cycle immediately.
-        //
-        // 不再因 CompositionTarget.IsActive 跳过。理由同 InvalidateWindow 的注释：
-        // IsActive 仅表示有任意长寿命订阅者，不代表下一帧一定到。如果跳过，
-        // 中键拖拽/快速 hover 等密集输入产生的 Requested 会被丢弃，表现为
-        // 规律性卡顿——必须等下一次独立输入事件才能 InvalidateWindow。
-        // InvalidateWindow 本身幂等（TrySetRenderFlag），重复调用不会重复渲染。
+        // Normal fall-through: preserve the general render-request hand-off for
+        // layout, animation and input invalidations that arrived during the frame.
         if (HasRenderFlag(RenderFlag_Requested))
         {
             ClearRenderFlag(RenderFlag_Requested);
@@ -10446,7 +10532,23 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         if (isFlushFrame)
         {
             if (_partialPresentsToFlush > 0) _partialPresentsToFlush--;
-            if (_partialPresentsToFlush > 0) ScheduleDeferredRender(1);
+            if (_partialPresentsToFlush > 0)
+            {
+                ScheduleDeferredRender(1);
+            }
+            else
+            {
+                // Every back buffer has now received the union represented by the
+                // history ring. Keeping those snapshots would be both redundant and
+                // expensive: the next isolated hover/caret update would fold stale
+                // regions (including a startup full-window seed) back into its clip,
+                // turning a tiny interaction into a near-full-window replay.
+                //
+                // Continuous activity never reaches this branch: a real frame
+                // re-arms the flush chain and keeps the ring until all buffers
+                // eventually converge.
+                ClearConvergedDirtyHistory();
+            }
             return;
         }
         // Cover every OTHER back buffer. With kDefaultSwapBufferCount=2 this is a
@@ -10468,6 +10570,16 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         // above only fires in Debug) against re-introducing the stale-deepest-buffer bug in Release.
         _partialPresentsToFlush = Math.Clamp(_lastSwapBufferCount - 1, 1, DirtyHistoryCount);
         ScheduleDeferredRender(1);
+    }
+
+    /// <summary>
+    /// Drops dirty snapshots after the final follow-up present has made every
+    /// FLIP_SEQUENTIAL back buffer identical.
+    /// </summary>
+    private void ClearConvergedDirtyHistory()
+    {
+        Array.Clear(_dirtyHistory);
+        _dirtyHistoryIndex = 0;
     }
 
     /// <summary>
@@ -10712,7 +10824,39 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     /// Detects the refresh rate of the monitor displaying this window.
     /// </summary>
     /// <returns>The refresh rate in Hz (e.g., 60, 120, 144), or 60 as fallback.</returns>
-    private int DetectMonitorRefreshRate()
+    private void UpdateRefreshRateForCurrentMonitor(bool force)
+    {
+        if (Handle == nint.Zero)
+            return;
+
+        // Cross-platform window backends own monitor discovery. They do not
+        // expose a stable native monitor identity here, so retain their existing
+        // event-driven refresh behavior and still benefit from global validation.
+        if (_platformWindow != null)
+        {
+            _ = CompositionTarget.UpdateRefreshRate(
+                _platformWindow.GetMonitorRefreshRate());
+            return;
+        }
+
+        var monitor = MonitorFromWindow(Handle, MONITOR_DEFAULTTONEAREST);
+        if (monitor == nint.Zero ||
+            (!force && monitor == _refreshRateMonitor))
+        {
+            return;
+        }
+
+        // Cache the monitor only after a plausible rate is accepted. If a
+        // hybrid-GPU transition reports the 0/1 sentinel, the next WM_MOVE will
+        // retry instead of permanently associating the new monitor with bad data.
+        if (CompositionTarget.UpdateRefreshRate(
+                DetectMonitorRefreshRate(monitor)))
+        {
+            _refreshRateMonitor = monitor;
+        }
+    }
+
+    private int DetectMonitorRefreshRate(nint hMonitor = default)
     {
         if (Handle == nint.Zero) return 60;
 
@@ -10721,7 +10865,8 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             return _platformWindow.GetMonitorRefreshRate();
 
         // Win32 path
-        var hMonitor = MonitorFromWindow(Handle, MONITOR_DEFAULTTONEAREST);
+        if (hMonitor == nint.Zero)
+            hMonitor = MonitorFromWindow(Handle, MONITOR_DEFAULTTONEAREST);
         MONITORINFOEX monitorInfoEx = new() { cbSize = (uint)Marshal.SizeOf<MONITORINFOEX>() };
 
         if (GetMonitorInfoEx(hMonitor, ref monitorInfoEx))

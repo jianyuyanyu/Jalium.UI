@@ -8,6 +8,37 @@ namespace Jalium.UI.Tests;
 public class CompositionTargetRenderingTests
 {
     [Fact]
+    public void UpdateRefreshRate_InvalidDriverSentinel_PreservesLastKnownGoodRate()
+    {
+        var originalRate = CompositionTarget.RefreshRate;
+
+        try
+        {
+            Assert.True(CompositionTarget.UpdateRefreshRate(144));
+            Assert.Equal(144, CompositionTarget.RefreshRate);
+            Assert.Equal(6, CompositionTarget.FrameIntervalMs);
+
+            // EnumDisplaySettings can report 0 or 1 for "default hardware
+            // rate", especially while hybrid graphics changes display
+            // ownership during a window move/resize. Neither is a literal Hz
+            // value and neither may poison the process-wide frame clock.
+            Assert.False(CompositionTarget.UpdateRefreshRate(1));
+            Assert.Equal(144, CompositionTarget.RefreshRate);
+            Assert.Equal(6, CompositionTarget.FrameIntervalMs);
+
+            Assert.False(CompositionTarget.UpdateRefreshRate(0));
+            Assert.Equal(144, CompositionTarget.RefreshRate);
+
+            Assert.False(CompositionTarget.UpdateRefreshRate(1001));
+            Assert.Equal(144, CompositionTarget.RefreshRate);
+        }
+        finally
+        {
+            CompositionTarget.UpdateRefreshRate(originalRate);
+        }
+    }
+
+    [Fact]
     public void Rendering_WhenOneSubscriberThrows_StillInvokesRemainingSubscribers()
     {
         int callCount = 0;

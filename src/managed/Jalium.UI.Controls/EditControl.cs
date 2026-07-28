@@ -205,6 +205,8 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
     private static int SmoothScrollIntervalMs => CompositionTarget.FrameIntervalMs;
     private bool _isFollowingBottom;
 
+    private readonly record struct SyntaxPreviewLine(int DocumentLineNumber, string Prefix, string Text);
+
     // Caret blink timer
     private DispatcherTimer? _caretTimer;
     private DispatcherTimer? _foldingRefreshTimer;
@@ -4480,13 +4482,16 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
         if (!_hasPointerPosition || _hoveredFoldedHintSection == null || contentWidth <= 0 || contentHeight <= 0)
             return false;
 
-        string previewText = GetFoldedSectionPreviewText(_hoveredFoldedHintSection);
+        var previewLines = BuildFoldedSectionPreviewLines(_hoveredFoldedHintSection);
+        string previewText = BuildSyntaxPreviewText(previewLines);
         if (string.IsNullOrEmpty(previewText))
             return false;
 
-        var tooltip = new FormattedText(previewText, fontFamily, Math.Max(11, fontSize - 1))
+        double previewFontSize = Math.Max(11, fontSize - 1);
+        var previewForeground = ResolveThemeBrush("OnePopupText", s_scopeGuideTooltipTextBrush, "TextPrimary");
+        var tooltip = new FormattedText(previewText, fontFamily, previewFontSize)
         {
-            Foreground = ResolveThemeBrush("OnePopupText", s_scopeGuideTooltipTextBrush, "TextPrimary"),
+            Foreground = previewForeground,
             MaxTextWidth = Math.Max(24, contentWidth - ScopeGuideTooltipPaddingX * 2 - 8),
             MaxTextHeight = Math.Max(24, contentHeight - ScopeGuideTooltipPaddingY * 2 - 8),
             Trimming = TextTrimming.None
@@ -4511,28 +4516,43 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
         var tooltipBackgroundBrush = ResolveThemeBrush("OnePopupBackground", s_scopeGuideTooltipBackgroundBrush, "TooltipBackground");
         var tooltipBorderPen = ResolveThemePen("OnePopupBorder", s_scopeGuideTooltipBorderPen, "TooltipBorder");
         dc.DrawRoundedRectangle(tooltipBackgroundBrush, tooltipBorderPen, tooltipRect, 3, 3);
-        dc.DrawText(tooltip, new Point(tooltipRect.X + ScopeGuideTooltipPaddingX, tooltipRect.Y + ScopeGuideTooltipPaddingY));
+        var textRect = new Rect(
+            tooltipRect.X + ScopeGuideTooltipPaddingX,
+            tooltipRect.Y + ScopeGuideTooltipPaddingY,
+            Math.Max(0, tooltipRect.Width - ScopeGuideTooltipPaddingX * 2),
+            Math.Max(0, tooltipRect.Height - ScopeGuideTooltipPaddingY * 2));
+        DrawSyntaxHighlightedPreview(
+            dc,
+            previewLines,
+            textRect,
+            fontFamily,
+            previewFontSize,
+            previewForeground,
+            GetSyntaxPreviewLineHeight(tooltip, previewLines.Count));
         return true;
     }
 
-    private string GetFoldedSectionPreviewText(FoldingSection section)
+    private List<SyntaxPreviewLine> BuildFoldedSectionPreviewLines(FoldingSection section)
     {
         int lineCount = _document.LineCount;
         if (lineCount <= 0)
-            return string.Empty;
+            return [];
 
         int firstPreviewLine = Math.Clamp(section.StartLine + 1, 1, lineCount);
         int lastPreviewLine = Math.Clamp(section.EndLine, firstPreviewLine, lineCount);
         int maxLineCount = Math.Max(1, FoldedHintPreviewMaxLines);
 
-        var lines = new List<string>(Math.Min(maxLineCount, lastPreviewLine - firstPreviewLine + 1));
+        var lines = new List<SyntaxPreviewLine>(Math.Min(maxLineCount, lastPreviewLine - firstPreviewLine + 1));
         for (int lineNumber = firstPreviewLine; lineNumber <= lastPreviewLine && lines.Count < maxLineCount; lineNumber++)
-            lines.Add(_document.GetLineText(lineNumber));
+            lines.Add(new SyntaxPreviewLine(lineNumber, string.Empty, _document.GetLineText(lineNumber)));
 
         if (lines.Count == 0)
-            lines.Add(_document.GetLineText(Math.Clamp(section.StartLine, 1, lineCount)));
+        {
+            int fallbackLine = Math.Clamp(section.StartLine, 1, lineCount);
+            lines.Add(new SyntaxPreviewLine(fallbackLine, string.Empty, _document.GetLineText(fallbackLine)));
+        }
 
-        return string.Join('\n', lines);
+        return lines;
     }
 
     private void DrawScopeGuideHoverTooltip(DrawingContext dc, double contentWidth, double contentHeight, string fontFamily, double fontSize)
@@ -5163,15 +5183,18 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
         int digits = Math.Max(1, _document.LineCount.ToString().Length);
         int prefixChars = digits + 3; // marker + line number + space
         int maxPreviewChars = Math.Clamp((int)Math.Floor(availableTextWidth / Math.Max(1, _view.CharWidth)) - prefixChars, 8, MinimapTooltipMaxPreviewCharsPerLine);
-        string tooltipText = BuildMinimapTooltipText(lineNumber, maxPreviewChars);
+        var previewLines = BuildMinimapTooltipLines(lineNumber, maxPreviewChars);
+        string tooltipText = BuildSyntaxPreviewText(previewLines);
         if (string.IsNullOrWhiteSpace(tooltipText))
             return;
 
         string fontFamily = FontFamily?.Source ?? "Cascadia Code";
         double fontSize = FontSize > 0 ? FontSize : 14;
-        var tooltip = new FormattedText(tooltipText, fontFamily, Math.Max(11, fontSize - 1))
+        double previewFontSize = Math.Max(11, fontSize - 1);
+        var previewForeground = ResolveThemeBrush("OnePopupText", s_minimapTooltipTextBrush, "TextPrimary");
+        var tooltip = new FormattedText(tooltipText, fontFamily, previewFontSize)
         {
-            Foreground = ResolveThemeBrush("OnePopupText", s_minimapTooltipTextBrush, "TextPrimary"),
+            Foreground = previewForeground,
             MaxTextWidth = availableTextWidth,
             MaxTextHeight = Math.Max(18, _minimapRect.Height - 4),
             Trimming = TextTrimming.CharacterEllipsis,
@@ -5185,7 +5208,7 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
             tooltipX = 2;
 
         double tooltipMaxY = Math.Max(2, _minimapRect.Bottom - tooltipHeight - 2);
-        double textLineHeight = Math.Max(1, tooltip.Height / MinimapTooltipPreviewLineCount);
+        double textLineHeight = GetSyntaxPreviewLineHeight(tooltip, previewLines.Length);
         double targetLineCenterY = _lastPointerPosition.Y;
         double desiredTooltipY = targetLineCenterY - MinimapTooltipPaddingY - (MinimapTooltipPreviewCenterIndex + 0.5) * textLineHeight;
         double tooltipY = Math.Clamp(desiredTooltipY, 2, tooltipMaxY);
@@ -5194,18 +5217,33 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
         var tooltipBackgroundBrush = ResolveThemeBrush("OnePopupBackground", s_minimapTooltipBackgroundBrush, "TooltipBackground");
         var tooltipBorderPen = ResolveThemePen("OnePopupBorder", s_minimapTooltipBorderPen, "TooltipBorder");
         dc.DrawRoundedRectangle(tooltipBackgroundBrush, tooltipBorderPen, tooltipRect, 3, 3);
-        dc.DrawText(tooltip, new Point(tooltipRect.X + MinimapTooltipPaddingX, tooltipRect.Y + MinimapTooltipPaddingY));
+        var textRect = new Rect(
+            tooltipRect.X + MinimapTooltipPaddingX,
+            tooltipRect.Y + MinimapTooltipPaddingY,
+            Math.Max(0, tooltipRect.Width - MinimapTooltipPaddingX * 2),
+            Math.Max(0, tooltipRect.Height - MinimapTooltipPaddingY * 2));
+        DrawSyntaxHighlightedPreview(
+            dc,
+            previewLines,
+            textRect,
+            fontFamily,
+            previewFontSize,
+            previewForeground,
+            textLineHeight);
     }
 
     private string BuildMinimapTooltipText(int lineNumber, int maxPreviewCharsPerLine)
+        => BuildSyntaxPreviewText(BuildMinimapTooltipLines(lineNumber, maxPreviewCharsPerLine));
+
+    private SyntaxPreviewLine[] BuildMinimapTooltipLines(int lineNumber, int maxPreviewCharsPerLine)
     {
         if (_document.LineCount <= 0)
-            return string.Empty;
+            return [];
 
         int centerLine = Math.Clamp(lineNumber, 1, _document.LineCount);
         int digits = Math.Max(1, _document.LineCount.ToString().Length);
         int maxChars = Math.Clamp(maxPreviewCharsPerLine, 8, MinimapTooltipMaxPreviewCharsPerLine);
-        var lines = new string[MinimapTooltipPreviewLineCount];
+        var lines = new SyntaxPreviewLine[MinimapTooltipPreviewLineCount];
         for (int i = 0; i < MinimapTooltipPreviewLineCount; i++)
         {
             int relative = i - MinimapTooltipPreviewCenterIndex;
@@ -5214,10 +5252,72 @@ public class EditControl : Control, IImeSupport, IEditorViewMetrics
             string marker = relative == 0 ? ">" : " ";
             string lineLabel = inRange ? previewLine.ToString().PadLeft(digits) : new string(' ', digits);
             string lineText = inRange ? TruncateMinimapPreviewLine(_document.GetLineText(previewLine), maxChars) : string.Empty;
-            lines[i] = $"{marker}{lineLabel} {lineText}";
+            lines[i] = new SyntaxPreviewLine(inRange ? previewLine : 0, $"{marker}{lineLabel} ", lineText);
         }
 
-        return string.Join('\n', lines);
+        return lines;
+    }
+
+    private static string BuildSyntaxPreviewText(IReadOnlyList<SyntaxPreviewLine> lines)
+    {
+        if (lines.Count == 0)
+            return string.Empty;
+
+        var textLines = new string[lines.Count];
+        for (int i = 0; i < lines.Count; i++)
+            textLines[i] = lines[i].Prefix + lines[i].Text;
+
+        return string.Join('\n', textLines);
+    }
+
+    private void DrawSyntaxHighlightedPreview(
+        DrawingContext dc,
+        IReadOnlyList<SyntaxPreviewLine> lines,
+        Rect textRect,
+        string fontFamily,
+        double fontSize,
+        Brush defaultForeground,
+        double lineHeight)
+    {
+        if (lines.Count == 0 || textRect.IsEmpty || lineHeight <= 0)
+            return;
+
+        dc.PushClip(new RectangleGeometry(textRect));
+        try
+        {
+            for (int i = 0; i < lines.Count; i++)
+            {
+                double y = textRect.Y + i * lineHeight;
+                if (y >= textRect.Bottom)
+                    break;
+
+                var line = lines[i];
+                _view.RenderSyntaxHighlightedPreviewLine(
+                    dc,
+                    line.DocumentLineNumber,
+                    line.Prefix,
+                    line.Text,
+                    new Point(textRect.X, y),
+                    fontFamily,
+                    fontSize,
+                    defaultForeground);
+            }
+        }
+        finally
+        {
+            dc.Pop();
+        }
+    }
+
+    private static double GetSyntaxPreviewLineHeight(FormattedText layout, int lineCount)
+    {
+        if (layout.LineHeight > 0 && double.IsFinite(layout.LineHeight))
+            return layout.LineHeight;
+
+        if (lineCount > 0 && layout.Height > 0 && double.IsFinite(layout.Height))
+            return Math.Max(1, layout.Height / lineCount);
+
+        return Math.Max(1, layout.FontSize * 1.2);
     }
 
     private static string TruncateMinimapPreviewLine(string text, int maxChars)

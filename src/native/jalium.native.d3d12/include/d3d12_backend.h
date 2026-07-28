@@ -27,6 +27,7 @@ public:
     JaliumBackend GetType() const override { return JALIUM_BACKEND_D3D12; }
     const wchar_t* GetName() const override { return L"Direct3D 12"; }
     JaliumResult CheckDeviceStatus() override;
+    JaliumResult SetGpuPreference(JaliumGpuPreference gpuPreference) override;
     JaliumResult GetAdapterInfo(JaliumAdapterInfo* out) const override;
 
     RenderTarget* CreateRenderTarget(void* hwnd, int32_t width, int32_t height) override;
@@ -110,7 +111,8 @@ private:
     // WIC resources
     ComPtr<IWICImagingFactory> wicFactory_;
 
-    JaliumGpuPreference gpuPrefFromEnv_ = JALIUM_GPU_PREFERENCE_AUTO;
+    JaliumGpuPreference gpuPreference_ = JALIUM_GPU_PREFERENCE_AUTO;
+    bool gpuPreferenceWasSet_ = false;
     bool initialized_ = false;
 
     /// Cached description of the adapter currently backing <see cref="device_"/>.<br/>

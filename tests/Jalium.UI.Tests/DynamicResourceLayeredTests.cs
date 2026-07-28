@@ -86,6 +86,102 @@ public class DynamicResourceLayeredTests
         }
     }
 
+    [Fact]
+    public void TriggerDynamicResource_ShouldNotDestroyLowerStyleResourceSubscription()
+    {
+        ResetApplicationState();
+        var app = new Application();
+
+        try
+        {
+            var baseBrush1 = new SolidColorBrush(Color.FromRgb(0x21, 0x31, 0x41));
+            var baseBrush2 = new SolidColorBrush(Color.FromRgb(0x31, 0x51, 0x71));
+            var triggerBrush = new SolidColorBrush(Color.FromRgb(0x08, 0x94, 0x8A));
+            app.Resources["BaseBrush"] = baseBrush1;
+            app.Resources["TriggerBrush"] = triggerBrush;
+
+            var style = new Style(typeof(Border));
+            style.Setters.Add(new Setter(
+                Border.BackgroundProperty,
+                new DynamicResourceReference("BaseBrush")));
+            var trigger = new Trigger
+            {
+                Property = FrameworkElement.TagProperty,
+                Value = "active"
+            };
+            trigger.Setters.Add(new Setter(
+                Border.BackgroundProperty,
+                new DynamicResourceReference("TriggerBrush")));
+            style.Triggers.Add(trigger);
+
+            var border = new Border { Style = style };
+            Assert.Same(baseBrush1, border.Background);
+
+            border.Tag = "active";
+            Assert.Same(triggerBrush, border.Background);
+
+            border.Tag = null;
+            Assert.Same(baseBrush1, border.Background);
+
+            app.Resources["BaseBrush"] = baseBrush2;
+            DynamicResourceBindingOperations.RefreshAll();
+
+            Assert.Same(baseBrush2, border.Background);
+            Assert.Equal(
+                BaseValueSource.Style,
+                DependencyPropertyHelper.GetValueSource(
+                    border,
+                    Border.BackgroundProperty).BaseValueSource);
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Fact]
+    public void LaterConstantTrigger_ShouldRemainWinnerWhenEarlierResourceRefreshes()
+    {
+        var earlier1 = new object();
+        var earlier2 = new object();
+        var later = new object();
+        var element = new TriggerResourceProbe();
+        element.Resources["Earlier"] = earlier1;
+
+        var style = new Style(typeof(TriggerResourceProbe));
+        var earlierTrigger = new Trigger
+        {
+            Property = TriggerResourceProbe.FirstFlagProperty,
+            Value = true
+        };
+        earlierTrigger.Setters.Add(new Setter(
+            TriggerResourceProbe.TokenProperty,
+            new DynamicResourceReference("Earlier")));
+        style.Triggers.Add(earlierTrigger);
+
+        var laterTrigger = new Trigger
+        {
+            Property = TriggerResourceProbe.SecondFlagProperty,
+            Value = true
+        };
+        laterTrigger.Setters.Add(new Setter(TriggerResourceProbe.TokenProperty, later));
+        style.Triggers.Add(laterTrigger);
+        element.Style = style;
+
+        element.FirstFlag = true;
+        Assert.Same(earlier1, element.Token);
+
+        element.SecondFlag = true;
+        Assert.Same(later, element.Token);
+
+        element.Resources["Earlier"] = earlier2;
+        DynamicResourceBindingOperations.RefreshAll();
+        Assert.Same(later, element.Token);
+
+        element.SecondFlag = false;
+        Assert.Same(earlier2, element.Token);
+    }
+
     private static void ResetApplicationState()
     {
         var currentField = typeof(Application).GetField("_current", BindingFlags.NonPublic | BindingFlags.Static);
@@ -93,5 +189,43 @@ public class DynamicResourceLayeredTests
 
         var resetMethod = typeof(ThemeManager).GetMethod("Reset", BindingFlags.NonPublic | BindingFlags.Static);
         resetMethod?.Invoke(null, null);
+    }
+
+    private sealed class TriggerResourceProbe : FrameworkElement
+    {
+        public static readonly DependencyProperty TokenProperty =
+            DependencyProperty.Register(
+                nameof(Token),
+                typeof(object),
+                typeof(TriggerResourceProbe),
+                new PropertyMetadata(null));
+
+        public static readonly DependencyProperty FirstFlagProperty =
+            DependencyProperty.Register(
+                nameof(FirstFlag),
+                typeof(bool),
+                typeof(TriggerResourceProbe),
+                new PropertyMetadata(false));
+
+        public static readonly DependencyProperty SecondFlagProperty =
+            DependencyProperty.Register(
+                nameof(SecondFlag),
+                typeof(bool),
+                typeof(TriggerResourceProbe),
+                new PropertyMetadata(false));
+
+        public object? Token => GetValue(TokenProperty);
+
+        public bool FirstFlag
+        {
+            get => (bool)(GetValue(FirstFlagProperty) ?? false);
+            set => SetValue(FirstFlagProperty, value);
+        }
+
+        public bool SecondFlag
+        {
+            get => (bool)(GetValue(SecondFlagProperty) ?? false);
+            set => SetValue(SecondFlagProperty, value);
+        }
     }
 }

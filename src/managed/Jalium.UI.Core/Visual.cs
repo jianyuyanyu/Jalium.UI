@@ -1332,6 +1332,13 @@ public abstract class Visual : DependencyObject
 
         if (child is UIElement uiChild && drawingContext is IOffsetDrawingContext offsetContext)
         {
+            // A fully transparent subtree cannot contribute a pixel. Cull it
+            // before bounds work and before walking its retained drawing tree.
+            if (uiChild.Opacity <= 0)
+            {
+                return false;
+            }
+
             var bounds = uiChild.VisualBounds;
             var savedOffset = offsetContext.Offset;
             var ro = uiChild.RenderOffset;

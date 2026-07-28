@@ -1028,11 +1028,20 @@ internal static partial class ClipboardPlatform
     /// <summary>Publishes top-down BGRA pixels as a standard bottom-up CF_DIB payload.</summary>
     internal static bool SetImagePixels(int width, int height, int stride, byte[] pixels)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
-        ArgumentOutOfRangeException.ThrowIfLessThan(stride, checked(width * 4));
         ArgumentNullException.ThrowIfNull(pixels);
-        if (pixels.Length < checked(stride * height))
+        if (!TryGetClipboardImageLayout(
+                width,
+                height,
+                stride,
+                out _,
+                out int sourceByteCount,
+                out _))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(width),
+                "The declared image dimensions, stride, or byte count are invalid or exceed the clipboard image limit.");
+        }
+        if (pixels.Length < sourceByteCount)
         {
             throw new ArgumentException("The pixel buffer is smaller than the declared image.", nameof(pixels));
         }
@@ -1046,8 +1055,19 @@ internal static partial class ClipboardPlatform
     private static byte[] EncodeDib(int width, int height, int stride, byte[] pixels)
     {
         const int bitmapInfoHeaderSize = 40;
-        var dibStride = checked(width * 4);
-        var dib = new byte[checked(bitmapInfoHeaderSize + (dibStride * height))];
+        if (!TryGetClipboardImageLayout(
+                width,
+                height,
+                stride,
+                out int dibStride,
+                out int sourceByteCount,
+                out int dibByteCount) ||
+            pixels.Length < sourceByteCount)
+        {
+            throw new ArgumentException("The pixel buffer layout is invalid or exceeds the clipboard image limit.", nameof(pixels));
+        }
+
+        var dib = new byte[checked(bitmapInfoHeaderSize + dibByteCount)];
         var header = dib.AsSpan(0, bitmapInfoHeaderSize);
         BinaryPrimitives.WriteInt32LittleEndian(header[0..4], bitmapInfoHeaderSize);
         BinaryPrimitives.WriteInt32LittleEndian(header[4..8], width);

@@ -73,6 +73,48 @@ public class UIElementArrangeTranslationTests
     }
 
     [Fact]
+    public void ScrollViewerOffsetChange_TranslatesPhysicalContentImmediately()
+    {
+        var panel = new CountingWrapPanel
+        {
+            ItemWidth = 40,
+            ItemHeight = 24,
+            HorizontalSpacing = 4,
+            VerticalSpacing = 4,
+        };
+        for (int i = 0; i < 30; i++)
+        {
+            panel.Children.Add(new Border());
+        }
+
+        var viewer = new ScrollViewer
+        {
+            Width = 140,
+            Height = 90,
+            Content = panel,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Visible,
+            IsScrollBarAutoHideEnabled = false,
+        };
+        for (var pass = 0; pass < 2; pass++)
+        {
+            viewer.Measure(new Size(140, 90));
+            viewer.Arrange(new Rect(0, 0, 140, 90));
+        }
+        int initialArrangeCount = panel.ArrangeOverrideCount;
+        Rect initialBounds = panel.VisualBounds;
+
+        viewer.ScrollToVerticalOffset(36);
+
+        Assert.True(viewer.IsMeasureValid);
+        Assert.True(viewer.IsArrangeValid);
+        Assert.True(panel.IsMeasureValid);
+        Assert.True(panel.IsArrangeValid);
+        Assert.Equal(initialArrangeCount, panel.ArrangeOverrideCount);
+        Assert.Equal(initialBounds.Y - 36, panel.VisualBounds.Y);
+    }
+
+    [Fact]
     public void InvalidatedArrange_DoesNotUseTranslationFastPath()
     {
         var panel = new CountingWrapPanel();

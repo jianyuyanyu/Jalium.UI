@@ -101,6 +101,56 @@ public sealed class GeometryPathParityTests
     }
 
     [Fact]
+    public void PathFigureBoundsStayExactAndAllocationFreeOnRenderHotPath()
+    {
+        var cubic = new PathFigure(
+            new Point(0, 0),
+            new PathSegment[]
+            {
+                new BezierSegment(
+                    new Point(0, 10),
+                    new Point(10, 10),
+                    new Point(10, 0)),
+            },
+            false);
+        var arc = new PathFigure(
+            new Point(15, 0),
+            new PathSegment[]
+            {
+                new ArcSegment(
+                    new Point(35, 0),
+                    new Size(10, 5),
+                    25,
+                    false,
+                    SweepDirection.Clockwise),
+            },
+            false);
+
+        Assert.Equal(new Rect(0, 0, 10, 7.5), PathGeometry.GetFigureBounds(cubic));
+        Assert.Equal(
+            Rect.Union(
+                PathGeometry.GetFigureBounds(cubic),
+                PathGeometry.GetFigureBounds(arc)),
+            new PathGeometry(new[] { cubic, arc }).Bounds);
+
+        for (int i = 0; i < 100; i++)
+        {
+            _ = PathGeometry.GetFigureBounds(cubic);
+            _ = PathGeometry.GetFigureBounds(arc);
+        }
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 1_000; i++)
+        {
+            _ = PathGeometry.GetFigureBounds(cubic);
+            _ = PathGeometry.GetFigureBounds(arc);
+        }
+        long after = GC.GetAllocatedBytesForCurrentThread();
+
+        Assert.Equal(0, after - before);
+    }
+
+    [Fact]
     public void PathCollectionsAreAnimatableDeepCloneAndFreezeChildren()
     {
         var segment = new BezierSegment(

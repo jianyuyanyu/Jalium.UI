@@ -153,6 +153,7 @@
     <!-- ============================================== -->
     <Style TargetType="ScrollBar">
         <Setter Property="Background" Value="{ThemeResource ScrollBarTrack}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="Transparent" />
         <Setter Property="BorderThickness" Value="0" />
         <Setter Property="ThumbStyle" Value="{ThemeResource ScrollBarThumbStyle}" />

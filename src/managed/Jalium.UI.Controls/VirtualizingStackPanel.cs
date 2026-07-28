@@ -241,6 +241,11 @@ public class VirtualizingStackPanel : VirtualizingPanel, IScrollInfo
     private double _computedOffset;
     private Size _extent;
     private Size _viewport;
+    // The scroll-axis viewport used to calculate the latest realization
+    // window. Measure can run with an unbounded constraint before the first
+    // arrange reveals the real viewport.
+    private double _measuredViewportAxis;
+    private double _viewportRecoveryArrangeAxis = double.NaN;
     private double _maxCrossAxis;
     private int _lastKnownItemCount = -1;
 
@@ -501,6 +506,16 @@ public class VirtualizingStackPanel : VirtualizingPanel, IScrollInfo
 
         SetViewport(CoerceViewport(availableSize));
         var viewportAxisSize = GetAxisSize(_viewport);
+        _measuredViewportAxis = viewportAxisSize;
+        if (IsUsableViewportAxis(_viewportRecoveryArrangeAxis) &&
+            viewportAxisSize >= _viewportRecoveryArrangeAxis - 0.5)
+        {
+            // Release the one-shot latch only when measure actually adopted
+            // the arrange viewport that requested recovery. A smaller finite
+            // constraint is still a valid measure, but clearing the latch for
+            // it would make an incompatible parent ping-pong forever.
+            _viewportRecoveryArrangeAxis = double.NaN;
+        }
 
         if (itemCount == 0)
         {
@@ -621,6 +636,19 @@ public class VirtualizingStackPanel : VirtualizingPanel, IScrollInfo
         }
 
         UpdateExtent(GetItemCount(), finalSize);
+
+        // An outer ScrollViewer can first measure this panel with an
+        // unbounded scroll axis, reducing the realization window to one item,
+        // and only reveal a finite viewport during arrange. Queue one
+        // corrective measure so the remaining visible items are realized
+        // without requiring a user scroll.
+        var arrangeViewportAxis = GetViewportAxisSize();
+        if (ShouldRequestViewportRecovery(arrangeViewportAxis))
+        {
+            _viewportRecoveryArrangeAxis = arrangeViewportAxis;
+            InvalidateMeasure();
+        }
+
         return finalSize;
     }
 
@@ -1363,6 +1391,40 @@ public class VirtualizingStackPanel : VirtualizingPanel, IScrollInfo
 
     private static bool AreClose(double left, double right) =>
         Math.Abs(left - right) <= 0.01;
+
+    private bool ShouldRequestViewportRecovery(
+        double arrangeViewportAxis)
+    {
+        if (!ShouldVirtualize() ||
+            !IsUsableViewportAxis(arrangeViewportAxis))
+        {
+            return false;
+        }
+
+        if (AreClose(
+                _viewportRecoveryArrangeAxis,
+                arrangeViewportAxis))
+        {
+            return false;
+        }
+
+        if (IsUsableViewportAxis(_measuredViewportAxis) &&
+            _measuredViewportAxis >= arrangeViewportAxis - 0.5)
+        {
+            // The current measure already covers this (possibly smaller)
+            // viewport. Drop any stale latch so a later growth can request a
+            // fresh recovery.
+            _viewportRecoveryArrangeAxis = double.NaN;
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsUsableViewportAxis(double value) =>
+        value > 0 &&
+        !double.IsNaN(value) &&
+        !double.IsInfinity(value);
 
     private void UpdateExtent(int itemCount, Size availableSize)
     {

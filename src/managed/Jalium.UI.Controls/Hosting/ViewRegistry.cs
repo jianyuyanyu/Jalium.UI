@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 
 namespace Jalium.UI.Hosting;
 
@@ -21,7 +22,13 @@ public sealed class ViewRegistry
     /// <paramref name="viewModelType"/> set as its <c>DataContext</c> when
     /// created through <see cref="IViewFactory"/>.
     /// </summary>
-    public void Register(Type viewType, Type viewModelType)
+    public void Register(
+        Type viewType,
+        [DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicConstructors |
+            DynamicallyAccessedMemberTypes.PublicProperties |
+            DynamicallyAccessedMemberTypes.PublicFields)]
+        Type viewModelType)
     {
         ArgumentNullException.ThrowIfNull(viewType);
         ArgumentNullException.ThrowIfNull(viewModelType);
@@ -31,7 +38,17 @@ public sealed class ViewRegistry
     /// <summary>
     /// Looks up the ViewModel type paired with <paramref name="viewType"/>.
     /// </summary>
-    public bool TryGetViewModelType(Type viewType, out Type? viewModelType)
+    [UnconditionalSuppressMessage(
+        "Trimming",
+        "IL2068:UnrecognizedReflectionPattern",
+        Justification =
+            "ViewModel types enter this registry through AddView<TView,TViewModel>, " +
+            "AotTypeRegistry-backed discovery, or the annotated Register method; " +
+            "all three preserve their public constructors.")]
+    public bool TryGetViewModelType(
+        Type viewType,
+        [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)]
+        out Type? viewModelType)
     {
         var found = _viewToViewModel.TryGetValue(viewType, out var vm);
         viewModelType = vm;

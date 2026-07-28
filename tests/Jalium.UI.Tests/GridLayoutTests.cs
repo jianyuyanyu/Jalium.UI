@@ -155,6 +155,51 @@ public class GridLayoutTests
     }
 
     [Fact]
+    public void Grid_StarRowUnderInfiniteHeight_UsesResolvedColumnWidth()
+    {
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(
+            new ColumnDefinition { Width = new GridLength(100) });
+        grid.ColumnDefinitions.Add(
+            new ColumnDefinition { Width = GridLength.Star });
+
+        var content = new MeasureConstraintProbe();
+        Grid.SetColumn(content, 1);
+        grid.Children.Add(content);
+
+        grid.Measure(new Size(300, double.PositiveInfinity));
+
+        Assert.Single(content.Constraints);
+        Assert.Equal(200, content.Constraints[0].Width, precision: 3);
+        Assert.True(
+            double.IsPositiveInfinity(content.Constraints[0].Height));
+    }
+
+    [Fact]
+    public void Grid_StarColumnUnderInfiniteWidth_UsesResolvedRowHeight()
+    {
+        var grid = new Grid();
+        grid.RowDefinitions.Add(
+            new RowDefinition { Height = new GridLength(60) });
+        grid.RowDefinitions.Add(
+            new RowDefinition { Height = GridLength.Star });
+
+        var content = new MeasureConstraintProbe();
+        Grid.SetRow(content, 1);
+        grid.Children.Add(content);
+
+        grid.Measure(new Size(double.PositiveInfinity, 200));
+
+        Assert.NotEmpty(content.Constraints);
+        Assert.All(
+            content.Constraints,
+            constraint => Assert.Equal(
+                140,
+                constraint.Height,
+                precision: 3));
+    }
+
+    [Fact]
     public void WrapPanel_WithBareGridChildren_SizesToContent_DoesNotBalloon()
     {
         // Reproduces the chip-explosion scenario: bare Grid wrappers inside a horizontal WrapPanel
@@ -175,5 +220,16 @@ public class GridLayoutTests
             $"WrapPanel ballooned vertically: height={wrap.DesiredSize.Height}");
         Assert.True(wrap.DesiredSize.Width < 500,
             $"WrapPanel ballooned horizontally: width={wrap.DesiredSize.Width}");
+    }
+
+    private sealed class MeasureConstraintProbe : FrameworkElement
+    {
+        public List<Size> Constraints { get; } = [];
+
+        protected override Size MeasureOverride(Size availableSize)
+        {
+            Constraints.Add(availableSize);
+            return new Size(50, 40);
+        }
     }
 }

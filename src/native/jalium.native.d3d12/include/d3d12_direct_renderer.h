@@ -680,6 +680,23 @@ public:
         }
         return total;
     }
+    int64_t GetPathScratchBytes() const {
+        const auto logicalBytes = [](const ComPtr<ID3D12Resource>& resource, int64_t bytesPerPixel) {
+            if (!resource) return int64_t{0};
+            const auto desc = resource->GetDesc();
+            return static_cast<int64_t>(desc.Width)
+                * static_cast<int64_t>(desc.Height)
+                * static_cast<int64_t>(desc.DepthOrArraySize)
+                * static_cast<int64_t>(desc.SampleDesc.Count)
+                * bytesPerPixel;
+        };
+
+        // R16G16B16A16_FLOAT MSAA color + D24S8 MSAA stencil/depth +
+        // R16G16B16A16_FLOAT single-sample resolve.
+        return logicalBytes(pathMsaaColor_, 8)
+            + logicalBytes(pathMsaaDepth_, 4)
+            + logicalBytes(pathResolveTexture_, 8);
+    }
 
 private:
     bool CreatePSOs();

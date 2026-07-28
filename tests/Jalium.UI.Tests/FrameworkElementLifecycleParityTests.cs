@@ -126,6 +126,48 @@ public class FrameworkElementLifecycleParityTests
         Assert.True(element.ShouldSerializeStyle());
     }
 
+    [Fact]
+    public void VisualChildrenAddedToLoadedParent_ShareOneLoadedDispatcherOperation()
+    {
+        var dispatcher = Jalium.UI.Threading.Dispatcher.CurrentDispatcher;
+        dispatcher.ProcessQueue();
+        var postedLoadedOperations = 0;
+        Jalium.UI.Threading.DispatcherHookEventHandler handler = (_, args) =>
+        {
+            if (args.Operation?.Priority ==
+                Jalium.UI.Threading.DispatcherPriority.Loaded)
+            {
+                postedLoadedOperations++;
+            }
+        };
+        dispatcher.Hooks.OperationPosted += handler;
+        try
+        {
+            var host = new VisualOnlyLoadedHost();
+            host.SetLoadedState(true);
+            var children = Enumerable.Range(0, 24)
+                .Select(_ => new ProbeElement(default))
+                .ToArray();
+
+            foreach (var child in children)
+            {
+                host.Add(child);
+            }
+
+            Assert.Equal(1, postedLoadedOperations);
+            Assert.All(children, child => Assert.False(child.IsLoaded));
+
+            dispatcher.ProcessQueue();
+
+            Assert.All(children, child => Assert.True(child.IsLoaded));
+        }
+        finally
+        {
+            dispatcher.Hooks.OperationPosted -= handler;
+            dispatcher.ProcessQueue();
+        }
+    }
+
     private sealed class ProbeElement : FrameworkElement
     {
         private readonly Size _desired;
@@ -150,6 +192,21 @@ public class FrameworkElementLifecycleParityTests
             base.OnApplyTemplate();
             ApplyCount++;
         }
+    }
+
+    private sealed class VisualOnlyLoadedHost : FrameworkElement
+    {
+        private readonly List<UIElement> _children = [];
+
+        public void Add(UIElement child)
+        {
+            _children.Add(child);
+            AddVisualChild(child);
+        }
+
+        protected override int VisualChildrenCount => _children.Count;
+
+        protected override Visual GetVisualChild(int index) => _children[index];
     }
 
     private sealed class EnumeratorEnumerable : IEnumerable

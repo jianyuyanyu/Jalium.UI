@@ -941,6 +941,28 @@ public class DependencyObject : DispatcherObject
                || _currentValues?.ContainsKey(dp) == true;
     }
 
+    internal bool TryGetLayerValue(
+        DependencyProperty dp,
+        LayerValueSource source,
+        out object? value)
+    {
+        ArgumentNullException.ThrowIfNull(dp);
+        Dictionary<DependencyProperty, object?>? values = source switch
+        {
+            LayerValueSource.ParentTemplate => _parentTemplateValues,
+            LayerValueSource.StyleTrigger => _styleTriggerValues,
+            LayerValueSource.TemplateTrigger => _templateTriggerValues,
+            LayerValueSource.StyleSetter => _styleSetterValues,
+            _ => throw new ArgumentOutOfRangeException(nameof(source), source, null)
+        };
+
+        if (values != null && values.TryGetValue(dp, out value))
+            return true;
+
+        value = null;
+        return false;
+    }
+
     internal void SetLayerValue(DependencyProperty dp, object? value, LayerValueSource source)
         => SetLayerValue(dp, value, source, allowAutoTransition: true);
 

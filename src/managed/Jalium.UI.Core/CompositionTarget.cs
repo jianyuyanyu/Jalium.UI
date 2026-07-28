@@ -16,6 +16,14 @@ namespace Jalium.UI.Media;
 /// </summary>
 public abstract partial class CompositionTarget
 {
+    // EnumDisplaySettings documents 0 and 1 as "default hardware rate".
+    // Hybrid-GPU/display hand-offs can briefly surface that sentinel while a
+    // window is moving or interactively resizing. Treating 1 as 1 Hz would
+    // globally reduce every frame-paced DispatcherTimer (including smooth
+    // scrolling) to one tick per second.
+    private const int MinimumPlausibleRefreshRate = 10;
+    private const int MaximumPlausibleRefreshRate = 1000;
+
     private static volatile int _refreshRate = 60;
     private static Timer? _frameTimer;
     private static int _subscriberCount;
@@ -326,12 +334,24 @@ public abstract partial class CompositionTarget
     /// Updates the detected refresh rate. Called by Window when the monitor changes.
     /// </summary>
     /// <param name="rate">The detected refresh rate in Hz.</param>
-    internal static void UpdateRefreshRate(int rate)
+    /// <returns>
+    /// <see langword="true"/> when <paramref name="rate"/> was accepted; otherwise
+    /// <see langword="false"/> and the last known-good rate remains active.
+    /// </returns>
+    internal static bool UpdateRefreshRate(int rate)
     {
-        if (rate > 0)
-        {
-            _refreshRate = rate;
-        }
+        // Keep the last known-good rate when a Windows display driver reports
+        // dmDisplayFrequency=0/1 during a transient topology or GPU hand-off.
+        // Falling back to the existing value is important: this setting is
+        // process-wide, so accepting the sentinel makes every ScrollViewer,
+        // animation and frame-paced DispatcherTimer appear permanently frozen
+        // after moving/resizing any window.
+        if (rate < MinimumPlausibleRefreshRate ||
+            rate > MaximumPlausibleRefreshRate)
+            return false;
+
+        _refreshRate = rate;
+        return true;
     }
 
     private static void StartTimer()
@@ -533,6 +553,7 @@ public abstract partial class CompositionTarget
         Jalium.UI.Diagnostics.HoverTrace.Bump(Jalium.UI.Diagnostics.HoverTrace.TICK);
         Jalium.UI.Diagnostics.HoverTrace.Gauge(Jalium.UI.Diagnostics.HoverTrace.G_TIMER_RUNNING, _timerRunning ? 1 : 0);
         Jalium.UI.Diagnostics.HoverTrace.Gauge(Jalium.UI.Diagnostics.HoverTrace.G_SUBS, _subscriberCount);
+        Jalium.UI.Diagnostics.HoverTrace.Gauge(Jalium.UI.Diagnostics.HoverTrace.G_FRAME_INTERVAL_MS, FrameIntervalMs);
 
         // Skip dispatching while suspended (e.g. Android app paused). The owning
         // timer loop keeps clocking, so rendering resumes immediately when

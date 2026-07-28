@@ -994,31 +994,69 @@ internal static class MarkupExtensionParser
     public static bool TryParse(string value, object targetObject, PropertyInfo? targetProperty, IAmbientResourceProvider? ambientProvider, out object? result)
     {
         result = null;
-
-        if (string.IsNullOrEmpty(value))
-            return false;
-
-        var trimmed = value.Trim();
-        if (!trimmed.StartsWith('{') || !trimmed.EndsWith('}'))
-            return false;
-
-        // Extract the extension content
-        var content = trimmed.Substring(1, trimmed.Length - 2).Trim();
-        if (string.IsNullOrEmpty(content))
-            return false;
-
-        // Find the extension name
-        var spaceIndex = content.IndexOf(' ');
-        var extensionName = spaceIndex >= 0 ? content.Substring(0, spaceIndex) : content;
-        var parameters = spaceIndex >= 0 ? content.Substring(spaceIndex + 1).Trim() : string.Empty;
-
-        // Create the markup extension
-        var extension = CreateMarkupExtension(extensionName, parameters, ambientProvider);
+        var extension = ParseMarkupExtension(value, ambientProvider);
         if (extension == null)
             return false;
 
         result = ProvideExtensionValue(extension, targetObject, targetProperty?.Name, ambientProvider);
         return true;
+    }
+
+    /// <summary>
+    /// Tries to parse and apply a markup extension whose target is an attached
+    /// dependency property. Unlike a normal CLR property, the target property is
+    /// registered on the attached owner rather than on <paramref name="targetObject"/>,
+    /// so callers must provide the resolved dependency property explicitly.
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Some markup extensions (e.g. x:Static) reflect on the resolved Type to read fields/properties.")]
+    internal static bool TryParseAttachedProperty(
+        string value,
+        object targetObject,
+        DependencyProperty? targetProperty,
+        IAmbientResourceProvider? ambientProvider,
+        out object? result)
+    {
+        result = null;
+        var extension = ParseMarkupExtension(value, ambientProvider);
+        if (extension == null)
+            return false;
+
+        result = ProvideExtensionValueForDependencyProperty(
+            extension,
+            targetObject,
+            targetProperty,
+            ambientProvider);
+        return true;
+    }
+
+    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Some markup extensions (e.g. x:Static) reflect on the resolved Type to read fields/properties.")]
+    private static MarkupExtension? ParseMarkupExtension(
+        string value,
+        IAmbientResourceProvider? ambientProvider)
+    {
+        if (string.IsNullOrEmpty(value))
+            return null;
+
+        var trimmed = value.Trim();
+        if (!trimmed.StartsWith('{') || !trimmed.EndsWith('}'))
+            return null;
+
+        var content = trimmed.Substring(1, trimmed.Length - 2).Trim();
+        if (string.IsNullOrEmpty(content))
+            return null;
+
+        var spaceIndex = content.IndexOf(' ');
+        var extensionName = spaceIndex >= 0
+            ? content.Substring(0, spaceIndex)
+            : content;
+        var parameters = spaceIndex >= 0
+            ? content.Substring(spaceIndex + 1).Trim()
+            : string.Empty;
+
+        return CreateMarkupExtension(
+            extensionName,
+            parameters,
+            ambientProvider);
     }
 
     /// <summary>
@@ -1040,23 +1078,41 @@ internal static class MarkupExtensionParser
         string? targetPropertyName,
         IAmbientResourceProvider? ambientProvider)
     {
-        var serviceProvider = new MarkupExtensionServiceProvider();
-
-        if (ambientProvider != null)
-        {
-            serviceProvider.AddService(typeof(IAmbientResourceProvider), ambientProvider);
-        }
-
         DependencyProperty? dp = null;
         if (targetObject is DependencyObject && !string.IsNullOrEmpty(targetPropertyName))
         {
             dp = FindDependencyProperty(targetObject.GetType(), targetPropertyName!);
         }
 
+        return ProvideExtensionValueForDependencyProperty(
+            extension,
+            targetObject,
+            dp,
+            ambientProvider);
+    }
+
+    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("MarkupExtension.ProvideValue may reflect on resolved types.")]
+    [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage("AOT", "IL3050:RequiresDynamicCode",
+        Justification = "This is the runtime XAML markup-extension parser; invoking it is the documented consumer responsibility under AOT. The base MarkupExtension.ProvideValue carries RequiresDynamicCode only because 'some extensions (e.g. x:Array) construct arrays of a runtime-supplied element Type' — that single extension is the dynamic-code case. The built-in extensions reachable through TryParse here (Binding/StaticResource/DynamicResource/x:Static etc.) construct no runtime-typed arrays, so no dynamic code is emitted at this call site.")]
+    internal static object? ProvideExtensionValueForDependencyProperty(
+        MarkupExtension extension,
+        object targetObject,
+        DependencyProperty? targetProperty,
+        IAmbientResourceProvider? ambientProvider)
+    {
+        var serviceProvider = new MarkupExtensionServiceProvider();
+
+        if (ambientProvider != null)
+        {
+            serviceProvider.AddService(
+                typeof(IAmbientResourceProvider),
+                ambientProvider);
+        }
+
         var provideValueTarget = new ProvideValueTarget
         {
             TargetObject = targetObject,
-            TargetProperty = dp
+            TargetProperty = targetProperty
         };
         serviceProvider.AddService(typeof(IProvideValueTarget), provideValueTarget);
 

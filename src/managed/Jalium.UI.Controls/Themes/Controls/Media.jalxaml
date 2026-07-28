@@ -16,6 +16,7 @@
     <!-- ============================================== -->
     <Style TargetType="Markdown">
         <Setter Property="Background" Value="{ThemeResource LayerFillColorDefaultBrush}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource SurfaceStrokeColorDefaultBrush}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="LinkForeground" Value="{ThemeResource HyperlinkForeground}" />

@@ -1,4 +1,4 @@
-using Jalium.UI.Input;
+﻿using Jalium.UI.Input;
 using Jalium.UI.Interop;
 using Jalium.UI.Media;
 using Jalium.UI.Media.Animation;

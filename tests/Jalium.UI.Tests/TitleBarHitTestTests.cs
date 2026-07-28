@@ -11,6 +11,14 @@ public class TitleBarHitTestTests
 {
     private const int HTCLIENT = 1;
     private const int HTCAPTION = 2;
+    private const int HTLEFT = 10;
+    private const int HTRIGHT = 11;
+    private const int HTTOP = 12;
+    private const int HTTOPLEFT = 13;
+    private const int HTTOPRIGHT = 14;
+    private const int HTBOTTOM = 15;
+    private const int HTBOTTOMLEFT = 16;
+    private const int HTBOTTOMRIGHT = 17;
 
     private static readonly byte[] s_testPngBytes = Convert.FromBase64String(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7+4u0AAAAASUVORK5CYII=");
@@ -109,8 +117,6 @@ public class TitleBarHitTestTests
     [InlineData(5.999, 90)]
     [InlineData(294, 90)]
     [InlineData(299.999, 90)]
-    [InlineData(150, 0)]
-    [InlineData(150, 5.999)]
     [InlineData(150, 174)]
     [InlineData(150, 179.999)]
     public void ComputeNcHitTest_WhenPointIsInsideClientEdge_ShouldNotResize(double x, double y)
@@ -131,11 +137,6 @@ public class TitleBarHitTestTests
     [Fact]
     public void ComputeNcHitTest_WhenPointIsInOuterFrame_ShouldResize()
     {
-        const int HTLEFT = 10;
-        const int HTRIGHT = 11;
-        const int HTTOP = 12;
-        const int HTBOTTOM = 15;
-
         var window = new Window
         {
             Width = 300,
@@ -150,6 +151,63 @@ public class TitleBarHitTestTests
         Assert.Equal(HTRIGHT, window.ComputeNcHitTestFromClientDip(300, 90, isMaximized: false));
         Assert.Equal(HTTOP, window.ComputeNcHitTestFromClientDip(150, -1, isMaximized: false));
         Assert.Equal(HTBOTTOM, window.ComputeNcHitTestFromClientDip(150, 180, isMaximized: false));
+    }
+
+    [Theory]
+    [InlineData(150, 0, HTTOP)]
+    [InlineData(150, 5.999, HTTOP)]
+    [InlineData(-1, 0, HTTOPLEFT)]
+    [InlineData(300, 0, HTTOPRIGHT)]
+    public void ComputeNcHitTest_CustomTitleBar_ReservesClientTopResizeBand(
+        double x,
+        double y,
+        int expected)
+    {
+        var window = new Window
+        {
+            Width = 300,
+            Height = 180,
+            TitleBarStyle = WindowTitleBarStyle.Custom,
+            ResizeMode = ResizeMode.CanResize
+        };
+
+        LayoutWindow(window, 300, 180);
+
+        Assert.Equal(expected, window.ComputeNcHitTestFromClientDip(x, y, isMaximized: false));
+        Assert.Equal(HTCAPTION, window.ComputeNcHitTestFromClientDip(150, 6, isMaximized: false));
+    }
+
+    [Theory]
+    [InlineData(0, 90, HTLEFT)]
+    [InlineData(5.999, 90, HTLEFT)]
+    [InlineData(294, 90, HTRIGHT)]
+    [InlineData(299.999, 90, HTRIGHT)]
+    [InlineData(150, 0, HTTOP)]
+    [InlineData(150, 5.999, HTTOP)]
+    [InlineData(150, 174, HTBOTTOM)]
+    [InlineData(150, 179.999, HTBOTTOM)]
+    [InlineData(0, 0, HTTOPLEFT)]
+    [InlineData(299.999, 0, HTTOPRIGHT)]
+    [InlineData(0, 179.999, HTBOTTOMLEFT)]
+    [InlineData(299.999, 179.999, HTBOTTOMRIGHT)]
+    public void ComputeNcHitTest_BorderlessWindow_ResizesFromClientEdge(
+        double x,
+        double y,
+        int expected)
+    {
+        var window = new Window
+        {
+            Width = 300,
+            Height = 180,
+            WindowStyle = WindowStyle.None,
+            TitleBarStyle = WindowTitleBarStyle.Native,
+            IsShowTitleBar = false,
+            ResizeMode = ResizeMode.CanResize
+        };
+
+        LayoutWindow(window, 300, 180);
+
+        Assert.Equal(expected, window.ComputeNcHitTestFromClientDip(x, y, isMaximized: false));
     }
 
     [Fact]
