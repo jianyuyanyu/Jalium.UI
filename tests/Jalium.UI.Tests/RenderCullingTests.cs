@@ -79,6 +79,29 @@ public class RenderCullingTests
         Assert.Equal(0, animated.RenderCount);
     }
 
+    [Fact]
+    public void Render_ShouldSkipFullyTransparentChildSubtree()
+    {
+        var root = new Canvas { Width = 200, Height = 100 };
+        var transparent = new CountingElement
+        {
+            Width = 60,
+            Height = 20,
+            Opacity = 0
+        };
+
+        Canvas.SetLeft(transparent, 10);
+        Canvas.SetTop(transparent, 10);
+        root.Children.Add(transparent);
+        root.Measure(new Size(200, 100));
+        root.Arrange(new Rect(0, 0, 200, 100));
+
+        root.Render(new ClipAwareDrawingContext(
+            new Rect(0, 0, 200, 100)));
+
+        Assert.Equal(0, transparent.RenderCount);
+    }
+
     private sealed class CountingElement : FrameworkElement
     {
         public int RenderCount { get; private set; }

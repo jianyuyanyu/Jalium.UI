@@ -6,14 +6,15 @@ namespace Jalium.UI.Gpu.Resources;
 public sealed class DescriptorHeapManager : IDisposable
 {
     private readonly IRenderBackendEx _backend;
-    private readonly DescriptorPool _srvCbvUavPool;
+    private readonly int _srvCbvUavCapacity;
+    private readonly HashSet<DescriptorHandle> _nativeDescriptors = [];
     private readonly DescriptorPool _samplerPool;
     private bool _disposed;
 
     /// <summary>
     /// 默认 SRV/CBV/UAV 描述符数量
     /// </summary>
-    public const int DefaultSrvCbvUavCount = 4096;
+    public const int DefaultSrvCbvUavCount = 2048;
 
     /// <summary>
     /// 默认 Sampler 描述符数量
@@ -25,8 +26,12 @@ public sealed class DescriptorHeapManager : IDisposable
         int srvCbvUavCount = DefaultSrvCbvUavCount,
         int samplerCount = DefaultSamplerCount)
     {
+        ArgumentNullException.ThrowIfNull(backend);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(srvCbvUavCount);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(samplerCount);
+
         _backend = backend;
-        _srvCbvUavPool = new DescriptorPool(DescriptorType.SrvCbvUav, srvCbvUavCount);
+        _srvCbvUavCapacity = srvCbvUavCount;
         _samplerPool = new DescriptorPool(DescriptorType.Sampler, samplerCount);
     }
 
@@ -35,13 +40,8 @@ public sealed class DescriptorHeapManager : IDisposable
     /// </summary>
     public DescriptorHandle AllocateSrv(nint resource)
     {
-        var slot = _srvCbvUavPool.Allocate();
-        var handle = new DescriptorHandle(slot, DescriptorType.SrvCbvUav);
-
-        // 通过 backend 创建实际的 SRV
-        _backend.CreateSrv(resource);
-
-        return handle;
+        ThrowIfDisposed();
+        return TrackNativeDescriptor(() => _backend.CreateSrv(resource));
     }
 
     /// <summary>
@@ -49,12 +49,8 @@ public sealed class DescriptorHeapManager : IDisposable
     /// </summary>
     public DescriptorHandle AllocateCbv(nint buffer, int offset, int size)
     {
-        var slot = _srvCbvUavPool.Allocate();
-        var handle = new DescriptorHandle(slot, DescriptorType.SrvCbvUav);
-
-        _backend.CreateCbv(buffer, offset, size);
-
-        return handle;
+        ThrowIfDisposed();
+        return TrackNativeDescriptor(() => _backend.CreateCbv(buffer, offset, size));
     }
 
     /// <summary>
@@ -62,12 +58,8 @@ public sealed class DescriptorHeapManager : IDisposable
     /// </summary>
     public DescriptorHandle AllocateUav(nint resource)
     {
-        var slot = _srvCbvUavPool.Allocate();
-        var handle = new DescriptorHandle(slot, DescriptorType.SrvCbvUav);
-
-        _backend.CreateUav(resource);
-
-        return handle;
+        ThrowIfDisposed();
+        return TrackNativeDescriptor(() => _backend.CreateUav(resource));
     }
 
     /// <summary>
@@ -75,6 +67,7 @@ public sealed class DescriptorHeapManager : IDisposable
     /// </summary>
     public DescriptorHandle AllocateSampler(SamplerDesc desc)
     {
+        ThrowIfDisposed();
         var slot = _samplerPool.Allocate();
         return new DescriptorHandle(slot, DescriptorType.Sampler);
     }
@@ -84,21 +77,38 @@ public sealed class DescriptorHeapManager : IDisposable
     /// </summary>
     public void Free(DescriptorHandle handle)
     {
+        ThrowIfDisposed();
+
         if (handle.Type == DescriptorType.Sampler)
         {
             _samplerPool.Free(handle.HeapIndex);
         }
         else
         {
-            _srvCbvUavPool.Free(handle.HeapIndex);
-            _backend.FreeDescriptor(handle);
+            if (handle.Type != DescriptorType.SrvCbvUav ||
+                !_nativeDescriptors.Remove(handle))
+            {
+                throw new ArgumentException(
+                    "The descriptor is not allocated by this manager.",
+                    nameof(handle));
+            }
+
+            try
+            {
+                _backend.FreeDescriptor(handle);
+            }
+            catch
+            {
+                _nativeDescriptors.Add(handle);
+                throw;
+            }
         }
     }
 
     /// <summary>
     /// 已分配的 SRV/CBV/UAV 数量
     /// </summary>
-    public int AllocatedSrvCbvUavCount => _srvCbvUavPool.AllocatedCount;
+    public int AllocatedSrvCbvUavCount => _nativeDescriptors.Count;
 
     /// <summary>
     /// 已分配的 Sampler 数量
@@ -108,10 +118,65 @@ public sealed class DescriptorHeapManager : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
+
+        List<Exception>? exceptions = null;
+        foreach (var descriptor in _nativeDescriptors)
+        {
+            try
+            {
+                _backend.FreeDescriptor(descriptor);
+            }
+            catch (Exception exception)
+            {
+                (exceptions ??= []).Add(exception);
+            }
+        }
+
+        _nativeDescriptors.Clear();
+        _samplerPool.Dispose();
         _disposed = true;
 
-        _srvCbvUavPool.Dispose();
-        _samplerPool.Dispose();
+        if (exceptions is not null)
+        {
+            throw new AggregateException(
+                "One or more native descriptors could not be released.",
+                exceptions);
+        }
+    }
+
+    private DescriptorHandle TrackNativeDescriptor(Func<DescriptorHandle> create)
+    {
+        if (_nativeDescriptors.Count >= _srvCbvUavCapacity)
+        {
+            throw new InvalidOperationException(
+                $"Descriptor heap exhausted. Type={DescriptorType.SrvCbvUav}, Capacity={_srvCbvUavCapacity}");
+        }
+
+        var handle = create();
+        if (!handle.IsValid || handle.Type != DescriptorType.SrvCbvUav)
+        {
+            if (handle.IsValid)
+            {
+                _backend.FreeDescriptor(handle);
+            }
+
+            throw new InvalidOperationException(
+                "The backend returned an invalid SRV/CBV/UAV descriptor.");
+        }
+
+        if (!_nativeDescriptors.Add(handle))
+        {
+            _backend.FreeDescriptor(handle);
+            throw new InvalidOperationException(
+                $"The backend returned duplicate descriptor {handle.HeapIndex}.");
+        }
+
+        return handle;
+    }
+
+    private void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
     }
 }
 
@@ -120,6 +185,8 @@ public sealed class DescriptorHeapManager : IDisposable
 /// </summary>
 public readonly struct DescriptorHandle : IEquatable<DescriptorHandle>
 {
+    private readonly bool _initialized;
+
     /// <summary>
     /// 堆内索引
     /// </summary>
@@ -133,19 +200,29 @@ public readonly struct DescriptorHandle : IEquatable<DescriptorHandle>
     /// <summary>
     /// 是否有效
     /// </summary>
-    public bool IsValid => HeapIndex != uint.MaxValue;
+    public bool IsValid => _initialized && HeapIndex != uint.MaxValue;
 
     public DescriptorHandle(uint heapIndex, DescriptorType type)
     {
         HeapIndex = heapIndex;
         Type = type;
+        _initialized = heapIndex != uint.MaxValue;
     }
 
-    public static DescriptorHandle Invalid => new(uint.MaxValue, DescriptorType.SrvCbvUav);
+    public static DescriptorHandle Invalid => default;
 
-    public bool Equals(DescriptorHandle other) => HeapIndex == other.HeapIndex && Type == other.Type;
+    public bool Equals(DescriptorHandle other)
+    {
+        if (!IsValid || !other.IsValid)
+        {
+            return IsValid == other.IsValid;
+        }
+
+        return HeapIndex == other.HeapIndex && Type == other.Type;
+    }
+
     public override bool Equals(object? obj) => obj is DescriptorHandle other && Equals(other);
-    public override int GetHashCode() => HashCode.Combine(HeapIndex, Type);
+    public override int GetHashCode() => IsValid ? HashCode.Combine(HeapIndex, Type) : 0;
 }
 
 /// <summary>
@@ -210,15 +287,20 @@ internal sealed class DescriptorPool : IDisposable
     private readonly DescriptorType _type;
     private readonly int _capacity;
     private readonly Stack<uint> _freeList;
+    private readonly bool[] _allocated;
     private int _allocatedCount;
+    private bool _disposed;
 
     public int AllocatedCount => _allocatedCount;
 
     public DescriptorPool(DescriptorType type, int capacity)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity);
+
         _type = type;
         _capacity = capacity;
         _freeList = new Stack<uint>(capacity);
+        _allocated = new bool[capacity];
 
         // 反向压入空闲列表，使低索引先分配
         for (int i = capacity - 1; i >= 0; i--)
@@ -229,24 +311,49 @@ internal sealed class DescriptorPool : IDisposable
 
     public uint Allocate()
     {
+        ThrowIfDisposed();
+
         if (_freeList.Count == 0)
         {
             throw new InvalidOperationException(
                 $"Descriptor heap exhausted. Type={_type}, Capacity={_capacity}");
         }
 
+        var index = _freeList.Pop();
+        _allocated[index] = true;
         _allocatedCount++;
-        return _freeList.Pop();
+        return index;
     }
 
     public void Free(uint index)
     {
+        ThrowIfDisposed();
+
+        if (index >= (uint)_capacity || !_allocated[index])
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(index),
+                index,
+                "The descriptor slot is outside this pool or is not allocated.");
+        }
+
+        _allocated[index] = false;
         _freeList.Push(index);
         _allocatedCount--;
     }
 
     public void Dispose()
     {
+        if (_disposed) return;
+
         _freeList.Clear();
+        Array.Clear(_allocated);
+        _allocatedCount = 0;
+        _disposed = true;
+    }
+
+    private void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
     }
 }

@@ -27,6 +27,34 @@ public class BorderClipTests
     }
 
     [Fact]
+    public void Border_LayoutClip_ReusesFrozenGeometryUntilShapeInputsChange()
+    {
+        var border = new TestBorder
+        {
+            ClipToBounds = true,
+            BorderThickness = new Thickness(2),
+            CornerRadius = new CornerRadius(12),
+        };
+        border.Measure(new Size(120, 40));
+        border.Arrange(new Rect(0, 0, 120, 40));
+
+        var rounded = Assert.IsType<RectangleGeometry>(border.InvokeGetLayoutClip());
+        Assert.Same(rounded, border.InvokeGetLayoutClip());
+        Assert.True(rounded.IsFrozen);
+
+        border.Shape = BorderShape.SuperEllipse;
+        var superEllipse = Assert.IsType<StreamGeometry>(border.InvokeGetLayoutClip());
+        Assert.NotSame(rounded, superEllipse);
+        Assert.Same(superEllipse, border.InvokeGetLayoutClip());
+        Assert.True(superEllipse.IsFrozen);
+
+        border.SuperEllipseN = 6;
+        var changedExponent = Assert.IsType<StreamGeometry>(border.InvokeGetLayoutClip());
+        Assert.NotSame(superEllipse, changedExponent);
+        Assert.True(changedExponent.IsFrozen);
+    }
+
+    [Fact]
     public void Border_ClipToBounds_WithSuperEllipse_UsesLocalCornerRadiusAndExponent()
     {
         var border = new TestBorder

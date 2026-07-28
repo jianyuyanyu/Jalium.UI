@@ -2623,83 +2623,98 @@ public sealed class PathGeometry : Geometry
         {
             if (Figures.Count == 0) return Rect.Empty;
 
-            double minX = double.MaxValue, minY = double.MaxValue;
-            double maxX = double.MinValue, maxY = double.MinValue;
-
+            var bounds = Rect.Empty;
             foreach (var figure in Figures)
             {
-                UpdateBounds(figure.StartPoint, ref minX, ref minY, ref maxX, ref maxY);
-                var currentPoint = figure.StartPoint;
-
-                foreach (var segment in figure.Segments)
-                {
-                    switch (segment)
-                    {
-                        case LineSegment line:
-                            UpdateBounds(line.Point, ref minX, ref minY, ref maxX, ref maxY);
-                            currentPoint = line.Point;
-                            break;
-
-                        case PolyLineSegment polyLine:
-                            foreach (var pt in polyLine.Points)
-                                UpdateBounds(pt, ref minX, ref minY, ref maxX, ref maxY);
-                            if (polyLine.Points.Count > 0)
-                                currentPoint = polyLine.Points[^1];
-                            break;
-
-                        case BezierSegment bezier:
-                            UpdateCubicBezierBounds(currentPoint, bezier.Point1, bezier.Point2, bezier.Point3,
-                                ref minX, ref minY, ref maxX, ref maxY);
-                            currentPoint = bezier.Point3;
-                            break;
-
-                        case PolyBezierSegment polyBezier:
-                        {
-                            var pts = polyBezier.Points;
-                            for (int i = 0; i + 2 < pts.Count; i += 3)
-                            {
-                                UpdateCubicBezierBounds(currentPoint, pts[i], pts[i + 1], pts[i + 2],
-                                    ref minX, ref minY, ref maxX, ref maxY);
-                                currentPoint = pts[i + 2];
-                            }
-                            break;
-                        }
-
-                        case QuadraticBezierSegment quad:
-                            UpdateQuadBezierBounds(currentPoint, quad.Point1, quad.Point2,
-                                ref minX, ref minY, ref maxX, ref maxY);
-                            currentPoint = quad.Point2;
-                            break;
-
-                        case PolyQuadraticBezierSegment polyQuad:
-                        {
-                            var pts = polyQuad.Points;
-                            for (int i = 0; i + 1 < pts.Count; i += 2)
-                            {
-                                UpdateQuadBezierBounds(currentPoint, pts[i], pts[i + 1],
-                                    ref minX, ref minY, ref maxX, ref maxY);
-                                currentPoint = pts[i + 1];
-                            }
-                            break;
-                        }
-
-                        case ArcSegment arc:
-                            UpdateArcBounds(currentPoint, arc, ref minX, ref minY, ref maxX, ref maxY);
-                            currentPoint = arc.Point;
-                            break;
-
-                        default:
-                            foreach (var pt in segment.GetPoints())
-                                UpdateBounds(pt, ref minX, ref minY, ref maxX, ref maxY);
-                            currentPoint = segment.GetEndPoint(currentPoint);
-                            break;
-                    }
-                }
+                bounds.Union(GetFigureBounds(figure));
             }
 
-            if (minX > maxX || minY > maxY) return Rect.Empty;
-            return new Rect(minX, minY, maxX - minX, maxY - minY);
+            return bounds;
         }
+    }
+
+    /// <summary>
+    /// Computes the tight local-space bounds for one path figure without
+    /// constructing a temporary <see cref="PathGeometry"/>.
+    /// </summary>
+    internal static Rect GetFigureBounds(PathFigure figure)
+    {
+        ArgumentNullException.ThrowIfNull(figure);
+
+        double minX = double.MaxValue, minY = double.MaxValue;
+        double maxX = double.MinValue, maxY = double.MinValue;
+
+        UpdateBounds(figure.StartPoint, ref minX, ref minY, ref maxX, ref maxY);
+        var currentPoint = figure.StartPoint;
+
+        foreach (var segment in figure.Segments)
+        {
+            switch (segment)
+            {
+                case LineSegment line:
+                    UpdateBounds(line.Point, ref minX, ref minY, ref maxX, ref maxY);
+                    currentPoint = line.Point;
+                    break;
+
+                case PolyLineSegment polyLine:
+                    foreach (var pt in polyLine.Points)
+                        UpdateBounds(pt, ref minX, ref minY, ref maxX, ref maxY);
+                    if (polyLine.Points.Count > 0)
+                        currentPoint = polyLine.Points[^1];
+                    break;
+
+                case BezierSegment bezier:
+                    UpdateCubicBezierBounds(currentPoint, bezier.Point1, bezier.Point2, bezier.Point3,
+                        ref minX, ref minY, ref maxX, ref maxY);
+                    currentPoint = bezier.Point3;
+                    break;
+
+                case PolyBezierSegment polyBezier:
+                {
+                    var pts = polyBezier.Points;
+                    for (int i = 0; i + 2 < pts.Count; i += 3)
+                    {
+                        UpdateCubicBezierBounds(currentPoint, pts[i], pts[i + 1], pts[i + 2],
+                            ref minX, ref minY, ref maxX, ref maxY);
+                        currentPoint = pts[i + 2];
+                    }
+                    break;
+                }
+
+                case QuadraticBezierSegment quad:
+                    UpdateQuadBezierBounds(currentPoint, quad.Point1, quad.Point2,
+                        ref minX, ref minY, ref maxX, ref maxY);
+                    currentPoint = quad.Point2;
+                    break;
+
+                case PolyQuadraticBezierSegment polyQuad:
+                {
+                    var pts = polyQuad.Points;
+                    for (int i = 0; i + 1 < pts.Count; i += 2)
+                    {
+                        UpdateQuadBezierBounds(currentPoint, pts[i], pts[i + 1],
+                            ref minX, ref minY, ref maxX, ref maxY);
+                        currentPoint = pts[i + 1];
+                    }
+                    break;
+                }
+
+                case ArcSegment arc:
+                    UpdateArcBounds(currentPoint, arc, ref minX, ref minY, ref maxX, ref maxY);
+                    currentPoint = arc.Point;
+                    break;
+
+                default:
+                    foreach (var pt in segment.GetPoints())
+                        UpdateBounds(pt, ref minX, ref minY, ref maxX, ref maxY);
+                    currentPoint = segment.GetEndPoint(currentPoint);
+                    break;
+            }
+        }
+
+        return minX > maxX || minY > maxY
+            ? Rect.Empty
+            : new Rect(minX, minY, maxX - minX, maxY - minY);
     }
 
     private static void UpdateBounds(Point pt, ref double minX, ref double minY, ref double maxX, ref double maxY)
@@ -2879,21 +2894,44 @@ public sealed class PathGeometry : Geometry
         double txBase = Math.Atan2(-ry * sinR, rx * cosR);
         double tyBase = Math.Atan2(ry * cosR, rx * sinR);
 
-        // Check the 4 candidate angles (2 for x extrema, 2 for y extrema)
-        double[] candidates = { txBase, txBase + Math.PI, tyBase, tyBase + Math.PI };
+        // Check the 4 candidate angles (2 for x extrema, 2 for y extrema).
+        // Keep this allocation-free: Bounds is called from the render hot path.
+        UpdateArcExtremum(txBase, startAngle, deltaAngle, cx, cy, rx, ry, cosR, sinR,
+            ref minX, ref minY, ref maxX, ref maxY);
+        UpdateArcExtremum(txBase + Math.PI, startAngle, deltaAngle, cx, cy, rx, ry, cosR, sinR,
+            ref minX, ref minY, ref maxX, ref maxY);
+        UpdateArcExtremum(tyBase, startAngle, deltaAngle, cx, cy, rx, ry, cosR, sinR,
+            ref minX, ref minY, ref maxX, ref maxY);
+        UpdateArcExtremum(tyBase + Math.PI, startAngle, deltaAngle, cx, cy, rx, ry, cosR, sinR,
+            ref minX, ref minY, ref maxX, ref maxY);
+    }
 
-        foreach (var angle in candidates)
+    private static void UpdateArcExtremum(
+        double angle,
+        double startAngle,
+        double deltaAngle,
+        double cx,
+        double cy,
+        double rx,
+        double ry,
+        double cosR,
+        double sinR,
+        ref double minX,
+        ref double minY,
+        ref double maxX,
+        ref double maxY)
+    {
+        if (!IsAngleInArc(angle, startAngle, deltaAngle))
         {
-            if (IsAngleInArc(angle, startAngle, deltaAngle))
-            {
-                var px = cx + rx * Math.Cos(angle) * cosR - ry * Math.Sin(angle) * sinR;
-                var py = cy + rx * Math.Cos(angle) * sinR + ry * Math.Sin(angle) * cosR;
-                if (px < minX) minX = px;
-                if (px > maxX) maxX = px;
-                if (py < minY) minY = py;
-                if (py > maxY) maxY = py;
-            }
+            return;
         }
+
+        var px = cx + rx * Math.Cos(angle) * cosR - ry * Math.Sin(angle) * sinR;
+        var py = cy + rx * Math.Cos(angle) * sinR + ry * Math.Sin(angle) * cosR;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
     }
 
     /// <summary>

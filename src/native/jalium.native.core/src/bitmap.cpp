@@ -1,4 +1,5 @@
 #include "jalium_internal.h"
+#include "jalium_abi_guard.h"
 
 // ============================================================================
 // Bitmap C API Implementation
@@ -11,17 +12,22 @@ JALIUM_API JaliumImage* jalium_bitmap_create_from_memory(
     const uint8_t* data,
     uint32_t dataSize)
 {
-    if (!ctx || !data || dataSize == 0) {
+    if (!ctx || !data || dataSize == 0 ||
+        dataSize > jalium::kMaxEncodedBitmapBytes) {
         return nullptr;
     }
 
-    auto backend = jalium::GetBackendFromContext(ctx);
-    if (!backend) {
+    try {
+        auto backend = jalium::GetBackendFromContext(ctx);
+        if (!backend) {
+            return nullptr;
+        }
+
+        auto bitmap = backend->CreateBitmapFromMemory(data, dataSize);
+        return reinterpret_cast<JaliumImage*>(bitmap);
+    } catch (...) {
         return nullptr;
     }
-
-    auto bitmap = backend->CreateBitmapFromMemory(data, dataSize);
-    return reinterpret_cast<JaliumImage*>(bitmap);
 }
 
 JALIUM_API JaliumImage* jalium_bitmap_create_from_pixels(
@@ -31,17 +37,23 @@ JALIUM_API JaliumImage* jalium_bitmap_create_from_pixels(
     uint32_t height,
     uint32_t stride)
 {
-    if (!ctx || !pixels || width == 0 || height == 0 || stride < width * 4u) {
+    jalium::PackedBgraLayout layout{};
+    if (!ctx || !pixels ||
+        !jalium::TryComputePackedBgraLayout(width, height, stride, layout)) {
         return nullptr;
     }
 
-    auto backend = jalium::GetBackendFromContext(ctx);
-    if (!backend) {
+    try {
+        auto backend = jalium::GetBackendFromContext(ctx);
+        if (!backend) {
+            return nullptr;
+        }
+
+        auto bitmap = backend->CreateBitmapFromPixels(pixels, width, height, stride);
+        return reinterpret_cast<JaliumImage*>(bitmap);
+    } catch (...) {
         return nullptr;
     }
-
-    auto bitmap = backend->CreateBitmapFromPixels(pixels, width, height, stride);
-    return reinterpret_cast<JaliumImage*>(bitmap);
 }
 
 JALIUM_API uint32_t jalium_bitmap_get_width(JaliumImage* bitmap) {
@@ -61,11 +73,17 @@ JALIUM_API int32_t jalium_bitmap_update_pixels(
     uint32_t height,
     uint32_t stride)
 {
-    if (!bitmap || !pixels || width == 0 || height == 0 || stride < width * 4u) {
+    jalium::PackedBgraLayout layout{};
+    if (!bitmap || !pixels ||
+        !jalium::TryComputePackedBgraLayout(width, height, stride, layout)) {
         return 0;
     }
-    auto* bmp = reinterpret_cast<jalium::Bitmap*>(bitmap);
-    return bmp->UpdatePackedPixels(pixels, width, height, stride) ? 1 : 0;
+    try {
+        auto* bmp = reinterpret_cast<jalium::Bitmap*>(bitmap);
+        return bmp->UpdatePackedPixels(pixels, width, height, stride) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
 }
 
 JALIUM_API void jalium_bitmap_destroy(JaliumImage* bitmap) {

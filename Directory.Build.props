@@ -20,6 +20,17 @@
 
   <PropertyGroup>
     <!-- Common settings for all projects -->
+    <!--
+      The solution intentionally keeps shared/build-only projects out of its
+      root list so MSBuild schedules each one through a single ProjectReference
+      graph. AssignProjectConfiguration normally clears Configuration and
+      Platform for references that are not listed in a solution, which silently
+      turns a Release solution build into Debug dependency builds. Preserve the
+      parent globals for those transitive projects.
+    -->
+    <ShouldUnsetParentConfigurationAndPlatform
+      Condition="'$(BuildingSolutionFile)' == 'true'">false</ShouldUnsetParentConfigurationAndPlatform>
+
     <!-- Multi-platform TFM: default cross-platform, platform entry packages set JaliumPlatform -->
     <TargetFramework Condition="'$(JaliumPlatform)' == ''">net10.0</TargetFramework>
     <TargetFramework Condition="'$(JaliumPlatform)' == 'windows'">net10.0-windows</TargetFramework>

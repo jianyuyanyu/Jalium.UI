@@ -193,6 +193,7 @@
     <!-- ============================================== -->
     <Style TargetType="Thumb">
         <Setter Property="Background" Value="{ThemeResource ControlBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="CornerRadius" Value="6" />

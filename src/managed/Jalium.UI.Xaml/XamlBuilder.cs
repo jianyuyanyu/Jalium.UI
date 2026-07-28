@@ -134,6 +134,27 @@ internal static class XamlBuilderInitializer
         {
             XamlReader.BuilderApplyCompiledBinding(target, propertyName, positionalPath, names, values, CtxOf(ctx));
         };
+
+        XamlBuilder.SetCompiledAttachedBindingImpl = static (
+            target,
+            ownerTypeName,
+            propertyName,
+            positionalPath,
+            names,
+            values,
+            ctx,
+            elementNamespaceUri) =>
+        {
+            XamlReader.BuilderApplyCompiledAttachedBinding(
+                target,
+                ownerTypeName,
+                propertyName,
+                positionalPath,
+                names,
+                values,
+                CtxOf(ctx),
+                elementNamespaceUri);
+        };
     }
 
     /// <summary>

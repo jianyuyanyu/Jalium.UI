@@ -23,7 +23,10 @@ D3D12VideoSurface::D3D12VideoSurface(D3D12Backend* backend, uint32_t width, uint
     // Allocate the CPU staging buffer up front so Lock can hand back a stable
     // pointer the decoder pump writes into. The default-heap texture itself
     // is lazily created on the first GetOrCreateD3D12Texture pass.
-    bitmap.pixelData_.assign(static_cast<size_t>(width) * height * 4u, 0);
+    PackedBgraLayout layout{};
+    if (TryComputeTightlyPackedBgraLayout(width, height, layout)) {
+        bitmap.pixelData_.assign(layout.packedBytes, 0);
+    }
     bitmap.isDynamic_ = true;
 }
 
@@ -32,7 +35,8 @@ bool D3D12VideoSurface::Lock(uint8_t** outPtr, uint32_t* outStride)
     if (!outPtr || !outStride) return false;
     if (bitmap.pixelData_.empty()) return false;
     *outPtr    = bitmap.pixelData_.data();
-    *outStride = bitmap.width_ * 4u;
+    *outStride = static_cast<uint32_t>(
+        static_cast<uint64_t>(bitmap.width_) * 4u);
     return true;
 }
 
@@ -53,7 +57,8 @@ bool D3D12VideoSurface::Unlock(const JaliumVideoSurfaceDirtyRect* /*dirty*/)
 VideoSurface* D3D12Backend::CreateVideoSurface(uint32_t width, uint32_t height,
                                                 uint32_t /*formatHint*/)
 {
-    if (width == 0 || height == 0) return nullptr;
+    PackedBgraLayout layout{};
+    if (!TryComputeTightlyPackedBgraLayout(width, height, layout)) return nullptr;
     return new D3D12VideoSurface(this, width, height);
 }
 

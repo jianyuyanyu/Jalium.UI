@@ -12,7 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <iterator>
+#include <new>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -130,12 +130,26 @@ bool FileExists(const std::string& path)
 
 bool ReadFileToString(const char* path, std::string& out)
 {
-    std::ifstream file(path, std::ios::binary);
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) return false;
-    std::string bytes(
-        (std::istreambuf_iterator<char>(file)),
-         std::istreambuf_iterator<char>());
-    if (bytes.empty() || bytes.size() > kMaxConfigFileSize) return false;
+    const std::streamoff fileSize = file.tellg();
+    if (fileSize <= 0 ||
+        static_cast<uint64_t>(fileSize) >
+            static_cast<uint64_t>(kMaxConfigFileSize)) {
+        return false;
+    }
+    file.seekg(0, std::ios::beg);
+    if (!file) return false;
+
+    std::string bytes;
+    try {
+        bytes.resize(static_cast<size_t>(fileSize));
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    if (!file.read(bytes.data(), static_cast<std::streamsize>(fileSize))) {
+        return false;
+    }
     if (bytes.compare(0, 3, "\xEF\xBB\xBF") == 0) bytes.erase(0, 3);
     out = std::move(bytes);
     return true;

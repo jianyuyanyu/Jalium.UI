@@ -7,6 +7,7 @@
     <!-- ============================================== -->
     <Style TargetType="DatePicker">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="10,6" />
@@ -36,6 +37,7 @@
     <!-- ============================================== -->
     <Style TargetType="TimePicker">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="10,6" />
@@ -65,6 +67,7 @@
     <!-- ============================================== -->
     <Style TargetType="Calendar">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="8" />
@@ -90,6 +93,7 @@
     <!-- ============================================== -->
     <Style TargetType="ColorPicker">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="10,6" />
@@ -119,6 +123,7 @@
     <!-- ============================================== -->
     <Style TargetType="CalendarButton">
         <Setter Property="Background" Value="Transparent" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="Transparent" />
         <Setter Property="BorderThickness" Value="0" />
         <Setter Property="Padding" Value="8,5" />
@@ -168,6 +173,7 @@
     <!-- ============================================== -->
     <Style TargetType="CalendarDayButton">
         <Setter Property="Background" Value="Transparent" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="Transparent" />
         <Setter Property="BorderThickness" Value="0" />
         <Setter Property="CornerRadius" Value="8" />
@@ -227,6 +233,7 @@
     <!-- ============================================== -->
     <Style TargetType="CalendarItem">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="8" />
@@ -252,6 +259,7 @@
     <!-- ============================================== -->
     <Style TargetType="DatePickerTextBox">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="10,7" />

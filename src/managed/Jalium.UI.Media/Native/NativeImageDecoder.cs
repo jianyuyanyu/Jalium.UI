@@ -76,6 +76,7 @@ public sealed class NativeImageDecoder : INativeImageDecoder
             }
         }
         if (status != NativeMediaStatus.Ok) return false;
+        if (w > int.MaxValue || h > int.MaxValue) return false;
         width = (int)w;
         height = (int)h;
         return true;
@@ -132,7 +133,30 @@ public sealed class NativeImageDecoder : INativeImageDecoder
                 throw new NativeMediaException(NativeMediaStatus.DecodeFailed, "jalium_image_decode (empty result)");
             }
 
-            var size = checked((int)native.StrideBytes * (int)native.Height);
+            if (native.Width > int.MaxValue ||
+                native.Height > int.MaxValue ||
+                native.StrideBytes > int.MaxValue)
+            {
+                throw new NativeMediaException(
+                    NativeMediaStatus.DecodeFailed,
+                    "jalium_image_decode (dimensions exceed managed limits)");
+            }
+
+            int width = (int)native.Width;
+            int height = (int)native.Height;
+            int stride = (int)native.StrideBytes;
+            int size;
+            try
+            {
+                size = PixelBufferLayout.GetRequiredByteCount(width, height, stride);
+            }
+            catch (ArgumentOutOfRangeException ex)
+            {
+                throw new NativeMediaException(
+                    NativeMediaStatus.DecodeFailed,
+                    $"jalium_image_decode (invalid pixel layout: {ex.Message})");
+            }
+
             var buffer = new byte[size];
             unsafe
             {
@@ -143,9 +167,9 @@ public sealed class NativeImageDecoder : INativeImageDecoder
             }
             return new DecodedImage(
                 buffer,
-                (int)native.Width,
-                (int)native.Height,
-                (int)native.StrideBytes,
+                width,
+                height,
+                stride,
                 NativeMediaInterop.FromNative(native.Format));
         }
         finally

@@ -29,7 +29,7 @@ public abstract partial class BitmapSource : ImageSource
 
     public virtual void CopyPixels(byte[] pixels, int stride, int offset)
     {
-        CopyPixels(new Int32Rect(0, 0, (int)Width, (int)Height), pixels, stride, offset);
+        CopyPixels(new Int32Rect(0, 0, PixelWidth, PixelHeight), pixels, stride, offset);
     }
 
     public virtual void CopyPixels(Int32Rect sourceRect, byte[] pixels, int stride, int offset)

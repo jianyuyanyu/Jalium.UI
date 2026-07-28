@@ -238,6 +238,21 @@ public sealed class PackagingRightsManagementParityTests
         Assert.False(manager.IsSigned);
     }
 
+    [Fact]
+    public void NewPackageSignaturesDefaultToSha256()
+    {
+        const string Sha256 = "http://www.w3.org/2001/04/xmlenc#sha256";
+        using var packageStream = new MemoryStream();
+        using Package package = Package.Open(
+            packageStream,
+            FileMode.Create,
+            FileAccess.ReadWrite);
+        var manager = new PackageDigitalSignatureManager(package);
+
+        Assert.Equal(Sha256, PackageDigitalSignatureManager.DefaultHashAlgorithm);
+        Assert.Equal(Sha256, manager.HashAlgorithm);
+    }
+
     private static void AssertParameterNames(MethodBase method, params string[] expected) =>
         Assert.Equal(expected, method.GetParameters().Select(static parameter => parameter.Name));
 }

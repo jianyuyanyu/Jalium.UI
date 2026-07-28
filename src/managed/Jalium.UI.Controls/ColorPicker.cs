@@ -235,7 +235,7 @@ public class ColorPicker : Control
     public ColorPicker()
     {
         Focusable = true;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
 
         AddHandler(MouseDownEvent, new MouseButtonEventHandler(OnMouseDownHandler));
         AddHandler(MouseUpEvent, new MouseButtonEventHandler(OnMouseUpHandler));

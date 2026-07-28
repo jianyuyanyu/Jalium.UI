@@ -94,6 +94,7 @@
     <!-- ============================================== -->
     <Style TargetType="Separator">
         <Setter Property="Background" Value="{ThemeResource ControlBorder}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="StrokeBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="StrokeThickness" Value="1" />
         <Setter Property="Margin" Value="0,6,0,6" />

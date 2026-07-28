@@ -235,6 +235,7 @@ public sealed class FrameResources : IDisposable
     private readonly int _uploadBufferSize;
     private int _uploadOffset;
     private nint _mappedPtr;
+    private bool _disposed;
 
     // 临时资源（帧结束时回收）
     private readonly List<nint> _tempBuffers = new();
@@ -247,14 +248,35 @@ public sealed class FrameResources : IDisposable
 
     public FrameResources(IRenderBackendEx backend, int uploadBufferSize)
     {
+        ArgumentNullException.ThrowIfNull(backend);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(uploadBufferSize);
+
         _backend = backend;
         _uploadBufferSize = uploadBufferSize;
 
         // 创建上传缓冲区
-        _uploadBuffer = backend.CreateBuffer(uploadBufferSize, BufferUsage.Upload);
+        var uploadBuffer = backend.CreateBuffer(uploadBufferSize, BufferUsage.Upload);
+        if (uploadBuffer == nint.Zero)
+        {
+            throw new InvalidOperationException("The backend failed to create the frame upload buffer.");
+        }
 
-        // 获取 CPU 映射指针（上传堆缓冲区在创建时即持久映射）
-        _mappedPtr = backend.GetBufferMappedPointer(_uploadBuffer);
+        try
+        {
+            // 获取 CPU 映射指针（上传堆缓冲区在创建时即持久映射）
+            _mappedPtr = backend.GetBufferMappedPointer(uploadBuffer);
+            if (_mappedPtr == nint.Zero)
+            {
+                throw new InvalidOperationException("The frame upload buffer is not CPU-mapped.");
+            }
+        }
+        catch
+        {
+            backend.DestroyBuffer(uploadBuffer);
+            throw;
+        }
+
+        _uploadBuffer = uploadBuffer;
     }
 
     /// <summary>
@@ -262,15 +284,26 @@ public sealed class FrameResources : IDisposable
     /// </summary>
     public GpuAllocation Allocate(int size, int alignment = 256)
     {
-        // 对齐偏移量
-        var alignedOffset = (_uploadOffset + alignment - 1) & ~(alignment - 1);
-
-        if (alignedOffset + size > _uploadBufferSize)
+        ThrowIfDisposed();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(size);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(alignment);
+        if ((alignment & (alignment - 1)) != 0)
         {
-            throw new OutOfMemoryException(
-                $"Upload heap exhausted. Requested {size} bytes at offset {alignedOffset}, heap size is {_uploadBufferSize}");
+            throw new ArgumentException("Alignment must be a power of two.", nameof(alignment));
         }
 
+        // 对齐偏移量
+        var alignedOffsetLong =
+            ((long)_uploadOffset + alignment - 1) & ~((long)alignment - 1);
+
+        if (alignedOffsetLong > _uploadBufferSize ||
+            size > _uploadBufferSize - alignedOffsetLong)
+        {
+            throw new OutOfMemoryException(
+                $"Upload heap exhausted. Requested {size} bytes at offset {alignedOffsetLong}, heap size is {_uploadBufferSize}");
+        }
+
+        var alignedOffset = (int)alignedOffsetLong;
         var allocation = new GpuAllocation(
             gpuAddress: _uploadBuffer,
             cpuAddress: _mappedPtr + alignedOffset,
@@ -286,8 +319,25 @@ public sealed class FrameResources : IDisposable
     /// </summary>
     public nint CreateTempBuffer(int size, BufferUsage usage)
     {
+        ThrowIfDisposed();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(size);
+
         var buffer = _backend.CreateBuffer(size, usage);
-        _tempBuffers.Add(buffer);
+        if (buffer == nint.Zero)
+        {
+            throw new InvalidOperationException("The backend failed to create a temporary buffer.");
+        }
+
+        try
+        {
+            _tempBuffers.Add(buffer);
+        }
+        catch
+        {
+            _backend.DestroyBuffer(buffer);
+            throw;
+        }
+
         return buffer;
     }
 
@@ -295,6 +345,12 @@ public sealed class FrameResources : IDisposable
     /// 重置帧资源（复用上传堆，回收临时资源）
     /// </summary>
     public void Reset()
+    {
+        ThrowIfDisposed();
+        ReleaseTemporaryResources();
+    }
+
+    private void ReleaseTemporaryResources()
     {
         _uploadOffset = 0;
 
@@ -313,8 +369,17 @@ public sealed class FrameResources : IDisposable
 
     public void Dispose()
     {
-        Reset();
+        if (_disposed) return;
+
+        ReleaseTemporaryResources();
         _backend.DestroyBuffer(_uploadBuffer);
+        _mappedPtr = nint.Zero;
+        _disposed = true;
+    }
+
+    private void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
     }
 }
 

@@ -328,7 +328,7 @@ public sealed class PackageDigitalSignatureManager
     public static string SignatureOriginRelationshipType =>
         "http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/origin";
 
-    public static string DefaultHashAlgorithm => SignedXml.XmlDsigSHA1Url;
+    public static string DefaultHashAlgorithm => SignedXml.XmlDsigSHA256Url;
 
     public event InvalidSignatureEventHandler? InvalidSignatureEvent;
 
@@ -619,7 +619,9 @@ public sealed class PackageDigitalSignatureManager
 
     private static HashAlgorithm CreateHashAlgorithm(string algorithmUri) => algorithmUri switch
     {
+#pragma warning disable CA5350 // Legacy OPC signatures can legitimately require SHA-1 for verification.
         SignedXml.XmlDsigSHA1Url => SHA1.Create(),
+#pragma warning restore CA5350
         SignedXml.XmlDsigSHA256Url => SHA256.Create(),
         SignedXml.XmlDsigSHA384Url => SHA384.Create(),
         SignedXml.XmlDsigSHA512Url => SHA512.Create(),

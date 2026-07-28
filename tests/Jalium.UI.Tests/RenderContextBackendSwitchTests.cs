@@ -66,6 +66,23 @@ public sealed class RenderContextBackendSwitchTests : IDisposable
         Assert.Same(installed, RenderContext.Current);
     }
 
+    [RequiresBackendFact(RenderBackend.D3D12)]
+    public void ExplicitGpuPreference_ReplacesIncompatibleCachedContext()
+    {
+        var automatic = RenderContext.GetOrCreateCurrent(
+            RenderBackend.D3D12,
+            GpuPreference.Auto,
+            forceReplace: true);
+
+        var integrated = RenderContext.GetOrCreateCurrent(
+            RenderBackend.D3D12,
+            GpuPreference.MinimumPower);
+
+        Assert.NotSame(automatic, integrated);
+        Assert.Equal(GpuPreference.MinimumPower, integrated.GpuPreference);
+        Assert.Same(integrated, RenderContext.Current);
+    }
+
     /// <summary>
     /// Regression guard for the software-downgrade / re-creation-churn defect:
     /// requesting an UNAVAILABLE explicit backend must leave the working current

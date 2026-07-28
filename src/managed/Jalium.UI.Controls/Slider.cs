@@ -291,7 +291,7 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
     public Slider()
     {
         Focusable = true;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
 
         // Register input event handlers
         AddHandler(MouseDownEvent, new MouseButtonEventHandler(OnMouseDownHandler));

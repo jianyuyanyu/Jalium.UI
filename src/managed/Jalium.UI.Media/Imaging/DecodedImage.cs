@@ -11,9 +11,13 @@ public readonly struct DecodedImage
     /// </summary>
     public DecodedImage(ReadOnlyMemory<byte> pixels, int width, int height, int stride, NativePixelFormat format)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
-        ArgumentOutOfRangeException.ThrowIfLessThan(stride, width * 4);
+        int requiredByteCount = PixelBufferLayout.GetRequiredByteCount(width, height, stride);
+        if (pixels.Length < requiredByteCount)
+        {
+            throw new ArgumentException(
+                "Pixel buffer is smaller than the specified dimensions and stride.",
+                nameof(pixels));
+        }
 
         Pixels = pixels;
         Width = width;

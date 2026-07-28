@@ -33,12 +33,24 @@ internal static class DynamicResourceBindingOperations
 
     private sealed class DynamicResourceSubscription
     {
+        public required DependencyProperty Property { get; init; }
         public required object ResourceKey { get; init; }
         public required EventHandler Handler { get; init; }
         public DependencyObject.LayerValueSource? LayerSource { get; set; }
     }
 
-    private static readonly ConditionalWeakTable<FrameworkElement, Dictionary<DependencyProperty, DynamicResourceSubscription>> Subscriptions = new();
+    private readonly record struct SubscriptionKey(
+        DependencyProperty Property,
+        DependencyObject.LayerValueSource? LayerSource);
+
+    // A property may simultaneously have a live resource expression at several
+    // dependency-property precedence layers. For example, a StyleSetter supplies
+    // the normal brush while a StyleTrigger temporarily supplies the hover brush.
+    // Keeping only one subscription per property destroys the lower expression
+    // when the trigger activates, so it can no longer react to later theme changes.
+    private static readonly ConditionalWeakTable<
+        FrameworkElement,
+        Dictionary<SubscriptionKey, DynamicResourceSubscription>> Subscriptions = new();
     private static readonly ConditionalWeakTable<FrameworkElement, DynamicResourceTargetRegistration> TargetRegistrations = new();
     private static readonly List<DynamicResourceTargetRegistration> RegisteredTargets = [];
     private static readonly object RegistryGate = new();
@@ -65,39 +77,44 @@ internal static class DynamicResourceBindingOperations
         ArgumentNullException.ThrowIfNull(resourceKey);
 
         var subscriptions = Subscriptions.GetOrCreateValue(target);
-        if (subscriptions.TryGetValue(property, out var existingSubscription))
+        var subscriptionKey = new SubscriptionKey(property, layerSource);
+        if (subscriptions.TryGetValue(subscriptionKey, out var existingSubscription))
         {
-            if (Equals(existingSubscription.ResourceKey, resourceKey) &&
-                existingSubscription.LayerSource == layerSource)
+            if (Equals(existingSubscription.ResourceKey, resourceKey))
             {
-                RefreshDynamicResource(target, property);
+                RefreshDynamicResource(target, subscriptionKey);
                 return;
             }
 
             target.ResourcesChanged -= existingSubscription.Handler;
-            subscriptions.Remove(property);
+            subscriptions.Remove(subscriptionKey);
         }
 
         // The event source is the target itself, so use the sender instead of closing over
         // the target. This keeps the subscription value free of an unnecessary strong edge
         // back to the ConditionalWeakTable key.
+        DynamicResourceSubscription? subscription = null;
         EventHandler handler = (sender, _) =>
         {
-            if (sender is FrameworkElement element)
+            if (sender is FrameworkElement element && subscription != null)
             {
-                RefreshDynamicResource(element, property);
+                RefreshDynamicResource(
+                    element,
+                    new SubscriptionKey(subscription.Property, subscription.LayerSource));
             }
         };
-        subscriptions[property] = new DynamicResourceSubscription
+        subscription = new DynamicResourceSubscription
         {
+            Property = property,
             ResourceKey = resourceKey,
             Handler = handler,
             LayerSource = layerSource
         };
+        subscriptions[subscriptionKey] = subscription;
 
         target.ResourcesChanged += handler;
         EnsureTargetRegistered(target);
-        RefreshDynamicResource(target, property);
+        RefreshDynamicResource(target, subscriptionKey);
     }
 
     internal static bool TryGetDynamicResourceKey(FrameworkElement target, DependencyProperty property, out object? resourceKey)
@@ -110,8 +127,40 @@ internal static class DynamicResourceBindingOperations
         if (!Subscriptions.TryGetValue(target, out var subscriptions))
             return false;
 
-        if (!subscriptions.TryGetValue(property, out var subscription))
-            return false;
+        var source = target.GetValueSourceInternal(property).BaseValueSource;
+        var effectiveLayer = source switch
+        {
+            BaseValueSource.ParentTemplate => DependencyObject.LayerValueSource.ParentTemplate,
+            BaseValueSource.StyleTrigger => DependencyObject.LayerValueSource.StyleTrigger,
+            BaseValueSource.TemplateTrigger or BaseValueSource.ParentTemplateTrigger
+                => DependencyObject.LayerValueSource.TemplateTrigger,
+            BaseValueSource.Style or BaseValueSource.DefaultStyle
+                => DependencyObject.LayerValueSource.StyleSetter,
+            _ => (DependencyObject.LayerValueSource?)null
+        };
+
+        if (!subscriptions.TryGetValue(new SubscriptionKey(property, effectiveLayer), out var subscription))
+        {
+            // A caller can ask while a higher non-resource value is effective. Prefer
+            // the local expression and then the highest framework layer as a stable
+            // fallback, matching dependency-property precedence.
+            var bestPrecedence = int.MaxValue;
+            foreach (var pair in subscriptions)
+            {
+                if (!ReferenceEquals(pair.Key.Property, property))
+                    continue;
+
+                var precedence = GetLayerPrecedence(pair.Key.LayerSource);
+                if (precedence < bestPrecedence)
+                {
+                    bestPrecedence = precedence;
+                    subscription = pair.Value;
+                }
+            }
+
+            if (subscription == null)
+                return false;
+        }
 
         resourceKey = subscription.ResourceKey;
         return true;
@@ -125,17 +174,17 @@ internal static class DynamicResourceBindingOperations
         if (!Subscriptions.TryGetValue(target, out var subscriptions))
             return;
 
-        if (!subscriptions.TryGetValue(property, out var subscription))
-            return;
-
-        target.ResourcesChanged -= subscription.Handler;
-        subscriptions.Remove(property);
-
-        if (subscriptions.Count == 0)
+        var keys = subscriptions.Keys
+            .Where(key => ReferenceEquals(key.Property, property))
+            .ToArray();
+        foreach (var key in keys)
         {
-            Subscriptions.Remove(target);
-            UnregisterTarget(target);
+            if (!subscriptions.Remove(key, out var subscription))
+                continue;
+            target.ResourcesChanged -= subscription.Handler;
         }
+
+        RemoveEmptyTargetRegistration(target, subscriptions);
     }
 
     /// <summary>
@@ -156,14 +205,13 @@ internal static class DynamicResourceBindingOperations
         if (!Subscriptions.TryGetValue(target, out var subscriptions))
             return;
 
-        if (!subscriptions.TryGetValue(property, out var subscription))
-            return;
-
-        if (subscription.LayerSource != layerSource)
+        var key = new SubscriptionKey(property, layerSource);
+        if (!subscriptions.TryGetValue(key, out var subscription))
             return;
 
         target.ResourcesChanged -= subscription.Handler;
-        subscriptions.Remove(property);
+        subscriptions.Remove(key);
+        RemoveEmptyTargetRegistration(target, subscriptions);
     }
 
     internal static void PromoteDynamicResourcesToLayer(
@@ -175,16 +223,22 @@ internal static class DynamicResourceBindingOperations
         if (!Subscriptions.TryGetValue(target, out var subscriptions) || subscriptions.Count == 0)
             return;
 
-        foreach (var property in subscriptions.Keys.ToArray())
+        foreach (var entry in subscriptions
+                     .Where(static pair => pair.Key.LayerSource == null)
+                     .ToArray())
         {
-            if (!subscriptions.TryGetValue(property, out var subscription))
-                continue;
+            var oldKey = entry.Key;
+            var subscription = entry.Value;
+            var newKey = new SubscriptionKey(oldKey.Property, layerSource);
+            if (subscriptions.Remove(newKey, out var replaced))
+            {
+                target.ResourcesChanged -= replaced.Handler;
+            }
 
-            if (subscription.LayerSource.HasValue)
-                continue;
-
+            subscriptions.Remove(oldKey);
             subscription.LayerSource = layerSource;
-            RefreshDynamicResource(target, property);
+            subscriptions[newKey] = subscription;
+            RefreshDynamicResource(target, newKey);
         }
     }
 
@@ -205,9 +259,9 @@ internal static class DynamicResourceBindingOperations
         if (!Subscriptions.TryGetValue(target, out var subscriptions) || subscriptions.Count == 0)
             return;
 
-        foreach (var property in subscriptions.Keys.ToArray())
+        foreach (var key in subscriptions.Keys.ToArray())
         {
-            RefreshDynamicResource(target, property);
+            RefreshDynamicResource(target, key);
         }
     }
 
@@ -261,18 +315,18 @@ internal static class DynamicResourceBindingOperations
                 continue;
             }
 
-            var properties = subscriptions.Keys.ToArray();
-            foreach (var property in properties)
+            var keys = subscriptions.Keys.ToArray();
+            foreach (var key in keys)
             {
                 if (changedKeys != null)
                 {
                     // Only refresh if this subscription's key was actually changed
-                    if (!subscriptions.TryGetValue(property, out var sub) ||
+                    if (!subscriptions.TryGetValue(key, out var sub) ||
                         !changedKeys.Contains(sub.ResourceKey))
                         continue;
                 }
 
-                RefreshDynamicResource(target, property);
+                RefreshDynamicResource(target, key);
             }
         }
 
@@ -458,52 +512,67 @@ internal static class DynamicResourceBindingOperations
         _inactiveTargetCount = 0;
     }
 
-    private static void RefreshDynamicResource(FrameworkElement target, DependencyProperty property)
+    private static void RefreshDynamicResource(FrameworkElement target, SubscriptionKey key)
     {
         if (!Subscriptions.TryGetValue(target, out var subscriptions))
             return;
 
-        if (!subscriptions.TryGetValue(property, out var subscription))
+        if (!subscriptions.TryGetValue(key, out var subscription))
             return;
 
         var resolved = ResourceLookup.FindResource(target, subscription.ResourceKey);
-        var currentValue = target.GetValue(property);
         if (subscription.LayerSource.HasValue)
         {
+            var layerSource = subscription.LayerSource.Value;
             if (resolved != null)
             {
-                if (ReferenceEquals(currentValue, resolved) || Equals(currentValue, resolved))
+                if (target.TryGetLayerValue(key.Property, layerSource, out var current) &&
+                    (ReferenceEquals(current, resolved) || Equals(current, resolved)))
                 {
                     return;
                 }
 
-                target.SetLayerValue(property, resolved, subscription.LayerSource.Value);
+                target.SetLayerValue(key.Property, resolved, layerSource);
             }
-            else
+            else if (target.TryGetLayerValue(key.Property, layerSource, out _))
             {
-                if (ReferenceEquals(currentValue, DependencyProperty.UnsetValue))
-                {
-                    return;
-                }
-
-                target.ClearLayerValue(property, subscription.LayerSource.Value);
+                target.ClearLayerValue(key.Property, layerSource);
             }
             return;
         }
 
-        if (resolved != null)
+        if (resolved != null && IsValidResourceValue(key.Property, resolved))
         {
-            if (ReferenceEquals(currentValue, resolved) || Equals(currentValue, resolved))
-            {
-                return;
-            }
+            target.SetValue(key.Property, resolved);
+        }
+        else if (target.HasLocalValue(key.Property))
+        {
+            target.ClearValue(key.Property);
+        }
+    }
 
-            target.SetValue(property, resolved);
-        }
-        else if (target.HasLocalValue(property))
+    private static int GetLayerPrecedence(DependencyObject.LayerValueSource? source)
+    {
+        return source switch
         {
-            target.ClearValue(property);
-        }
+            null => 0,
+            DependencyObject.LayerValueSource.TemplateTrigger => 1,
+            DependencyObject.LayerValueSource.StyleTrigger => 2,
+            DependencyObject.LayerValueSource.ParentTemplate => 3,
+            DependencyObject.LayerValueSource.StyleSetter => 4,
+            _ => 5
+        };
+    }
+
+    private static void RemoveEmptyTargetRegistration(
+        FrameworkElement target,
+        Dictionary<SubscriptionKey, DynamicResourceSubscription> subscriptions)
+    {
+        if (subscriptions.Count != 0)
+            return;
+
+        Subscriptions.Remove(target);
+        UnregisterTarget(target);
     }
 
     // ---- Non-FrameworkElement DependencyObject support (Freezable-like) ----
@@ -573,7 +642,7 @@ internal static class DynamicResourceBindingOperations
             return;
 
         var resolved = ResourceLookup.FindResource(subscription.Host, subscription.ResourceKey);
-        if (resolved != null)
+        if (resolved != null && IsValidResourceValue(property, resolved))
         {
             target.SetValue(property, resolved);
         }
@@ -581,5 +650,10 @@ internal static class DynamicResourceBindingOperations
         {
             target.ClearValue(property);
         }
+    }
+
+    private static bool IsValidResourceValue(DependencyProperty property, object value)
+    {
+        return property.IsValidType(value) && property.IsValidValue(value);
     }
 }

@@ -24,9 +24,7 @@ public sealed class MediaFrame : IDisposable
         NativePixelFormat format)
     {
         ArgumentNullException.ThrowIfNull(pool);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
-        ArgumentOutOfRangeException.ThrowIfLessThan(stride, width * 4);
+        int bufferSize = PixelBufferLayout.GetRequiredByteCount(width, height, stride);
 
         _pool = pool;
         Width = width;
@@ -35,7 +33,7 @@ public sealed class MediaFrame : IDisposable
         PresentationTime = presentationTime;
         Format = format;
 
-        _bufferSize = checked(stride * height);
+        _bufferSize = bufferSize;
         _buffer = pool.Rent(_bufferSize);
     }
 

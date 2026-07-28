@@ -2,8 +2,9 @@ namespace Jalium.UI.Controls;
 
 /// <summary>
 /// Horizontal items host used by <see cref="Primitives.DataGridCellsPresenter"/>.
-/// It preserves each column's measured width and supplies the virtualization hooks inherited
-/// from <see cref="VirtualizingPanel"/>.
+/// It eagerly lays out every cell in an already-realized row and does not own a
+/// scrolling viewport. Row virtualization is provided by
+/// <see cref="Primitives.DataGridRowsPresenter"/>.
 /// </summary>
 public class DataGridCellsPanel : VirtualizingPanel
 {

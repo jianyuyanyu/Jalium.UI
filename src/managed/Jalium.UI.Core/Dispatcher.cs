@@ -168,7 +168,7 @@ internal sealed partial class DispatcherCore : IDisposable
             try
             {
                 var dispatcherWake = new NativeDispatcherWake();
-                dispatcherWake.SetCallback(ProcessQueue);
+                dispatcherWake.SetCallback(ProcessNativeWake);
                 _dispatcherWake = dispatcherWake;
             }
             catch
@@ -177,6 +177,26 @@ internal sealed partial class DispatcherCore : IDisposable
                 // queue remains usable and a later EnsureNativeWake call retries.
             }
         }
+    }
+
+    /// <summary>
+    /// Processes a platform-native wake only when it is delivered back to this
+    /// dispatcher's managed owner thread.
+    /// </summary>
+    /// <remarks>
+    /// Linux identifies its platform thread by the native thread identity. The OS
+    /// may recycle that identity after a short-lived managed thread exits while a
+    /// stale dispatcher registration is still alive. A later poll on the recycled
+    /// native thread can therefore observe the old eventfd. Never let that callback
+    /// enter <see cref="ProcessQueue"/> on the new managed thread: the access check
+    /// would throw across a reverse P/Invoke boundary and terminate the process.
+    /// </remarks>
+    internal void ProcessNativeWake()
+    {
+        if (!CheckAccess())
+            return;
+
+        ProcessQueue();
     }
 
     /// <summary>

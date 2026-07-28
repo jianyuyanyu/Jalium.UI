@@ -4,6 +4,8 @@
 #include "glyph_atlas.h"
 #include "text_layout.h"
 
+#include <cmath>
+
 namespace jalium {
 
 TextEngine::TextEngine() = default;
@@ -41,6 +43,10 @@ TextFormat* TextEngine::CreateTextFormat(
     int32_t fontWeight,
     int32_t fontStyle)
 {
+    if (!fontFamily || !std::isfinite(fontSize) ||
+        fontSize <= 0.001f || fontSize > 35791.0f) {
+        return nullptr;
+    }
     return new JaliumTextFormat(this, fontFamily, fontSize, fontWeight, fontStyle);
 }
 

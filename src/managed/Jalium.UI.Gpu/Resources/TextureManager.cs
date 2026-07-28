@@ -13,6 +13,9 @@ public sealed class TextureManager : IDisposable
 
     public TextureManager(IRenderBackendEx backend, DescriptorHeapManager descriptors)
     {
+        ArgumentNullException.ThrowIfNull(backend);
+        ArgumentNullException.ThrowIfNull(descriptors);
+
         _backend = backend;
         _descriptors = descriptors;
     }
@@ -22,22 +25,17 @@ public sealed class TextureManager : IDisposable
     /// </summary>
     public TextureHandle LoadTexture(string path, TextureFormat format)
     {
-        var id = _nextId++;
-        var handle = _backend.LoadTexture(path, format);
-        var srv = _descriptors.AllocateSrv(handle);
+        ThrowIfDisposed();
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
 
-        _textures[id] = new TextureEntry
-        {
-            NativeHandle = handle,
-            Srv = srv,
-            Width = 0, // 实际尺寸从 native 获取
-            Height = 0,
-            Format = format,
-            Usage = TextureUsage.ShaderResource,
-            IsRenderTarget = false
-        };
-
-        return new TextureHandle(id);
+        return CreateAndRegisterTexture(
+            () => _backend.LoadTexture(path, format),
+            width: 0,
+            height: 0,
+            format,
+            TextureUsage.ShaderResource,
+            isRenderTarget: false,
+            createUav: false);
     }
 
     /// <summary>
@@ -45,23 +43,18 @@ public sealed class TextureManager : IDisposable
     /// </summary>
     public TextureHandle CreateRenderTarget(int width, int height, TextureFormat format)
     {
-        var id = _nextId++;
+        ThrowIfDisposed();
+        ValidateDimensions(width, height);
+
         var usage = TextureUsage.RenderTarget | TextureUsage.ShaderResource;
-        var handle = _backend.CreateTexture2D(width, height, format, usage);
-        var srv = _descriptors.AllocateSrv(handle);
-
-        _textures[id] = new TextureEntry
-        {
-            NativeHandle = handle,
-            Srv = srv,
-            Width = width,
-            Height = height,
-            Format = format,
-            Usage = usage,
-            IsRenderTarget = true
-        };
-
-        return new TextureHandle(id);
+        return CreateAndRegisterTexture(
+            () => _backend.CreateTexture2D(width, height, format, usage),
+            width,
+            height,
+            format,
+            usage,
+            isRenderTarget: true,
+            createUav: false);
     }
 
     /// <summary>
@@ -69,25 +62,18 @@ public sealed class TextureManager : IDisposable
     /// </summary>
     public TextureHandle CreateReadWrite(int width, int height, TextureFormat format)
     {
-        var id = _nextId++;
+        ThrowIfDisposed();
+        ValidateDimensions(width, height);
+
         var usage = TextureUsage.UnorderedAccess | TextureUsage.ShaderResource;
-        var handle = _backend.CreateTexture2D(width, height, format, usage);
-        var srv = _descriptors.AllocateSrv(handle);
-        var uav = _descriptors.AllocateUav(handle);
-
-        _textures[id] = new TextureEntry
-        {
-            NativeHandle = handle,
-            Srv = srv,
-            Uav = uav,
-            Width = width,
-            Height = height,
-            Format = format,
-            Usage = usage,
-            IsRenderTarget = false
-        };
-
-        return new TextureHandle(id);
+        return CreateAndRegisterTexture(
+            () => _backend.CreateTexture2D(width, height, format, usage),
+            width,
+            height,
+            format,
+            usage,
+            isRenderTarget: false,
+            createUav: true);
     }
 
     /// <summary>
@@ -95,22 +81,22 @@ public sealed class TextureManager : IDisposable
     /// </summary>
     public TextureHandle CreateGlyphAtlas(string fontId, float fontSize, int width, int height)
     {
-        var id = _nextId++;
-        var handle = _backend.CreateGlyphAtlas(fontId, fontSize, width, height);
-        var srv = _descriptors.AllocateSrv(handle);
-
-        _textures[id] = new TextureEntry
+        ThrowIfDisposed();
+        ArgumentException.ThrowIfNullOrWhiteSpace(fontId);
+        if (!float.IsFinite(fontSize) || fontSize <= 0)
         {
-            NativeHandle = handle,
-            Srv = srv,
-            Width = width,
-            Height = height,
-            Format = TextureFormat.R8,
-            Usage = TextureUsage.ShaderResource,
-            IsRenderTarget = false
-        };
+            throw new ArgumentOutOfRangeException(nameof(fontSize), fontSize, "Font size must be finite and positive.");
+        }
+        ValidateDimensions(width, height);
 
-        return new TextureHandle(id);
+        return CreateAndRegisterTexture(
+            () => _backend.CreateGlyphAtlas(fontId, fontSize, width, height),
+            width,
+            height,
+            TextureFormat.R8,
+            TextureUsage.ShaderResource,
+            isRenderTarget: false,
+            createUav: false);
     }
 
     /// <summary>
@@ -118,7 +104,8 @@ public sealed class TextureManager : IDisposable
     /// </summary>
     public DescriptorHandle GetSrv(TextureHandle handle)
     {
-        return _textures.TryGetValue(handle.Id, out var entry)
+        ThrowIfDisposed();
+        return handle.IsValid && _textures.TryGetValue(handle.Id, out var entry)
             ? entry.Srv
             : DescriptorHandle.Invalid;
     }
@@ -128,7 +115,10 @@ public sealed class TextureManager : IDisposable
     /// </summary>
     public DescriptorHandle GetUav(TextureHandle handle)
     {
-        return _textures.TryGetValue(handle.Id, out var entry) && entry.Uav.IsValid
+        ThrowIfDisposed();
+        return handle.IsValid &&
+               _textures.TryGetValue(handle.Id, out var entry) &&
+               entry.Uav.IsValid
             ? entry.Uav
             : DescriptorHandle.Invalid;
     }
@@ -138,7 +128,8 @@ public sealed class TextureManager : IDisposable
     /// </summary>
     public nint GetNativeHandle(TextureHandle handle)
     {
-        return _textures.TryGetValue(handle.Id, out var entry)
+        ThrowIfDisposed();
+        return handle.IsValid && _textures.TryGetValue(handle.Id, out var entry)
             ? entry.NativeHandle
             : nint.Zero;
     }
@@ -148,7 +139,8 @@ public sealed class TextureManager : IDisposable
     /// </summary>
     public (int Width, int Height) GetSize(TextureHandle handle)
     {
-        return _textures.TryGetValue(handle.Id, out var entry)
+        ThrowIfDisposed();
+        return handle.IsValid && _textures.TryGetValue(handle.Id, out var entry)
             ? (entry.Width, entry.Height)
             : (0, 0);
     }
@@ -158,24 +150,46 @@ public sealed class TextureManager : IDisposable
     /// </summary>
     public void ResizeRenderTarget(TextureHandle handle, int newWidth, int newHeight)
     {
-        if (!_textures.TryGetValue(handle.Id, out var entry) || !entry.IsRenderTarget)
+        ThrowIfDisposed();
+        ValidateDimensions(newWidth, newHeight);
+
+        if (!handle.IsValid ||
+            !_textures.TryGetValue(handle.Id, out var entry) ||
+            !entry.IsRenderTarget)
+        {
             return;
+        }
 
-        // 释放旧资源
-        _descriptors.Free(entry.Srv);
-        if (entry.Uav.IsValid) _descriptors.Free(entry.Uav);
-        _backend.DestroyTexture(entry.NativeHandle);
+        var replacement = CreateTextureEntry(
+            () => _backend.CreateTexture2D(newWidth, newHeight, entry.Format, entry.Usage),
+            newWidth,
+            newHeight,
+            entry.Format,
+            entry.Usage,
+            isRenderTarget: true,
+            createUav: false);
 
-        // 创建新资源
-        var newHandle = _backend.CreateTexture2D(newWidth, newHeight, entry.Format, entry.Usage);
-        var newSrv = _descriptors.AllocateSrv(newHandle);
+        try
+        {
+            ReleaseTrackedEntry(handle.Id, entry);
+            _textures.Add(handle.Id, replacement);
+        }
+        catch (Exception replacementError)
+        {
+            try
+            {
+                ReleaseDetachedEntry(replacement);
+            }
+            catch (Exception cleanupError)
+            {
+                throw new AggregateException(
+                    "The render target could not be resized and its replacement could not be fully released.",
+                    replacementError,
+                    cleanupError);
+            }
 
-        entry.NativeHandle = newHandle;
-        entry.Srv = newSrv;
-        entry.Width = newWidth;
-        entry.Height = newHeight;
-
-        _textures[handle.Id] = entry;
+            throw;
+        }
     }
 
     /// <summary>
@@ -183,26 +197,236 @@ public sealed class TextureManager : IDisposable
     /// </summary>
     public void Destroy(TextureHandle handle)
     {
-        if (!_textures.Remove(handle.Id, out var entry))
+        ThrowIfDisposed();
+        if (!handle.IsValid || !_textures.TryGetValue(handle.Id, out var entry))
             return;
 
-        _descriptors.Free(entry.Srv);
-        if (entry.Uav.IsValid) _descriptors.Free(entry.Uav);
-        _backend.DestroyTexture(entry.NativeHandle);
+        ReleaseTrackedEntry(handle.Id, entry);
     }
 
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
 
-        foreach (var entry in _textures.Values)
+        List<Exception>? exceptions = null;
+        foreach (var id in _textures.Keys.ToArray())
+        {
+            try
+            {
+                ReleaseTrackedEntry(id, _textures[id]);
+            }
+            catch (Exception exception)
+            {
+                (exceptions ??= []).Add(exception);
+            }
+        }
+
+        if (exceptions is not null)
+        {
+            throw new AggregateException(
+                "One or more textures could not be released.",
+                exceptions);
+        }
+
+        _disposed = true;
+    }
+
+    private TextureHandle CreateAndRegisterTexture(
+        Func<nint> createNative,
+        int width,
+        int height,
+        TextureFormat format,
+        TextureUsage usage,
+        bool isRenderTarget,
+        bool createUav)
+    {
+        var entry = CreateTextureEntry(
+            createNative,
+            width,
+            height,
+            format,
+            usage,
+            isRenderTarget,
+            createUav);
+
+        try
+        {
+            var id = AllocateId();
+            _textures.Add(id, entry);
+            return new TextureHandle(id);
+        }
+        catch (Exception registrationError)
+        {
+            try
+            {
+                ReleaseDetachedEntry(entry);
+            }
+            catch (Exception cleanupError)
+            {
+                throw new AggregateException(
+                    "The texture could not be registered and its native resources could not be fully released.",
+                    registrationError,
+                    cleanupError);
+            }
+
+            throw;
+        }
+    }
+
+    private TextureEntry CreateTextureEntry(
+        Func<nint> createNative,
+        int width,
+        int height,
+        TextureFormat format,
+        TextureUsage usage,
+        bool isRenderTarget,
+        bool createUav)
+    {
+        var nativeHandle = nint.Zero;
+        var srv = DescriptorHandle.Invalid;
+        var uav = DescriptorHandle.Invalid;
+
+        try
+        {
+            nativeHandle = createNative();
+            if (nativeHandle == nint.Zero)
+            {
+                throw new InvalidOperationException("The backend failed to create the texture.");
+            }
+
+            srv = _descriptors.AllocateSrv(nativeHandle);
+            if (createUav)
+            {
+                uav = _descriptors.AllocateUav(nativeHandle);
+            }
+
+            return new TextureEntry
+            {
+                NativeHandle = nativeHandle,
+                Srv = srv,
+                Uav = uav,
+                Width = width,
+                Height = height,
+                Format = format,
+                Usage = usage,
+                IsRenderTarget = isRenderTarget
+            };
+        }
+        catch (Exception creationError)
+        {
+            var partialEntry = new TextureEntry
+            {
+                NativeHandle = nativeHandle,
+                Srv = srv,
+                Uav = uav
+            };
+
+            try
+            {
+                ReleaseDetachedEntry(partialEntry);
+            }
+            catch (Exception cleanupError)
+            {
+                throw new AggregateException(
+                    "Texture creation failed and its partial native resources could not be fully released.",
+                    creationError,
+                    cleanupError);
+            }
+
+            throw;
+        }
+    }
+
+    private void ReleaseTrackedEntry(uint id, TextureEntry entry)
+    {
+        if (entry.Uav.IsValid)
+        {
+            _descriptors.Free(entry.Uav);
+            entry.Uav = DescriptorHandle.Invalid;
+            _textures[id] = entry;
+        }
+
+        if (entry.Srv.IsValid)
         {
             _descriptors.Free(entry.Srv);
-            if (entry.Uav.IsValid) _descriptors.Free(entry.Uav);
-            _backend.DestroyTexture(entry.NativeHandle);
+            entry.Srv = DescriptorHandle.Invalid;
+            _textures[id] = entry;
         }
-        _textures.Clear();
+
+        if (entry.NativeHandle != nint.Zero)
+        {
+            _backend.DestroyTexture(entry.NativeHandle);
+            entry.NativeHandle = nint.Zero;
+            _textures[id] = entry;
+        }
+
+        _textures.Remove(id);
+    }
+
+    private void ReleaseDetachedEntry(TextureEntry entry)
+    {
+        List<Exception>? exceptions = null;
+
+        if (entry.Uav.IsValid)
+        {
+            TryRelease(() => _descriptors.Free(entry.Uav), ref exceptions);
+        }
+
+        if (entry.Srv.IsValid)
+        {
+            TryRelease(() => _descriptors.Free(entry.Srv), ref exceptions);
+        }
+
+        if (entry.NativeHandle != nint.Zero)
+        {
+            TryRelease(() => _backend.DestroyTexture(entry.NativeHandle), ref exceptions);
+        }
+
+        if (exceptions is not null)
+        {
+            throw new AggregateException(
+                "One or more texture resources could not be released.",
+                exceptions);
+        }
+    }
+
+    private static void TryRelease(Action release, ref List<Exception>? exceptions)
+    {
+        try
+        {
+            release();
+        }
+        catch (Exception exception)
+        {
+            (exceptions ??= []).Add(exception);
+        }
+    }
+
+    private uint AllocateId()
+    {
+        for (var attempt = 0; attempt <= _textures.Count; attempt++)
+        {
+            var candidate = _nextId;
+            _nextId = candidate == uint.MaxValue ? 0 : candidate + 1;
+
+            if (candidate != uint.MaxValue && !_textures.ContainsKey(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        throw new InvalidOperationException("No texture handle identifiers are available.");
+    }
+
+    private static void ValidateDimensions(int width, int height)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
+    }
+
+    private void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
     }
 }
 
@@ -211,16 +435,31 @@ public sealed class TextureManager : IDisposable
 /// </summary>
 public readonly struct TextureHandle : IEquatable<TextureHandle>
 {
+    private readonly bool _initialized;
+
     public readonly uint Id;
 
-    public TextureHandle(uint id) => Id = id;
+    public TextureHandle(uint id)
+    {
+        Id = id;
+        _initialized = id != uint.MaxValue;
+    }
 
-    public static TextureHandle Invalid => new(uint.MaxValue);
-    public bool IsValid => Id != uint.MaxValue;
+    public static TextureHandle Invalid => default;
+    public bool IsValid => _initialized && Id != uint.MaxValue;
 
-    public bool Equals(TextureHandle other) => Id == other.Id;
+    public bool Equals(TextureHandle other)
+    {
+        if (!IsValid || !other.IsValid)
+        {
+            return IsValid == other.IsValid;
+        }
+
+        return Id == other.Id;
+    }
+
     public override bool Equals(object? obj) => obj is TextureHandle other && Equals(other);
-    public override int GetHashCode() => (int)Id;
+    public override int GetHashCode() => IsValid ? (int)Id : 0;
 }
 
 /// <summary>

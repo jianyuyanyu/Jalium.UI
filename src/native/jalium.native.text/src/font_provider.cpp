@@ -5,9 +5,9 @@
 #include <cstring>
 #include <cwchar>
 #include <fstream>
-#include <iterator>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -75,12 +75,29 @@ FontBytes AcquireFontBytes(const std::string& path)
     // Disk I/O runs outside the lock so concurrent loads of different fonts do
     // not serialize; a same-file race is resolved below in favor of the buffer
     // registered first.
-    std::ifstream file(key, std::ios::binary);
+    std::ifstream file(key, std::ios::binary | std::ios::ate);
     if (!file) return nullptr;
-    auto loaded = std::make_shared<std::vector<uint8_t>>(
-        (std::istreambuf_iterator<char>(file)),
-         std::istreambuf_iterator<char>());
-    if (loaded->empty()) return nullptr;
+    const std::streamoff fileSize = file.tellg();
+    if (fileSize < 12 ||
+        static_cast<uint64_t>(fileSize) >
+            static_cast<uint64_t>(kMaxFontFileBytes)) {
+        return nullptr;
+    }
+    file.seekg(0, std::ios::beg);
+    if (!file) return nullptr;
+
+    std::shared_ptr<std::vector<uint8_t>> loaded;
+    try {
+        loaded = std::make_shared<std::vector<uint8_t>>(
+            static_cast<size_t>(fileSize));
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
+    if (!file.read(
+            reinterpret_cast<char*>(loaded->data()),
+            static_cast<std::streamsize>(fileSize))) {
+        return nullptr;
+    }
     FontBytes bytes = std::move(loaded);
 
     std::lock_guard<std::mutex> lock(cache.mutex);

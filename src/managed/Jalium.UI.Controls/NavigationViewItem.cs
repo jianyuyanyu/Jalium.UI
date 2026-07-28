@@ -193,7 +193,7 @@ public class NavigationViewItem : ContentControl
     public NavigationViewItem()
     {
         Focusable = true;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
 
         // Phase 1 damage-driven compositor opt-in: each nav item is a content-stable
         // container, so cache its subtree into a GPU layer and re-composite it (a

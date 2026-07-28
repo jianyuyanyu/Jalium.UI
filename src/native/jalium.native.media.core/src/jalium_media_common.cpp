@@ -62,7 +62,13 @@ JALIUM_MEDIA_API void jalium_media_swap_rb_inplace(
     uint32_t height,
     uint32_t stride_bytes)
 {
-    if (!pixels || width == 0 || height == 0 || stride_bytes < width * 4u) {
+    const uint32_t row_bytes = jalium_media_compute_stride(width);
+    if (!pixels || row_bytes == 0 || height == 0 || stride_bytes < row_bytes) {
+        return;
+    }
+    if (height > 1 &&
+        static_cast<size_t>(height - 1) >
+            (SIZE_MAX - static_cast<size_t>(row_bytes)) / stride_bytes) {
         return;
     }
     for (uint32_t y = 0; y < height; ++y) {

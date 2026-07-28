@@ -58,7 +58,18 @@ public sealed class Dispatcher
         return dispatcher is null ? null : FromCore(dispatcher);
     }
 
-    internal static Dispatcher? MainDispatcher =>
+    /// <summary>
+    /// Gets the dispatcher for the main UI thread, or <see langword="null"/> when no main
+    /// thread has been established yet.
+    /// </summary>
+    /// <remarks>
+    /// Use this — not <see cref="CurrentDispatcher"/> — when marshalling work back to the UI
+    /// thread from a background thread. <see cref="CurrentDispatcher"/> creates/returns the
+    /// dispatcher of the <em>calling</em> thread, so a background caller would get its own
+    /// dispatcher, <see cref="CheckAccess"/> would return <see langword="true"/>, and the work
+    /// would run off the UI thread instead of being marshalled to it.
+    /// </remarks>
+    public static Dispatcher? MainDispatcher =>
         DispatcherCore.MainDispatcher is { } dispatcher ? FromCore(dispatcher) : null;
 
     internal static Dispatcher GetForCurrentThread() => CurrentDispatcher;

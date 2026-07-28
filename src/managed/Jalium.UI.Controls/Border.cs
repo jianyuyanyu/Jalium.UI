@@ -22,6 +22,8 @@ public class Border : Decorator
     private double _cachedBorderWidth;
     private PathGeometry? _cachedAsymmetricStrokeGeometry;
     private AsymmetricStrokeGeometryKey? _cachedAsymmetricStrokeGeometryKey;
+    private Geometry? _cachedLayoutClipGeometry;
+    private LayoutClipGeometryKey? _cachedLayoutClipGeometryKey;
 
     private readonly record struct AsymmetricStrokeGeometryKey(
         Rect Rect,
@@ -29,6 +31,14 @@ public class Border : Decorator
         CornerRadius CornerRadius,
         bool IsSuperEllipse,
         double Exponent);
+
+    private readonly record struct LayoutClipGeometryKey(
+        Rect GeometryRect,
+        Rect BoundsRect,
+        CornerRadius CornerRadius,
+        ClipEdges Edges,
+        BorderShape Shape,
+        double SuperEllipseExponent);
 
     // Liquid glass mouse-following highlight (window-level tracking)
     private Point _lgLightLocal;
@@ -531,32 +541,46 @@ public class Border : Decorator
         var innerRadius = GetInnerCornerRadius(cornerRadius, border);
         innerRadius = MaskClipCornerRadius(innerRadius, clipEdges);
 
+        var shape = Shape;
+        var exponent = SuperEllipseN;
+        var cacheKey = new LayoutClipGeometryKey(
+            geometryRect,
+            clipRect,
+            innerRadius,
+            clipEdges,
+            shape,
+            exponent);
+        if (_cachedLayoutClipGeometry is not null &&
+            _cachedLayoutClipGeometryKey == cacheKey)
+        {
+            return _cachedLayoutClipGeometry;
+        }
+
+        Geometry geometry;
         // A superellipse is a closed four-sided contour. Once one or more sides
         // are open, retain the selected adjacent corner radii on the rectangular
         // half-plane clip below instead of closing the contour at a distant edge.
-        if (Shape == BorderShape.SuperEllipse && clipEdges == ClipEdges.All)
+        if (shape == BorderShape.SuperEllipse && clipEdges == ClipEdges.All)
         {
-            return CreateSuperEllipseGeometry(geometryRect, innerRadius, SuperEllipseN);
+            geometry = CreateSuperEllipseGeometry(geometryRect, innerRadius, exponent);
+        }
+        else
+        {
+            var maxRadius = Math.Max(
+                Math.Max(innerRadius.TopLeft, innerRadius.TopRight),
+                Math.Max(innerRadius.BottomRight, innerRadius.BottomLeft));
+            geometry = maxRadius > 0
+                ? new RectangleGeometry(geometryRect, innerRadius)
+                : new RectangleGeometry(geometryRect);
+            var rectangle = (RectangleGeometry)geometry;
+            rectangle.BoundsClipEdges = clipEdges;
+            rectangle.BoundsClipRect = clipRect;
         }
 
-        var maxRadius = Math.Max(
-            Math.Max(innerRadius.TopLeft, innerRadius.TopRight),
-            Math.Max(innerRadius.BottomRight, innerRadius.BottomLeft));
-
-        if (maxRadius > 0)
-        {
-            return new RectangleGeometry(geometryRect, innerRadius)
-            {
-                BoundsClipEdges = clipEdges,
-                BoundsClipRect = clipRect
-            };
-        }
-
-        return new RectangleGeometry(geometryRect)
-        {
-            BoundsClipEdges = clipEdges,
-            BoundsClipRect = clipRect
-        };
+        geometry.Freeze();
+        _cachedLayoutClipGeometryKey = cacheKey;
+        _cachedLayoutClipGeometry = geometry;
+        return geometry;
     }
 
     #endregion

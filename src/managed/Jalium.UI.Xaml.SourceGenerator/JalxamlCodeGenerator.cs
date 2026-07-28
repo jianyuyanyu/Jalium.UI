@@ -908,6 +908,25 @@ internal static class JalxamlCodeGenerator
         var prop = attr.LocalName;
         var value = attr.Value;
 
+        // Attached dependency properties participate in the same binding system
+        // as normal properties, but their DependencyProperty identity belongs to
+        // the attached owner rather than the target element. Preserve that owner
+        // information in the lowered call instead of forwarding the binding
+        // envelope as a literal string to SetXxx.
+        if (BindingMarkupLowering.TryLower(
+                value,
+                out var bindPath,
+                out var bindNames,
+                out var bindValues))
+        {
+            var pathExpr = bindPath == null
+                ? "null"
+                : EscapeStringLiteral(bindPath);
+            sb.AppendLine(
+                $"{pad}global::Jalium.UI.Markup.XamlBuilder.SetCompiledAttachedBinding({targetVar}, \"{owner}\", \"{prop}\", {pathExpr}, {EmitStringArray(bindNames)}, {EmitStringArray(bindValues)}, __ctx, {EscapeStringLiteral(attr.NamespaceUri ?? string.Empty)});");
+            return;
+        }
+
         // Fast paths: known framework attached properties get parsed at compile time and
         // call the strongly-typed setter directly (zero reflection).
         var fastPath = TryEmitAttachedFastPath(owner, prop, value, targetVar, pad);

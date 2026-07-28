@@ -140,19 +140,127 @@ public class ThemeRuntimeSwitchTests
             root.Arrange(new Rect(0, 0, 480, 360));
 
             var buttonBefore = GetBrushColor(button.Background);
+            var buttonForegroundBefore = GetBrushColor(button.Foreground);
             var textBoxBefore = GetBrushColor(textBox.Background);
             var navBefore = GetBrushColor(navigationView.Background);
 
             ThemeManager.ApplyTheme(ThemeVariant.Light);
 
             var buttonAfter = GetBrushColor(button.Background);
+            var buttonForegroundAfter = GetBrushColor(button.Foreground);
             var textBoxAfter = GetBrushColor(textBox.Background);
             var navAfter = GetBrushColor(navigationView.Background);
 
             Assert.NotEqual(buttonBefore, buttonAfter);
+            Assert.NotEqual(buttonForegroundBefore, buttonForegroundAfter);
+            Assert.Equal(
+                GetBrushColor(Assert.IsAssignableFrom<Brush>(app.Resources["TextPrimary"])),
+                buttonForegroundAfter);
             Assert.NotEqual(textBoxBefore, textBoxAfter);
             Assert.NotEqual(navBefore, navAfter);
             Assert.Equal(ThemeVariant.Light, ThemeManager.CurrentTheme);
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Fact]
+    public void ImplicitComponentStyles_WithForeground_ShouldUseDynamicThemeResources()
+    {
+        ResetApplicationState();
+        ThemeLoader.Initialize();
+        var app = new Application();
+
+        try
+        {
+            var failures = EnumerateResourceDictionaries(app.Resources)
+                .SelectMany(static dictionary => dictionary.Keys
+                    .Cast<object>()
+                    .Where(static key => key is Type)
+                    .Select(key => (TargetType: (Type)key, Style: dictionary[key] as Style)))
+                .Where(static entry =>
+                    entry.Style != null &&
+                    entry.TargetType.GetProperty(
+                        nameof(Control.Foreground),
+                        BindingFlags.Instance | BindingFlags.Public) != null)
+                .Where(static entry =>
+                {
+                    var setter = FindSetter(entry.Style!, nameof(Control.Foreground));
+                    return setter?.Value is not IDynamicResourceReference;
+                })
+                .Select(static entry => entry.TargetType.FullName ?? entry.TargetType.Name)
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(static name => name, StringComparer.Ordinal)
+                .ToArray();
+
+            Assert.True(
+                failures.Length == 0,
+                "Implicit component styles with a Foreground property must bind it " +
+                "to a dynamic theme resource. Missing: " +
+                string.Join(", ", failures));
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Fact]
+    public void ApplyTheme_ShouldUpdate_DefaultForeground_AcrossComponentFamilies()
+    {
+        ResetApplicationState();
+        ThemeLoader.Initialize();
+        var app = new Application();
+
+        try
+        {
+            var controls = new Control[]
+            {
+                new DatePicker(),
+                new InfoBar(),
+                new DataGrid(),
+                new Markdown(),
+                new NavigationView(),
+                new ComboBox(),
+                new TabControl(),
+                new TextBox(),
+                new Jalium.UI.Controls.Primitives.ToggleButton(),
+                new TreeView(),
+            };
+            var textBlock = new TextBlock { Text = "Theme" };
+            var root = new StackPanel { Width = 640, Height = 900 };
+            foreach (var control in controls)
+            {
+                root.Children.Add(control);
+            }
+            root.Children.Add(textBlock);
+
+            app.MainWindow = new Window { Content = root };
+            root.Measure(new Size(640, 900));
+            root.Arrange(new Rect(0, 0, 640, 900));
+
+            var before = controls
+                .Select(static control => GetBrushColor(control.Foreground))
+                .Append(GetBrushColor(textBlock.Foreground))
+                .ToArray();
+
+            ThemeManager.ApplyTheme(ThemeVariant.Light);
+
+            var expected = GetBrushColor(
+                Assert.IsAssignableFrom<Brush>(app.Resources["TextPrimary"]));
+            var after = controls
+                .Select(static control => GetBrushColor(control.Foreground))
+                .Append(GetBrushColor(textBlock.Foreground))
+                .ToArray();
+
+            Assert.Equal(before.Length, after.Length);
+            for (var i = 0; i < after.Length; i++)
+            {
+                Assert.NotEqual(before[i], after[i]);
+                Assert.Equal(expected, after[i]);
+            }
         }
         finally
         {
@@ -235,6 +343,99 @@ public class ThemeRuntimeSwitchTests
             Assert.Equal("Consolas", ThemeManager.CurrentMonospaceFontFamily);
             Assert.Equal("Calibri", textBlock.FontFamily.Source);
             Assert.Equal("Calibri", button.FontFamily.Source);
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Theory]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    [InlineData(double.NegativeInfinity)]
+    [InlineData(0.0)]
+    [InlineData(-1.0)]
+    public void ApplyTypography_InvalidBodyFontSize_UsesFiniteDefault(double bodyFontSize)
+    {
+        ResetApplicationState();
+        ThemeLoader.Initialize();
+        var app = new Application();
+
+        try
+        {
+            ThemeManager.ApplyTypography("Georgia", "Calibri", "Consolas", bodyFontSize);
+
+            Assert.Equal(FrameworkElement.DefaultFontSize, ThemeManager.CurrentBodyFontSize);
+            Assert.Equal(
+                FrameworkElement.DefaultFontSize,
+                Assert.IsType<double>(app.Resources["BodyFontSize"]));
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Fact]
+    public void ApplyTheme_InvalidVariant_ThrowsWithoutMutatingThemeState()
+    {
+        ResetApplicationState();
+        ThemeLoader.Initialize();
+        _ = new Application();
+
+        try
+        {
+            ThemeVariant themeBefore = ThemeManager.CurrentTheme;
+            object? keyBefore = ResourceDictionary.CurrentThemeKey;
+            int versionBefore = ThemeManager.CurrentThemeVersion;
+
+            Assert.Throws<ArgumentOutOfRangeException>(
+                () => ThemeManager.ApplyTheme((ThemeVariant)int.MaxValue));
+
+            Assert.Equal(themeBefore, ThemeManager.CurrentTheme);
+            Assert.Equal(keyBefore, ResourceDictionary.CurrentThemeKey);
+            Assert.Equal(versionBefore, ThemeManager.CurrentThemeVersion);
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Fact]
+    public void Reset_DetachesOnlyThemeManagedDictionaries_AndAllowsCleanReinitialize()
+    {
+        ResetApplicationState();
+        ThemeLoader.Initialize();
+        var app = new Application();
+        var userDictionary = new ResourceDictionary();
+        app.Resources.MergedDictionaries.Insert(0, userDictionary);
+        ResourceDictionary[] managedDictionaries = app.Resources.MergedDictionaries
+            .Where(dictionary => !ReferenceEquals(dictionary, userDictionary))
+            .ToArray();
+
+        try
+        {
+            Assert.NotEmpty(managedDictionaries);
+
+            ThemeManager.Reset();
+
+            Assert.False(ThemeManager.IsInitialized);
+            Assert.Single(app.Resources.MergedDictionaries);
+            Assert.Same(userDictionary, app.Resources.MergedDictionaries[0]);
+            foreach (ResourceDictionary dictionary in managedDictionaries)
+            {
+                Assert.DoesNotContain(
+                    app.Resources.MergedDictionaries,
+                    candidate => ReferenceEquals(candidate, dictionary));
+            }
+
+            ThemeManager.Initialize(app);
+
+            Assert.True(ThemeManager.IsInitialized);
+            Assert.Contains(userDictionary, app.Resources.MergedDictionaries);
+            Assert.Equal(managedDictionaries.Length + 1, app.Resources.MergedDictionaries.Count);
         }
         finally
         {
@@ -629,5 +830,38 @@ public class ThemeRuntimeSwitchTests
     private static Color GetBrushColor(Brush? brush)
     {
         return Assert.IsType<SolidColorBrush>(brush).Color;
+    }
+
+    private static IEnumerable<ResourceDictionary> EnumerateResourceDictionaries(
+        ResourceDictionary root)
+    {
+        yield return root;
+
+        foreach (var dictionary in root.MergedDictionaries)
+        {
+            foreach (var nested in EnumerateResourceDictionaries(dictionary))
+            {
+                yield return nested;
+            }
+        }
+    }
+
+    private static Setter? FindSetter(Style style, string propertyName)
+    {
+        for (var current = style; current != null; current = current.BasedOn)
+        {
+            var setter = current.Setters
+                .OfType<Setter>()
+                .FirstOrDefault(candidate =>
+                    candidate.TargetName == null &&
+                    (candidate.Property?.Name == propertyName ||
+                     candidate.PropertyName == propertyName));
+            if (setter != null)
+            {
+                return setter;
+            }
+        }
+
+        return null;
     }
 }

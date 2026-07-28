@@ -273,6 +273,21 @@ public class Grid : Panel
     private static double SanitizeSpacing(double value) =>
         (double.IsNaN(value) || double.IsInfinity(value) || value < 0) ? 0 : value;
 
+    private static double GetTrackSpanSize(
+        double[] trackSizes,
+        int start,
+        int span,
+        double spacing)
+    {
+        double size = Math.Max(0, span - 1) * spacing;
+        for (var index = start; index < start + span; index++)
+        {
+            size += trackSizes[index];
+        }
+
+        return size;
+    }
+
     private static bool IsSharedStar(RowDefinition definition) =>
         definition.Height.IsStar && definition.SharedSizeGroup != null;
 
@@ -430,6 +445,27 @@ public class Grid : Panel
             ? double.PositiveInfinity
             : Math.Max(0, availableSize.Width - fixedColumnWidth - totalColumnSpacing);
 
+        // Resolve finite star columns before measuring star-as-auto rows. Row sizing
+        // depends on the child's final wrapping width; passing the whole Grid width
+        // here makes a child in the second column measure once across every column
+        // and then again at its real cell width.
+        if (totalColumnStars > 0 &&
+            !double.IsPositiveInfinity(availableColumnSpace))
+        {
+            double starUnitWidth = availableColumnSpace / totalColumnStars;
+            for (int i = 0; i < columnCount; i++)
+            {
+                if (columnStarValues[i] > 0)
+                {
+                    var def = columnDefs[i];
+                    columnWidths[i] = Math.Clamp(
+                        starUnitWidth * columnStarValues[i],
+                        def.MinWidth,
+                        def.MaxWidth);
+                }
+            }
+        }
+
         // Distribute star space
         // When available size is infinite (e.g. inside ScrollViewer), treat star as Auto (WPF behavior)
         if (totalRowStars > 0)
@@ -442,6 +478,10 @@ public class Grid : Panel
                     if (child is not FrameworkElement fe) continue;
                     var row = Math.Min(GetRow(child), rowCount - 1);
                     var rowSpan = Math.Min(GetRowSpan(child), rowCount - row);
+                    var column = Math.Min(GetColumn(child), columnCount - 1);
+                    var columnSpan = Math.Min(
+                        GetColumnSpan(child),
+                        columnCount - column);
                     bool inStarRow = false;
                     for (int i = row; i < row + rowSpan; i++)
                     {
@@ -449,7 +489,17 @@ public class Grid : Panel
                     }
                     if (inStarRow)
                     {
-                        fe.Measure(new Size(availableSize.Width, double.PositiveInfinity));
+                        var measureWidth =
+                            double.IsPositiveInfinity(availableColumnSpace)
+                                ? double.PositiveInfinity
+                                : GetTrackSpanSize(
+                                    columnWidths,
+                                    column,
+                                    columnSpan,
+                                    columnSpacing);
+                        fe.Measure(new Size(
+                            measureWidth,
+                            double.PositiveInfinity));
                         if (rowSpan == 1)
                         {
                             var def = rowDefs[row];
@@ -483,6 +533,8 @@ public class Grid : Panel
                     if (child is not FrameworkElement fe) continue;
                     var column = Math.Min(GetColumn(child), columnCount - 1);
                     var columnSpan = Math.Min(GetColumnSpan(child), columnCount - column);
+                    var row = Math.Min(GetRow(child), rowCount - 1);
+                    var rowSpan = Math.Min(GetRowSpan(child), rowCount - row);
                     bool inStarColumn = false;
                     for (int i = column; i < column + columnSpan; i++)
                     {
@@ -490,25 +542,23 @@ public class Grid : Panel
                     }
                     if (inStarColumn)
                     {
-                        fe.Measure(new Size(double.PositiveInfinity, availableSize.Height));
+                        var measureHeight =
+                            double.IsPositiveInfinity(availableRowSpace)
+                                ? double.PositiveInfinity
+                                : GetTrackSpanSize(
+                                    rowHeights,
+                                    row,
+                                    rowSpan,
+                                    rowSpacing);
+                        fe.Measure(new Size(
+                            double.PositiveInfinity,
+                            measureHeight));
                         if (columnSpan == 1)
                         {
                             var def = columnDefs[column];
                             columnWidths[column] = Math.Max(columnWidths[column],
                                 Math.Clamp(fe.DesiredSize.Width, def.MinWidth, def.MaxWidth));
                         }
-                    }
-                }
-            }
-            else
-            {
-                double starUnitWidth = availableColumnSpace / totalColumnStars;
-                for (int i = 0; i < columnCount; i++)
-                {
-                    if (columnStarValues[i] > 0)
-                    {
-                        var def = columnDefs[i];
-                        columnWidths[i] = Math.Clamp(starUnitWidth * columnStarValues[i], def.MinWidth, def.MaxWidth);
                     }
                 }
             }

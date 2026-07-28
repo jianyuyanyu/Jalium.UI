@@ -19,7 +19,8 @@
 // Frame flow:
 //   • First stencil-path batch in this frame:
 //       – Lazy-create 8× MSAA color + 8× MSAA depth-stencil + 1× resolve
-//         texture sized to the path-content extent. Grow-only (high-water-mark):
+//         texture sized to the path-content extent. Grow-only until a viewport
+//         resize establishes a new allocation boundary (high-water-mark):
 //         a window-sized request reuses the buffers; an oversized element-effect
 //         capture grows them once, then the common case keeps hitting the cache.
 //       – Clear MSAA color (transparent) and stencil (0). RTV/DSV bound.
@@ -502,8 +503,9 @@ bool D3D12DirectRenderer::EnsureStencilDepthBuffer(UINT width, UINT height)
 {
     if (!stencilPathReady_) return false;
 
-    // Grow-only: the MSAA scratch + 1× resolve are sized to the high-water-mark
-    // of every content extent requested so far (normally the window viewport;
+    // Grow-only between render-target resizes: the MSAA scratch + 1× resolve
+    // are sized to the high-water-mark of every content extent requested since
+    // the last viewport resize (normally the window viewport;
     // larger when a stencil path is rendered inside an oversized element-effect
     // capture — pw>viewportWidth_ or ph>viewportHeight_). A request that already
     // fits the current allocation reuses it, so a one-off oversized capture grows

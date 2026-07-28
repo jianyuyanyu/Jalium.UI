@@ -1,5 +1,6 @@
 using Jalium.UI;
 using Jalium.UI.Controls.Editor;
+using Jalium.UI.Media;
 
 namespace Jalium.UI.Tests;
 
@@ -639,6 +640,41 @@ public class EditorFeatureTests
     }
 
     [Fact]
+    public void EditorView_RenderSyntaxHighlightedPreviewLine_ShouldColorTokensAndKeepPrefixNeutral()
+    {
+        var doc = new TextDocument("alpha beta");
+        var keywordBrush = new SolidColorBrush(Color.FromRgb(220, 40, 40));
+        var stringBrush = new SolidColorBrush(Color.FromRgb(40, 120, 220));
+        var neutralBrush = new SolidColorBrush(Color.FromRgb(210, 210, 210));
+        var view = new EditorView
+        {
+            Document = doc,
+            Highlighter = new PreviewSyntaxHighlighter(),
+            ClassificationBrushResolver = (classification, fallback) => classification switch
+            {
+                TokenClassification.Keyword => keywordBrush,
+                TokenClassification.String => stringBrush,
+                _ => fallback,
+            }
+        };
+        var drawingContext = new PreviewRecordingDrawingContext();
+
+        view.RenderSyntaxHighlightedPreviewLine(
+            drawingContext,
+            1,
+            ">1 ",
+            doc.GetLineText(1),
+            new Point(0, 0),
+            "Cascadia Code",
+            13,
+            neutralBrush);
+
+        Assert.Contains(drawingContext.Texts, item => item.text == ">1 " && ReferenceEquals(item.brush, neutralBrush));
+        Assert.Contains(drawingContext.Texts, item => item.text == "alpha" && ReferenceEquals(item.brush, keywordBrush));
+        Assert.Contains(drawingContext.Texts, item => item.text == " beta" && ReferenceEquals(item.brush, stringBrush));
+    }
+
+    [Fact]
     public void BracketMatcher_FindMatchingBracketPair_WhenCaretAfterOpen_ShouldReturnPair()
     {
         var doc = new TextDocument("a(b)c");
@@ -686,5 +722,37 @@ public class EditorFeatureTests
 
             return ([new SyntaxToken(0, lineText.Length, TokenClassification.PlainText)], null);
         }
+    }
+
+    private sealed class PreviewSyntaxHighlighter : ISyntaxHighlighter
+    {
+        public object? GetInitialState() => null;
+
+        public (SyntaxToken[] tokens, object? stateAtLineEnd) HighlightLine(int lineNumber, string lineText, object? stateAtLineStart)
+        {
+            return ([
+                new SyntaxToken(0, 5, TokenClassification.Keyword),
+                new SyntaxToken(5, lineText.Length - 5, TokenClassification.String),
+            ], null);
+        }
+    }
+
+    private sealed class PreviewRecordingDrawingContext : DrawingContextAdapter
+    {
+        public List<(string text, Brush? brush)> Texts { get; } = [];
+
+        public override void DrawLine(Pen pen, Point point0, Point point1) { }
+        public override void DrawRectangle(Brush? brush, Pen? pen, Rect rectangle) { }
+        public override void DrawRoundedRectangle(Brush? brush, Pen? pen, Rect rectangle, double radiusX, double radiusY) { }
+        public override void DrawEllipse(Brush? brush, Pen? pen, Point center, double radiusX, double radiusY) { }
+        public override void DrawText(FormattedText formattedText, Point origin) => Texts.Add((formattedText.Text, formattedText.Foreground));
+        public override void DrawGeometry(Brush? brush, Pen? pen, Geometry geometry) { }
+        public override void DrawImage(ImageSource imageSource, Rect rectangle) { }
+        public override void DrawBackdropEffect(Rect rectangle, IBackdropEffect effect, CornerRadius cornerRadius) { }
+        public override void PushTransform(Transform transform) { }
+        public override void PushClip(Geometry clipGeometry) { }
+        public override void PushOpacity(double opacity) { }
+        public override void Pop() { }
+        public override void Close() { }
     }
 }

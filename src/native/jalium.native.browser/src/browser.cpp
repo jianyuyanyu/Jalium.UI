@@ -26,16 +26,76 @@ using GetAvailableCoreWebView2BrowserVersionStringFn = HRESULT(STDAPICALLTYPE*)(
 HMODULE g_webview2_loader = nullptr;
 CreateCoreWebView2EnvironmentWithOptionsFn g_create_environment = nullptr;
 GetAvailableCoreWebView2BrowserVersionStringFn g_get_browser_version = nullptr;
+SRWLOCK g_webview2_loader_lock = SRWLOCK_INIT;
+
+HMODULE LoadSiblingLibrary(const wchar_t* library_name) noexcept {
+    static const unsigned char module_anchor = 0;
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&module_anchor),
+            &module)) {
+        return nullptr;
+    }
+
+    wchar_t module_path[32768] = {};
+    const DWORD length = GetModuleFileNameW(
+        module,
+        module_path,
+        static_cast<DWORD>(sizeof(module_path) / sizeof(module_path[0])));
+    if (length == 0 ||
+        length >= sizeof(module_path) / sizeof(module_path[0])) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return nullptr;
+    }
+
+    size_t directory_length = length;
+    while (directory_length > 0 &&
+           module_path[directory_length - 1] != L'\\' &&
+           module_path[directory_length - 1] != L'/') {
+        --directory_length;
+    }
+    const size_t library_name_length = wcslen(library_name);
+    if (directory_length == 0 ||
+        directory_length + library_name_length >=
+            sizeof(module_path) / sizeof(module_path[0])) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return nullptr;
+    }
+
+    std::memcpy(
+        module_path + directory_length,
+        library_name,
+        (library_name_length + 1) * sizeof(wchar_t));
+    return LoadLibraryExW(
+        module_path,
+        nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+}
 
 HRESULT EnsureWebView2Loader() {
+    AcquireSRWLockExclusive(&g_webview2_loader_lock);
+    struct UnlockOnExit {
+        ~UnlockOnExit() { ReleaseSRWLockExclusive(&g_webview2_loader_lock); }
+    } unlock;
+
     if (g_webview2_loader && g_create_environment && g_get_browser_version) return S_OK;
-    g_webview2_loader = LoadLibraryW(L"WebView2Loader.dll");
+    g_webview2_loader = LoadSiblingLibrary(L"WebView2Loader.dll");
     if (!g_webview2_loader) return HRESULT_FROM_WIN32(GetLastError());
     g_create_environment = reinterpret_cast<CreateCoreWebView2EnvironmentWithOptionsFn>(
         GetProcAddress(g_webview2_loader, "CreateCoreWebView2EnvironmentWithOptions"));
     g_get_browser_version = reinterpret_cast<GetAvailableCoreWebView2BrowserVersionStringFn>(
         GetProcAddress(g_webview2_loader, "GetAvailableCoreWebView2BrowserVersionString"));
-    return (g_create_environment && g_get_browser_version) ? S_OK : E_NOINTERFACE;
+    if (!g_create_environment || !g_get_browser_version) {
+        FreeLibrary(g_webview2_loader);
+        g_webview2_loader = nullptr;
+        g_create_environment = nullptr;
+        g_get_browser_version = nullptr;
+        return E_NOINTERFACE;
+    }
+    return S_OK;
 }
 #endif
 

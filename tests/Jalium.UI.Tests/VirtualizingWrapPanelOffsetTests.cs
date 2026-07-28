@@ -240,6 +240,229 @@ public class VirtualizingWrapPanelOffsetTests
         Assert.True(panel.IsArrangeValid);
     }
 
+    [Fact]
+    public void AncestorScrollViewerMode_ReportsFullExtentButRealizesOnlyItsViewport()
+    {
+        var control = new TrackingWrapItemsControl
+        {
+            Width = Viewport.Width,
+            ItemsSource = Enumerable.Range(0, 100)
+                .Select(index => $"Item {index}")
+                .ToList(),
+        };
+        VirtualizingPanel.SetCacheLength(
+            control,
+            new VirtualizationCacheLength(0));
+
+        var panel = Assert.IsType<VirtualizingWrapPanel>(
+            control.Host);
+        panel.ItemWidth = 80;
+        panel.ItemHeight = 40;
+        panel.UseAncestorScrollViewer = true;
+
+        var owner = new ScrollViewer
+        {
+            Width = Viewport.Width,
+            Height = Viewport.Height,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Content = control
+        };
+
+        owner.Measure(Viewport);
+        owner.Arrange(
+            new Rect(0, 0, Viewport.Width, Viewport.Height));
+
+        Assert.Equal(1000, panel.ExtentHeight, precision: 3);
+        Assert.Equal(1000, control.DesiredSize.Height, precision: 3);
+        Assert.InRange(panel.Children.Count, 1, 16);
+        Assert.Null(
+            control.ItemContainerGenerator.ContainerFromIndex(99));
+    }
+
+    [Fact]
+    public void AncestorScrollViewerMode_SmallScrollInsideRealizedWindow_DoesNotRemeasure()
+    {
+        var control = new TrackingWrapItemsControl
+        {
+            Width = Viewport.Width,
+            ItemsSource = Enumerable.Range(0, 100)
+                .Select(index => $"Item {index}")
+                .ToList(),
+        };
+        VirtualizingPanel.SetCacheLength(
+            control,
+            new VirtualizationCacheLength(0));
+
+        var panel = Assert.IsType<VirtualizingWrapPanel>(
+            control.Host);
+        panel.ItemWidth = 80;
+        panel.ItemHeight = 40;
+        panel.UseAncestorScrollViewer = true;
+
+        var owner = new ScrollViewer
+        {
+            Width = Viewport.Width,
+            Height = Viewport.Height,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Content = control
+        };
+
+        owner.Measure(Viewport);
+        owner.Arrange(
+            new Rect(0, 0, Viewport.Width, Viewport.Height));
+        panel.Measure(
+            new Size(Viewport.Width, double.PositiveInfinity));
+        panel.Arrange(
+            new Rect(
+                0,
+                0,
+                Viewport.Width,
+                panel.ExtentHeight));
+
+        var createdBeforeScroll = control.ContainerCreateCount;
+        Assert.True(panel.IsMeasureValid);
+        Assert.True(panel.IsArrangeValid);
+
+        // The initial realization includes every row intersecting offsets
+        // 0..120. Moving by one pixel changes only the ancestor's physical
+        // translation; no new item is needed and the panel's full-content
+        // child coordinates remain valid.
+        owner.ScrollToVerticalOffset(1);
+
+        Assert.Equal(1, panel.VerticalOffset, precision: 3);
+        Assert.True(panel.IsMeasureValid);
+        Assert.True(panel.IsArrangeValid);
+        Assert.Equal(
+            createdBeforeScroll,
+            control.ContainerCreateCount);
+
+        // Crossing into a row that was not realized by the initial viewport
+        // still has to schedule a measure so that the missing containers can
+        // be generated before the next frame.
+        owner.ScrollToVerticalOffset(40);
+
+        Assert.Equal(40, panel.VerticalOffset, precision: 3);
+        Assert.False(panel.IsMeasureValid);
+    }
+
+    [Fact]
+    public void AncestorScrollViewerMode_AdvancesCacheBeforeViewportNeedsTheNextRow()
+    {
+        var control = new TrackingWrapItemsControl
+        {
+            Width = Viewport.Width,
+            ItemsSource = Enumerable.Range(0, 100)
+                .Select(index => $"Item {index}")
+                .ToList(),
+        };
+        VirtualizingPanel.SetCacheLength(
+            control,
+            new VirtualizationCacheLength(0, 40));
+        VirtualizingPanel.SetCacheLengthUnit(
+            control,
+            VirtualizationCacheLengthUnit.Pixel);
+
+        var panel = Assert.IsType<VirtualizingWrapPanel>(
+            control.Host);
+        panel.ItemWidth = 80;
+        panel.ItemHeight = 40;
+        panel.UseAncestorScrollViewer = true;
+
+        var owner = new ScrollViewer
+        {
+            Width = Viewport.Width,
+            Height = Viewport.Height,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Content = control
+        };
+
+        owner.Measure(Viewport);
+        owner.Arrange(
+            new Rect(0, 0, Viewport.Width, Viewport.Height));
+        panel.Measure(
+            new Size(Viewport.Width, double.PositiveInfinity));
+        panel.Arrange(
+            new Rect(
+                0,
+                0,
+                Viewport.Width,
+                panel.ExtentHeight));
+
+        Assert.NotNull(
+            control.ItemContainerGenerator.ContainerFromIndex(16));
+        Assert.Null(
+            control.ItemContainerGenerator.ContainerFromIndex(20));
+        Assert.True(panel.IsMeasureValid);
+
+        // Rows 1..4 cover the viewport at offset 40 and are already realized.
+        // Row 5 has only entered the forward cache, so the panel should schedule
+        // its creation now instead of waiting for it to become visible.
+        owner.ScrollToVerticalOffset(40);
+
+        Assert.Equal(40, panel.VerticalOffset, precision: 3);
+        Assert.False(panel.IsMeasureValid);
+        Assert.Null(
+            control.ItemContainerGenerator.ContainerFromIndex(20));
+    }
+
+    [Fact]
+    public void AncestorScrollViewerMode_RecyclesToAJumpedPhysicalViewport()
+    {
+        var control = new TrackingWrapItemsControl
+        {
+            Width = Viewport.Width,
+            ItemsSource = Enumerable.Range(0, 100)
+                .Select(index => $"Item {index}")
+                .ToList(),
+        };
+        VirtualizingPanel.SetCacheLength(
+            control,
+            new VirtualizationCacheLength(0));
+
+        var panel = Assert.IsType<VirtualizingWrapPanel>(
+            control.Host);
+        panel.ItemWidth = 80;
+        panel.ItemHeight = 40;
+        panel.UseAncestorScrollViewer = true;
+
+        var owner = new ScrollViewer
+        {
+            Width = Viewport.Width,
+            Height = Viewport.Height,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Content = control
+        };
+
+        owner.Measure(Viewport);
+        owner.Arrange(
+            new Rect(0, 0, Viewport.Width, Viewport.Height));
+        var createdBeforeJump = control.ContainerCreateCount;
+        Assert.Equal(1000, owner.ExtentHeight, precision: 3);
+
+        owner.ScrollToVerticalOffset(800);
+        Assert.Equal(800, owner.VerticalOffset, precision: 3);
+        owner.Arrange(
+            new Rect(0, 0, Viewport.Width, Viewport.Height));
+        panel.Measure(
+            new Size(Viewport.Width, double.PositiveInfinity));
+        panel.Arrange(
+            new Rect(
+                0,
+                0,
+                Viewport.Width,
+                panel.ExtentHeight));
+
+        Assert.Equal(800, panel.VerticalOffset, precision: 3);
+        Assert.NotNull(
+            control.ItemContainerGenerator.ContainerFromIndex(80));
+        Assert.Equal(createdBeforeJump, control.ContainerCreateCount);
+        Assert.InRange(panel.Children.Count, 1, 16);
+    }
+
     private static (TrackingWrapItemsControl Control, VirtualizingWrapPanel Panel) CreatePanel()
     {
         var control = new TrackingWrapItemsControl

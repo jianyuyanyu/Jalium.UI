@@ -1719,6 +1719,15 @@ uint32_t VulkanGlyphAtlas::GenerateGlyphs(
                     ++glyphRasterMissesThisRun;
                     continue;
                 }
+                // A full atlas reports the glyph as temporarily invalid while
+                // scheduling a grow/reset. Never memoize that empty result:
+                // GrowAtlas preserves cache_ entries, so an invalid entry here
+                // would survive the generation bump and remain a permanent
+                // missing character after the atlas has gained capacity.
+                if (!val.entry.valid && (needsGrow_ || needsReset_)) {
+                    ++glyphRasterMissesThisRun;
+                    continue;
+                }
                 val.fontFaceRef = run.fontFace;
                 it = cache_.emplace(key, std::move(val)).first;
                 ++glyphRasterMissesThisRun;

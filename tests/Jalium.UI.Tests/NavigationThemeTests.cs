@@ -2,6 +2,7 @@ using System.Reflection;
 using Jalium.UI;
 using Jalium.UI.Controls;
 using Jalium.UI.Controls.Themes;
+using Jalium.UI.Markup;
 
 namespace Jalium.UI.Tests;
 
@@ -102,6 +103,31 @@ public class NavigationThemeTests
 
             Assert.Same(app.Resources["TextSecondary"], foregroundMethod!.Invoke(header, null));
             Assert.Same(app.Resources["ControlBorder"], backgroundMethod!.Invoke(separator, null));
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Fact]
+    public void NavigationView_PaneScrollViewer_ShouldUseLayoutRounding()
+    {
+        ResetApplicationState();
+        ThemeLoader.Initialize();
+        var app = new Application();
+
+        try
+        {
+            var navigationView = new NavigationView();
+            navigationView.Style =
+                Assert.IsType<Style>(app.Resources[typeof(NavigationView)]);
+            navigationView.ApplyTemplate();
+
+            var paneScrollViewer = Assert.IsType<ScrollViewer>(
+                navigationView.FindName("PART_PaneScrollViewer"));
+
+            Assert.True(paneScrollViewer.UseLayoutRounding);
         }
         finally
         {

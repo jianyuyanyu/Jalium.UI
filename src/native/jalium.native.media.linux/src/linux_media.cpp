@@ -153,9 +153,13 @@ jalium_media_status_t ReadFile(
         return JALIUM_MEDIA_E_IO;
     }
     const long length = std::ftell(file);
-    if (length <= 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+    if (length <= 0 ||
+        static_cast<uint64_t>(length) >
+            JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES ||
+        std::fseek(file, 0, SEEK_SET) != 0) {
         std::fclose(file);
-        return JALIUM_MEDIA_E_IO;
+        return length > 0 ? JALIUM_MEDIA_E_OUT_OF_MEMORY
+                          : JALIUM_MEDIA_E_IO;
     }
     try {
         bytes.resize(static_cast<size_t>(length));
@@ -200,6 +204,13 @@ uint32_t ReadLittleEndian24(const uint8_t* value) noexcept
     return static_cast<uint32_t>(value[0]) |
            (static_cast<uint32_t>(value[1]) << 8) |
            (static_cast<uint32_t>(value[2]) << 16);
+}
+
+uint16_t ReadLittleEndian16(const uint8_t* value) noexcept
+{
+    return static_cast<uint16_t>(
+        static_cast<uint16_t>(value[0]) |
+        (static_cast<uint16_t>(value[1]) << 8));
 }
 
 uint32_t ReadLittleEndian32(const uint8_t* value) noexcept
@@ -311,16 +322,18 @@ bool ParseAnimatedWebP(
 }
 
 struct WebPRuntime {
+    using GetInfo = int (*)(const uint8_t*, size_t, int*, int*);
     using DecodeRgba = uint8_t* (*)(const uint8_t*, size_t, int*, int*);
     using Free = void (*)(void*);
 
     void* library = nullptr;
+    GetInfo get_info = nullptr;
     DecodeRgba decode_rgba = nullptr;
     Free free = nullptr;
 
     bool IsAvailable() const noexcept
     {
-        return library && decode_rgba && free;
+        return library && get_info && decode_rgba && free;
     }
 };
 
@@ -337,11 +350,13 @@ const WebPRuntime& GetWebPRuntime() noexcept
             if (value.library) break;
         }
         if (value.library) {
+            value.get_info = reinterpret_cast<WebPRuntime::GetInfo>(
+                dlsym(value.library, "WebPGetInfo"));
             value.decode_rgba = reinterpret_cast<WebPRuntime::DecodeRgba>(
                 dlsym(value.library, "WebPDecodeRGBA"));
             value.free = reinterpret_cast<WebPRuntime::Free>(
                 dlsym(value.library, "WebPFree"));
-            if (!value.decode_rgba || !value.free) {
+            if (!value.get_info || !value.decode_rgba || !value.free) {
                 dlclose(value.library);
                 value = {};
             }
@@ -435,37 +450,45 @@ jalium_media_status_t DecodeWebPFrame(
         std::vector<uint8_t> frame_file;
 
         if (!animated) {
+            int inspected_width = 0;
+            int inspected_height = 0;
+            if (!webp.get_info(
+                    data, size, &inspected_width, &inspected_height) ||
+                inspected_width <= 0 || inspected_height <= 0) {
+                return JALIUM_MEDIA_E_DECODE_FAILED;
+            }
+            uint32_t inspected_stride = 0;
+            size_t inspected_size = 0;
+            if (!jalium_media_compute_bgra_layout(
+                    static_cast<uint32_t>(inspected_width),
+                    static_cast<uint32_t>(inspected_height),
+                    &inspected_stride,
+                    &inspected_size)) {
+                return JALIUM_MEDIA_E_OUT_OF_MEMORY;
+            }
+
             int decoded_width = 0;
             int decoded_height = 0;
             uint8_t* decoded = webp.decode_rgba(
                 data, size, &decoded_width, &decoded_height);
-            if (!decoded || decoded_width <= 0 || decoded_height <= 0) {
+            if (!decoded ||
+                decoded_width != inspected_width ||
+                decoded_height != inspected_height) {
                 if (decoded) webp.free(decoded);
                 return JALIUM_MEDIA_E_DECODE_FAILED;
             }
             canvas_width = static_cast<uint32_t>(decoded_width);
             canvas_height = static_cast<uint32_t>(decoded_height);
-            if (canvas_height > std::numeric_limits<size_t>::max() /
-                    (static_cast<size_t>(canvas_width) * 4u)) {
-                webp.free(decoded);
-                return JALIUM_MEDIA_E_OUT_OF_MEMORY;
-            }
-            const size_t byte_count = static_cast<size_t>(canvas_width) *
-                canvas_height * 4u;
-            canvas.assign(decoded, decoded + byte_count);
+            canvas.assign(decoded, decoded + inspected_size);
             webp.free(decoded);
         } else {
             canvas_width = animation.canvas_width;
             canvas_height = animation.canvas_height;
-            if (canvas_width > std::numeric_limits<size_t>::max() / 4u ||
-                canvas_height > std::numeric_limits<size_t>::max() /
-                    (static_cast<size_t>(canvas_width) * 4u)) {
-                return JALIUM_MEDIA_E_OUT_OF_MEMORY;
-            }
-            const size_t canvas_size = static_cast<size_t>(canvas_width) *
-                canvas_height * 4u;
-            // Keep untrusted image allocations bounded even on 64-bit hosts.
-            if (canvas_size > 1024u * 1024u * 1024u) {
+            uint32_t canvas_stride = 0;
+            size_t canvas_size = 0;
+            if (!jalium_media_compute_bgra_layout(
+                    canvas_width, canvas_height,
+                    &canvas_stride, &canvas_size)) {
                 return JALIUM_MEDIA_E_OUT_OF_MEMORY;
             }
             canvas.assign(canvas_size, 0);
@@ -517,12 +540,12 @@ jalium_media_status_t DecodeWebPFrame(
             }
         }
 
-        const uint32_t stride = jalium_media_compute_stride(canvas_width);
-        if (stride != canvas_width * 4u ||
-            canvas_height > std::numeric_limits<size_t>::max() / stride) {
+        uint32_t stride = 0;
+        size_t output_size = 0;
+        if (!jalium_media_compute_bgra_layout(
+                canvas_width, canvas_height, &stride, &output_size)) {
             return JALIUM_MEDIA_E_OUT_OF_MEMORY;
         }
-        const size_t output_size = static_cast<size_t>(stride) * canvas_height;
         auto* output = static_cast<uint8_t*>(
             jalium_media_aligned_alloc(output_size));
         if (!output) return JALIUM_MEDIA_E_OUT_OF_MEMORY;
@@ -595,26 +618,34 @@ jalium_media_status_t DecodeStaticPng(
     int width = 0;
     int height = 0;
     int components = 0;
-    stbi_uc* decoded = stbi_load_from_memory(
-        data, static_cast<int>(size), &width, &height, &components, 4);
-    if (!decoded || width <= 0 || height <= 0) {
-        stbi_image_free(decoded);
+    if (!stbi_info_from_memory(
+            data, static_cast<int>(size), &width, &height, &components) ||
+        width <= 0 || height <= 0) {
         return JALIUM_MEDIA_E_DECODE_FAILED;
     }
-    if (static_cast<uint64_t>(width) * 4u >
-            std::numeric_limits<uint32_t>::max()) {
-        stbi_image_free(decoded);
+
+    uint32_t stride = 0;
+    size_t output_size = 0;
+    if (!jalium_media_compute_bgra_layout(
+            static_cast<uint32_t>(width),
+            static_cast<uint32_t>(height),
+            &stride,
+            &output_size)) {
         return JALIUM_MEDIA_E_OUT_OF_MEMORY;
+    }
+
+    int decoded_width = 0;
+    int decoded_height = 0;
+    stbi_uc* decoded = stbi_load_from_memory(
+        data, static_cast<int>(size),
+        &decoded_width, &decoded_height, &components, 4);
+    if (!decoded || decoded_width != width || decoded_height != height) {
+        stbi_image_free(decoded);
+        return JALIUM_MEDIA_E_DECODE_FAILED;
     }
 
     const uint32_t output_width = static_cast<uint32_t>(width);
     const uint32_t output_height = static_cast<uint32_t>(height);
-    const uint32_t stride = jalium_media_compute_stride(output_width);
-    if (output_height > std::numeric_limits<size_t>::max() / stride) {
-        stbi_image_free(decoded);
-        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
-    }
-    const size_t output_size = static_cast<size_t>(stride) * output_height;
     auto* output = static_cast<uint8_t*>(
         jalium_media_aligned_alloc(output_size));
     if (!output) {
@@ -638,6 +669,95 @@ jalium_media_status_t DecodeStaticPng(
     return JALIUM_MEDIA_OK;
 }
 
+bool InspectGif(
+    const uint8_t* data,
+    size_t size,
+    uint32_t& width,
+    uint32_t& height,
+    uint32_t& frame_count,
+    size_t& frame_size) noexcept
+{
+    width = 0;
+    height = 0;
+    frame_count = 0;
+    frame_size = 0;
+    if (!IsGif(data, size) || size < 13) return false;
+
+    width = ReadLittleEndian16(data + 6);
+    height = ReadLittleEndian16(data + 8);
+    uint32_t stride = 0;
+    if (!jalium_media_compute_bgra_layout(
+            width, height, &stride, &frame_size)) {
+        return false;
+    }
+
+    size_t offset = 13;
+    const uint8_t logical_packed = data[10];
+    if ((logical_packed & 0x80u) != 0) {
+        const size_t table_size =
+            3u * (static_cast<size_t>(2u) << (logical_packed & 0x07u));
+        if (table_size > size - offset) return false;
+        offset += table_size;
+    }
+
+    auto skip_sub_blocks = [&](size_t& position) noexcept {
+        while (position < size) {
+            const size_t block_size = data[position++];
+            if (block_size == 0) return true;
+            if (block_size > size - position) return false;
+            position += block_size;
+        }
+        return false;
+    };
+
+    bool saw_trailer = false;
+    while (offset < size) {
+        const uint8_t marker = data[offset++];
+        if (marker == 0x3bu) {
+            saw_trailer = true;
+            break;
+        }
+        if (marker == 0x21u) {
+            if (offset >= size) return false;
+            ++offset; // extension label
+            if (!skip_sub_blocks(offset)) return false;
+            continue;
+        }
+        if (marker != 0x2cu || size - offset < 9) return false;
+
+        const uint32_t left = ReadLittleEndian16(data + offset);
+        const uint32_t top = ReadLittleEndian16(data + offset + 2);
+        const uint32_t frame_width = ReadLittleEndian16(data + offset + 4);
+        const uint32_t frame_height = ReadLittleEndian16(data + offset + 6);
+        const uint8_t image_packed = data[offset + 8];
+        offset += 9;
+        if (frame_width == 0 || frame_height == 0 ||
+            left > width || top > height ||
+            frame_width > width - left || frame_height > height - top) {
+            return false;
+        }
+        if ((image_packed & 0x80u) != 0) {
+            const size_t table_size =
+                3u * (static_cast<size_t>(2u) << (image_packed & 0x07u));
+            if (table_size > size - offset) return false;
+            offset += table_size;
+        }
+        if (offset >= size) return false;
+        ++offset; // LZW minimum code size
+        if (!skip_sub_blocks(offset) ||
+            frame_count == std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        ++frame_count;
+        if (frame_size >
+            JALIUM_MEDIA_MAX_PIXEL_BUFFER_BYTES / frame_count) {
+            return false;
+        }
+    }
+
+    return saw_trailer && frame_count != 0;
+}
+
 jalium_media_status_t DecodeGifFrame(
     const uint8_t* data,
     size_t size,
@@ -651,6 +771,17 @@ jalium_media_status_t DecodeGifFrame(
         return JALIUM_MEDIA_E_OUT_OF_MEMORY;
     }
 
+    uint32_t inspected_width = 0;
+    uint32_t inspected_height = 0;
+    uint32_t inspected_frame_count = 0;
+    size_t frame_size = 0;
+    if (!InspectGif(
+            data, size,
+            inspected_width, inspected_height,
+            inspected_frame_count, frame_size)) {
+        return JALIUM_MEDIA_E_DECODE_FAILED;
+    }
+
     int* delays = nullptr;
     int width = 0;
     int height = 0;
@@ -659,7 +790,11 @@ jalium_media_status_t DecodeGifFrame(
     stbi_uc* frames = stbi_load_gif_from_memory(
         data, static_cast<int>(size), &delays, &width, &height,
         &frame_count, &components, 4);
-    if (!frames || width <= 0 || height <= 0 || frame_count <= 0) {
+    if (!frames ||
+        width != static_cast<int>(inspected_width) ||
+        height != static_cast<int>(inspected_height) ||
+        frame_count <= 0 ||
+        static_cast<uint32_t>(frame_count) != inspected_frame_count) {
         stbi_image_free(frames);
         stbi_image_free(delays);
         return JALIUM_MEDIA_E_DECODE_FAILED;
@@ -677,10 +812,9 @@ jalium_media_status_t DecodeGifFrame(
         return JALIUM_MEDIA_E_INVALID_ARG;
     }
 
-    const uint32_t output_width = static_cast<uint32_t>(width);
-    const uint32_t output_height = static_cast<uint32_t>(height);
+    const uint32_t output_width = inspected_width;
+    const uint32_t output_height = inspected_height;
     const uint32_t stride = jalium_media_compute_stride(output_width);
-    const size_t frame_size = static_cast<size_t>(stride) * output_height;
     auto* output = static_cast<uint8_t*>(jalium_media_aligned_alloc(frame_size));
     if (!output) {
         stbi_image_free(frames);
@@ -949,8 +1083,11 @@ jalium_media_status_t CopyVideoSample(
 
     width = GST_VIDEO_INFO_WIDTH(&info);
     height = GST_VIDEO_INFO_HEIGHT(&info);
-    stride = jalium_media_compute_stride(width);
-    if (width == 0 || height == 0) return JALIUM_MEDIA_E_DECODE_FAILED;
+    size_t size = 0;
+    if (!jalium_media_compute_bgra_layout(
+            width, height, &stride, &size)) {
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
+    }
 
     GstVideoFrame frame;
     if (!gst_video_frame_map(&frame, &info, buffer, GST_MAP_READ)) {
@@ -960,7 +1097,13 @@ jalium_media_status_t CopyVideoSample(
     const auto* source = static_cast<const uint8_t*>(
         GST_VIDEO_FRAME_PLANE_DATA(&frame, 0));
     const int source_stride = GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0);
-    const size_t size = static_cast<size_t>(stride) * height;
+    if (!source ||
+        source_stride == std::numeric_limits<int>::min() ||
+        static_cast<size_t>(
+            source_stride < 0 ? -source_stride : source_stride) < stride) {
+        gst_video_frame_unmap(&frame);
+        return JALIUM_MEDIA_E_DECODE_FAILED;
+    }
     try {
         pixels.resize(size);
     } catch (...) {
@@ -1457,7 +1600,13 @@ bool ParseApng(
 
         const uint32_t canvas_width = ReadBigEndian32(ihdr);
         const uint32_t canvas_height = ReadBigEndian32(ihdr + 4);
-        if (canvas_width == 0 || canvas_height == 0) return false;
+        uint32_t canvas_stride = 0;
+        size_t canvas_size = 0;
+        if (!jalium_media_compute_bgra_layout(
+                canvas_width, canvas_height,
+                &canvas_stride, &canvas_size)) {
+            return false;
+        }
         for (const auto& frame : frames) {
             if (frame.width == 0 || frame.height == 0 ||
                 frame.x > canvas_width || frame.y > canvas_height ||
@@ -1586,12 +1735,13 @@ jalium_media_status_t DecodeApngFrame(
 
         const uint32_t canvas_width = ReadBigEndian32(ihdr);
         const uint32_t canvas_height = ReadBigEndian32(ihdr + 4);
-        if (canvas_height > std::numeric_limits<size_t>::max() /
-                                (static_cast<size_t>(canvas_width) * 4)) {
+        uint32_t canvas_stride = 0;
+        size_t canvas_size = 0;
+        if (!jalium_media_compute_bgra_layout(
+                canvas_width, canvas_height,
+                &canvas_stride, &canvas_size)) {
             return JALIUM_MEDIA_E_OUT_OF_MEMORY;
         }
-        const size_t canvas_size =
-            static_cast<size_t>(canvas_width) * canvas_height * 4;
         std::vector<uint8_t> canvas(canvas_size, 0);
         std::vector<uint8_t> restore_canvas;
 
@@ -1629,11 +1779,11 @@ jalium_media_status_t DecodeApngFrame(
         std::memcpy(output, canvas.data(), canvas_size);
         if (format == JALIUM_PF_BGRA8) {
             jalium_media_swap_rb_inplace(
-                output, canvas_width, canvas_height, canvas_width * 4);
+                output, canvas_width, canvas_height, canvas_stride);
         }
         out_image->width = canvas_width;
         out_image->height = canvas_height;
-        out_image->stride_bytes = canvas_width * 4;
+        out_image->stride_bytes = canvas_stride;
         out_image->format = format;
         out_image->pixels = output;
         out_image->_reserved = output;
@@ -2639,6 +2789,8 @@ JALIUM_MEDIA_API jalium_media_status_t jalium_image_decode_memory(
     jalium_image_t* out_image)
 {
     if (!data || size == 0 || !out_image) return JALIUM_MEDIA_E_INVALID_ARG;
+    if (size > JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES)
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
     if (!IsSupportedFormat(requested_format)) return JALIUM_MEDIA_E_UNSUPPORTED_FORMAT;
     std::memset(out_image, 0, sizeof(*out_image));
     if (IsGif(data, size)) {
@@ -2683,6 +2835,8 @@ JALIUM_MEDIA_API jalium_media_status_t jalium_image_read_dimensions(
 {
     if (!data || size == 0 || !out_width || !out_height)
         return JALIUM_MEDIA_E_INVALID_ARG;
+    if (size > JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES)
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
     jalium_image_t image{};
     const auto status = jalium_image_decode_memory(
         data, size, JALIUM_PF_BGRA8, &image);
@@ -2699,6 +2853,8 @@ JALIUM_MEDIA_API jalium_media_status_t jalium_image_read_frame_count(
 {
     if (!data || size == 0 || !out_frame_count)
         return JALIUM_MEDIA_E_INVALID_ARG;
+    if (size > JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES)
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
     *out_frame_count = 0;
     if (IsGif(data, size)) {
         return DecodeGifFrame(
@@ -2731,6 +2887,8 @@ JALIUM_MEDIA_API jalium_media_status_t jalium_image_decode_frame(
 {
     if (!data || size == 0 || !out_image)
         return JALIUM_MEDIA_E_INVALID_ARG;
+    if (size > JALIUM_MEDIA_MAX_ENCODED_IMAGE_BYTES)
+        return JALIUM_MEDIA_E_OUT_OF_MEMORY;
     if (!IsSupportedFormat(requested_format))
         return JALIUM_MEDIA_E_UNSUPPORTED_FORMAT;
     std::memset(out_image, 0, sizeof(*out_image));

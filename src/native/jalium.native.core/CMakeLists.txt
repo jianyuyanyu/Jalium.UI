@@ -5,6 +5,7 @@ set(HEADERS
     include/jalium_types.h
     include/jalium_backend.h
     include/jalium_internal.h
+    include/jalium_abi_guard.h
     include/jalium_rendering_engine.h
     include/jalium_triangulate.h
     include/jalium_path_stats.h

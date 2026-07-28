@@ -25,6 +25,15 @@
 
 #pragma comment(lib, "d3dcompiler.lib")
 
+// jalium_api.h belongs to jalium.native.core, where JALIUM_API imports core
+// exports for backend consumers. This translation unit also owns a separate
+// P/Invoke surface in jalium.native.d3d12, so its definitions must be exported
+// from this DLL rather than accidentally remaining dllimport declarations.
+#if defined(_WIN32) && !defined(JALIUM_STATIC)
+#undef JALIUM_API
+#define JALIUM_API __declspec(dllexport)
+#endif
+
 using Microsoft::WRL::ComPtr;
 
 // ============================================================================
@@ -35,7 +44,11 @@ namespace {
 
 // Global pipeline context registry
 std::mutex g_pipelineMutex;
-std::unordered_map<void*, jalium::PipelineContext*> g_pipelines;
+struct PipelineRegistryEntry {
+    jalium::PipelineContext* pipeline = nullptr;
+    size_t referenceCount = 0;
+};
+std::unordered_map<void*, PipelineRegistryEntry> g_pipelines;
 
 // Input layout definitions (D3D12_INPUT_ELEMENT_DESC arrays)
 // Must match managed UIInputLayouts exactly.
@@ -383,7 +396,7 @@ PipelineContext* GetPipeline(void* ctx) {
     }
     std::lock_guard lock(g_pipelineMutex);
     auto it = g_pipelines.find(ctx);
-    auto* result = (it != g_pipelines.end()) ? it->second : nullptr;
+    auto* result = (it != g_pipelines.end()) ? it->second.pipeline : nullptr;
     g_cachedPipelineKey = ctx;
     g_cachedPipelineValue = result;
     g_cachedGeneration = g_pipelineGeneration.load(std::memory_order_acquire);
@@ -393,6 +406,9 @@ PipelineContext* GetPipeline(void* ctx) {
 D3D12Backend* GetD3D12Backend(void* ctx) {
     if (!ctx) return nullptr;
     auto* context = reinterpret_cast<Context*>(ctx);
+    if (context->GetBackend() != JALIUM_BACKEND_D3D12) {
+        return nullptr;
+    }
     return static_cast<D3D12Backend*>(context->GetBackendImpl());
 }
 
@@ -540,19 +556,28 @@ void PipelineContext::Submit() {
 }
 
 int PipelineContext::AllocateSrvIndex() {
+    std::lock_guard lock(srvAllocationMutex_);
+
     // Prefer recycled indices to avoid exhausting the descriptor heap
     if (!srvFreeList_.empty()) {
         int index = srvFreeList_.top();
         srvFreeList_.pop();
+        srvAllocated_[static_cast<size_t>(index)] = true;
         return index;
     }
     if (nextSrvIndex_ >= static_cast<int>(kPipelineMaxSrvDescriptors))
         return -1;
-    return nextSrvIndex_++;
+    int index = nextSrvIndex_++;
+    srvAllocated_[static_cast<size_t>(index)] = true;
+    return index;
 }
 
 void PipelineContext::FreeSrvIndex(int index) {
-    if (index >= 0 && index < nextSrvIndex_) {
+    std::lock_guard lock(srvAllocationMutex_);
+    if (index >= 0 &&
+        index < nextSrvIndex_ &&
+        srvAllocated_[static_cast<size_t>(index)]) {
+        srvAllocated_[static_cast<size_t>(index)] = false;
         srvFreeList_.push(index);
     }
 }
@@ -675,8 +700,15 @@ extern "C" {
 JALIUM_API int jalium_pipeline_init(void* context) {
     if (!context) return E_INVALIDARG;
 
+    std::lock_guard lock(g_pipelineMutex);
+    auto existing = g_pipelines.find(context);
+    if (existing != g_pipelines.end()) {
+        ++existing->second.referenceCount;
+        return S_OK;
+    }
+
     auto* backend = jalium::GetD3D12Backend(context);
-    if (!backend) return E_FAIL;
+    if (!backend || !backend->Initialize()) return E_FAIL;
 
     auto* pipeline = new jalium::PipelineContext(backend);
     if (!pipeline->Initialize()) {
@@ -684,10 +716,12 @@ JALIUM_API int jalium_pipeline_init(void* context) {
         return E_FAIL;
     }
 
-    {
-        std::lock_guard lock(g_pipelineMutex);
-        g_pipelines[context] = pipeline;
-    }
+    g_pipelines.emplace(
+        context,
+        PipelineRegistryEntry {
+            .pipeline = pipeline,
+            .referenceCount = 1,
+        });
 
     return S_OK;
 }
@@ -698,7 +732,12 @@ JALIUM_API void jalium_pipeline_shutdown(void* context) {
         std::lock_guard lock(g_pipelineMutex);
         auto it = g_pipelines.find(context);
         if (it != g_pipelines.end()) {
-            pipeline = it->second;
+            if (it->second.referenceCount > 1) {
+                --it->second.referenceCount;
+                return;
+            }
+
+            pipeline = it->second.pipeline;
             g_pipelines.erase(it);
         }
     }
@@ -764,11 +803,15 @@ JALIUM_API void* jalium_buffer_create_empty(void* context, int size, int usage) 
 
 JALIUM_API void jalium_buffer_update(void* context, void* buffer, int offset, const void* data, int size) {
     (void)context;
-    if (!buffer || !data || size <= 0) return;
+    if (!buffer || !data || offset < 0 || size <= 0) return;
 
-    auto* buf = static_cast<jalium::PipelineBuffer*>(buffer);
-    if (!buf->mappedData) return;
-    if (offset + size > buf->size) return;
+    auto* buf = jalium::TryGetPipelineBuffer(buffer);
+    if (!buf || !buf->mappedData) return;
+
+    // Subtraction after validating the lower bound avoids signed overflow in
+    // offset + size. A negative offset previously wrote before the mapped
+    // allocation, crossing the managed/native ABI as an arbitrary OOB write.
+    if (offset > buf->size || size > buf->size - offset) return;
 
     memcpy(static_cast<uint8_t*>(buf->mappedData) + offset, data, static_cast<size_t>(size));
 }
@@ -777,7 +820,9 @@ JALIUM_API void jalium_buffer_destroy(void* context, void* buffer) {
     (void)context;
     if (!buffer) return;
 
-    auto* buf = static_cast<jalium::PipelineBuffer*>(buffer);
+    auto* buf = jalium::TryGetPipelineBuffer(buffer);
+    if (!buf) return;
+
     if (buf->mappedData) {
         buf->resource->Unmap(0, nullptr);
         buf->mappedData = nullptr;
@@ -787,8 +832,8 @@ JALIUM_API void jalium_buffer_destroy(void* context, void* buffer) {
 
 JALIUM_API void* jalium_buffer_get_mapped_ptr(void* context, void* buffer) {
     (void)context;
-    if (!buffer) return nullptr;
-    return static_cast<jalium::PipelineBuffer*>(buffer)->mappedData;
+    auto* buf = jalium::TryGetPipelineBuffer(buffer);
+    return buf ? buf->mappedData : nullptr;
 }
 
 // ===== Textures =====
@@ -832,8 +877,16 @@ JALIUM_API void* jalium_texture_load(void* context, const char* path, int format
     converter->GetSize(&width, &height);
     if (width == 0 || height == 0) return nullptr;
 
-    std::vector<uint8_t> pixels(width * height * 4);
-    hr = converter->CopyPixels(nullptr, width * 4,
+    jalium::PackedBgraLayout pixelLayout;
+    if (!jalium::TryComputeTightlyPackedBgraLayout(
+            width, height, pixelLayout)) {
+        return nullptr;
+    }
+
+    std::vector<uint8_t> pixels(pixelLayout.packedBytes);
+    hr = converter->CopyPixels(
+        nullptr,
+        static_cast<UINT>(pixelLayout.rowBytes),
         static_cast<UINT>(pixels.size()), pixels.data());
     if (FAILED(hr)) return nullptr;
 
@@ -896,7 +949,7 @@ JALIUM_API void* jalium_texture_load(void* context, const char* path, int format
     hr = staging->Map(0, &readRange, reinterpret_cast<void**>(&mapped));
     if (FAILED(hr)) { delete tex; return nullptr; }
 
-    const UINT srcRowPitch = width * 4;
+    const UINT srcRowPitch = static_cast<UINT>(pixelLayout.rowBytes);
     for (UINT row = 0; row < numRows; ++row) {
         memcpy(
             mapped + footprint.Offset + row * footprint.Footprint.RowPitch,
@@ -1119,8 +1172,8 @@ JALIUM_API void* jalium_texture_create_2d(void* context, int width, int height, 
 }
 
 JALIUM_API void jalium_texture_destroy(void* context, void* texture) {
-    if (!texture) return;
-    auto* tex = static_cast<jalium::PipelineTexture*>(texture);
+    auto* tex = jalium::TryGetPipelineTexture(texture);
+    if (!tex) return;
     // Reclaim the SRV descriptor index so it can be reused
     if (tex->srvIndex >= 0) {
         auto* pipeline = jalium::GetPipeline(context);
@@ -1137,7 +1190,9 @@ JALIUM_API void jalium_bind_vertex_buffer(void* context, void* buffer) {
     auto* pipeline = jalium::GetPipeline(context);
     if (!pipeline || !buffer) return;
 
-    auto* buf = static_cast<jalium::PipelineBuffer*>(buffer);
+    auto* buf = jalium::TryGetPipelineBuffer(buffer);
+    if (!buf) return;
+
     auto* cmdList = pipeline->GetCommandList();
 
     D3D12_VERTEX_BUFFER_VIEW vbv = {};
@@ -1152,7 +1207,9 @@ JALIUM_API void jalium_bind_index_buffer(void* context, void* buffer) {
     auto* pipeline = jalium::GetPipeline(context);
     if (!pipeline || !buffer) return;
 
-    auto* buf = static_cast<jalium::PipelineBuffer*>(buffer);
+    auto* buf = jalium::TryGetPipelineBuffer(buffer);
+    if (!buf) return;
+
     auto* cmdList = pipeline->GetCommandList();
 
     D3D12_INDEX_BUFFER_VIEW ibv = {};
@@ -1167,7 +1224,9 @@ JALIUM_API void jalium_bind_instance_buffer(void* context, void* buffer) {
     auto* pipeline = jalium::GetPipeline(context);
     if (!pipeline || !buffer) return;
 
-    auto* buf = static_cast<jalium::PipelineBuffer*>(buffer);
+    auto* buf = jalium::TryGetPipelineBuffer(buffer);
+    if (!buf) return;
+
     auto* cmdList = pipeline->GetCommandList();
 
     UINT stride = jalium::GetInstanceStride(pipeline->CurrentInputLayout());
@@ -1185,7 +1244,9 @@ JALIUM_API void jalium_bind_uniform_buffer(void* context, void* buffer) {
     auto* pipeline = jalium::GetPipeline(context);
     if (!pipeline || !buffer) return;
 
-    auto* buf = static_cast<jalium::PipelineBuffer*>(buffer);
+    auto* buf = jalium::TryGetPipelineBuffer(buffer);
+    if (!buf) return;
+
     auto* cmdList = pipeline->GetCommandList();
 
     // Bind as root CBV at parameter index 0
@@ -1202,7 +1263,9 @@ JALIUM_API void jalium_bind_texture(void* context, int slot, void* texture) {
     auto* pipeline = jalium::GetPipeline(context);
     if (!pipeline || !texture) return;
 
-    auto* tex = static_cast<jalium::PipelineTexture*>(texture);
+    auto* tex = jalium::TryGetPipelineTexture(texture);
+    if (!tex) return;
+
     if (tex->srvIndex < 0) return;
 
     auto* cmdList = pipeline->GetCommandList();
@@ -1553,11 +1616,20 @@ JALIUM_API int jalium_descriptor_create_srv(void* context, void* resource) {
     if (!pipeline || !resource) return -1;
 
     auto* res = jalium::ExtractD3D12Resource(resource);
+    if (!res) return -1;
+
+    auto resDesc = res->GetDesc();
+    if (resDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        resDesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        return -1;
+    }
+    if (resDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+        resDesc.Width < 4) {
+        return -1;
+    }
 
     int index = pipeline->AllocateSrvIndex();
     if (index < 0) return -1;
-
-    auto resDesc = res->GetDesc();
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -1581,16 +1653,33 @@ JALIUM_API int jalium_descriptor_create_srv(void* context, void* resource) {
 
 JALIUM_API int jalium_descriptor_create_cbv(void* context, void* buffer, int offset, int size) {
     auto* pipeline = jalium::GetPipeline(context);
-    if (!pipeline || !buffer || size <= 0) return -1;
+    if (!pipeline ||
+        !buffer ||
+        offset < 0 ||
+        size <= 0 ||
+        size > D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16 ||
+        (offset & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1)) != 0) {
+        return -1;
+    }
 
-    auto* res = jalium::ExtractD3D12Resource(buffer);
+    auto* pipelineBuffer = jalium::TryGetPipelineBuffer(buffer);
+    if (!pipelineBuffer || !pipelineBuffer->resource) return -1;
+
+    constexpr int alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+    const int alignedSize = (size + alignment - 1) & ~(alignment - 1);
+    if (offset > pipelineBuffer->size ||
+        alignedSize > pipelineBuffer->size - offset) {
+        return -1;
+    }
 
     int index = pipeline->AllocateSrvIndex();
     if (index < 0) return -1;
 
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
-    cbvDesc.BufferLocation = res->GetGPUVirtualAddress() + static_cast<UINT64>(offset);
-    cbvDesc.SizeInBytes    = (static_cast<UINT>(size) + 255) & ~255u; // 256-byte aligned
+    cbvDesc.BufferLocation =
+        pipelineBuffer->resource->GetGPUVirtualAddress() +
+        static_cast<UINT64>(offset);
+    cbvDesc.SizeInBytes = static_cast<UINT>(alignedSize);
 
     pipeline->GetDevice()->CreateConstantBufferView(
         &cbvDesc, pipeline->GetSrvCpuHandle(index));
@@ -1603,11 +1692,21 @@ JALIUM_API int jalium_descriptor_create_uav(void* context, void* resource) {
     if (!pipeline || !resource) return -1;
 
     auto* res = jalium::ExtractD3D12Resource(resource);
+    if (!res) return -1;
+
+    auto resDesc = res->GetDesc();
+    if ((resDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0 ||
+        (resDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+         resDesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)) {
+        return -1;
+    }
+    if (resDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+        resDesc.Width < 4) {
+        return -1;
+    }
 
     int index = pipeline->AllocateSrvIndex();
     if (index < 0) return -1;
-
-    auto resDesc = res->GetDesc();
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
 
@@ -1670,9 +1769,12 @@ JALIUM_API void jalium_cmd_resource_barrier(
     auto* pipeline = jalium::GetPipeline(context);
     if (!pipeline || !resource) return;
 
+    auto* nativeResource = jalium::ExtractD3D12Resource(resource);
+    if (!nativeResource) return;
+
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource   = jalium::ExtractD3D12Resource(resource);
+    barrier.Transition.pResource   = nativeResource;
     barrier.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(stateBefore);
     barrier.Transition.StateAfter  = static_cast<D3D12_RESOURCE_STATES>(stateAfter);
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;

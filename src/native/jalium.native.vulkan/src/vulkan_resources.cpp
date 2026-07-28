@@ -66,15 +66,16 @@ VulkanBitmap::VulkanBitmap(uint32_t width, uint32_t height, std::vector<uint8_t>
 
 bool VulkanBitmap::UpdatePackedPixels(const uint8_t* pixels, uint32_t width, uint32_t height, uint32_t stride)
 {
-    if (!pixels || width == 0 || height == 0 || stride < width * 4u) {
+    PackedBgraLayout layout{};
+    if (!pixels || !TryComputePackedBgraLayout(width, height, stride, layout)) {
         return false;
     }
     if (width != width_ || height != height_) {
         return false;  // Size change requires recreation.
     }
 
-    const size_t rowBytes = static_cast<size_t>(width) * 4u;
-    const size_t requiredSize = rowBytes * height;
+    const size_t rowBytes = layout.rowBytes;
+    const size_t requiredSize = layout.packedBytes;
     auto& current = *pixelData_;
 
     // Memcmp short-circuit — same pattern as D3D12Bitmap. Video frames /

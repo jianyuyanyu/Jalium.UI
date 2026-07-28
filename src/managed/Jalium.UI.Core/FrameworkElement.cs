@@ -19,6 +19,10 @@ namespace Jalium.UI;
 [Markup.XmlLangProperty(nameof(Language))]
 public partial class FrameworkElement : UIElement, IFrameworkInputElement, Markup.IQueryAmbient, ISupportInitialize
 {
+    private static readonly ConditionalWeakTable<
+        Jalium.UI.Threading.Dispatcher,
+        PendingLoadedQueue> PendingLoadedQueues = new();
+
     // Virtualizing panels detach generated containers into a recycle pool and later attach the
     // same retained visual subtree back to the same panel. A normal reparent must recursively
     // refresh styles/resources/bindings, but that work is redundant (and very expensive) when
@@ -1774,15 +1778,7 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
             // state after the first layout pass and this recursively updates descendants.
             if (FrameworkParent?.IsLoaded == true)
             {
-                var dispatcher = Jalium.UI.Threading.Dispatcher.CurrentDispatcher;
-                if (dispatcher != null)
-                {
-                    dispatcher.BeginInvoke(() => SetLoadedState(true));
-                }
-                else
-                {
-                    SetLoadedState(true);
-                }
+                QueueLoadedState();
             }
         }
         else if (oldParent != null)
@@ -1802,6 +1798,64 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
 
             SetLoadedState(false);
         }
+    }
+
+    private void QueueLoadedState()
+    {
+        var dispatcher = Jalium.UI.Threading.Dispatcher.CurrentDispatcher;
+        if (dispatcher == null)
+        {
+            SetLoadedState(true);
+            return;
+        }
+
+        var queue = PendingLoadedQueues.GetValue(
+            dispatcher,
+            static _ => new PendingLoadedQueue());
+        var scheduleDrain = false;
+        lock (queue.SyncRoot)
+        {
+            queue.Elements.Add(this);
+            if (!queue.DrainScheduled)
+            {
+                queue.DrainScheduled = true;
+                scheduleDrain = true;
+            }
+        }
+
+        if (scheduleDrain)
+        {
+            dispatcher.BeginInvoke(
+                Jalium.UI.Threading.DispatcherPriority.Loaded,
+                () => DrainLoadedQueue(queue));
+        }
+    }
+
+    private static void DrainLoadedQueue(PendingLoadedQueue queue)
+    {
+        FrameworkElement[] elements;
+        lock (queue.SyncRoot)
+        {
+            elements = queue.Elements.ToArray();
+            queue.Elements.Clear();
+            queue.DrainScheduled = false;
+        }
+
+        foreach (var element in elements)
+        {
+            if (element.FrameworkParent?.IsLoaded == true)
+            {
+                element.SetLoadedState(true);
+            }
+        }
+    }
+
+    private sealed class PendingLoadedQueue
+    {
+        internal object SyncRoot { get; } = new();
+        internal HashSet<FrameworkElement> Elements { get; } =
+            new(ReferenceEqualityComparer.Instance);
+        internal bool DrainScheduled { get; set; }
     }
 
     /// <summary>

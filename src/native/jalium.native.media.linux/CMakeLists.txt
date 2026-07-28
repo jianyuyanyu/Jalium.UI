@@ -79,6 +79,7 @@ if(JALIUM_MEDIA_LINUX_BUILD_TESTS AND NOT JALIUM_BUILD_STATIC)
         tests/linux_media_smoke.cpp)
     target_include_directories(jalium.native.media.linux.tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../jalium.native.media.core/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../jalium.native.media.android/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../jalium.native.core/include)
     target_link_libraries(jalium.native.media.linux.tests
         PRIVATE
@@ -122,4 +123,22 @@ if(JALIUM_MEDIA_LINUX_BUILD_TESTS AND NOT JALIUM_BUILD_STATIC)
             jalium.native.media.linux.real-h264-http-multitrack
             PROPERTIES TIMEOUT 90)
     endif()
+endif()
+
+option(
+    JALIUM_MEDIA_LINUX_BUILD_BENCHMARKS
+    "Build Linux native media performance benchmarks"
+    OFF)
+if(JALIUM_MEDIA_LINUX_BUILD_BENCHMARKS AND NOT JALIUM_BUILD_STATIC)
+    add_executable(jalium.native.media.audio-open-benchmark
+        tests/audio_open_benchmark.cpp)
+    target_include_directories(
+        jalium.native.media.audio-open-benchmark
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../jalium.native.media.core/include)
+    target_link_libraries(
+        jalium.native.media.audio-open-benchmark
+        PRIVATE
+            jalium.native.media.linux
+            jalium.native.media.core)
 endif()

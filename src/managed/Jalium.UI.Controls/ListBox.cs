@@ -105,7 +105,7 @@ public class ListBox : Selector
     public ListBox()
     {
         _selectedItems = (List<object>)SelectedItemsImpl;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
 
         if (ItemsPanel == null)
         {
@@ -1173,7 +1173,7 @@ public class ListBoxItem : ContentControl
         // ContentPresenter handles displaying string/object content
         UseTemplateContentManagement();
 
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         Focusable = true;
         // Register input event handlers
         AddHandler(MouseDownEvent, new MouseButtonEventHandler(OnMouseDownHandler));

@@ -42,6 +42,38 @@ public sealed class D3D12RetainedLayerParityTests
         return pixels;
     }
 
+    private static byte[] RenderMsaaPath(
+        RenderContext context,
+        nint hwnd,
+        NativeBrush brush,
+        bool clipToDamage)
+    {
+        using var rt = context.CreateRenderTarget(hwnd, Width, Height);
+        Assert.True(rt.IsValid);
+        Assert.Equal(RenderingEngine.Impeller, rt.RenderingEngine);
+        rt.SetPathMsaaSampleCount(4);
+
+        var pixels = new byte[Width * Height * 4];
+        Assert.True(rt.TryBeginDraw());
+        rt.Clear(0.12f, 0.12f, 0.18f);
+        if (clipToDamage)
+        {
+            rt.PushClip(100f, 100f, 40f, 40f);
+        }
+
+        DrawPathContent(rt, brush);
+
+        if (clipToDamage)
+        {
+            rt.PopClip();
+        }
+
+        Assert.Equal(JaliumResult.Ok, rt.RequestReadback());
+        Assert.Equal(JaliumResult.Ok, rt.TryEndDraw());
+        Assert.Equal(JaliumResult.Ok, rt.FetchReadback(pixels, (uint)(Width * 4), out _, out _));
+        return pixels;
+    }
+
     private static void AssertBuffersClose(byte[] expected, byte[] actual, int tolerance, string scenario)
     {
         Assert.Equal(expected.Length, actual.Length);
@@ -176,5 +208,74 @@ public sealed class D3D12RetainedLayerParityTests
             viaLayer,
             tolerance: 4,
             scenario: "Ancestor rounded clip was baked into the D3D12 retained layer");
+    }
+
+    [RequiresWindowsBackendFact(RenderBackend.D3D12)]
+    public void MsaaStencilPath_DamageScopedResolve_PreservesClipAndBackground()
+    {
+        using var window = new HiddenNativeWindow(Width, Height);
+        using var context = new RenderContext(
+            RenderBackend.D3D12,
+            GpuPreference.Auto,
+            RenderingEngine.Impeller);
+        using var brush = context.CreateSolidBrush(0.90f, 0.25f, 0.15f, 1f);
+        Assert.True(brush.IsValid);
+
+        byte[] baseline = RenderMsaaPath(
+            context, window.Hwnd, brush, clipToDamage: false);
+        byte[] clipped = RenderMsaaPath(
+            context, window.Hwnd, brush, clipToDamage: true);
+
+        int backgroundOffset = ((12 * Width) + 12) * 4;
+        int visiblePathPixels = 0;
+        int maxInsideDifference = 0;
+        int maxOutsideBackgroundDifference = 0;
+        for (int y = 0; y < Height; y++)
+        {
+            for (int x = 0; x < Width; x++)
+            {
+                int offset = ((y * Width) + x) * 4;
+                bool insideDamage = x is >= 100 and < 140 && y is >= 100 and < 140;
+                for (int channel = 0; channel < 4; channel++)
+                {
+                    if (insideDamage)
+                    {
+                        maxInsideDifference = Math.Max(
+                            maxInsideDifference,
+                            Math.Abs(clipped[offset + channel] - baseline[offset + channel]));
+                    }
+                    else
+                    {
+                        maxOutsideBackgroundDifference = Math.Max(
+                            maxOutsideBackgroundDifference,
+                            Math.Abs(
+                                clipped[offset + channel] -
+                                clipped[backgroundOffset + channel]));
+                    }
+                }
+
+                if (insideDamage &&
+                    Enumerable.Range(0, 3).Any(channel =>
+                        Math.Abs(
+                            baseline[offset + channel] -
+                            baseline[backgroundOffset + channel]) > 20))
+                {
+                    visiblePathPixels++;
+                }
+            }
+        }
+
+        Assert.True(
+            visiblePathPixels >= 400,
+            $"The clipped MSAA test area contained too little path coverage " +
+            $"({visiblePathPixels} pixels).");
+        Assert.True(
+            maxInsideDifference <= 4,
+            $"Damage-scoped MSAA resolve changed pixels inside the dirty clip " +
+            $"(maxDiff={maxInsideDifference}).");
+        Assert.True(
+            maxOutsideBackgroundDifference <= 2,
+            $"Damage-scoped MSAA resolve leaked path scratch outside the dirty clip " +
+            $"(maxDiff={maxOutsideBackgroundDifference}).");
     }
 }

@@ -874,9 +874,31 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
             return;
         }
 
-        ClearItemContainerStyleAndBindingGroup(element, item);
+        var preserveGeneratedContent =
+            _containersPreservingGeneratedContent.Contains(element);
 
-        if (_containersPreservingGeneratedContent.Contains(element))
+        // A viewport recycle returns to this same ItemsControl and therefore
+        // keeps a fixed ItemContainerStyle/ItemBindingGroup. Clearing and then
+        // immediately restoring those values invalidates the ControlTemplate
+        // and rebuilds its whole visual subtree. At two or three columns that
+        // made ordinary scrolling spend most of the UI thread in Style.Apply.
+        //
+        // A selector can choose a different style for the next item, so retain
+        // the old clear/re-evaluate behavior in that case. Collection changes
+        // use the non-preserving path and still receive a complete clear.
+        if (!preserveGeneratedContent ||
+            ItemContainerStyleSelector != null)
+        {
+            ClearItemContainerStyleAndBindingGroup(element, item);
+        }
+        else
+        {
+            // Alternation depends on the realized index even when the chrome is
+            // stable, so it must be recomputed during the next Prepare call.
+            element.ClearValue(AlternationIndexPropertyKey);
+        }
+
+        if (preserveGeneratedContent)
         {
             // Record that the base implementation actually suppressed a generated-content clear.
             // A custom container can override ClearContainerForItem and intentionally skip base
@@ -1366,8 +1388,18 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
     {
         ArgumentNullException.ThrowIfNull(container);
         ArgumentNullException.ThrowIfNull(item);
-        return container is FrameworkElement frameworkElement &&
-               ReferenceEquals(frameworkElement.ReadLocalValue(FrameworkElement.StyleProperty), DependencyProperty.UnsetValue);
+        if (container is not FrameworkElement frameworkElement)
+        {
+            return false;
+        }
+
+        var localStyle =
+            frameworkElement.ReadLocalValue(FrameworkElement.StyleProperty);
+        return ReferenceEquals(
+                   localStyle,
+                   DependencyProperty.UnsetValue) ||
+               (ItemContainerStyleSelector == null &&
+                ReferenceEquals(localStyle, ItemContainerStyle));
     }
 
     protected virtual void OnAlternationCountChanged(int oldAlternationCount, int newAlternationCount)
@@ -1515,9 +1547,23 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
     private void ApplyItemContainerStyleAndBindingGroup(FrameworkElement element, object item)
     {
         var style = SelectContainerStyle(item, element);
-        if (style != null && ShouldApplyItemContainerStyle(element, item))
+        var shouldApplyStyle =
+            style != null &&
+            ShouldApplyItemContainerStyle(element, item);
+        if (shouldApplyStyle &&
+            !ReferenceEquals(element.Style, style))
         {
             element.Style = style;
+        }
+        else if (!shouldApplyStyle &&
+                 ItemContainerStyleSelector == null &&
+                 style != null &&
+                 ReferenceEquals(element.Style, style))
+        {
+            // A derived ItemsControl can veto a fixed style for the newly
+            // assigned item. Remove a style retained by viewport recycling in
+            // that case so the fast path cannot leak the old item's chrome.
+            element.ClearValue(FrameworkElement.StyleProperty);
         }
 
         if (ItemBindingGroup != null &&

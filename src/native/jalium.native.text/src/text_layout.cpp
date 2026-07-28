@@ -845,6 +845,35 @@ void JaliumTextFormat::GenerateGlyphQuads(
     float savedDescent = descent_;
     float savedLineGap = lineGap_;
     float savedLineHeight = lineHeight_;
+    struct RestoreMetrics {
+        float& fontSize;
+        float& ascent;
+        float& descent;
+        float& lineGap;
+        float& lineHeight;
+        float savedFontSize;
+        float savedAscent;
+        float savedDescent;
+        float savedLineGap;
+        float savedLineHeight;
+
+        ~RestoreMetrics() noexcept
+        {
+            fontSize = savedFontSize;
+            ascent = savedAscent;
+            descent = savedDescent;
+            lineGap = savedLineGap;
+            lineHeight = savedLineHeight;
+        }
+    } restore{
+        fontSizePx_, ascent_, descent_, lineGap_, lineHeight_,
+        savedFontSize, savedAscent, savedDescent, savedLineGap, savedLineHeight
+    };
+
+    if (!std::isfinite(renderScale) || renderScale <= 0.0f ||
+        !std::isfinite(fontSizePx_ * renderScale)) {
+        renderScale = 1.0f;
+    }
 
     if (renderScale != 1.0f) {
         fontSizePx_ *= renderScale;
@@ -862,10 +891,6 @@ void JaliumTextFormat::GenerateGlyphQuads(
     GlyphAtlas* atlas = engine_->GetGlyphAtlas();
     GlyphRasterizer* rasterizer = engine_->GetGlyphRasterizer();
     if (!atlas || !rasterizer) {
-        if (renderScale != 1.0f) {
-            fontSizePx_ = savedFontSize; ascent_ = savedAscent; descent_ = savedDescent;
-            lineGap_ = savedLineGap; lineHeight_ = savedLineHeight;
-        }
         return;
     }
 
@@ -931,7 +956,8 @@ void JaliumTextFormat::GenerateGlyphQuads(
                 // Round (not truncate) the raster em: HarfBuzz advances are
                 // fractional, so a truncated raster size desyncs glyph ink width
                 // from the advance and skews spacing at fractional (high-DPI/scaled) sizes.
-                static_cast<uint16_t>(std::lround(fontSizePx_)),
+                static_cast<uint16_t>(std::lround(std::clamp(
+                    fontSizePx_, 1.0f, 4095.0f))),
                 subpixelX,
                 glyphAaMode);
 
@@ -958,14 +984,6 @@ void JaliumTextFormat::GenerateGlyphQuads(
         }
     }
 
-    // Restore original font state
-    if (renderScale != 1.0f) {
-        fontSizePx_ = savedFontSize;
-        ascent_ = savedAscent;
-        descent_ = savedDescent;
-        lineGap_ = savedLineGap;
-        lineHeight_ = savedLineHeight;
-    }
 }
 
 } // namespace jalium

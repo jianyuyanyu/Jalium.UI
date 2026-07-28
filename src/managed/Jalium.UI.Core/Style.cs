@@ -206,7 +206,16 @@ public class Style : DispatcherObject, Jalium.UI.Markup.INameScope, IQueryAmbien
         foreach (var trigger in _triggers)
         {
             trigger.ParentStyle = this;
-            trigger.Attach(element);
+            trigger.RegisterStyleAttachment(element);
+            try
+            {
+                trigger.Attach(element);
+            }
+            catch
+            {
+                trigger.UnregisterStyleAttachment(element);
+                throw;
+            }
         }
     }
 
@@ -224,7 +233,14 @@ public class Style : DispatcherObject, Jalium.UI.Markup.INameScope, IQueryAmbien
         // Remove triggers
         foreach (var trigger in _triggers)
         {
-            trigger.Detach(element);
+            try
+            {
+                trigger.Detach(element);
+            }
+            finally
+            {
+                trigger.UnregisterStyleAttachment(element);
+            }
         }
 
         // Remove property and event setters in reverse declaration order.
@@ -773,7 +789,10 @@ public class Setter : SetterBase, ISupportInitialize
         var actualProperty = ResolvePropertyForTarget(resolvedProperty, target);
         if (actualProperty == null) return;
 
-        DynamicResourceBindingOperations.ClearDynamicResource(target, actualProperty);
+        DynamicResourceBindingOperations.ClearDynamicResource(
+            target,
+            actualProperty,
+            DependencyObject.LayerValueSource.StyleSetter);
         target.ClearLayerValue(actualProperty, DependencyObject.LayerValueSource.StyleSetter);
     }
 
@@ -891,6 +910,55 @@ public abstract class TriggerBase : DependencyObject
     /// </summary>
     private readonly ConditionalWeakTable<FrameworkElement, HashSet<DependencyProperty>> _activeSetters = new();
 
+    private sealed class ResolvedTriggerSetter
+    {
+        public required Setter Setter { get; init; }
+        public required FrameworkElement Target { get; init; }
+        public required DependencyProperty Property { get; init; }
+    }
+
+    /// <summary>
+    /// Setter TargetName and dependency-property resolution are invariant for one trigger
+    /// attachment. Cache them for the lifetime of the attachment so pointer-state transitions
+    /// do not repeatedly walk the visual tree or query the dependency-property registry.
+    /// </summary>
+    private readonly ConditionalWeakTable<FrameworkElement, ResolvedTriggerSetter[]> _resolvedSetters = new();
+
+    private sealed class StyleTriggerAttachmentSet
+    {
+        public List<TriggerBase> Triggers { get; } = [];
+    }
+
+    /// <summary>
+    /// All style triggers that are actually applied to an element, in application order.
+    /// This includes theme styles, BasedOn chains, implicit styles, and explicit styles.
+    /// A single StyleTrigger value layer is shared by those sources, so precedence must use
+    /// this complete order instead of looking only at ParentStyle.Triggers.
+    /// </summary>
+    private static readonly ConditionalWeakTable<FrameworkElement, StyleTriggerAttachmentSet>
+        s_styleTriggerAttachments = new();
+
+    private sealed class TriggerBindingState
+    {
+        public required FrameworkElement Target { get; init; }
+        public required DependencyProperty TargetProperty { get; init; }
+        public required DependencyProperty ShadowProperty { get; init; }
+        public required Action<DependencyProperty, object?, object?> Handler { get; init; }
+    }
+
+    /// <summary>
+    /// A Binding setter cannot be installed directly on its target property: doing so would
+    /// replace the template's baseline binding and leave the trigger value behind when
+    /// overlapping triggers deactivate out of order. Bindings therefore evaluate on a private
+    /// shadow property and copy their current value into the trigger layer only while they win.
+    /// </summary>
+    private readonly ConditionalWeakTable<FrameworkElement, Dictionary<Setter, TriggerBindingState>>
+        _bindingSetterStates = new();
+
+    private readonly object _bindingShadowPropertyGate = new();
+    private readonly Dictionary<Setter, DependencyProperty> _bindingShadowProperties = new();
+    private static int s_triggerBindingPropertyCounter;
+
     /// <summary>
     /// Gets or sets the parent style that contains this trigger.
     /// </summary>
@@ -901,6 +969,24 @@ public abstract class TriggerBase : DependencyObject
     /// This is set when the trigger is attached as part of a ControlTemplate.
     /// </summary>
     internal IList<TriggerBase>? ParentTemplateTriggers { get; set; }
+
+    internal void RegisterStyleAttachment(FrameworkElement element)
+    {
+        var attachments = s_styleTriggerAttachments.GetOrCreateValue(element);
+        attachments.Triggers.Add(this);
+    }
+
+    internal void UnregisterStyleAttachment(FrameworkElement element)
+    {
+        if (!s_styleTriggerAttachments.TryGetValue(element, out var attachments))
+            return;
+
+        attachments.Triggers.Remove(this);
+        if (attachments.Triggers.Count == 0)
+        {
+            s_styleTriggerAttachments.Remove(element);
+        }
+    }
 
     /// <summary>
     /// Attaches this trigger to the specified element.
@@ -996,36 +1082,58 @@ public abstract class TriggerBase : DependencyObject
             ? DependencyObject.LayerValueSource.TemplateTrigger
             : DependencyObject.LayerValueSource.StyleTrigger;
 
-        // Build the set of (target, dp) keys owned by any *later* active sibling.
-        // If a key is in this set, our setter for it is suppressed — the later sibling
-        // already wrote (or will write) its own value and must remain authoritative.
-        var laterSiblingOwned = ComputeLaterSiblingOwnedKeys(element);
+        var siblings = GetSiblingTriggers(element);
+        var myIndex = siblings?.IndexOf(this) ?? -1;
 
-        foreach (var setter in Setters.OfType<Setter>())
+        foreach (var resolvedSetter in GetResolvedSetters(element))
         {
-            var target = GetSetterTarget(element, setter.TargetName);
-            if (target == null)
-                continue;
-
-            var resolvedProperty = setter.Property;
-            if (resolvedProperty == null && setter.PropertyName != null)
-                resolvedProperty = Setter.ResolveDependencyPropertyByName(setter.PropertyName, target.GetType());
-            if (resolvedProperty == null)
-                continue;
-
-            var actualProperty = ResolvePropertyForTarget(resolvedProperty, target);
-            if (actualProperty == null)
-                continue;
-
-            var key = (target, actualProperty);
+            var setter = resolvedSetter.Setter;
+            var target = resolvedSetter.Target;
+            var actualProperty = resolvedSetter.Property;
 
             // Track that this trigger conceptually owns this property — even if we end up
             // skipping the write below, we still need to remember the ownership so that
             // RemoveTriggerSetters can later re-apply ours when the later sibling deactivates.
             TrackActiveSetter(target, actualProperty);
 
+            // Keep trigger bindings separate from the target property's baseline binding.
+            // The shadow binding remains live even while a later trigger wins, so taking over
+            // later uses the current source value instead of a stale snapshot.
+            if (setter.Value is BindingBase binding)
+            {
+                var bindingState = EnsureBindingSetterState(
+                    element,
+                    setter,
+                    target,
+                    actualProperty,
+                    binding);
+
+                if (HasLaterActiveOwner(
+                        element,
+                        target,
+                        actualProperty,
+                        siblings,
+                        myIndex))
+                {
+                    EnsureSetterInvalidation(target, actualProperty);
+                    continue;
+                }
+
+                DynamicResourceBindingOperations.ClearDynamicResource(
+                    target,
+                    actualProperty,
+                    layerSource);
+                ApplyBindingSetterValue(bindingState, layerSource);
+                continue;
+            }
+
             // Honor WPF precedence: defer to any active later sibling.
-            if (laterSiblingOwned.Contains(key))
+            if (HasLaterActiveOwner(
+                    element,
+                    target,
+                    actualProperty,
+                    siblings,
+                    myIndex))
             {
                 EnsureSetterInvalidation(target, actualProperty);
                 continue;
@@ -1034,18 +1142,6 @@ public abstract class TriggerBase : DependencyObject
             if (setter.Value is IDynamicResourceReference dynamicReference)
             {
                 DynamicResourceBindingOperations.SetDynamicResource(target, actualProperty, dynamicReference.ResourceKey, layerSource);
-                EnsureSetterInvalidation(target, actualProperty);
-                continue;
-            }
-
-            // 触发器内的 Setter.Value 也可能是 BindingBase（{TemplateBinding ...} /
-            // {Binding ..., RelativeSource={RelativeSource TemplatedParent}} 等）。
-            // 直接走 SetLayerValue 会把 BindingBase 当成属性值灌进 DP，触发渲染时
-            // 类型强转崩溃。WPF 行为：让 binding 在 trigger 激活期间建立连接，
-            // 失活时由 RemoveTriggerSetters 调用 ClearBinding 还原。
-            if (setter.Value is BindingBase binding)
-            {
-                target.SetBinding(actualProperty, binding);
                 EnsureSetterInvalidation(target, actualProperty);
                 continue;
             }
@@ -1063,27 +1159,28 @@ public abstract class TriggerBase : DependencyObject
                 continue;
             }
 
+            DynamicResourceBindingOperations.ClearDynamicResource(
+                target,
+                actualProperty,
+                layerSource);
             target.SetLayerValue(actualProperty, valueToSet, layerSource, allowAutoTransition: true);
             EnsureSetterInvalidation(target, actualProperty);
         }
     }
 
     /// <summary>
-    /// Returns the set of (target, dp) keys that any *later* sibling trigger (in the
-    /// declaring collection) currently owns for the given element. Used by
-    /// ApplyTriggerSetters to defer to later-defined triggers (WPF precedence).
+    /// Returns whether a later trigger in the effective style/template order currently
+    /// owns the specified target property.
     /// </summary>
-    private HashSet<(FrameworkElement, DependencyProperty)> ComputeLaterSiblingOwnedKeys(FrameworkElement element)
+    private static bool HasLaterActiveOwner(
+        FrameworkElement element,
+        FrameworkElement target,
+        DependencyProperty property,
+        IList<TriggerBase>? siblings,
+        int myIndex)
     {
-        var result = new HashSet<(FrameworkElement, DependencyProperty)>();
-
-        IList<TriggerBase>? siblings = ParentStyle?.Triggers as IList<TriggerBase> ?? ParentTemplateTriggers;
-        if (siblings == null)
-            return result;
-
-        var myIndex = siblings.IndexOf(this);
-        if (myIndex < 0)
-            return result;
+        if (siblings == null || myIndex < 0)
+            return false;
 
         for (int i = myIndex + 1; i < siblings.Count; i++)
         {
@@ -1091,24 +1188,154 @@ public abstract class TriggerBase : DependencyObject
             if (!later.IsActiveForElement(element))
                 continue;
 
-            foreach (var setter in later.Setters.OfType<Setter>())
+            foreach (var resolvedSetter in later.GetResolvedSetters(element))
             {
-                var target = GetSetterTarget(element, setter.TargetName);
-                if (target == null) continue;
-
-                var resolvedProp = setter.Property;
-                if (resolvedProp == null && setter.PropertyName != null)
-                    resolvedProp = Setter.ResolveDependencyPropertyByName(setter.PropertyName, target.GetType());
-                if (resolvedProp == null) continue;
-
-                var actualProperty = ResolvePropertyForTarget(resolvedProp, target);
-                if (actualProperty == null) continue;
-
-                result.Add((target, actualProperty));
+                if (ReferenceEquals(resolvedSetter.Target, target) &&
+                    ReferenceEquals(resolvedSetter.Property, property))
+                {
+                    return true;
+                }
             }
         }
 
-        return result;
+        return false;
+    }
+
+    private TriggerBindingState EnsureBindingSetterState(
+        FrameworkElement element,
+        Setter setter,
+        FrameworkElement target,
+        DependencyProperty targetProperty,
+        BindingBase binding)
+    {
+        var states = _bindingSetterStates.GetOrCreateValue(element);
+        if (states.TryGetValue(setter, out var existing))
+        {
+            return existing;
+        }
+
+        var shadowProperty = GetBindingShadowProperty(setter);
+
+        TriggerBindingState? state = null;
+        Action<DependencyProperty, object?, object?> handler = (changedProperty, _, _) =>
+        {
+            if (changedProperty != shadowProperty || state is null)
+                return;
+
+            ApplyBindingSetterValueIfWinning(element, state);
+        };
+
+        state = new TriggerBindingState
+        {
+            Target = target,
+            TargetProperty = targetProperty,
+            ShadowProperty = shadowProperty,
+            Handler = handler
+        };
+
+        states.Add(setter, state);
+        target.PropertyChangedInternal += handler;
+        target.SetBinding(shadowProperty, binding);
+        return state;
+    }
+
+    private DependencyProperty GetBindingShadowProperty(Setter setter)
+    {
+        lock (_bindingShadowPropertyGate)
+        {
+            if (_bindingShadowProperties.TryGetValue(setter, out var property))
+                return property;
+
+            property = DependencyProperty.RegisterAttached(
+                $"_TriggerBindingValue{Interlocked.Increment(ref s_triggerBindingPropertyCounter)}",
+                typeof(object),
+                typeof(TriggerBase),
+                new PropertyMetadata(null));
+            _bindingShadowProperties.Add(setter, property);
+            return property;
+        }
+    }
+
+    private void ApplyBindingSetterValueIfWinning(
+        FrameworkElement element,
+        TriggerBindingState state)
+    {
+        if (!IsActiveForElement(element))
+            return;
+
+        var siblings = GetSiblingTriggers(element);
+        var myIndex = siblings?.IndexOf(this) ?? -1;
+        if (HasLaterActiveOwner(
+                element,
+                state.Target,
+                state.TargetProperty,
+                siblings,
+                myIndex))
+            return;
+
+        var layerSource = ParentTemplateTriggers != null
+            ? DependencyObject.LayerValueSource.TemplateTrigger
+            : DependencyObject.LayerValueSource.StyleTrigger;
+        ApplyBindingSetterValue(state, layerSource);
+    }
+
+    private static void ApplyBindingSetterValue(
+        TriggerBindingState state,
+        DependencyObject.LayerValueSource layerSource)
+    {
+        var value = state.Target.GetValue(state.ShadowProperty);
+        if (ReferenceEquals(value, DependencyProperty.UnsetValue) ||
+            !state.TargetProperty.IsValidType(value))
+        {
+            state.Target.ClearLayerValue(
+                state.TargetProperty,
+                layerSource,
+                allowAutoTransition: true);
+        }
+        else
+        {
+            state.Target.SetLayerValue(
+                state.TargetProperty,
+                value,
+                layerSource,
+                allowAutoTransition: true);
+        }
+
+        EnsureSetterInvalidation(state.Target, state.TargetProperty);
+    }
+
+    private void RemoveBindingSetterState(FrameworkElement element, Setter setter)
+    {
+        if (!_bindingSetterStates.TryGetValue(element, out var states) ||
+            !states.Remove(setter, out var state))
+        {
+            return;
+        }
+
+        state.Target.PropertyChangedInternal -= state.Handler;
+        state.Target.ClearBinding(state.ShadowProperty);
+        state.Target.ClearValue(state.ShadowProperty);
+
+        if (states.Count == 0)
+        {
+            _bindingSetterStates.Remove(element);
+        }
+    }
+
+    private void ClearBindingSetterStates(FrameworkElement element)
+    {
+        if (!_bindingSetterStates.TryGetValue(element, out var states))
+            return;
+
+        foreach (var state in states.Values)
+        {
+            state.Target.PropertyChangedInternal -= state.Handler;
+            state.Target.ClearBinding(state.ShadowProperty);
+            state.Target.ClearValue(state.ShadowProperty);
+        }
+
+        states.Clear();
+        _bindingSetterStates.Remove(element);
     }
 
     /// <summary>
@@ -1306,118 +1533,57 @@ public abstract class TriggerBase : DependencyObject
             ? DependencyObject.LayerValueSource.TemplateTrigger
             : DependencyObject.LayerValueSource.StyleTrigger;
 
-        // (1) Resolve own setters: setter list → (target, dp, setter) entries that we previously
-        //     claimed via _activeSetters in ApplyTriggerSetters (whether we actually wrote the
-        //     layer or were suppressed by a later sibling).
-        var ownSetters = new List<(FrameworkElement Target, DependencyProperty Property, Setter Setter)>();
-        var ownKeys = new HashSet<(FrameworkElement, DependencyProperty)>();
+        var siblings = GetSiblingTriggers(element);
+        var myIndex = siblings?.IndexOf(this) ?? -1;
 
-        foreach (var setter in Setters.OfType<Setter>())
+        // Per owned key: either the layer is already owned by a later trigger, an earlier
+        // active trigger takes over, or the trigger layer falls back to its baseline.
+        foreach (var resolvedSetter in GetResolvedSetters(element))
         {
-            var target = GetSetterTarget(element, setter.TargetName);
-            if (target == null) continue;
+            var setter = resolvedSetter.Setter;
+            var target = resolvedSetter.Target;
+            var actualProperty = resolvedSetter.Property;
+            if (!IsSetterActive(target, actualProperty))
+                continue;
 
-            var resolvedProperty = setter.Property;
-            if (resolvedProperty == null && setter.PropertyName != null)
-                resolvedProperty = Setter.ResolveDependencyPropertyByName(setter.PropertyName, target.GetType());
-            if (resolvedProperty == null) continue;
+            FindWinningSiblingSetter(
+                element,
+                target,
+                actualProperty,
+                siblings,
+                myIndex,
+                out var takeoverTrigger,
+                out var takeoverSetter,
+                out var suppressedByLater);
 
-            var actualProperty = ResolvePropertyForTarget(resolvedProperty, target);
-            if (actualProperty == null) continue;
-
-            var key = (target, actualProperty);
-            if (!IsSetterActive(target, actualProperty)) continue;
-
-            ownSetters.Add((target, actualProperty, setter));
-            ownKeys.Add(key);
-        }
-
-        if (ownSetters.Count == 0)
-            return;
-
-        // (2) For each owned key, walk siblings in declaration order to find:
-        //     – the latest still-active sibling owning the key (takeover)
-        //     – whether any later sibling currently owns the key (we were suppressed)
-        var takeoverSetter = new Dictionary<(FrameworkElement, DependencyProperty), Setter>();
-        var suppressedByLater = new HashSet<(FrameworkElement, DependencyProperty)>();
-
-        IList<TriggerBase>? siblings = ParentStyle?.Triggers as IList<TriggerBase> ?? ParentTemplateTriggers;
-        if (siblings != null)
-        {
-            int myIndex = siblings.IndexOf(this);
-            for (int i = 0; i < siblings.Count; i++)
-            {
-                var sibling = siblings[i];
-                if (sibling == this) continue;
-                if (!sibling.IsActiveForElement(element)) continue;
-
-                foreach (var setter in sibling.Setters.OfType<Setter>())
-                {
-                    var target = GetSetterTarget(element, setter.TargetName);
-                    if (target == null) continue;
-
-                    var resolvedProp = setter.Property;
-                    if (resolvedProp == null && setter.PropertyName != null)
-                        resolvedProp = Setter.ResolveDependencyPropertyByName(setter.PropertyName, target.GetType());
-                    if (resolvedProp == null) continue;
-
-                    var actualProperty = ResolvePropertyForTarget(resolvedProp, target);
-                    if (actualProperty == null) continue;
-
-                    var key = (target, actualProperty);
-                    if (!ownKeys.Contains(key)) continue;
-
-                    // Later-defined active sibling overwrites earlier — keep updating so the
-                    // last write wins. Also note whether this sibling is past our own index:
-                    // if any later sibling owns the key, our SetLayerValue was suppressed,
-                    // so RemoveTriggerSetters must leave the layer alone (layer is theirs).
-                    takeoverSetter[key] = setter;
-                    if (myIndex >= 0 && i > myIndex)
-                        suppressedByLater.Add(key);
-                }
-            }
-        }
-
-        // (3) Per owned key: either layer is already someone else's (suppressed-by-later),
-        //     a take-over sibling needs to claim it, or we ClearLayerValue back to baseline.
-        foreach (var (target, actualProperty, setter) in ownSetters)
-        {
-            var key = (target, actualProperty);
             UntrackActiveSetter(target, actualProperty);
 
-            // Tear down any binding/dynamic-resource that *we* established.
-            // ApplyTriggerSetters skips SetBinding/SetDynamicResource when suppressed by a
-            // later sibling, so there's nothing of ours to tear down in that case.
-            bool weActuallyWroteLayer = !suppressedByLater.Contains(key);
-            if (weActuallyWroteLayer)
+            // A trigger Binding runs on its own shadow property and must always be detached,
+            // including when a later sibling currently owns the visible target property.
+            if (setter.Value is BindingBase)
             {
-                if (setter.Value is IDynamicResourceReference)
-                    DynamicResourceBindingOperations.ClearDynamicResource(target, actualProperty);
-                else if (setter.Value is BindingBase)
-                    target.ClearBinding(actualProperty);
+                RemoveBindingSetterState(element, setter);
             }
 
-            if (suppressedByLater.Contains(key))
+            if (suppressedByLater)
             {
                 // Layer belongs to a later sibling that's still active — leave it untouched.
                 continue;
             }
 
-            if (takeoverSetter.TryGetValue(key, out var reapplySetter))
+            DynamicResourceBindingOperations.ClearDynamicResource(
+                target,
+                actualProperty,
+                layerSource);
+
+            if (takeoverTrigger != null && takeoverSetter != null)
             {
-                if (reapplySetter.Value is IDynamicResourceReference dynamicReference)
-                {
-                    DynamicResourceBindingOperations.SetDynamicResource(target, actualProperty, dynamicReference.ResourceKey, layerSource);
-                }
-                else if (reapplySetter.Value is BindingBase reapplyBinding)
-                {
-                    target.SetBinding(actualProperty, reapplyBinding);
-                }
-                else
-                {
-                    var valueToSet = ConvertValueIfNeeded(reapplySetter.Value, actualProperty.PropertyType);
-                    target.SetLayerValue(actualProperty, valueToSet, layerSource, allowAutoTransition: true);
-                }
+                takeoverTrigger.ApplyWinningSetter(
+                    element,
+                    takeoverSetter.Setter,
+                    target,
+                    actualProperty,
+                    layerSource);
             }
             else
             {
@@ -1426,6 +1592,184 @@ public abstract class TriggerBase : DependencyObject
 
             EnsureSetterInvalidation(target, actualProperty);
         }
+    }
+
+    private void FindWinningSiblingSetter(
+        FrameworkElement element,
+        FrameworkElement target,
+        DependencyProperty property,
+        IList<TriggerBase>? siblings,
+        int myIndex,
+        out TriggerBase? winningTrigger,
+        out ResolvedTriggerSetter? winningSetter,
+        out bool suppressedByLater)
+    {
+        winningTrigger = null;
+        winningSetter = null;
+        suppressedByLater = false;
+
+        if (siblings == null)
+            return;
+
+        for (var index = 0; index < siblings.Count; index++)
+        {
+            var sibling = siblings[index];
+            if (ReferenceEquals(sibling, this) || !sibling.IsActiveForElement(element))
+                continue;
+
+            foreach (var candidate in sibling.GetResolvedSetters(element))
+            {
+                if (!ReferenceEquals(candidate.Target, target) ||
+                    !ReferenceEquals(candidate.Property, property))
+                {
+                    continue;
+                }
+
+                winningTrigger = sibling;
+                winningSetter = candidate;
+                if (myIndex >= 0 && index > myIndex)
+                {
+                    suppressedByLater = true;
+                }
+            }
+        }
+    }
+
+    private void ApplyWinningSetter(
+        FrameworkElement element,
+        Setter setter,
+        FrameworkElement target,
+        DependencyProperty actualProperty,
+        DependencyObject.LayerValueSource layerSource)
+    {
+        if (setter.Value is BindingBase binding)
+        {
+            DynamicResourceBindingOperations.ClearDynamicResource(
+                target,
+                actualProperty,
+                layerSource);
+            var bindingState = EnsureBindingSetterState(
+                element,
+                setter,
+                target,
+                actualProperty,
+                binding);
+            ApplyBindingSetterValue(bindingState, layerSource);
+            return;
+        }
+
+        if (setter.Value is IDynamicResourceReference dynamicReference)
+        {
+            DynamicResourceBindingOperations.SetDynamicResource(
+                target,
+                actualProperty,
+                dynamicReference.ResourceKey,
+                layerSource);
+            return;
+        }
+
+        var valueToSet = ConvertValueIfNeeded(setter.Value, actualProperty.PropertyType);
+        if (actualProperty.IsValidType(valueToSet))
+        {
+            DynamicResourceBindingOperations.ClearDynamicResource(
+                target,
+                actualProperty,
+                layerSource);
+            target.SetLayerValue(
+                actualProperty,
+                valueToSet,
+                layerSource,
+                allowAutoTransition: true);
+        }
+        else
+        {
+            target.ClearLayerValue(
+                actualProperty,
+                layerSource,
+                allowAutoTransition: true);
+        }
+    }
+
+    private IList<TriggerBase>? GetSiblingTriggers(FrameworkElement element)
+    {
+        if (ParentTemplateTriggers != null)
+            return ParentTemplateTriggers;
+
+        if (ParentStyle != null &&
+            s_styleTriggerAttachments.TryGetValue(element, out var attachments))
+        {
+            return attachments.Triggers;
+        }
+
+        return ParentStyle?.Triggers as IList<TriggerBase>;
+    }
+
+    private ResolvedTriggerSetter[] GetResolvedSetters(FrameworkElement element)
+        => _resolvedSetters.GetValue(element, ResolveSetters);
+
+    private ResolvedTriggerSetter[] ResolveSetters(FrameworkElement element)
+    {
+        List<ResolvedTriggerSetter>? resolved = null;
+
+        foreach (var setterBase in Setters)
+        {
+            if (setterBase is not Setter setter)
+                continue;
+
+            var target = GetSetterTarget(element, setter.TargetName);
+            if (target == null)
+                continue;
+
+            var property = setter.Property;
+            if (property == null && setter.PropertyName != null)
+            {
+                property = Setter.ResolveDependencyPropertyByName(
+                    setter.PropertyName,
+                    target.GetType());
+            }
+
+            if (property == null)
+                continue;
+
+            property = ResolvePropertyForTarget(property, target);
+            if (property == null)
+                continue;
+
+            resolved ??= [];
+
+            // Multiple setters for the same target property follow declaration-order
+            // semantics. Keep only the last declaration so activation/deactivation cannot
+            // track and clear one property more than once.
+            var replaced = false;
+            for (var index = 0; index < resolved.Count; index++)
+            {
+                var existing = resolved[index];
+                if (ReferenceEquals(existing.Target, target) &&
+                    ReferenceEquals(existing.Property, property))
+                {
+                    resolved[index] = new ResolvedTriggerSetter
+                    {
+                        Setter = setter,
+                        Target = target,
+                        Property = property
+                    };
+                    replaced = true;
+                    break;
+                }
+            }
+
+            if (!replaced)
+            {
+                resolved.Add(new ResolvedTriggerSetter
+                {
+                    Setter = setter,
+                    Target = target,
+                    Property = property
+                });
+            }
+        }
+
+        return resolved?.ToArray() ?? [];
     }
 
     /// <summary>
@@ -1478,7 +1822,9 @@ public abstract class TriggerBase : DependencyObject
     /// </summary>
     protected void ClearPreTriggerValues(FrameworkElement element)
     {
+        ClearBindingSetterStates(element);
         _activeSetters.Remove(element);
+        _resolvedSetters.Remove(element);
     }
 
     private void TrackActiveSetter(FrameworkElement target, DependencyProperty property)
@@ -2155,6 +2501,7 @@ public sealed class MultiTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
         /// EvaluateTriggerForElement 按此数组逐条取值，避免每次重新走 visual-tree 搜索。
         /// </summary>
         public FrameworkElement?[] ConditionSources = Array.Empty<FrameworkElement?>();
+        public FrameworkElement[] SubscribedSources = Array.Empty<FrameworkElement>();
     }
 
     private readonly ConditionalWeakTable<FrameworkElement, ElementState> _elementStates = new();
@@ -2208,16 +2555,34 @@ public sealed class MultiTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
         // 收集去重后的源元素集合，handler 订阅到每个唯一源——任何一个源的相关 DP 变化
         // 都会触发整组重评估（"all must be true" 语义）。
         state.ConditionSources = new FrameworkElement?[Conditions.Count];
-        var uniqueSources = new HashSet<FrameworkElement>();
+        List<FrameworkElement>? uniqueSources = null;
         for (int i = 0; i < Conditions.Count; i++)
         {
             var source = GetSetterTarget(element, Conditions[i].SourceName);
             state.ConditionSources[i] = source;
-            if (source != null) uniqueSources.Add(source);
+            if (source == null)
+                continue;
+
+            uniqueSources ??= [];
+            var alreadyAdded = false;
+            foreach (var existing in uniqueSources)
+            {
+                if (ReferenceEquals(existing, source))
+                {
+                    alreadyAdded = true;
+                    break;
+                }
+            }
+
+            if (!alreadyAdded)
+            {
+                uniqueSources.Add(source);
+            }
         }
+        state.SubscribedSources = uniqueSources?.ToArray() ?? [];
 
         // 没有任何可订阅的源：所有 SourceName 都没解到——直接放弃，避免无效订阅与误激活。
-        if (uniqueSources.Count == 0)
+        if (state.SubscribedSources.Length == 0)
             return;
 
         // Create a closure that captures this specific element
@@ -2244,7 +2609,7 @@ public sealed class MultiTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
 
         // Subscribe handler to every distinct source so any of them firing PropertyChanged
         // wakes this MultiTrigger.
-        foreach (var source in uniqueSources)
+        foreach (var source in state.SubscribedSources)
         {
             source.PropertyChangedInternal += state.Handler;
         }
@@ -2259,13 +2624,10 @@ public sealed class MultiTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
         if (_elementStates.TryGetValue(element, out var state))
         {
             // Unsubscribe handler from every distinct source we subscribed to in Attach.
-            if (state.Handler != null && state.ConditionSources.Length > 0)
+            if (state.Handler != null)
             {
-                var unsubscribed = new HashSet<FrameworkElement>();
-                foreach (var source in state.ConditionSources)
+                foreach (var source in state.SubscribedSources)
                 {
-                    if (source == null) continue;
-                    if (!unsubscribed.Add(source)) continue;
                     source.PropertyChangedInternal -= state.Handler;
                 }
             }
@@ -2366,12 +2728,26 @@ public sealed class DataTrigger : TriggerBase
     // Distinct instances now use distinct properties; per-element attached values keep multiple
     // elements sharing one style independent. Mirrors MultiDataTrigger's per-condition shadow props.
     private static int _propertyCounter;
+    private readonly object _shadowPropertyGate = new();
     private DependencyProperty? _shadowProperty;
 
-    private DependencyProperty ShadowProperty =>
-        _shadowProperty ??= DependencyProperty.RegisterAttached(
-            $"_DataTriggerValue{Interlocked.Increment(ref _propertyCounter)}",
-            typeof(object), typeof(DataTrigger), new PropertyMetadata(null));
+    private DependencyProperty ShadowProperty
+    {
+        get
+        {
+            if (_shadowProperty != null)
+                return _shadowProperty;
+
+            lock (_shadowPropertyGate)
+            {
+                return _shadowProperty ??= DependencyProperty.RegisterAttached(
+                    $"_DataTriggerValue{Interlocked.Increment(ref _propertyCounter)}",
+                    typeof(object),
+                    typeof(DataTrigger),
+                    new PropertyMetadata(null));
+            }
+        }
+    }
 
     /// <summary>
     /// Gets or sets the binding that produces the value to compare with Value.
@@ -2525,8 +2901,14 @@ public sealed class DataTrigger : TriggerBase
 [Jalium.UI.Markup.ContentProperty(nameof(Actions))]
 public class EventTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
 {
-    private FrameworkElement? _attachedElement;
-    private FrameworkElement? _eventSource;
+    private sealed class AttachmentState
+    {
+        public required FrameworkElement EventSource { get; init; }
+        public required RoutedEvent RoutedEvent { get; init; }
+        public required RoutedEventHandler Handler { get; init; }
+    }
+
+    private readonly ConditionalWeakTable<FrameworkElement, AttachmentState> _attachments = new();
     private RoutedEvent? _routedEvent;
     private string? _sourceName;
     private TriggerActionCollection? _actions;
@@ -2624,27 +3006,35 @@ public class EventTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
     /// <inheritdoc />
     internal override void Attach(FrameworkElement element)
     {
-        _attachedElement = element;
-        _eventSource = string.IsNullOrEmpty(SourceName)
+        Detach(element);
+
+        var eventSource = string.IsNullOrEmpty(SourceName)
             ? element
             : element.FindName(SourceName) as FrameworkElement;
 
-        if (RoutedEvent != null && _eventSource != null)
+        var routedEvent = RoutedEvent;
+        if (routedEvent == null || eventSource == null)
+            return;
+
+        RoutedEventHandler handler = (_, _) => InvokeEventActions(element);
+        eventSource.AddHandler(routedEvent, handler);
+        _attachments.Add(element, new AttachmentState
         {
-            _eventSource.AddHandler(RoutedEvent, new RoutedEventHandler(OnEventRaised));
-        }
+            EventSource = eventSource,
+            RoutedEvent = routedEvent,
+            Handler = handler
+        });
     }
 
     /// <inheritdoc />
     internal override void Detach(FrameworkElement element)
     {
-        if (RoutedEvent != null && _eventSource != null)
-        {
-            _eventSource.RemoveHandler(RoutedEvent, new RoutedEventHandler(OnEventRaised));
-        }
+        if (!_attachments.TryGetValue(element, out var state))
+            return;
 
-        _attachedElement = null;
-        _eventSource = null;
+        state.EventSource.RemoveHandler(state.RoutedEvent, state.Handler);
+
+        _attachments.Remove(element);
     }
 
     /// <inheritdoc />
@@ -2654,11 +3044,11 @@ public class EventTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
         return false;
     }
 
-    private void OnEventRaised(object sender, RoutedEventArgs e)
+    private void InvokeEventActions(FrameworkElement attachedElement)
     {
         foreach (var action in Actions)
         {
-            action.Invoke(_attachedElement);
+            action.Invoke(attachedElement);
         }
     }
 }
@@ -2676,11 +3066,12 @@ public sealed class MultiDataTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
     {
         public bool IsActive;
         public Action<DependencyProperty, object?, object?>? Handler;
-        public List<BindingExpressionBase> BindingExpressions = new();
-        public List<DependencyProperty> ShadowProperties = new();
+        public DependencyProperty[] ShadowProperties = Array.Empty<DependencyProperty>();
     }
 
     private readonly ConditionalWeakTable<FrameworkElement, ElementState> _elementStates = new();
+    private readonly object _shadowPropertyGate = new();
+    private DependencyProperty[]? _shadowProperties;
 
     // Counter for generating unique shadow property names
     private static int _propertyCounter;
@@ -2720,6 +3111,8 @@ public sealed class MultiDataTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
         {
             Conditions.Seal(dataConditions: true);
         }
+
+        _ = GetShadowProperties();
     }
 
     /// <inheritdoc />
@@ -2730,23 +3123,17 @@ public sealed class MultiDataTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
         _elementStates.Remove(element);
         _elementStates.Add(element, state);
 
-        // Create shadow properties for each condition
-        foreach (var condition in Conditions)
-        {
-            var propId = Interlocked.Increment(ref _propertyCounter);
-            var shadowProp = DependencyProperty.RegisterAttached(
-                $"_MultiDataTriggerValue{propId}",
-                typeof(object),
-                typeof(MultiDataTrigger),
-                new PropertyMetadata(null));
-            state.ShadowProperties.Add(shadowProp);
-        }
+        // Shadow properties describe the trigger declaration, not an attached
+        // element. Reuse one property per condition across every element sharing
+        // this sealed trigger; registering them per attachment permanently grew
+        // the global dependency-property registry during virtualization.
+        state.ShadowProperties = GetShadowProperties();
 
         // Create a closure that captures this specific element
         state.Handler = (dp, oldValue, newValue) =>
         {
             // Check if this property is one of our shadow properties
-            if (state.ShadowProperties.Contains(dp))
+            if (Array.IndexOf(state.ShadowProperties, dp) >= 0)
             {
                 EvaluateTriggerForElement(element);
             }
@@ -2762,7 +3149,7 @@ public sealed class MultiDataTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
             if (condition.Binding != null)
             {
                 var bindingExpr = BindingOperations.SetBinding(element, state.ShadowProperties[i], condition.Binding);
-                state.BindingExpressions.Add(bindingExpr);
+                _ = bindingExpr;
             }
         }
 
@@ -2799,6 +3186,32 @@ public sealed class MultiDataTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
         ClearPreTriggerValues(element);
     }
 
+    private DependencyProperty[] GetShadowProperties()
+    {
+        if (_shadowProperties != null)
+            return _shadowProperties;
+
+        lock (_shadowPropertyGate)
+        {
+            if (_shadowProperties != null)
+                return _shadowProperties;
+
+            var properties = new DependencyProperty[Conditions.Count];
+            for (var index = 0; index < properties.Length; index++)
+            {
+                var propertyId = Interlocked.Increment(ref _propertyCounter);
+                properties[index] = DependencyProperty.RegisterAttached(
+                    $"_MultiDataTriggerValue{propertyId}",
+                    typeof(object),
+                    typeof(MultiDataTrigger),
+                    new PropertyMetadata(null));
+            }
+
+            _shadowProperties = properties;
+            return properties;
+        }
+    }
+
     /// <inheritdoc />
     internal override bool IsActiveForElement(FrameworkElement element)
     {
@@ -2815,7 +3228,7 @@ public sealed class MultiDataTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
         for (int i = 0; i < Conditions.Count; i++)
         {
             var condition = Conditions[i];
-            if (i >= state.ShadowProperties.Count)
+            if (i >= state.ShadowProperties.Length)
             {
                 shouldBeActive = false;
                 break;

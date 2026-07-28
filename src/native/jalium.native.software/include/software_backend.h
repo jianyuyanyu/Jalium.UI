@@ -132,7 +132,7 @@ public:
     SoftwareBitmap bitmap;
 
     SoftwareVideoSurface(uint32_t w, uint32_t h)
-        : bitmap(w, h, std::vector<uint8_t>(static_cast<size_t>(w) * h * 4u, 0)) {}
+        : bitmap(w, h, CreatePixelBuffer(w, h)) {}
 
     uint32_t GetWidth()  const override { return bitmap.width_; }
     uint32_t GetHeight() const override { return bitmap.height_; }
@@ -141,8 +141,10 @@ public:
     bool Lock(uint8_t** outPtr, uint32_t* outStride) override
     {
         if (!outPtr || !outStride) return false;
+        if (bitmap.pixels_.empty()) return false;
         *outPtr = bitmap.pixels_.data();
-        *outStride = bitmap.width_ * 4u;
+        *outStride = static_cast<uint32_t>(
+            static_cast<uint64_t>(bitmap.width_) * 4u);
         return true;
     }
 
@@ -150,6 +152,16 @@ public:
     {
         // Software composer reads pixels_ on the next composite pass.
         return true;
+    }
+
+private:
+    static std::vector<uint8_t> CreatePixelBuffer(uint32_t w, uint32_t h)
+    {
+        PackedBgraLayout layout{};
+        if (!TryComputeTightlyPackedBgraLayout(w, h, layout)) {
+            return {};
+        }
+        return std::vector<uint8_t>(layout.packedBytes, 0);
     }
 };
 

@@ -121,4 +121,71 @@ public class TouchCaptureTests
             Touch.UnregisterTouchPoint(301);
         }
     }
+
+    [Fact]
+    public void UnregisterTouchPoint_ClearsUiElementCaptureState()
+    {
+        var element = new Border();
+        var device = Touch.RegisterTouchPoint(302, new Point(0, 0), element);
+        int lostCount = 0;
+        element.AddHandler(
+            UIElement.LostTouchCaptureEvent,
+            new RoutedEventHandler((_, _) => lostCount++));
+        Assert.True(element.CaptureTouch(device));
+
+        Touch.UnregisterTouchPoint(device.Id);
+
+        Assert.Equal(1, lostCount);
+        Assert.Null(device.Captured);
+        Assert.Null(UIElement.GetTouchCapture(device.Id));
+        Assert.False(element.AreAnyTouchesCaptured);
+        Assert.Empty(element.TouchesCaptured);
+    }
+
+    [Fact]
+    public void CaptureTouch_StealingBetweenUiAndContentElementsKeepsOneOwner()
+    {
+        var visual = new Border();
+        var content = new ContentElement();
+        var device = Touch.RegisterTouchPoint(303, new Point(0, 0), visual);
+
+        try
+        {
+            Assert.True(visual.CaptureTouch(device));
+            Assert.True(content.CaptureTouch(device));
+
+            Assert.False(visual.AreAnyTouchesCaptured);
+            Assert.Empty(visual.TouchesCaptured);
+            Assert.True(content.AreAnyTouchesCaptured);
+            Assert.Contains(device, content.TouchesCaptured);
+            Assert.Same(content, device.Captured);
+            Assert.Null(UIElement.GetTouchCapture(device.Id));
+
+            Assert.True(visual.CaptureTouch(device));
+
+            Assert.False(content.AreAnyTouchesCaptured);
+            Assert.Empty(content.TouchesCaptured);
+            Assert.True(visual.AreAnyTouchesCaptured);
+            Assert.Same(visual, device.Captured);
+            Assert.Same(visual, UIElement.GetTouchCapture(device.Id));
+        }
+        finally
+        {
+            Touch.UnregisterTouchPoint(device.Id);
+        }
+    }
+
+    [Fact]
+    public void UnregisterTouchPoint_ClearsContentElementCaptureState()
+    {
+        var content = new ContentElement();
+        var device = Touch.RegisterTouchPoint(304, new Point(0, 0), null);
+        Assert.True(content.CaptureTouch(device));
+
+        Touch.UnregisterTouchPoint(device.Id);
+
+        Assert.Null(device.Captured);
+        Assert.False(content.AreAnyTouchesCaptured);
+        Assert.Empty(content.TouchesCaptured);
+    }
 }

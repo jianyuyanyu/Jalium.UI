@@ -12,8 +12,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Build.Framework" Version="18.4.0" />
-    <PackageReference Include="Microsoft.Build.Utilities.Core" Version="18.4.0" />
+    <PackageReference Include="Microsoft.Build.Framework" Version="18.8.2" />
+    <PackageReference Include="Microsoft.Build.Utilities.Core" Version="18.8.2" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.3.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
@@ -27,8 +27,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\managed\Jalium.UI.Build\Jalium.UI.Build.csproj"
-                      AdditionalProperties="BuildJaliumNativeProjects=false;BuildJaliumNativeStaticProjects=false" />
+    <ProjectReference Include="..\..\src\managed\Jalium.UI.Build\Jalium.UI.Build.csproj" />
     <ProjectReference Include="..\..\src\managed\Jalium.UI.Core\Jalium.UI.Core.csproj" />
     <ProjectReference Include="..\..\src\managed\Jalium.UI.Controls\Jalium.UI.Controls.csproj" />
     <ProjectReference Include="..\..\src\managed\Jalium.UI.Gpu\Jalium.UI.Gpu.csproj" />
@@ -53,6 +52,8 @@
     <_WindowsOnlyTestSource Include="..\Jalium.UI.Tests\VulkanRetainedLayerParityTests.cs" />
     <_WindowsOnlyTestSource Include="..\Jalium.UI.Tests\VulkanStrokeAlignmentTests.cs" />
     <_WindowsOnlyTestSource Include="..\Jalium.UI.Tests\VulkanSuperEllipseAntialiasingTests.cs" />
+    <_WindowsOnlyTestSource Include="..\Jalium.UI.Tests\VulkanVcGradientClipTests.cs" />
+    <_WindowsOnlyTestSource Include="..\Jalium.UI.Tests\SuperEllipseNativeRenderingTests.cs" />
     <_WindowsOnlyTestSource Include="..\Jalium.UI.Tests\WindowTaskbarRelaunchTests.cs" />
 
     <Compile Include="..\Jalium.UI.Tests\**\*.cs"

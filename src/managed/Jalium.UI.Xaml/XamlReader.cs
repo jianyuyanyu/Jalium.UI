@@ -2,6 +2,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.ComponentModel;
 using System.Runtime.Serialization;
+using System.Text;
 using System.Xml;
 using Jalium.UI;
 using Jalium.UI.Controls;
@@ -21,6 +22,10 @@ namespace Jalium.UI.Markup;
 [RequiresUnreferencedCode("XAML loading uses XamlTypeRegistry types whose ctors / overrides may use reflection on user-supplied targets, and may invoke Razor reflection.")]
 public partial class XamlReader
 {
+    private const int RestrictiveMaxCharacters = 4 * 1024 * 1024;
+    private const int RestrictiveMaxDepth = 128;
+    private const int RestrictiveMaxElements = 100_000;
+
     private static readonly Jalium.UI.Xaml.XamlSchemaContext s_wpfSchemaContext = new();
     private CancellationTokenSource? _asyncCancellation;
 
@@ -58,7 +63,12 @@ public partial class XamlReader
     }
 
     public static object Parse(string xamlText, bool useRestrictiveXamlReader)
-        => Parse(xamlText);
+    {
+        ArgumentNullException.ThrowIfNull(xamlText);
+        return useRestrictiveXamlReader
+            ? LoadRestrictive(xamlText, baseUri: null)
+            : Parse(xamlText);
+    }
 
     public static object Parse(string xamlText, ParserContext parserContext)
         => Parse(xamlText, parserContext, useRestrictiveXamlReader: false);
@@ -67,6 +77,10 @@ public partial class XamlReader
     {
         ArgumentNullException.ThrowIfNull(xamlText);
         ArgumentNullException.ThrowIfNull(parserContext);
+        if (useRestrictiveXamlReader)
+        {
+            return LoadRestrictive(xamlText, parserContext.BaseUri);
+        }
         using var xmlReader = JalxamlParser.CreateReader(xamlText);
         return LoadInternal(xmlReader, null, parserContext.BaseUri, null);
     }
@@ -98,7 +112,13 @@ public partial class XamlReader
         return LoadInternal(xmlReader, null, null, null);
     }
 
-    public static object Load(Stream stream, bool useRestrictiveXamlReader) => Load(stream);
+    public static object Load(Stream stream, bool useRestrictiveXamlReader)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        return useRestrictiveXamlReader
+            ? LoadRestrictive(ReadRestrictiveText(stream), baseUri: null)
+            : Load(stream);
+    }
 
     public static object Load(Stream stream, ParserContext parserContext)
         => Load(stream, parserContext, useRestrictiveXamlReader: false);
@@ -107,6 +127,12 @@ public partial class XamlReader
     {
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(parserContext);
+        if (useRestrictiveXamlReader)
+        {
+            return LoadRestrictive(
+                ReadRestrictiveText(stream),
+                parserContext.BaseUri);
+        }
         using var xmlReader = JalxamlParser.CreateReader(stream);
         return LoadInternal(xmlReader, null, parserContext.BaseUri, null);
     }
@@ -117,6 +143,17 @@ public partial class XamlReader
     public static object Load(XmlReader reader, bool useRestrictiveXamlReader)
     {
         ArgumentNullException.ThrowIfNull(reader);
+        if (useRestrictiveXamlReader)
+        {
+            if (reader is JalxamlReader)
+            {
+                throw new XamlParseException(
+                    "Restrictive XAML loading requires raw text or a non-JALXAML XmlReader so active Razor code cannot run before validation.");
+            }
+
+            Uri? baseUri = TryGetBaseUri(reader);
+            return LoadRestrictive(ReadRestrictiveXml(reader), baseUri);
+        }
         return LoadInternal(reader, null, TryGetBaseUri(reader), null);
     }
 
@@ -210,6 +247,158 @@ public partial class XamlReader
 
     private static Uri? TryGetBaseUri(XmlReader reader)
         => Uri.TryCreate(reader.BaseURI, UriKind.RelativeOrAbsolute, out Uri? uri) ? uri : null;
+
+    private static object LoadRestrictive(string xaml, Uri? baseUri)
+    {
+        ValidateRestrictiveXaml(xaml, baseUri);
+        using var xmlReader = JalxamlParser.CreateReader(xaml);
+        return LoadInternal(
+            xmlReader,
+            existingInstance: null,
+            baseUri: baseUri,
+            sourceAssembly: null,
+            restrictive: true);
+    }
+
+    private static string ReadRestrictiveText(Stream stream)
+    {
+        using var reader = new StreamReader(stream);
+        var buffer = new char[4096];
+        var builder = new StringBuilder();
+        while (true)
+        {
+            int read = reader.Read(buffer, 0, buffer.Length);
+            if (read == 0)
+            {
+                return builder.ToString();
+            }
+
+            if (builder.Length > RestrictiveMaxCharacters - read)
+            {
+                throw new XamlParseException(
+                    $"Restrictive XAML input exceeds the {RestrictiveMaxCharacters}-character limit.");
+            }
+
+            builder.Append(buffer, 0, read);
+        }
+    }
+
+    private static string ReadRestrictiveXml(XmlReader reader)
+    {
+        while (reader.NodeType != XmlNodeType.Element && reader.Read())
+        {
+        }
+
+        if (reader.NodeType != XmlNodeType.Element)
+        {
+            throw new XamlParseException("No root element found in restrictive XAML input.");
+        }
+
+        string xaml = reader.ReadOuterXml();
+        if (xaml.Length > RestrictiveMaxCharacters)
+        {
+            throw new XamlParseException(
+                $"Restrictive XAML input exceeds the {RestrictiveMaxCharacters}-character limit.");
+        }
+
+        return xaml;
+    }
+
+    private static void ValidateRestrictiveXaml(string xaml, Uri? baseUri)
+    {
+        ArgumentNullException.ThrowIfNull(xaml);
+        if (xaml.Length > RestrictiveMaxCharacters)
+        {
+            throw new XamlParseException(
+                $"Restrictive XAML input exceeds the {RestrictiveMaxCharacters}-character limit.");
+        }
+
+        for (int i = 0; i < xaml.Length; i++)
+        {
+            if (xaml[i] != '@')
+            {
+                continue;
+            }
+
+            if (i + 1 < xaml.Length && xaml[i + 1] == '@')
+            {
+                i++;
+                continue;
+            }
+
+            throw new XamlParseException(
+                "Razor expressions and code blocks are not allowed in restrictive XAML.");
+        }
+
+        using var reader = JalxamlParser.CreateReader(xaml);
+        var context = new XamlParserContext
+        {
+            BaseUri = baseUri,
+            IsRestrictive = true,
+        };
+
+        int elementCount = 0;
+        while (reader.Read())
+        {
+            if (reader.NodeType != XmlNodeType.Element)
+            {
+                continue;
+            }
+
+            if (reader.Depth > RestrictiveMaxDepth)
+            {
+                throw new XamlParseException(
+                    $"Restrictive XAML nesting exceeds the depth limit of {RestrictiveMaxDepth}.");
+            }
+
+            elementCount++;
+            if (elementCount > RestrictiveMaxElements)
+            {
+                throw new XamlParseException(
+                    $"Restrictive XAML contains more than {RestrictiveMaxElements} elements.");
+            }
+
+            string localName = reader.LocalName;
+            string namespaceUri = reader.NamespaceURI;
+            string typeName = localName.Contains('.')
+                ? localName.Substring(0, localName.IndexOf('.'))
+                : localName;
+            Type? elementType = context.ResolveType(namespaceUri, typeName);
+            if (elementType is null)
+            {
+                throw new XamlParseException(
+                    $"Restrictive XAML cannot resolve type '{typeName}' in namespace '{namespaceUri}'.");
+            }
+
+            if (!reader.HasAttributes)
+            {
+                continue;
+            }
+
+            for (int attributeIndex = 0; attributeIndex < reader.AttributeCount; attributeIndex++)
+            {
+                reader.MoveToAttribute(attributeIndex);
+                if (reader.Prefix == "xmlns" || reader.Name == "xmlns")
+                {
+                    if (reader.Value.StartsWith("clr-namespace:", StringComparison.Ordinal))
+                    {
+                        throw new XamlParseException(
+                            "CLR namespace mappings are not allowed in restrictive XAML.");
+                    }
+                    continue;
+                }
+
+                context.ValidateRestrictiveAttribute(
+                    elementType,
+                    reader.LocalName,
+                    reader.Prefix,
+                    reader.Value,
+                    reader.NamespaceURI);
+            }
+
+            reader.MoveToElement();
+        }
+    }
 
     /// <summary>
     /// Reads XAML from a stream and creates an object tree with assembly context.
@@ -445,7 +634,7 @@ public partial class XamlReader
 
     private static object LoadInternal(XmlReader reader, object? existingInstance, Uri? baseUri, Assembly? sourceAssembly,
         ResourceDictionary? parentResourceDictionary = null, Dictionary<string, object>? namedElementsOut = null,
-        object? codeBehindForEvents = null)
+        object? codeBehindForEvents = null, bool restrictive = false)
     {
 
         var context = new XamlParserContext
@@ -453,6 +642,7 @@ public partial class XamlReader
             BaseUri = baseUri,
             SourceAssembly = sourceAssembly,
             ParentResourceDictionary = parentResourceDictionary,
+            IsRestrictive = restrictive,
             // Hot reload parses a STANDALONE source tree (existingInstance == null) yet still needs its
             // inline event handlers (Click=…) to bind to the LIVE instance's code-behind so grafted new
             // elements stay interactive. codeBehindForEvents carries that target and affects ONLY event
@@ -549,6 +739,12 @@ public partial class XamlReader
 
     private static object ParseElement(XmlReader reader, XamlParserContext context, object? existingInstance = null)
     {
+        if (context.IsRestrictive && reader.Depth > RestrictiveMaxDepth)
+        {
+            throw new XamlParseException(
+                $"Restrictive XAML nesting exceeds the depth limit of {RestrictiveMaxDepth}.");
+        }
+
         var elementName = reader.LocalName;
         var namespaceUri = reader.NamespaceURI;
         var lineInfo = reader as IXmlLineInfo;
@@ -670,6 +866,13 @@ public partial class XamlReader
                 continue;
             }
 
+            context.ValidateRestrictiveAttribute(
+                currentInstance.GetType(),
+                attrName,
+                prefix,
+                attrValue,
+                attrNamespaceUri);
+
             // Handle x: directives
             if (prefix == "x")
             {
@@ -736,32 +939,20 @@ public partial class XamlReader
         var ownerTypeName = parts[0];
         var propertyName = parts[1];
 
-        // Prefer the attribute's own namespace, set when the author used an explicit prefix
-        // (e.g. `b:AnimatedBg.StartWindow` where `b` maps to a clr-namespace URI).
-        Type? ownerType = null;
-        if (!string.IsNullOrEmpty(attributeNamespaceUri))
-        {
-            ownerType = context.ResolveType(attributeNamespaceUri, ownerTypeName);
-        }
-
-        // Unprefixed attached properties (e.g. `Grid.Row`) inherit XML's no-namespace rule,
-        // so look them up under the host element's xmlns instead.
-        if (ownerType == null && !string.IsNullOrEmpty(elementNamespaceUri))
-        {
-            ownerType = context.ResolveType(elementNamespaceUri, ownerTypeName);
-        }
-
-        // Fall back to the AOT-safe simple-name registry as a last resort.
-        if (ownerType == null)
-        {
-            ownerType = FindTypeByName(ownerTypeName);
-        }
+        var ownerType = ResolveAttachedPropertyOwnerType(
+            context,
+            ownerTypeName,
+            attributeNamespaceUri,
+            elementNamespaceUri);
 
         if (ownerType == null)
         {
             throw new XamlParseException($"Cannot resolve attached property owner type: {ownerTypeName}");
         }
 
+        var attachedProperty = instance is DependencyObject
+            ? DependencyProperty.FromName(ownerType, propertyName)
+            : null;
 
         // Find the Set method (e.g., Grid.SetRow)
         var setMethod = ownerType.GetMethod($"Set{propertyName}", BindingFlags.Public | BindingFlags.Static);
@@ -773,7 +964,27 @@ public partial class XamlReader
                 var targetType = parameters[1].ParameterType;
                 object? convertedValue = null;
 
-                if (ownerType == typeof(Grid) &&
+                if (MarkupExtensionParser.TryParseAttachedProperty(
+                        value,
+                        instance,
+                        attachedProperty,
+                        context,
+                        out var extensionResult))
+                {
+                    if (extensionResult is BindingExpressionBase)
+                        return;
+
+                    if (extensionResult is BindingBase)
+                    {
+                        throw new XamlParseException(
+                            $"Attached binding '{ownerTypeName}.{propertyName}' requires a registered DependencyProperty.");
+                    }
+
+                    convertedValue = ConvertAttachedPropertyValue(
+                        extensionResult,
+                        targetType);
+                }
+                else if (ownerType == typeof(Grid) &&
                     instance is UIElement element &&
                     targetType == typeof(int) &&
                     (propertyName == "Row" || propertyName == "Column"))
@@ -811,15 +1022,79 @@ public partial class XamlReader
         }
 
         // Try DependencyProperty directly via the AOT-safe registry.
-        var dp = DependencyProperty.FromName(ownerType, propertyName);
-        if (dp != null && instance is DependencyObject depObj)
+        if (attachedProperty != null &&
+            instance is DependencyObject depObj)
         {
-            var convertedValue = TypeConverterRegistry.ConvertValue(value, dp.PropertyType);
-            depObj.SetValue(dp, convertedValue);
+            object? convertedValue;
+            if (MarkupExtensionParser.TryParseAttachedProperty(
+                    value,
+                    instance,
+                    attachedProperty,
+                    context,
+                    out var extensionResult))
+            {
+                if (extensionResult is BindingExpressionBase)
+                    return;
+
+                convertedValue = ConvertAttachedPropertyValue(
+                    extensionResult,
+                    attachedProperty.PropertyType);
+            }
+            else
+            {
+                convertedValue = TypeConverterRegistry.ConvertValue(
+                    value,
+                    attachedProperty.PropertyType);
+            }
+
+            depObj.SetValue(attachedProperty, convertedValue);
             return;
         }
 
         throw new XamlParseException($"Cannot find attached property setter for: {propertyPath}");
+    }
+
+    private static Type? ResolveAttachedPropertyOwnerType(
+        XamlParserContext context,
+        string ownerTypeName,
+        string attributeNamespaceUri,
+        string elementNamespaceUri)
+    {
+        // Prefer the attribute's own namespace, set when the author used an
+        // explicit prefix (for example b:AnimatedBg.StartWindow).
+        Type? ownerType = null;
+        if (!string.IsNullOrEmpty(attributeNamespaceUri))
+        {
+            ownerType = context.ResolveType(
+                attributeNamespaceUri,
+                ownerTypeName);
+        }
+
+        // Unprefixed attached properties (for example Grid.Row) inherit the
+        // host element's namespace.
+        if (ownerType == null &&
+            !string.IsNullOrEmpty(elementNamespaceUri))
+        {
+            ownerType = context.ResolveType(
+                elementNamespaceUri,
+                ownerTypeName);
+        }
+
+        return context.FilterRestrictiveType(
+            ownerType ?? FindTypeByName(ownerTypeName),
+            ownerTypeName);
+    }
+
+    private static object? ConvertAttachedPropertyValue(
+        object? value,
+        Type targetType)
+    {
+        if (value == null || targetType.IsInstanceOfType(value))
+            return value;
+
+        return value is string text
+            ? TypeConverterRegistry.ConvertValue(text, targetType)
+            : value;
     }
 
     [return: DynamicallyAccessedMembers(
@@ -1233,7 +1508,9 @@ public partial class XamlReader
         var ownerMatchesInstance = OwnerTypeMatchesInstance(type, ownerTypeName);
         if (!ownerMatchesInstance)
         {
-            var attachedOwnerType = context.ResolveType(namespaceUri, ownerTypeName) ?? FindTypeByName(ownerTypeName);
+            var attachedOwnerType = context.FilterRestrictiveType(
+                context.ResolveType(namespaceUri, ownerTypeName) ?? FindTypeByName(ownerTypeName),
+                ownerTypeName);
             if (attachedOwnerType != null && attachedOwnerType != type)
             {
                 ParseAttachedPropertyElement(reader, instance, attachedOwnerType, propertyName, depth, isEmpty, context);
@@ -2467,7 +2744,7 @@ public partial class XamlReader
             // （它们在 ModuleInitializer 里都注册了简单名）。
             var registryType = XamlTypeRegistry.GetType(trimmed);
             if (registryType != null)
-                return registryType;
+                return context.FilterRestrictiveType(registryType, trimmed);
 
             // Fallback：用元素的默认命名空间走 ResolveType，避免漏掉
             // xmlns="clr-namespace:..." 这种"匿名前缀"场景。
@@ -2685,6 +2962,7 @@ public partial class XamlReader
     [RequiresUnreferencedCode("Reads ContentPropertyAttribute and the matching property via reflection on the runtime type.")]
     private static object SetContentProperty(object instance, string content, XamlParserContext context)
     {
+        context.ValidateRestrictiveValue(content);
         content = content.Trim();
         if (string.IsNullOrEmpty(content))
         {
@@ -3261,6 +3539,53 @@ public partial class XamlReader
             BuilderSetProperty(target, propertyName, result, context);
     }
 
+    /// <summary>
+    /// Apply a SourceGenerator-lowered binding to an attached dependency
+    /// property. The owner type supplies the dependency-property identity while
+    /// the binding target remains the element carrying the attached property.
+    /// </summary>
+    [RequiresUnreferencedCode("Resolves the attached owner type and binding parameters, which may use reflection.")]
+    internal static void BuilderApplyCompiledAttachedBinding(
+        object target,
+        string ownerTypeName,
+        string propertyName,
+        string? positionalPath,
+        string[] names,
+        string[] values,
+        XamlParserContext context,
+        string elementNamespaceUri)
+    {
+        var ownerType = ResolveAttachedPropertyOwnerType(
+            context,
+            ownerTypeName,
+            elementNamespaceUri,
+            elementNamespaceUri)
+            ?? throw new XamlParseException(
+                $"Cannot resolve attached property owner type: {ownerTypeName}");
+        var targetProperty =
+            DependencyProperty.FromName(ownerType, propertyName)
+            ?? throw new XamlParseException(
+                $"Attached binding '{ownerTypeName}.{propertyName}' requires a registered DependencyProperty.");
+
+        var extension = MarkupExtensionParser.BuildBindingExtension(
+            positionalPath,
+            names,
+            values,
+            context);
+        var result =
+            MarkupExtensionParser.ProvideExtensionValueForDependencyProperty(
+                extension,
+                target,
+                targetProperty,
+                context);
+
+        if (result is not BindingExpressionBase)
+        {
+            throw new XamlParseException(
+                $"Unable to attach binding to '{ownerTypeName}.{propertyName}'.");
+        }
+    }
+
     [RequiresUnreferencedCode("XamlBuilder.SetAttachedProperty resolves the static SetXxx method via reflection on the owner type.")]
     internal static void BuilderSetAttachedProperty(
         object instance,
@@ -3546,6 +3871,73 @@ public partial class XamlReader
 /// </summary>
 internal sealed class XamlParserContext : IAmbientResourceProvider
 {
+    private static readonly HashSet<Assembly> s_restrictiveFrameworkAssemblies =
+    [
+        typeof(DependencyObject).Assembly,
+        typeof(Grid).Assembly,
+        typeof(Brush).Assembly,
+        typeof(Binding).Assembly,
+        typeof(XamlReader).Assembly,
+    ];
+
+    private static readonly HashSet<Type> s_restrictivePrimitiveTypes =
+    [
+        typeof(string),
+        typeof(bool),
+        typeof(byte),
+        typeof(short),
+        typeof(int),
+        typeof(long),
+        typeof(float),
+        typeof(double),
+        typeof(decimal),
+        typeof(DateTime),
+        typeof(DateTimeOffset),
+        typeof(TimeSpan),
+        typeof(Guid),
+        typeof(Uri),
+    ];
+
+    private static readonly HashSet<Type> s_restrictiveDeniedTypes =
+    [
+        typeof(Application),
+        typeof(WebView),
+        typeof(MediaElement),
+        typeof(Terminal),
+        typeof(MapView),
+        typeof(ObjectDataProvider),
+        typeof(XmlDataProvider),
+        typeof(RazorSectionHost),
+        typeof(StaticExtension),
+        typeof(TypeExtension),
+        typeof(ArrayExtension),
+    ];
+
+    private static readonly HashSet<string> s_restrictiveDeniedProperties =
+        new(StringComparer.Ordinal)
+        {
+            "Source",
+            "UriSource",
+            "NavigateUri",
+            "StartupUri",
+            "ObjectType",
+            "ObjectInstance",
+            "MethodName",
+            "Command",
+            "CommandParameter",
+        };
+
+    private static readonly HashSet<string> s_restrictiveMarkupExtensions =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Binding",
+            "StaticResource",
+            "DynamicResource",
+            "ThemeResource",
+            "TemplateBinding",
+            "Null",
+        };
+
     // Bootstrap fallback: a handful of well-known XML namespace → CLR namespace pairs used
     // when XmlnsDefinitionRegistry has not yet observed an assembly-level declaration (for
     // example because the type lives in an assembly the scan has not reached, or because a
@@ -3608,6 +4000,170 @@ internal sealed class XamlParserContext : IAmbientResourceProvider
     /// Gets or sets the code-behind instance for event handler wiring.
     /// </summary>
     public object? CodeBehindInstance { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether this parse must reject active content and
+    /// user-defined runtime types.
+    /// </summary>
+    public bool IsRestrictive { get; set; }
+
+    internal Type? FilterRestrictiveType(Type? type, string displayName)
+    {
+        if (!IsRestrictive || type is null)
+        {
+            return type;
+        }
+
+        if (!IsRestrictiveTypeAllowed(type))
+        {
+            throw new XamlParseException(
+                $"Type '{type.FullName ?? displayName}' is not allowed in restrictive XAML.");
+        }
+
+        return type;
+    }
+
+    [UnconditionalSuppressMessage(
+        "Trimming",
+        "IL2070",
+        Justification = "Restrictive validation reaches only framework types admitted by the fixed assembly/type allowlist; those XAML-facing types and their public event surface are preserved by the framework registry.")]
+    internal void ValidateRestrictiveAttribute(
+        Type elementType,
+        string attributeName,
+        string prefix,
+        string value,
+        string attributeNamespaceUri = "")
+    {
+        if (!IsRestrictive)
+        {
+            return;
+        }
+
+        if (prefix == "x")
+        {
+            if (attributeName is not "Name" and not "Key")
+            {
+                throw new XamlParseException(
+                    $"x:{attributeName} is not allowed in restrictive XAML.");
+            }
+            ValidateRestrictiveValue(value);
+            return;
+        }
+
+        string memberName = attributeName;
+        int separator = memberName.LastIndexOf('.');
+        if (separator >= 0 && separator < memberName.Length - 1)
+        {
+            string ownerName = memberName.Substring(0, separator);
+            Type? ownerType = ResolveType(attributeNamespaceUri, ownerName)
+                ?? XamlTypeRegistry.GetType(ownerName);
+            FilterRestrictiveType(ownerType, ownerName);
+            memberName = memberName.Substring(separator + 1);
+        }
+
+        if (elementType.GetEvent(memberName, BindingFlags.Instance | BindingFlags.Public) is not null)
+        {
+            throw new XamlParseException(
+                $"Event handler '{attributeName}' is not allowed in restrictive XAML.");
+        }
+
+        if (s_restrictiveDeniedProperties.Contains(memberName))
+        {
+            throw new XamlParseException(
+                $"Property '{attributeName}' is not allowed in restrictive XAML.");
+        }
+
+        if (memberName == "Property")
+        {
+            string ownerToken = value.Trim().Trim('(', ')');
+            int ownerSeparator = ownerToken.LastIndexOf('.');
+            if (ownerSeparator > 0)
+            {
+                ownerToken = ownerToken.Substring(0, ownerSeparator);
+                int prefixSeparator = ownerToken.LastIndexOf(':');
+                if (prefixSeparator >= 0 && prefixSeparator < ownerToken.Length - 1)
+                {
+                    ownerToken = ownerToken.Substring(prefixSeparator + 1);
+                }
+
+                FilterRestrictiveType(
+                    XamlTypeRegistry.GetType(ownerToken),
+                    ownerToken);
+            }
+        }
+
+        ValidateRestrictiveValue(value);
+    }
+
+    internal void ValidateRestrictiveValue(string value)
+    {
+        if (!IsRestrictive || string.IsNullOrEmpty(value))
+        {
+            return;
+        }
+
+        if (value.Contains('@', StringComparison.Ordinal))
+        {
+            throw new XamlParseException(
+                "Razor expressions are not allowed in restrictive XAML.");
+        }
+
+        string trimmed = value.Trim();
+        if (!trimmed.StartsWith('{') ||
+            trimmed.StartsWith("{}", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        int end = trimmed.IndexOfAny([' ', ',', '}'], 1);
+        if (end < 0)
+        {
+            end = trimmed.Length;
+        }
+
+        string extensionName = trimmed.Substring(1, end - 1);
+        if (extensionName.StartsWith("x:", StringComparison.OrdinalIgnoreCase))
+        {
+            extensionName = extensionName.Substring(2);
+        }
+
+        if (!s_restrictiveMarkupExtensions.Contains(extensionName) ||
+            ContainsActiveNestedMarkup(trimmed))
+        {
+            throw new XamlParseException(
+                $"Markup extension '{extensionName}' is not allowed in restrictive XAML.");
+        }
+    }
+
+    private static bool IsRestrictiveTypeAllowed(Type type)
+    {
+        if (s_restrictivePrimitiveTypes.Contains(type))
+        {
+            return true;
+        }
+
+        if (!s_restrictiveFrameworkAssemblies.Contains(type.Assembly) ||
+            s_restrictiveDeniedTypes.Contains(type) ||
+            typeof(Window).IsAssignableFrom(type) ||
+            typeof(DataSourceProvider).IsAssignableFrom(type) ||
+            typeof(Jalium.UI.Interactivity.Behavior).IsAssignableFrom(type) ||
+            typeof(Jalium.UI.Interactivity.BehaviorTriggerAction).IsAssignableFrom(type))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool ContainsActiveNestedMarkup(string value)
+    {
+        return value.Contains("{x:Static", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("{Static ", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("{x:Type", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("{Type ", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("{x:Array", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("{Array ", StringComparison.OrdinalIgnoreCase);
+    }
 
     /// <summary>
     /// Sets the current resource key (from x:Key attribute).
@@ -3864,13 +4420,13 @@ internal sealed class XamlParserContext : IAmbientResourceProvider
         var cacheKey = new TypeCacheKey(namespaceUri, typeName, SourceAssembly);
         if (s_typeCache.TryGetValue(cacheKey, out var cachedType))
         {
-            return cachedType;
+            return FilterRestrictiveType(cachedType, typeName);
         }
 
         var resolved = ResolveTypeUncached(namespaceUri, typeName);
         // null 也 cache —— 见 s_typeCache 注释。
         s_typeCache.TryAdd(cacheKey, resolved);
-        return resolved;
+        return FilterRestrictiveType(resolved, typeName);
     }
 
     private Type? ResolveTypeUncached(string namespaceUri, string typeName)
@@ -3950,7 +4506,7 @@ internal sealed class XamlParserContext : IAmbientResourceProvider
     [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage("Trimming", "IL2026:RequiresUnreferencedCode",
         Justification = "This is the user-defined-type fallback of the runtime XAML reader, reached only after the AOT-safe XamlTypeRegistry (which preserves every framework type) misses. Resolving a user type named in jalxaml via Assembly.GetType is the documented consumer responsibility under AOT — the RUC contract is already declared at the public XamlReader.Load/Parse boundary (see the class-level RequiresUnreferencedCode), and user code-behind types reachable from XAML are preserved via XamlTypeRegistry registration / the SourceGenerator's DynamicDependency emission.")]
     [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage("Trimming", "IL2073:DynamicallyAccessedMembers",
-        Justification = "The [return: DynamicallyAccessedMembers] promises preserved members on the resolved type so downstream reflective construction is safe. For the registry hit path that guarantee holds (registered types carry the DAM annotation on Register<T>/RegisterType<T>). For this Assembly.GetType fallback the resolved user type is a runtime-discovered token that cannot carry DAM statically; its preservation is the documented consumer responsibility (XamlReader.Load/Parse RUC contract + SourceGenerator DynamicDependency), so the return annotation is satisfied by the consumer-side preservation rather than a static flow.")]
+        Justification = "The [return: DynamicallyAccessedMembers] promises preserved members on the resolved type so downstream reflective construction is safe. For the registry hit path that guarantee holds (registered types carry the DAM annotation on Register<T>/RegisterType). For this Assembly.GetType fallback the resolved user type is a runtime-discovered token that cannot carry DAM statically; its preservation is the documented consumer responsibility (XamlReader.Load/Parse RUC contract + SourceGenerator DynamicDependency), so the return annotation is satisfied by the consumer-side preservation rather than a static flow.")]
     [return: DynamicallyAccessedMembers(
         DynamicallyAccessedMemberTypes.PublicConstructors |
         DynamicallyAccessedMemberTypes.PublicProperties |
@@ -4359,7 +4915,7 @@ public static class XamlTypeRegistry
     /// Gets a type by its simple name.
     /// </summary>
     [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage("Trimming", "IL2073:DynamicallyAccessedMembers",
-        Justification = "The _types dictionary is populated exclusively by the DAM-annotated Register<T>/RegisterType<T> generics (each carries the same PublicConstructors|PublicProperties|PublicFields|PublicMethods|NonPublicFields annotation on T), so every stored Type already has those members preserved. The trimmer cannot propagate DAM through the Dictionary<string,Type> value type, so it cannot statically prove the returned token satisfies the [return: DAM] promise; the promise is in fact upheld by those registration generics.")]
+        Justification = "The _types dictionary is populated by DAM-annotated Register<T>/RegisterType entry points (each carries the same PublicConstructors|PublicProperties|PublicFields|PublicMethods|NonPublicFields contract), so every stored Type already has those members preserved. The trimmer cannot propagate DAM through the Dictionary<string,Type> value type, so it cannot statically prove the returned token satisfies the [return: DAM] promise; the promise is upheld by those registration entry points.")]
     [return: DynamicallyAccessedMembers(
         DynamicallyAccessedMemberTypes.PublicConstructors |
         DynamicallyAccessedMemberTypes.PublicProperties |
@@ -4378,6 +4934,22 @@ public static class XamlTypeRegistry
     /// <summary>
     /// Registers a custom type for XAML parsing.
     /// Call this for any custom types used in XAML.
+    /// </summary>
+    public static void RegisterType(
+        [DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicConstructors |
+            DynamicallyAccessedMemberTypes.PublicProperties |
+            DynamicallyAccessedMemberTypes.PublicFields |
+            DynamicallyAccessedMemberTypes.PublicMethods |
+            DynamicallyAccessedMemberTypes.NonPublicFields)]
+        Type type)
+    {
+        ArgumentNullException.ThrowIfNull(type);
+        _types[type.Name] = type;
+    }
+
+    /// <summary>
+    /// Registers a custom non-static type for XAML parsing.
     /// </summary>
     public static void RegisterType<[DynamicallyAccessedMembers(
         DynamicallyAccessedMemberTypes.PublicConstructors |

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -11,6 +12,8 @@
 #include <Windows.h>
 #else
 #include <dlfcn.h>
+#include <limits.h>
+#include <stdio.h>
 #endif
 
 #ifdef __ANDROID__
@@ -23,6 +26,135 @@
 #endif
 
 namespace {
+
+// Backend modules are part of the same trusted RID payload as
+// jalium.native.core. Loading a bare filename would let the process current
+// directory participate in DLL/DSO resolution, so resolve the backend only
+// beside this module.
+#ifdef _WIN32
+const wchar_t* GetBackendLibraryName(JaliumBackend backend)
+{
+    switch (backend) {
+        case JALIUM_BACKEND_VULKAN:   return L"jalium.native.vulkan.dll";
+        case JALIUM_BACKEND_D3D12:    return L"jalium.native.d3d12.dll";
+        case JALIUM_BACKEND_METAL:    return L"jalium.native.metal.dll";
+        case JALIUM_BACKEND_SOFTWARE: return L"jalium.native.software.dll";
+        default:                      return nullptr;
+    }
+}
+
+bool LoadBackendLibraryFromModuleDirectory(JaliumBackend backend)
+{
+    const wchar_t* libraryName = GetBackendLibraryName(backend);
+    if (!libraryName) return false;
+
+    static const unsigned char moduleAnchor = 0;
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&moduleAnchor),
+            &module)) {
+        return false;
+    }
+
+    wchar_t modulePath[32768] = {};
+    const DWORD length = GetModuleFileNameW(
+        module, modulePath, static_cast<DWORD>(sizeof(modulePath) / sizeof(modulePath[0])));
+    if (length == 0 || length >= sizeof(modulePath) / sizeof(modulePath[0])) {
+        return false;
+    }
+
+    size_t directoryLength = length;
+    while (directoryLength > 0 &&
+           modulePath[directoryLength - 1] != L'\\' &&
+           modulePath[directoryLength - 1] != L'/') {
+        --directoryLength;
+    }
+    if (directoryLength == 0) return false;
+
+    const size_t libraryNameLength = wcslen(libraryName);
+    if (directoryLength + libraryNameLength >=
+        sizeof(modulePath) / sizeof(modulePath[0])) {
+        return false;
+    }
+
+    memcpy(
+        modulePath + directoryLength,
+        libraryName,
+        (libraryNameLength + 1) * sizeof(wchar_t));
+    return LoadLibraryExW(
+               modulePath,
+               nullptr,
+               LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                   LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) != nullptr;
+}
+#else
+const char* GetBackendLibraryName(JaliumBackend backend)
+{
+#if defined(__APPLE__)
+    switch (backend) {
+        case JALIUM_BACKEND_VULKAN:   return "libjalium.native.vulkan.dylib";
+        case JALIUM_BACKEND_METAL:    return "libjalium.native.metal.dylib";
+        case JALIUM_BACKEND_SOFTWARE: return "libjalium.native.software.dylib";
+        default:                      return nullptr;
+    }
+#else
+    switch (backend) {
+        case JALIUM_BACKEND_VULKAN:   return "libjalium.native.vulkan.so";
+        case JALIUM_BACKEND_SOFTWARE: return "libjalium.native.software.so";
+        default:                      return nullptr;
+    }
+#endif
+}
+
+bool LoadBackendLibraryFromModuleDirectory(JaliumBackend backend)
+{
+    const char* libraryName = GetBackendLibraryName(backend);
+    if (!libraryName) return false;
+
+    static const unsigned char moduleAnchor = 0;
+    Dl_info moduleInfo{};
+    if (dladdr(&moduleAnchor, &moduleInfo) == 0 || !moduleInfo.dli_fname) {
+        return false;
+    }
+
+    char modulePath[PATH_MAX] = {};
+    if (!realpath(moduleInfo.dli_fname, modulePath)) {
+        return false;
+    }
+
+    char* separator = strrchr(modulePath, '/');
+    if (!separator) return false;
+    const size_t directoryLength =
+        static_cast<size_t>(separator - modulePath) + 1u;
+    const size_t libraryNameLength = strlen(libraryName);
+    if (directoryLength + libraryNameLength >= sizeof(modulePath)) {
+        return false;
+    }
+
+    memcpy(
+        modulePath + directoryLength,
+        libraryName,
+        libraryNameLength + 1u);
+    return dlopen(modulePath, RTLD_NOW | RTLD_GLOBAL) != nullptr;
+}
+#endif
+
+bool TryLoadBackendLibraryOnce(JaliumBackend backend)
+{
+    // Mirror BackendRegistry::MAX_BACKENDS — JaliumBackend values index this array.
+    static constexpr int kMaxOnDemandBackends = 16;
+    static std::atomic_flag attempted[kMaxOnDemandBackends] = {};
+
+    const int backendIndex = static_cast<int>(backend);
+    if (backendIndex < 0 || backendIndex >= kMaxOnDemandBackends ||
+        attempted[backendIndex].test_and_set(std::memory_order_acq_rel)) {
+        return false;
+    }
+
+    return LoadBackendLibraryFromModuleDirectory(backend);
+}
 
 // Reads JALIUM_RENDER_BACKEND and returns a JaliumBackend override, or
 // JALIUM_BACKEND_AUTO if no valid override is present. Accepts the same values
@@ -86,6 +218,7 @@ JaliumBackend ReadBackendEnvOverride()
 extern "C" {
 
 JALIUM_API JaliumContext* jalium_context_create(JaliumBackend backend) {
+    try {
     auto& registry = jalium::GetBackendRegistry();
 
     LOGI_CTX("jalium_context_create: requested backend=%d", (int)backend);
@@ -107,29 +240,7 @@ JALIUM_API JaliumContext* jalium_context_create(JaliumBackend backend) {
             // register its factory. Only after that can registry.IsAvailable
             // return the truth.
             if (!registry.IsAvailable(envOverride)) {
-#ifdef _WIN32
-                const char* libName = nullptr;
-                switch (envOverride) {
-                    case JALIUM_BACKEND_VULKAN:   libName = "jalium.native.vulkan.dll"; break;
-                    case JALIUM_BACKEND_D3D12:    libName = "jalium.native.d3d12.dll"; break;
-                    case JALIUM_BACKEND_METAL:    libName = "jalium.native.metal.dll"; break;
-                    case JALIUM_BACKEND_SOFTWARE: libName = "jalium.native.software.dll"; break;
-                    default: break;
-                }
-                if (libName) {
-                    (void)LoadLibraryA(libName);
-                }
-#else
-                const char* libName = nullptr;
-                switch (envOverride) {
-                    case JALIUM_BACKEND_VULKAN:   libName = "libjalium.native.vulkan.so"; break;
-                    case JALIUM_BACKEND_SOFTWARE: libName = "libjalium.native.software.so"; break;
-                    default: break;
-                }
-                if (libName) {
-                    (void)dlopen(libName, RTLD_NOW | RTLD_GLOBAL);
-                }
-#endif
+                (void)TryLoadBackendLibraryOnce(envOverride);
             }
             if (registry.IsAvailable(envOverride)) {
                 backend = envOverride;
@@ -183,41 +294,7 @@ JALIUM_API JaliumContext* jalium_context_create(JaliumBackend backend) {
     // disqualifies the backend so no factory gets registered) would call
     // LoadLibrary/dlopen again and leak another module refcount.
     if (actualBackend != JALIUM_BACKEND_AUTO && !registry.IsAvailable(actualBackend)) {
-        // Mirror BackendRegistry::MAX_BACKENDS — JaliumBackend values index this array.
-        static constexpr int kMaxOnDemandBackends = 16;
-        static std::atomic_flag s_onDemandAttempted[kMaxOnDemandBackends] = {};
-
-        const int backendIdx = static_cast<int>(actualBackend);
-        const bool firstAttempt = backendIdx >= 0 && backendIdx < kMaxOnDemandBackends
-            && !s_onDemandAttempted[backendIdx].test_and_set(std::memory_order_acq_rel);
-
-        if (firstAttempt) {
-#ifdef _WIN32
-            const char* libName = nullptr;
-            switch (actualBackend) {
-                case JALIUM_BACKEND_VULKAN:   libName = "jalium.native.vulkan.dll"; break;
-                case JALIUM_BACKEND_D3D12:    libName = "jalium.native.d3d12.dll"; break;
-                case JALIUM_BACKEND_METAL:    libName = "jalium.native.metal.dll"; break;
-                case JALIUM_BACKEND_SOFTWARE: libName = "jalium.native.software.dll"; break;
-                default: break;
-            }
-            if (libName) {
-                LOGI_CTX("jalium_context_create: on-demand loading %s", libName);
-                (void)LoadLibraryA(libName);
-            }
-#else
-            const char* libName = nullptr;
-            switch (actualBackend) {
-                case JALIUM_BACKEND_VULKAN:   libName = "libjalium.native.vulkan.so"; break;
-                case JALIUM_BACKEND_SOFTWARE: libName = "libjalium.native.software.so"; break;
-                default: break;
-            }
-            if (libName) {
-                LOGI_CTX("jalium_context_create: on-demand loading %s", libName);
-                (void)dlopen(libName, RTLD_NOW | RTLD_GLOBAL);
-            }
-#endif
-        }
+        (void)TryLoadBackendLibraryOnce(actualBackend);
     }
 
     auto factory = registry.GetFactory(actualBackend);
@@ -236,6 +313,14 @@ JALIUM_API JaliumContext* jalium_context_create(JaliumBackend backend) {
     auto* ctx = new jalium::Context(actualBackend, std::move(backendImpl));
     LOGI_CTX("jalium_context_create: success, ctx=%p", (void*)ctx);
     return reinterpret_cast<JaliumContext*>(ctx);
+    } catch (const std::bad_alloc&) {
+        LOGE_CTX("jalium_context_create: allocation failed");
+        return nullptr;
+    } catch (...) {
+        // Never allow a backend factory exception to cross the C ABI.
+        LOGE_CTX("jalium_context_create: backend factory threw");
+        return nullptr;
+    }
 }
 
 JALIUM_API JaliumResult jalium_context_set_gpu_preference(
@@ -248,12 +333,9 @@ JALIUM_API JaliumResult jalium_context_set_gpu_preference(
         return JALIUM_ERROR_INVALID_ARGUMENT;
     }
 
-    // Context creation currently constructs the selected backend immediately;
-    // no cross-backend setter exists yet. Keep the declared/PInvoke ABI real
-    // and deterministic instead of leaving a missing entry point. Backends
-    // which add a pre-device preference hook can replace this result without
-    // changing the C ABI.
-    return JALIUM_ERROR_NOT_SUPPORTED;
+    auto* impl = reinterpret_cast<jalium::Context*>(ctx)->GetBackendImpl();
+    if (!impl) return JALIUM_ERROR_INVALID_STATE;
+    return impl->SetGpuPreference(gpuPreference);
 }
 
 JALIUM_API void jalium_context_destroy(JaliumContext* ctx) {

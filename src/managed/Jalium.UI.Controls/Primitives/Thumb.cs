@@ -150,7 +150,7 @@ public class Thumb : Control
     /// </summary>
     public Thumb()
     {
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         Focusable = true;
 
         // Register mouse event handlers

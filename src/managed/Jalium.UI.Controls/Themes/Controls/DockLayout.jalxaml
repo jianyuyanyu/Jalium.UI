@@ -5,11 +5,13 @@
     <!-- DockLayout -->
     <Style TargetType="DockLayout">
         <Setter Property="Background" Value="{ThemeResource WindowBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
     </Style>
 
     <!-- DockTabPanel -->
     <Style TargetType="DockTabPanel">
         <Setter Property="Background" Value="{ThemeResource DockContentBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="TabStripBackground" Value="{ThemeResource DockTabStripBackground}" />
         <Setter Property="TabStripBorderBrush" Value="{ThemeResource DockTabStripBorder}" />
         <Setter Property="TabStripHeight" Value="32" />
@@ -48,6 +50,7 @@
     <!-- Split (internal) -->
     <Style TargetType="Split">
         <Setter Property="Background" Value="{ThemeResource DockSplitterBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
     </Style>
 
 </ResourceDictionary>

@@ -684,7 +684,7 @@ public sealed partial class FormattedText
 
     private static void ValidateEmSize(double value, string parameterName)
     {
-        if (!(value > 0) || double.IsInfinity(value))
+        if (!double.IsFinite(value) || value <= 0.001 || value > 35791.0)
         {
             throw new ArgumentOutOfRangeException(parameterName);
         }

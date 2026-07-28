@@ -139,11 +139,16 @@ RasterizedGlyph RasterizeOutline(
     GlyphAntialiasMode antialiasMode)
 {
     RasterizedGlyph result{};
-    if (!face || glyphIndex == 0 || fontSizePx <= 0.0f) return result;
+    if (!face || glyphIndex == 0 || !std::isfinite(fontSizePx) ||
+        fontSizePx <= 0.0f) {
+        return result;
+    }
+    fontSizePx = std::min(fontSizePx, 4095.0f);
 
     const float upem = static_cast<float>(face->UnitsPerEm());
     if (upem <= 0.0f) return result;
     const float scale = fontSizePx / upem;
+    if (!std::isfinite(scale) || scale <= 0.0f) return result;
     result.advanceX = face->GetAdvance(static_cast<uint16_t>(glyphIndex)) * scale;
 
     float tolerance = 0.25f / scale;
@@ -169,17 +174,34 @@ RasterizedGlyph RasterizeOutline(
             minY = std::min(minY, y); maxY = std::max(maxY, y);
         }
     }
-    if (!(maxX > minX) || !(maxY > minY)) return result;
+    if (!std::isfinite(minX) || !std::isfinite(minY) ||
+        !std::isfinite(maxX) || !std::isfinite(maxY) ||
+        !(maxX > minX) || !(maxY > minY)) {
+        return result;
+    }
 
     // LCD's five-tap filter reaches two subpixels outside the outline. Two
     // logical padding pixels are cheap and prevent colored fringe clipping.
     const int padding = antialiasMode == GlyphAntialiasMode::HorizontalLcd ? 2 : 1;
-    const int x0 = static_cast<int>(std::floor(minX)) - padding;
-    const int y0 = static_cast<int>(std::floor(minY)) - 1;
-    int x1 = static_cast<int>(std::ceil(maxX)) + padding;
-    int y1 = static_cast<int>(std::ceil(maxY)) + 1;
-    if (x1 - x0 > 4095) x1 = x0 + 4095;
-    if (y1 - y0 > 4095) y1 = y0 + 4095;
+    const double x0Double = std::floor(static_cast<double>(minX)) - padding;
+    const double y0Double = std::floor(static_cast<double>(minY)) - 1.0;
+    const double x1Double = std::ceil(static_cast<double>(maxX)) + padding;
+    const double y1Double = std::ceil(static_cast<double>(maxY)) + 1.0;
+    if (x0Double < std::numeric_limits<int>::min() ||
+        y0Double < std::numeric_limits<int>::min() ||
+        x1Double > std::numeric_limits<int>::max() ||
+        y1Double > std::numeric_limits<int>::max() ||
+        x1Double <= x0Double || y1Double <= y0Double) {
+        return result;
+    }
+    const int x0 = static_cast<int>(x0Double);
+    const int y0 = static_cast<int>(y0Double);
+    int x1 = x1Double - x0Double > 4095.0
+        ? x0 + 4095
+        : static_cast<int>(x1Double);
+    int y1 = y1Double - y0Double > 4095.0
+        ? y0 + 4095
+        : static_cast<int>(y1Double);
     const int width = x1 - x0;
     const int height = y1 - y0;
     if (width <= 0 || height <= 0) return result;
@@ -604,7 +626,11 @@ RasterizedGlyph GlyphRasterizer::Rasterize(
     GlyphAntialiasMode antialiasMode)
 {
     RasterizedGlyph color;
-    if (face && glyphIndex != 0 && fontSizePx > 0.0f && face->HasColorTables()) {
+    if (!std::isfinite(fontSizePx) || fontSizePx <= 0.0f) {
+        return color;
+    }
+    fontSizePx = std::min(fontSizePx, 4095.0f);
+    if (face && glyphIndex != 0 && face->HasColorTables()) {
         // Bitmap strikes first: Noto Color Emoji uses CBDT/CBLC PNG records.
         // COLR/CPAL v0 remains the vector-color path. Unsupported COLR v1
         // paint graphs safely fall through to an outline only when this base

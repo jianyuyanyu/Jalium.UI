@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using WpfDispatcher = Jalium.UI.Threading.Dispatcher;
 using WpfDispatcherObject = Jalium.UI.Threading.DispatcherObject;
 using WpfPriority = Jalium.UI.Threading.DispatcherPriority;
@@ -12,51 +13,151 @@ public sealed class ThreadingDispatcherParityTests
     [Fact]
     public void CanonicalDispatcherOwnsTheEstablishedPerThreadQueue()
     {
-        WpfDispatcher dispatcher = WpfDispatcher.CurrentDispatcher;
+        RunOnFreshDispatcherThread(dispatcher =>
+        {
+            Assert.Same(dispatcher, WpfDispatcher.CurrentDispatcher);
+            Assert.Same(dispatcher, WpfDispatcher.FromThread(Thread.CurrentThread));
+            Assert.Same(Thread.CurrentThread, dispatcher.Thread);
+            Assert.True(dispatcher.CheckAccess());
 
-        Assert.Same(dispatcher, WpfDispatcher.CurrentDispatcher);
-        Assert.Same(dispatcher, WpfDispatcher.FromThread(Thread.CurrentThread));
-        Assert.Same(Thread.CurrentThread, dispatcher.Thread);
-        Assert.True(dispatcher.CheckAccess());
+            var order = new List<string>();
+            Jalium.UI.Threading.DispatcherOperation background = dispatcher.InvokeAsync(
+                () => order.Add("background"),
+                WpfPriority.Background);
+            Jalium.UI.Threading.DispatcherOperation normal = dispatcher.InvokeAsync(
+                () => order.Add("normal"),
+                WpfPriority.Normal);
 
-        dispatcher.ProcessQueue();
-        var order = new List<string>();
-        Jalium.UI.Threading.DispatcherOperation background = dispatcher.InvokeAsync(
-            () => order.Add("background"),
-            WpfPriority.Background);
-        Jalium.UI.Threading.DispatcherOperation normal = dispatcher.InvokeAsync(
-            () => order.Add("normal"),
-            WpfPriority.Normal);
+            Assert.Equal(Jalium.UI.Threading.DispatcherOperationStatus.Pending, background.Status);
+            Assert.Equal(Jalium.UI.Threading.DispatcherOperationStatus.Pending, normal.Status);
 
-        Assert.Equal(Jalium.UI.Threading.DispatcherOperationStatus.Pending, background.Status);
-        Assert.Equal(Jalium.UI.Threading.DispatcherOperationStatus.Pending, normal.Status);
+            dispatcher.ProcessQueue();
 
-        dispatcher.ProcessQueue();
-
-        Assert.Equal(new[] { "normal", "background" }, order);
-        Assert.True(background.Task.IsCompletedSuccessfully);
-        Assert.True(normal.Task.IsCompletedSuccessfully);
-        Assert.Same(dispatcher, background.Dispatcher);
+            Assert.Equal(new[] { "normal", "background" }, order);
+            Assert.True(background.Task.IsCompletedSuccessfully);
+            Assert.True(normal.Task.IsCompletedSuccessfully);
+            Assert.Same(dispatcher, background.Dispatcher);
+        });
     }
 
     [Fact]
-    public async Task GenericInvokeAsyncCarriesTypedResultTaskAndAwaiter()
+    public void NativeWakeCallbackNeverProcessesAnotherThreadsDispatcherQueue()
     {
-        WpfDispatcher dispatcher = WpfDispatcher.CurrentDispatcher;
-        dispatcher.ProcessQueue();
+        Exception? workerFailure = null;
+        WpfDispatcher? ownerDispatcher = null;
+        int operationRan = 0;
+        using var ready = new ManualResetEventSlim();
+        using var releaseOwner = new ManualResetEventSlim();
 
-        Jalium.UI.Threading.DispatcherOperation<int> operation = dispatcher.InvokeAsync(
-            () => 42,
-            WpfPriority.Background);
+        var ownerThread = new Thread(() =>
+        {
+            try
+            {
+                ownerDispatcher = WpfDispatcher.CurrentDispatcher;
+                ownerDispatcher.BeginInvoke(() => Volatile.Write(ref operationRan, 1));
+                ready.Set();
 
-        _ = Assert.IsAssignableFrom<Task<int>>(operation.Task);
-        Assert.False(operation.Task.IsCompleted);
+                if (!releaseOwner.Wait(TimeSpan.FromSeconds(5)))
+                    throw new TimeoutException("Foreign wake test did not release the dispatcher owner.");
 
-        dispatcher.ProcessQueue();
+                ownerDispatcher.CoreDispatcher.ProcessNativeWake();
+            }
+            catch (Exception ex)
+            {
+                workerFailure = ex;
+            }
+            finally
+            {
+                ownerDispatcher?.DisposeCore();
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "ThreadingDispatcherParityTests.NativeWakeOwner",
+        };
 
-        Assert.Equal(42, operation.Result);
-        Assert.Equal(42, await operation);
-        Assert.True(operation.Task.IsCompletedSuccessfully);
+        ownerThread.Start();
+        try
+        {
+            Assert.True(
+                ready.Wait(TimeSpan.FromSeconds(5)),
+                "Dispatcher owner did not initialize within the timeout.");
+
+            ownerDispatcher!.CoreDispatcher.ProcessNativeWake();
+            Assert.Equal(0, Volatile.Read(ref operationRan));
+        }
+        finally
+        {
+            releaseOwner.Set();
+            Assert.True(
+                ownerThread.Join(TimeSpan.FromSeconds(5)),
+                "Dispatcher owner did not exit within the timeout.");
+        }
+
+        if (workerFailure is not null)
+        {
+            ExceptionDispatchInfo.Capture(workerFailure).Throw();
+        }
+
+        Assert.Equal(1, Volatile.Read(ref operationRan));
+    }
+
+    // xUnit reuses worker threads, whose dispatcher may retain work posted by a prior test.
+    // This contract needs a controlled two-item queue to assert exact priority order.
+    private static void RunOnFreshDispatcherThread(Action<WpfDispatcher> action)
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            WpfDispatcher? dispatcher = null;
+            try
+            {
+                dispatcher = WpfDispatcher.CurrentDispatcher;
+                action(dispatcher);
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+            }
+            finally
+            {
+                dispatcher?.DisposeCore();
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "ThreadingDispatcherParityTests.Queue",
+        };
+
+        thread.Start();
+        Assert.True(
+            thread.Join(TimeSpan.FromSeconds(5)),
+            "Fresh dispatcher test thread did not exit within the timeout.");
+
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+    }
+
+    [Fact]
+    public void GenericInvokeAsyncCarriesTypedResultTaskAndAwaiter()
+    {
+        RunOnFreshDispatcherThread(dispatcher =>
+        {
+            Jalium.UI.Threading.DispatcherOperation<int> operation = dispatcher.InvokeAsync(
+                () => 42,
+                WpfPriority.Background);
+
+            _ = Assert.IsAssignableFrom<Task<int>>(operation.Task);
+            Assert.False(operation.Task.IsCompleted);
+
+            dispatcher.ProcessQueue();
+
+            Assert.Equal(42, operation.Result);
+            Assert.Equal(42, operation.GetAwaiter().GetResult());
+            Assert.True(operation.Task.IsCompletedSuccessfully);
+        });
     }
 
     [Fact]

@@ -12,7 +12,8 @@ namespace Jalium.UI.Hosting;
 public sealed class ViewDiscoveryOptions
 {
     /// <summary>
-    /// Assemblies to scan for views and view-models. When empty, the
+    /// Assemblies to inspect for views and view-models. Source-generated
+    /// catalogs are used when available. When empty, the
     /// convenience overloads default to the assembly that called
     /// <c>AddViewsAndViewModels</c>.
     /// </summary>

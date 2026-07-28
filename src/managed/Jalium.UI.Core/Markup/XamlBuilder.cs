@@ -274,6 +274,9 @@ public static class XamlBuilder
     /// <summary>Registered by Jalium.UI.Xaml: apply an SG-pre-split <c>{Binding ...}</c> to a property.</summary>
     public static Action<object, string, string?, string[], string[], XamlBuildContext>? SetCompiledBindingImpl { get; set; }
 
+    /// <summary>Registered by Jalium.UI.Xaml: apply an SG-pre-split <c>{Binding ...}</c> to an attached dependency property.</summary>
+    public static Action<object, string, string, string?, string[], string[], XamlBuildContext, string>? SetCompiledAttachedBindingImpl { get; set; }
+
     /// <summary>
     /// Bind <paramref name="propertyName"/> on <paramref name="target"/> to a Razor value-expression
     /// (<c>@(expr)</c>, <c>@identifier</c>, <c>$.path</c>, <c>#.path</c>, or interpolated mix).
@@ -328,6 +331,33 @@ public static class XamlBuilder
     /// </summary>
     public static void SetCompiledBinding(object target, string propertyName, string? positionalPath, string[] names, string[] values, XamlBuildContext ctx)
         => Required(SetCompiledBindingImpl, nameof(SetCompiledBindingImpl))(target, propertyName, positionalPath, names, values, ctx);
+
+    /// <summary>
+    /// Apply a SourceGenerator-lowered binding to an attached dependency
+    /// property. <paramref name="ownerTypeName"/> identifies the type that
+    /// registered the dependency property; <paramref name="target"/> remains
+    /// the element whose effective value is bound.
+    /// </summary>
+    public static void SetCompiledAttachedBinding(
+        object target,
+        string ownerTypeName,
+        string propertyName,
+        string? positionalPath,
+        string[] names,
+        string[] values,
+        XamlBuildContext ctx,
+        string elementNamespaceUri = "")
+        => Required(
+            SetCompiledAttachedBindingImpl,
+            nameof(SetCompiledAttachedBindingImpl))(
+                target,
+                ownerTypeName,
+                propertyName,
+                positionalPath,
+                names,
+                values,
+                ctx,
+                elementNamespaceUri);
 
     // Strongly-typed attached fast paths.
     /// <summary>Strongly-typed setter for <c>Grid.Row</c>.</summary>

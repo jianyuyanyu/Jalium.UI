@@ -11,6 +11,7 @@ public sealed class WindowInputDispatcherThumbCaptureTests
     [Fact]
     public void CapturedThumb_MoveAndRelease_BypassHitTestAndReleaseImmediately()
     {
+        UIElement.ForceReleaseMouseCapture();
         using var host = new CountingInputHost();
         var thumb = new Thumb { Width = 12, Height = 80 };
         host.HitTarget = thumb;

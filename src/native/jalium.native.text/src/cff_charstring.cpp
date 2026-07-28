@@ -1,7 +1,9 @@
 #include "cff_charstring.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <string>
 
 namespace jalium::font {
@@ -11,6 +13,10 @@ namespace jalium::font {
 // escape operators.
 // ---------------------------------------------------------------------------
 namespace {
+
+constexpr size_t kMaxDictOperands = 513;
+constexpr size_t kMaxDictOperators = 4096;
+constexpr uint32_t kMaxCffIndexObjects = 1024u * 1024u;
 
 struct Dict {
     std::vector<std::pair<int, std::vector<double>>> ops;
@@ -34,7 +40,15 @@ Dict ParseDict(const ByteReader& r, uint32_t off, uint32_t len,
                const std::vector<uint16_t>* cff2RegionCounts = nullptr) {
     Dict d; std::vector<double> operands;
     size_t vsIndex = 0;   // CFF2: DICT vsindex governs k for later DICT blends
-    uint32_t p = off, end = off + len;
+    if (off > r.Size()) return d;
+    size_t p = off;
+    const size_t boundedLength = std::min<size_t>(len, r.Size() - p);
+    const size_t end = p + boundedLength;
+    const auto pushOperand = [&](double value) {
+        if (operands.size() >= kMaxDictOperands) return false;
+        operands.push_back(value);
+        return true;
+    };
     while (p < end) {
         uint8_t b0 = r.U8(p);
         if (cff2RegionCounts && b0 == 23) {
@@ -57,28 +71,53 @@ Dict ParseDict(const ByteReader& r, uint32_t off, uint32_t len,
             if (op == 22 && cff2RegionCounts && !operands.empty() &&
                 operands[0] >= 0 && operands[0] < 65536.0)
                 vsIndex = static_cast<size_t>(operands[0]);
+            if (d.ops.size() >= kMaxDictOperators) return {};
             d.ops.push_back({ op, operands }); operands.clear();
-        } else if (b0 == 28) { operands.push_back(static_cast<int16_t>(r.U16(p + 1))); p += 3; }
-        else if (b0 == 29) { operands.push_back(static_cast<int32_t>(r.U32(p + 1))); p += 5; }
+        } else if (b0 == 28) {
+            if (!pushOperand(static_cast<int16_t>(r.U16(p + 1)))) return {};
+            p += 3;
+        }
+        else if (b0 == 29) {
+            if (!pushOperand(static_cast<int32_t>(r.U32(p + 1)))) return {};
+            p += 5;
+        }
         else if (b0 == 30) { // real number (BCD nibbles)
             p++; std::string s; bool done = false;
             while (p < end && !done) {
                 uint8_t by = r.U8(p++);
                 for (int half = 0; half < 2 && !done; ++half) {
                     int nib = half == 0 ? (by >> 4) : (by & 0xF);
+                    if (nib == 0xf) {
+                        done = true;
+                        continue;
+                    }
+                    if (s.size() >= 128) continue;
                     if (nib <= 9) s += static_cast<char>('0' + nib);
                     else if (nib == 0xa) s += '.';
                     else if (nib == 0xb) s += 'E';
                     else if (nib == 0xc) s += "E-";
                     else if (nib == 0xe) s += '-';
-                    else if (nib == 0xf) done = true;
                 }
             }
-            operands.push_back(std::atof(s.c_str()));
+            if (!pushOperand(std::atof(s.c_str()))) return {};
         }
-        else if (b0 >= 32 && b0 <= 246) { operands.push_back(static_cast<double>(static_cast<int>(b0) - 139)); p++; }
-        else if (b0 >= 247 && b0 <= 250) { operands.push_back((static_cast<int>(b0) - 247) * 256 + r.U8(p + 1) + 108); p += 2; }
-        else if (b0 >= 251 && b0 <= 254) { operands.push_back(-(static_cast<int>(b0) - 251) * 256 - r.U8(p + 1) - 108); p += 2; }
+        else if (b0 >= 32 && b0 <= 246) {
+            if (!pushOperand(static_cast<double>(
+                    static_cast<int>(b0) - 139))) return {};
+            p++;
+        }
+        else if (b0 >= 247 && b0 <= 250) {
+            if (!pushOperand(
+                    (static_cast<int>(b0) - 247) * 256 +
+                    r.U8(p + 1) + 108)) return {};
+            p += 2;
+        }
+        else if (b0 >= 251 && b0 <= 254) {
+            if (!pushOperand(
+                    -(static_cast<int>(b0) - 251) * 256 -
+                    r.U8(p + 1) - 108)) return {};
+            p += 2;
+        }
         else { p++; }
     }
     return d;
@@ -89,8 +128,29 @@ Dict ParseDict(const ByteReader& r, uint32_t off, uint32_t len,
 // straight to an unsigned type is UB. Clamp to [0, limit] and map anything
 // outside to 0 ("absent"), which every call site already treats as missing.
 uint32_t DictOffset(double v, uint64_t limit) {
-    if (!std::isfinite(v) || v < 0.0 || v > static_cast<double>(limit)) return 0;
+    const uint64_t boundedLimit =
+        std::min<uint64_t>(limit, std::numeric_limits<uint32_t>::max());
+    if (!std::isfinite(v) || v < 0.0 ||
+        v > static_cast<double>(boundedLimit)) {
+        return 0;
+    }
     return static_cast<uint32_t>(v);
+}
+
+bool TryAddOffset(
+    uint32_t base,
+    uint32_t relative,
+    uint64_t limit,
+    uint32_t& result) noexcept
+{
+    const uint64_t sum =
+        static_cast<uint64_t>(base) + static_cast<uint64_t>(relative);
+    if (sum > limit || sum > std::numeric_limits<uint32_t>::max()) {
+        result = 0;
+        return false;
+    }
+    result = static_cast<uint32_t>(sum);
+    return true;
 }
 
 } // namespace
@@ -99,16 +159,27 @@ CffIndex CffFontProgram::ParseIndex(uint32_t off, uint32_t& endOff) const {
     CffIndex ix;
     // CFF2 widened count to uint32; an empty INDEX ends right after count.
     const uint32_t headSize = isCff2_ ? 4u : 2u;
+    const uint64_t size = cff_.Size();
+    if (off > size || headSize > size - off) {
+        endOff = static_cast<uint32_t>(
+            std::min<uint64_t>(size, std::numeric_limits<uint32_t>::max()));
+        return ix;
+    }
+    const uint32_t headerEnd = off + headSize;
     const uint32_t count = isCff2_ ? cff_.U32(off) : cff_.U16(off);
-    if (count == 0) { endOff = off + headSize; return ix; }
-    uint8_t offSize = cff_.U8(off + headSize);
-    if (offSize < 1 || offSize > 4) { endOff = off + headSize; return ix; }
+    if (count == 0) { endOff = headerEnd; return ix; }
+    if (count > kMaxCffIndexObjects || headerEnd >= size) {
+        endOff = headerEnd;
+        return ix;
+    }
+    uint8_t offSize = cff_.U8(headerEnd);
+    if (offSize < 1 || offSize > 4) { endOff = headerEnd; return ix; }
     const uint64_t offArr = static_cast<uint64_t>(off) + headSize + 1;
-    const uint64_t sz = cff_.Size();
+    const uint64_t sz = size;
     // The offset array must fit in the table: a corrupt 32-bit count would
     // otherwise reserve gigabytes for the offsets vector below.
     if (offArr > sz || (static_cast<uint64_t>(count) + 1) * offSize > sz - offArr) {
-        endOff = off + headSize; return ix;
+        endOff = headerEnd; return ix;
     }
     uint64_t dataBase = offArr + (static_cast<uint64_t>(count) + 1) * offSize - 1; // 1-based
     ix.offsets.reserve(static_cast<size_t>(count) + 1);
@@ -132,6 +203,16 @@ bool CffFontProgram::Parse(const ByteReader& cffTable, uint16_t numGlyphs, bool 
     numGlyphs_ = numGlyphs;
     valid_ = false;
     isCff2_ = isCff2;
+    isCID_ = false;
+    charStrings_ = {};
+    globalSubrs_ = {};
+    localSubrs_.clear();
+    nominalWidthX_.clear();
+    defaultWidthX_.clear();
+    fdSelect_.clear();
+    ivdRegionCounts_.clear();
+    fdVsIndex_.clear();
+    if (cff_.Size() > std::numeric_limits<uint32_t>::max()) return false;
     if (isCff2) return ParseCff2();
     if (cff_.Size() < 4) return false;
 
@@ -146,27 +227,43 @@ bool CffFontProgram::Parse(const ByteReader& cffTable, uint16_t numGlyphs, bool 
     Dict top = ParseDict(cff_, topIdx.objOffset(0), topIdx.objLength(0));
     isCID_ = top.Has(1230); // ROS
 
-    uint32_t csOff = static_cast<uint32_t>(top.Num(17, 0, 0));
+    const uint64_t size = cff_.Size();
+    uint32_t csOff = DictOffset(top.Num(17, 0, 0), size);
     if (csOff == 0) return false;
     charStrings_ = ParseIndex(csOff, endOff);
     if (charStrings_.count() == 0) return false;
 
     if (isCID_) {
         // CID-keyed: FDArray (per-FD Private+subrs) + FDSelect (gid -> fd).
-        uint32_t fdArrayOff = static_cast<uint32_t>(top.Num(1236, 0, 0));
-        uint32_t fdSelectOff = static_cast<uint32_t>(top.Num(1237, 0, 0));
+        uint32_t fdArrayOff = DictOffset(top.Num(1236, 0, 0), size);
+        uint32_t fdSelectOff = DictOffset(top.Num(1237, 0, 0), size);
         if (fdArrayOff) {
             CffIndex fdArray = ParseIndex(fdArrayOff, endOff);
-            for (uint32_t i = 0; i < fdArray.count(); ++i) {
+            const uint32_t fdCount = std::min(fdArray.count(), 65536u);
+            for (uint32_t i = 0; i < fdCount; ++i) {
                 Dict fd = ParseDict(cff_, fdArray.objOffset(i), fdArray.objLength(i));
                 CffIndex lsub; float nom = 0, def = 0;
                 if (fd.Has(18)) {
-                    uint32_t psz = static_cast<uint32_t>(fd.Num(18, 0, 0));
-                    uint32_t poff = static_cast<uint32_t>(fd.Num(18, 1, 0));
-                    Dict priv = ParseDict(cff_, poff, psz);
-                    def = static_cast<float>(priv.Num(20, 0, 0));
-                    nom = static_cast<float>(priv.Num(21, 0, 0));
-                    if (priv.Has(19)) lsub = ParseIndex(poff + static_cast<uint32_t>(priv.Num(19, 0, 0)), endOff);
+                    uint32_t psz = DictOffset(fd.Num(18, 0, 0), size);
+                    uint32_t poff = DictOffset(fd.Num(18, 1, 0), size);
+                    if (poff <= size && psz <= size - poff) {
+                        Dict priv = ParseDict(cff_, poff, psz);
+                        const double defaultWidth = priv.Num(20, 0, 0);
+                        const double nominalWidth = priv.Num(21, 0, 0);
+                        def = std::isfinite(defaultWidth)
+                            ? static_cast<float>(defaultWidth) : 0.0f;
+                        nom = std::isfinite(nominalWidth)
+                            ? static_cast<float>(nominalWidth) : 0.0f;
+                        uint32_t subrOffset = 0;
+                        if (priv.Has(19) &&
+                            TryAddOffset(
+                                poff,
+                                DictOffset(priv.Num(19, 0, 0), size),
+                                size,
+                                subrOffset)) {
+                            lsub = ParseIndex(subrOffset, endOff);
+                        }
+                    }
                 }
                 localSubrs_.push_back(std::move(lsub));
                 nominalWidthX_.push_back(nom);
@@ -179,12 +276,26 @@ bool CffFontProgram::Parse(const ByteReader& cffTable, uint16_t numGlyphs, bool 
         // Non-CID: single Private DICT + local subrs.
         CffIndex lsub; float nom = 0, def = 0;
         if (top.Has(18)) {
-            uint32_t psz = static_cast<uint32_t>(top.Num(18, 0, 0));
-            uint32_t poff = static_cast<uint32_t>(top.Num(18, 1, 0));
-            Dict priv = ParseDict(cff_, poff, psz);
-            def = static_cast<float>(priv.Num(20, 0, 0));
-            nom = static_cast<float>(priv.Num(21, 0, 0));
-            if (priv.Has(19)) lsub = ParseIndex(poff + static_cast<uint32_t>(priv.Num(19, 0, 0)), endOff);
+            uint32_t psz = DictOffset(top.Num(18, 0, 0), size);
+            uint32_t poff = DictOffset(top.Num(18, 1, 0), size);
+            if (poff <= size && psz <= size - poff) {
+                Dict priv = ParseDict(cff_, poff, psz);
+                const double defaultWidth = priv.Num(20, 0, 0);
+                const double nominalWidth = priv.Num(21, 0, 0);
+                def = std::isfinite(defaultWidth)
+                    ? static_cast<float>(defaultWidth) : 0.0f;
+                nom = std::isfinite(nominalWidth)
+                    ? static_cast<float>(nominalWidth) : 0.0f;
+                uint32_t subrOffset = 0;
+                if (priv.Has(19) &&
+                    TryAddOffset(
+                        poff,
+                        DictOffset(priv.Num(19, 0, 0), size),
+                        size,
+                        subrOffset)) {
+                    lsub = ParseIndex(subrOffset, endOff);
+                }
+            }
         }
         localSubrs_.push_back(std::move(lsub));
         nominalWidthX_.push_back(nom);
@@ -227,18 +338,32 @@ bool CffFontProgram::ParseCff2() {
     // internal offsets are relative to its own start (after the prefix).
     uint32_t vsOff = DictOffset(top.Num(24, 0, 0), sz);
     if (vsOff) {
-        uint32_t ivs = vsOff + 2;
-        if (cff_.U16(ivs) == 1) { // ItemVariationStore format
+        uint32_t ivs = 0;
+        if (TryAddOffset(vsOff, 2, sz, ivs) &&
+            static_cast<uint64_t>(ivs) + 8 <= sz &&
+            cff_.U16(ivs) == 1) { // ItemVariationStore format
             uint16_t ivdCount = cff_.U16(ivs + 6);
-            ivdRegionCounts_.reserve(ivdCount);
-            for (uint16_t i = 0; i < ivdCount; ++i) {
+            const uint64_t offsetArray = static_cast<uint64_t>(ivs) + 8;
+            const uint16_t boundedCount = static_cast<uint16_t>(
+                std::min<uint64_t>(ivdCount, (sz - offsetArray) / 4));
+            ivdRegionCounts_.reserve(boundedCount);
+            for (uint16_t i = 0; i < boundedCount; ++i) {
                 // A NULL (0) offset is the spec's "no variation data" slot: k=0
                 // makes blend keep its bases and pop the count, exactly the
                 // default-instance meaning. Chasing it would misread the store
                 // header (variationRegionListOffset's low half) as a count.
                 uint32_t rel = cff_.U32(static_cast<size_t>(ivs) + 8 + static_cast<size_t>(i) * 4);
-                ivdRegionCounts_.push_back(rel ? cff_.U16(static_cast<size_t>(ivs) + rel + 4)
-                                               : static_cast<uint16_t>(0)); // regionIndexCount
+                uint32_t ivd = 0;
+                uint32_t regionCountOffset = 0;
+                if (rel &&
+                    TryAddOffset(ivs, rel, sz, ivd) &&
+                    TryAddOffset(ivd, 4, sz, regionCountOffset) &&
+                    static_cast<uint64_t>(regionCountOffset) + 2 <= sz) {
+                    ivdRegionCounts_.push_back(
+                        cff_.U16(regionCountOffset)); // regionIndexCount
+                } else {
+                    ivdRegionCounts_.push_back(0);
+                }
             }
         }
     }
@@ -258,10 +383,20 @@ bool CffFontProgram::ParseCff2() {
             if (fd.Has(18)) {
                 uint32_t psz = DictOffset(fd.Num(18, 0, 0), sz);
                 uint32_t poff = DictOffset(fd.Num(18, 1, 0), sz);
-                Dict priv = ParseDict(cff_, poff, psz, &ivdRegionCounts_);
-                // vsindex addresses at most 2^16 ItemVariationData entries.
-                vsIdx = static_cast<uint16_t>(DictOffset(priv.Num(22, 0, 0), 0xFFFFu)); // initial ivd for this FD's charstrings
-                if (priv.Has(19)) lsub = ParseIndex(poff + DictOffset(priv.Num(19, 0, 0), sz), endOff);
+                if (poff <= sz && psz <= sz - poff) {
+                    Dict priv = ParseDict(cff_, poff, psz, &ivdRegionCounts_);
+                    // vsindex addresses at most 2^16 ItemVariationData entries.
+                    vsIdx = static_cast<uint16_t>(
+                        DictOffset(priv.Num(22, 0, 0), 0xFFFFu));
+                    const uint32_t relativeSubrs =
+                        DictOffset(priv.Num(19, 0, 0), sz);
+                    uint32_t subrOffset = 0;
+                    if (priv.Has(19) && relativeSubrs != 0 &&
+                        TryAddOffset(
+                            poff, relativeSubrs, sz, subrOffset)) {
+                        lsub = ParseIndex(subrOffset, endOff);
+                    }
+                }
             }
             localSubrs_.push_back(std::move(lsub));
             nominalWidthX_.push_back(0); // CFF2 charstrings carry no widths (hmtx only)
@@ -382,7 +517,9 @@ struct T2Interp {
     void run(uint32_t off, uint32_t len, int depth) {
         if (depth > 10) return;
         const ByteReader& r = *cff;
-        uint32_t p = off, end = off + len;
+        if (off > r.Size()) return;
+        size_t p = off;
+        const size_t end = p + std::min<size_t>(len, r.Size() - p);
         while (p < end) {
             uint8_t b0 = r.U8(p++);
             if (b0 >= 32 || b0 == 28) {

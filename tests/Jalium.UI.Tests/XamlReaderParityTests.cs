@@ -28,6 +28,77 @@ public sealed class XamlReaderParityTests
     }
 
     [Fact]
+    public void RestrictiveModeRejectsUserTypeBeforeConstructorRuns()
+    {
+        RestrictiveXamlConstructorProbe.ConstructionCount = 0;
+        string assemblyName = typeof(RestrictiveXamlConstructorProbe).Assembly.GetName().Name!;
+        string xaml =
+            $"<probe:RestrictiveXamlConstructorProbe " +
+            $"xmlns:probe=\"clr-namespace:Jalium.UI.Tests;assembly={assemblyName}\" />";
+
+        Assert.Throws<XamlParseException>(
+            () => MarkupXamlReader.Parse(xaml, useRestrictiveXamlReader: true));
+        Assert.Equal(0, RestrictiveXamlConstructorProbe.ConstructionCount);
+    }
+
+    [Fact]
+    public void RestrictiveModeRejectsRazorBeforeFileSideEffect()
+    {
+        string path = Path.Combine(
+            Path.GetTempPath(),
+            $"jalium-restrictive-xaml-{Guid.NewGuid():N}.txt");
+        string escapedPath = path.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        string xaml =
+            $"<Grid>@{{ File.WriteAllText(\"{escapedPath}\", \"owned\"); }}</Grid>";
+
+        try
+        {
+            Assert.Throws<XamlParseException>(
+                () => MarkupXamlReader.Parse(xaml, useRestrictiveXamlReader: true));
+            Assert.False(File.Exists(path));
+        }
+        finally
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+    }
+
+    [Fact]
+    public void RestrictiveModeRejectsActiveMarkupExtensions()
+    {
+        const string xaml =
+            """
+            <TextBlock xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                       Text="{x:Static Environment.MachineName}" />
+            """;
+
+        Assert.Throws<XamlParseException>(
+            () => MarkupXamlReader.Parse(xaml, useRestrictiveXamlReader: true));
+    }
+
+    [Fact]
+    public void RestrictiveModeRejectsExcessiveNesting()
+    {
+        var xaml = new StringBuilder();
+        for (int i = 0; i < 130; i++)
+        {
+            xaml.Append("<Grid>");
+        }
+        for (int i = 0; i < 130; i++)
+        {
+            xaml.Append("</Grid>");
+        }
+
+        Assert.Throws<XamlParseException>(
+            () => MarkupXamlReader.Parse(
+                xaml.ToString(),
+                useRestrictiveXamlReader: true));
+    }
+
+    [Fact]
     public void InstanceReaderRaisesAsyncCompletionAndSupportsCancellation()
     {
         var originalContext = SynchronizationContext.Current;
@@ -150,5 +221,15 @@ public sealed class XamlReaderParityTests
             (SendOrPostCallback callback, object? state) = _callbacks.Dequeue();
             callback(state);
         }
+    }
+}
+
+public sealed class RestrictiveXamlConstructorProbe
+{
+    public static int ConstructionCount { get; set; }
+
+    public RestrictiveXamlConstructorProbe()
+    {
+        ConstructionCount++;
     }
 }

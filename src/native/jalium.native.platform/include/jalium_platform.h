@@ -881,6 +881,11 @@ JALIUM_PLATFORM_API JaliumResult jalium_drag_begin_with_image(
 /// Test-only protocol callback injection. These entry points are compiled only
 /// in explicit native-test builds and exercise the same listeners used by a
 /// real Wayland compositor/device.
+/// Evaluates the production external clipboard/drag payload accumulation limit
+/// without allocating the payload.
+JALIUM_PLATFORM_API int32_t jalium_test_external_transfer_fits(
+    uint64_t currentSize,
+    uint64_t incomingSize);
 JALIUM_PLATFORM_API int32_t jalium_test_wayland_inject_touch(
     JaliumPlatformWindow* window,
     JaliumEventType type,

@@ -28,6 +28,30 @@ public class ClipToBoundsEdgesTests
     }
 
     [Fact]
+    public void ImplicitBoundsClip_ReusesFrozenGeometryUntilInputsChange()
+    {
+        var element = new ProbeElement { ClipToBounds = true };
+        element.Measure(new Size(100, 50));
+        element.Arrange(new Rect(0, 0, 100, 50));
+
+        var first = Assert.IsType<RectangleGeometry>(element.ExposedLayoutClip());
+        var repeated = Assert.IsType<RectangleGeometry>(element.ExposedLayoutClip());
+
+        Assert.Same(first, repeated);
+        Assert.True(first.IsFrozen);
+
+        element.ClipToBoundsEdges = ClipEdges.Left | ClipEdges.Top;
+        var changedEdges = Assert.IsType<RectangleGeometry>(element.ExposedLayoutClip());
+        Assert.NotSame(first, changedEdges);
+        Assert.True(changedEdges.IsFrozen);
+
+        element.Arrange(new Rect(0, 0, 120, 50));
+        var resized = Assert.IsType<RectangleGeometry>(element.ExposedLayoutClip());
+        Assert.NotSame(changedEdges, resized);
+        Assert.Equal(new Rect(0, 0, 120, 50), resized.BoundsClipRect);
+    }
+
+    [Fact]
     public void ClipToBoundsEdges_ClipsOnlySelectedEdges()
     {
         var element = new ProbeElement

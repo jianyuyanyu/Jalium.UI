@@ -2,6 +2,7 @@ using Jalium.UI;
 using Jalium.UI.Controls;
 using Jalium.UI.Diagnostics;
 using Jalium.UI.Media;
+using Jalium.UI.Media.Imaging;
 using Jalium.UI.Threading;
 
 namespace Jalium.UI.DesktopDemo;

@@ -7,6 +7,7 @@
     <!-- ============================================== -->
     <Style TargetType="NavigationView">
         <Setter Property="Background" Value="{ThemeResource WindowBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="FontFamily" Value="{ThemeResource BodyFontFamily}" />
         <Setter Property="HorizontalContentAlignment" Value="Stretch" />
         <Setter Property="VerticalContentAlignment" Value="Stretch" />
@@ -42,6 +43,7 @@
                             <ScrollViewer Name="PART_PaneScrollViewer"
                                           Grid.Row="1"
                                           Margin="0"
+                                          UseLayoutRounding="True"
                                           VerticalScrollBarVisibility="Auto"
                                           HorizontalScrollBarVisibility="Disabled"
                                           ClipToBounds="True">
@@ -92,6 +94,7 @@
     <!-- ============================================== -->
     <Style TargetType="NavigationViewItem">
         <Setter Property="Background" Value="Transparent" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="FontFamily" Value="{ThemeResource BodyFontFamily}" />
         <Setter Property="Margin" Value="8,2,8,2" />
         <Setter Property="CornerRadius" Value="10" />
@@ -208,6 +211,7 @@
     <!-- ============================================== -->
     <Style TargetType="NavigationViewItemSeparator">
         <Setter Property="Background" Value="{ThemeResource ControlBorder}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="Height" Value="1" />
         <Setter Property="Margin" Value="20,7,20,7" />
     </Style>

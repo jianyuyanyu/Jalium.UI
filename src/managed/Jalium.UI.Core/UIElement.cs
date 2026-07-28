@@ -61,6 +61,7 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
         EventManager.RegisterClassHandler(typeof(UIElement), MouseWheelEvent, new MouseWheelEventHandler((s, e) => ((UIElement)s).OnMouseWheel(e)));
 
         // Touch
+        TouchDevice.CaptureChanged += OnTouchDeviceCaptureChanged;
         EventManager.RegisterClassHandler(typeof(UIElement), PreviewTouchDownEvent, new TouchEventHandler((s, e) => ((UIElement)s).OnPreviewTouchDown(e)));
         EventManager.RegisterClassHandler(typeof(UIElement), TouchDownEvent, new TouchEventHandler((s, e) => ((UIElement)s).OnTouchDown(e)));
         EventManager.RegisterClassHandler(typeof(UIElement), PreviewTouchMoveEvent, new TouchEventHandler((s, e) => ((UIElement)s).OnPreviewTouchMove(e)));
@@ -1132,8 +1133,15 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     /// Protected so FrameworkElement.ArrangeCore can update before firing SizeChanged.
     /// </summary>
     protected Size _renderSize;
+    private RectangleGeometry? _boundsLayoutClipCache;
     private bool _isMeasureValid;
     private bool _isArrangeValid;
+
+    // Set while this element's own ArrangeCore is running, so InvalidateArrange can tell
+    // a request raised from inside that call apart from an ordinary one and keep it from
+    // being erased when Arrange marks itself valid.
+    private bool _isArrangeInProgress;
+    private bool _arrangeInvalidatedWhileArranging;
     // 从未真正跑过 MeasureCore（Collapsed 短路测量不算）。Arrange 的 measure-dirty
     // 守卫用它决定补测约束：测过用 _previousAvailableSize，从未测过时该字段还是
     // default(0,0)，必须改用本次槽尺寸。对应 WPF 的 NeverMeasured。
@@ -1233,11 +1241,23 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
         if (ClipToBounds && ClipToBoundsEdges != ClipEdges.None)
         {
             var bounds = new Rect(0, 0, _renderSize.Width, _renderSize.Height);
-            return new RectangleGeometry(ExpandBoundsClip(bounds, ClipToBoundsEdges))
+            var edges = ClipToBoundsEdges;
+            var geometryBounds = ExpandBoundsClip(bounds, edges);
+            if (_boundsLayoutClipCache is null ||
+                _boundsLayoutClipCache.Rect != geometryBounds ||
+                _boundsLayoutClipCache.BoundsClipEdges != edges ||
+                _boundsLayoutClipCache.BoundsClipRect != bounds)
             {
-                BoundsClipEdges = ClipToBoundsEdges,
-                BoundsClipRect = bounds
-            };
+                var geometry = new RectangleGeometry(geometryBounds)
+                {
+                    BoundsClipEdges = edges,
+                    BoundsClipRect = bounds
+                };
+                geometry.Freeze();
+                _boundsLayoutClipCache = geometry;
+            }
+
+            return _boundsLayoutClipCache;
         }
         return null;
     }
@@ -1337,6 +1357,32 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     public bool IsArrangeValid => _isArrangeValid;
 
     /// <summary>
+    /// Marks an element whose host measures and arranges it at a rectangle the host
+    /// computes on its own, without consulting this element's
+    /// <see cref="DesiredSize"/>. Layout invalidations originating here therefore
+    /// cannot change anything above the host, and are not propagated past it.
+    /// </summary>
+    /// <remarks>
+    /// Without this, a control that toggles the visibility of a part it owns and
+    /// positions itself — a scroll bar appearing, a spinner fading in — dirties the
+    /// entire ancestor chain up to the window and buys a whole extra measure and
+    /// arrange round for a change that provably moved nothing outside the control.
+    /// <para>
+    /// The contract an isolated element's host must honour:
+    /// (a) it measures and arranges the element itself, within its own layout pass;
+    /// (b) the rectangle it uses does not depend on the element's DesiredSize.
+    /// Breaking either one means the element can be left un-measured or stale,
+    /// because nothing else will come along to lay it out.
+    /// </para>
+    /// <para>
+    /// Only layout propagation stops here. The element itself is still invalidated
+    /// and still queued, and render invalidation still walks up, so nothing goes
+    /// unpainted.
+    /// </para>
+    /// </remarks>
+    internal virtual bool IsLayoutIsolated => false;
+
+    /// <summary>
     /// Gets the previous available size used for measurement (used by LayoutManager).
     /// </summary>
     internal Size PreviousAvailableSize => _previousAvailableSize;
@@ -1372,6 +1418,15 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     {
         _isMeasureValid = false;
         _isArrangeValid = false;
+
+        // Same reasoning as in InvalidateArrange: this clears the arrange flag directly,
+        // so a request raised from inside this element's own arrange has to be recorded
+        // here too or the end of that pass will erase it.
+        if (_isArrangeInProgress)
+        {
+            _arrangeInvalidatedWhileArranging = true;
+        }
+
         FindLayoutManager()?.InvalidateMeasure(this);
 
         // Always register this element in the window's dirty-element set — NOT only
@@ -1406,6 +1461,18 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     public void InvalidateArrange()
     {
         _isArrangeValid = false;
+
+        // Arrange ends by marking itself valid. An invalidation raised from inside this
+        // element's own ArrangeCore — a panel that derives a size from the rect it was
+        // given and writes it back, say — would be erased by that, and since the element
+        // is then arrange-valid, the next pass short-circuits on an unchanged rect and
+        // its ArrangeOverride never runs again. It stays laid out for the size it had
+        // when it made the change. Remember the invalidation so Arrange can honour it.
+        if (_isArrangeInProgress)
+        {
+            _arrangeInvalidatedWhileArranging = true;
+        }
+
         FindLayoutManager()?.InvalidateArrange(this);
 
         // Always register as dirty — same reasoning as InvalidateMeasure above. An
@@ -2157,6 +2224,9 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
         bool trace = LayoutDiagnostics.IsRecording;
         long startTicks = trace ? Stopwatch.GetTimestamp() : 0;
         Dispatcher.LastLayoutExceptionElement = null;
+        var wasArrangeInProgress = _isArrangeInProgress;
+        _isArrangeInProgress = true;
+        _arrangeInvalidatedWhileArranging = false;
         try
         {
             ArrangeCore(finalRect);
@@ -2166,7 +2236,15 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
             Dispatcher.LastLayoutExceptionElement ??= this;
             throw;
         }
-        _isArrangeValid = true;
+        finally
+        {
+            _isArrangeInProgress = wasArrangeInProgress;
+        }
+
+        // Not unconditionally true: an ArrangeOverride that changed something affecting
+        // its own layout asked to be arranged again, and that request has to outlive the
+        // pass that raised it. LayoutManager already has it queued.
+        _isArrangeValid = !_arrangeInvalidatedWhileArranging;
         if (trace)
         {
             double us = (Stopwatch.GetTimestamp() - startTicks) * 1_000_000.0 / Stopwatch.Frequency;
@@ -2291,8 +2369,16 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
             // 可用空间分配。也要 InvalidateVisual 以擦除/绘制子元素留下的痕迹。
             if (element.VisualParent is UIElement parent)
             {
-                parent.InvalidateMeasure();
-                parent.InvalidateArrange();
+                // ...除非父级本来就不看这个子元素的尺寸（IsLayoutIsolated）：它自己
+                // 算矩形、自己 measure/arrange 这个子元素，所以显隐不可能改变父级
+                // 的布局，重新 layout 整条祖先链纯属浪费。渲染失效照旧向上，
+                // 否则擦不掉残迹。
+                if (!element.IsLayoutIsolated)
+                {
+                    parent.InvalidateMeasure();
+                    parent.InvalidateArrange();
+                }
+
                 parent.InvalidateVisual();
             }
 
@@ -5585,29 +5671,17 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
         if (!IsEnabled || Visibility != Visibility.Visible)
             return false;
 
-        if (s_touchCaptures.TryGetValue(touchDevice.Id, out var previous))
-        {
-            if (ReferenceEquals(previous.Element, this))
-                return true;
-            previous.Element.RemoveCapturedTouchInternal(touchDevice);
-        }
-
-        s_touchCaptures[touchDevice.Id] = new CaptureRecord(this, touchDevice);
-        AddCapturedTouchInternal(touchDevice);
-        touchDevice.Capture(this);
-        return true;
+        return touchDevice.Capture(this);
     }
 
     /// <summary>Releases a previously captured touch contact from this element.</summary>
     public bool ReleaseTouchCapture(TouchDevice touchDevice)
     {
         ArgumentNullException.ThrowIfNull(touchDevice);
-        if (!s_touchCaptures.TryGetValue(touchDevice.Id, out var record) || !ReferenceEquals(record.Element, this))
+        if (!ReferenceEquals(touchDevice.Captured, this))
             return false;
-        s_touchCaptures.Remove(touchDevice.Id);
-        RemoveCapturedTouchInternal(touchDevice);
-        touchDevice.Capture(null);
-        return true;
+
+        return touchDevice.Capture(null);
     }
 
     /// <summary>Releases all touch contacts captured by this element.</summary>
@@ -5634,12 +5708,42 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     {
         if (s_touchCaptures.Count == 0) return;
         var snapshot = s_touchCaptures.ToArray();
-        s_touchCaptures.Clear();
         foreach (var pair in snapshot)
         {
             CaptureRecord record = pair.Value;
-            record.Element.RemoveCapturedTouchInternal(record.Device);
-            record.Device.Capture(null);
+            if (ReferenceEquals(record.Device.Captured, record.Element))
+            {
+                record.Device.Capture(null);
+            }
+            else
+            {
+                OnTouchDeviceCaptureChanged(record.Device, record.Element, null);
+            }
+        }
+    }
+
+    private static void OnTouchDeviceCaptureChanged(
+        TouchDevice device,
+        IInputElement? previous,
+        IInputElement? current)
+    {
+        _ = previous;
+
+        if (s_touchCaptures.TryGetValue(device.Id, out CaptureRecord existing) &&
+            (!ReferenceEquals(existing.Device, device) ||
+             !ReferenceEquals(existing.Element, current)))
+        {
+            s_touchCaptures.Remove(device.Id);
+            existing.Element.RemoveCapturedTouchInternal(existing.Device);
+        }
+
+        if (current is UIElement element &&
+            (!s_touchCaptures.TryGetValue(device.Id, out existing) ||
+             !ReferenceEquals(existing.Device, device) ||
+             !ReferenceEquals(existing.Element, element)))
+        {
+            s_touchCaptures[device.Id] = new CaptureRecord(element, device);
+            element.AddCapturedTouchInternal(device);
         }
     }
 
@@ -5710,7 +5814,6 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
 
     private const string TransitionAllValue = "All";
     private const string TransitionNoneValue = "None";
-    private const string DefaultTransitionPropertyValue = TransitionNoneValue;
     private static readonly TimeSpan s_defaultTransitionDuration = TimeSpan.FromMilliseconds(180);
 
     private Dictionary<string, bool>? _transitionPropertyLookup;
@@ -5738,7 +5841,7 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Behavior)]
     public static readonly DependencyProperty TransitionPropertyProperty =
         DependencyProperty.Register(nameof(TransitionProperty), typeof(TransitionPropertyCollection), typeof(UIElement),
-            new PropertyMetadata(DefaultTransitionPropertyValue, OnTransitionConfigurationChanged));
+            new PropertyMetadata(null, OnTransitionConfigurationChanged));
 
     /// <summary>
     /// Identifies the TransitionDuration dependency property.
@@ -5762,7 +5865,19 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Behavior)]
     public TransitionPropertyCollection TransitionProperty
     {
-        get => TransitionPropertyCollection.FromRawValue(GetValue(TransitionPropertyProperty));
+        get
+        {
+            var rawValue = GetValue(TransitionPropertyProperty);
+            if (rawValue is TransitionPropertyCollection collection)
+                return collection;
+
+            // Collection dependency-property defaults cannot be a shared mutable instance. Materialize
+            // a per-element value on first access while retaining the Default base source so a later
+            // style/template contribution can still take precedence.
+            collection = TransitionPropertyCollection.FromRawValue(rawValue);
+            SetCurrentValue(TransitionPropertyProperty, collection);
+            return collection;
+        }
         set => SetValue(TransitionPropertyProperty, value ?? TransitionPropertyCollection.None());
     }
 

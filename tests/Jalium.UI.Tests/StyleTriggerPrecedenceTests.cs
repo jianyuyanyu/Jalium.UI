@@ -1,4 +1,5 @@
 using Jalium.UI;
+using Jalium.UI.Data;
 
 namespace Jalium.UI.Tests;
 
@@ -39,6 +40,116 @@ public class StyleTriggerPrecedenceTests
 
         element.SetValue(TriggerProbeElement.FlagProperty, false);
         Assert.Equal("Style", element.GetValue(TriggerProbeElement.TokenProperty));
+    }
+
+    [Fact]
+    public void BasedOnAndDerivedTriggers_ShouldUseCompleteAppliedStyleOrder()
+    {
+        var baseStyle = new Style(typeof(TriggerProbeElement));
+        baseStyle.Setters.Add(new Setter(TriggerProbeElement.TokenProperty, "BaseStyle"));
+        var baseTrigger = new Trigger
+        {
+            Property = TriggerProbeElement.FlagProperty,
+            Value = true
+        };
+        baseTrigger.Setters.Add(new Setter(TriggerProbeElement.TokenProperty, "BaseTrigger"));
+        baseStyle.Triggers.Add(baseTrigger);
+
+        var derivedStyle = new Style(typeof(TriggerProbeElement), baseStyle);
+        derivedStyle.Setters.Add(new Setter(TriggerProbeElement.TokenProperty, "DerivedStyle"));
+        var derivedTrigger = new Trigger
+        {
+            Property = TriggerProbeElement.AltFlagProperty,
+            Value = true
+        };
+        derivedTrigger.Setters.Add(new Setter(TriggerProbeElement.TokenProperty, "DerivedTrigger"));
+        derivedStyle.Triggers.Add(derivedTrigger);
+
+        var element = new TriggerProbeElement { Style = derivedStyle };
+        Assert.Equal("DerivedStyle", element.GetValue(TriggerProbeElement.TokenProperty));
+
+        element.SetValue(TriggerProbeElement.AltFlagProperty, true);
+        Assert.Equal("DerivedTrigger", element.GetValue(TriggerProbeElement.TokenProperty));
+
+        // Activating the base trigger later must not overwrite the later, derived trigger.
+        element.SetValue(TriggerProbeElement.FlagProperty, true);
+        Assert.Equal("DerivedTrigger", element.GetValue(TriggerProbeElement.TokenProperty));
+
+        element.SetValue(TriggerProbeElement.AltFlagProperty, false);
+        Assert.Equal("BaseTrigger", element.GetValue(TriggerProbeElement.TokenProperty));
+
+        element.SetValue(TriggerProbeElement.FlagProperty, false);
+        Assert.Equal("DerivedStyle", element.GetValue(TriggerProbeElement.TokenProperty));
+    }
+
+    [Fact]
+    public void StackedStyles_ShouldResolveTriggersByActualApplicationOrder()
+    {
+        var lowerStyle = new Style(typeof(TriggerProbeElement));
+        var lowerTrigger = new Trigger
+        {
+            Property = TriggerProbeElement.FlagProperty,
+            Value = true
+        };
+        lowerTrigger.Setters.Add(new Setter(TriggerProbeElement.TokenProperty, "LowerTrigger"));
+        lowerStyle.Triggers.Add(lowerTrigger);
+
+        var upperStyle = new Style(typeof(TriggerProbeElement));
+        var upperTrigger = new Trigger
+        {
+            Property = TriggerProbeElement.AltFlagProperty,
+            Value = true
+        };
+        upperTrigger.Setters.Add(new Setter(TriggerProbeElement.TokenProperty, "UpperTrigger"));
+        upperStyle.Triggers.Add(upperTrigger);
+
+        var element = new TriggerProbeElement();
+        lowerStyle.Apply(element);
+        upperStyle.Apply(element);
+
+        element.SetValue(TriggerProbeElement.AltFlagProperty, true);
+        element.SetValue(TriggerProbeElement.FlagProperty, true);
+        Assert.Equal("UpperTrigger", element.GetValue(TriggerProbeElement.TokenProperty));
+
+        element.SetValue(TriggerProbeElement.AltFlagProperty, false);
+        Assert.Equal("LowerTrigger", element.GetValue(TriggerProbeElement.TokenProperty));
+
+        upperStyle.Remove(element);
+        lowerStyle.Remove(element);
+    }
+
+    [Fact]
+    public void SharedBindingTrigger_ShouldAttachSafelyAcrossConcurrentElements()
+    {
+        var style = new Style(typeof(TriggerProbeElement));
+        var trigger = new Trigger
+        {
+            Property = TriggerProbeElement.FlagProperty,
+            Value = true
+        };
+        trigger.Setters.Add(new Setter(
+            TriggerProbeElement.TokenProperty,
+            new Binding(nameof(BindingProbe.Token))));
+        style.Triggers.Add(trigger);
+        style.Seal();
+
+        var values = new string?[64];
+        Parallel.For(0, values.Length, index =>
+        {
+            var expected = $"value-{index}";
+            var element = new TriggerProbeElement
+            {
+                DataContext = new BindingProbe { Token = expected }
+            };
+            element.SetValue(TriggerProbeElement.FlagProperty, true);
+            element.Style = style;
+            values[index] = element.GetValue(TriggerProbeElement.TokenProperty) as string;
+        });
+
+        for (var index = 0; index < values.Length; index++)
+        {
+            Assert.Equal($"value-{index}", values[index]);
+        }
     }
 
     [Fact]
@@ -103,5 +214,10 @@ public class StyleTriggerPrecedenceTests
                 typeof(bool),
                 typeof(TriggerProbeElement),
                 new PropertyMetadata(false));
+    }
+
+    private sealed class BindingProbe
+    {
+        public string? Token { get; init; }
     }
 }

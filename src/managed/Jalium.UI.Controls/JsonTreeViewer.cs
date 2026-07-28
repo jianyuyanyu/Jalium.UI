@@ -473,7 +473,7 @@ public class JsonTreeViewer : Control
     public JsonTreeViewer()
     {
         Focusable = true;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         AddHandler(KeyDownEvent, new KeyEventHandler(OnKeyDownHandler));
     }
 

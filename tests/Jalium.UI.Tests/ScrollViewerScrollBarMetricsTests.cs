@@ -99,7 +99,7 @@ public class ScrollViewerScrollBarMetricsTests
 
         viewer.Measure(new Size(240, 160));
         viewer.Arrange(new Rect(0, 0, 240, 160));
-        Assert.Equal(2, content.MeasureCount); // initial finite probe + overflow measure
+        Assert.Equal(1, content.MeasureCount);
 
         var beforeResize = content.MeasureCount;
         viewer.Width = 260;
@@ -112,7 +112,7 @@ public class ScrollViewerScrollBarMetricsTests
     }
 
     [Fact]
-    public void StickyOverflow_TransitionsBetweenOverflowAndFit()
+    public void ScrollableAxis_UsesStableInfiniteConstraintAcrossOverflowTransitions()
     {
         var content = new MutableOverflowMeasureProbe { DesiredHeight = 1000 };
         var viewer = new ScrollViewer
@@ -126,7 +126,8 @@ public class ScrollViewerScrollBarMetricsTests
 
         viewer.Measure(new Size(240, 160));
         viewer.Arrange(new Rect(0, 0, 240, 160));
-        Assert.Equal(2, content.MeasureCount);
+        Assert.Equal(1, content.MeasureCount);
+        Assert.True(double.IsPositiveInfinity(content.LastAvailableSize.Height));
         Assert.Equal(1000, viewer.ExtentHeight);
 
         content.DesiredHeight = 80;
@@ -135,8 +136,8 @@ public class ScrollViewerScrollBarMetricsTests
         var beforeFit = content.MeasureCount;
         viewer.Measure(new Size(240, 160));
         viewer.Arrange(new Rect(0, 0, 240, 160));
-        Assert.Equal(beforeFit + 2, content.MeasureCount);
-        Assert.False(double.IsInfinity(content.LastAvailableSize.Height));
+        Assert.Equal(beforeFit + 1, content.MeasureCount);
+        Assert.True(double.IsPositiveInfinity(content.LastAvailableSize.Height));
         Assert.Equal(80, viewer.ExtentHeight);
         Assert.Equal(0, viewer.ScrollableHeight);
 
@@ -145,8 +146,44 @@ public class ScrollViewerScrollBarMetricsTests
         var beforeOverflow = content.MeasureCount;
         viewer.Measure(new Size(240, 160));
         viewer.Arrange(new Rect(0, 0, 240, 160));
-        Assert.Equal(beforeOverflow + 2, content.MeasureCount);
+        Assert.Equal(beforeOverflow + 1, content.MeasureCount);
         Assert.True(double.IsPositiveInfinity(content.LastAvailableSize.Height));
+        Assert.Equal(1000, viewer.ExtentHeight);
+    }
+
+    [Fact]
+    public void SwitchingBetweenShortAndTallContent_ReusesTallPageMeasureCache()
+    {
+        var tall = new MutableOverflowMeasureProbe { DesiredHeight = 1000 };
+        var shortPage = new MutableOverflowMeasureProbe { DesiredHeight = 80 };
+        var content = new SwitchingMeasureHost(tall, shortPage);
+        var viewer = new ScrollViewer
+        {
+            Content = content,
+            Width = 240,
+            Height = 160,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+        };
+
+        viewer.Measure(new Size(240, 160));
+        viewer.Arrange(new Rect(0, 0, 240, 160));
+        Assert.Equal(1, tall.MeasureCount);
+        Assert.True(double.IsPositiveInfinity(tall.LastAvailableSize.Height));
+
+        content.Activate(shortPage);
+        viewer.InvalidateMeasure();
+        viewer.Measure(new Size(240, 160));
+        viewer.Arrange(new Rect(0, 0, 240, 160));
+        Assert.Equal(1, shortPage.MeasureCount);
+        Assert.True(double.IsPositiveInfinity(shortPage.LastAvailableSize.Height));
+
+        content.Activate(tall);
+        viewer.InvalidateMeasure();
+        viewer.Measure(new Size(240, 160));
+        viewer.Arrange(new Rect(0, 0, 240, 160));
+
+        Assert.Equal(1, tall.MeasureCount);
         Assert.Equal(1000, viewer.ExtentHeight);
     }
 
@@ -374,6 +411,39 @@ public class ScrollViewerScrollBarMetricsTests
             MeasureCount++;
             LastAvailableSize = availableSize;
             return new Size(120, DesiredHeight);
+        }
+    }
+
+    private sealed class SwitchingMeasureHost : Panel
+    {
+        private UIElement _active;
+
+        public SwitchingMeasureHost(params UIElement[] pages)
+        {
+            _active = pages[0];
+            foreach (var page in pages)
+            {
+                Children.Add(page);
+            }
+        }
+
+        public void Activate(UIElement page)
+        {
+            _active = page;
+            InvalidateMeasure();
+            InvalidateArrange();
+        }
+
+        protected override Size MeasureOverride(Size availableSize)
+        {
+            _active.Measure(availableSize);
+            return _active.DesiredSize;
+        }
+
+        protected override Size ArrangeOverride(Size finalSize)
+        {
+            _active.Arrange(new Rect(finalSize));
+            return finalSize;
         }
     }
 }

@@ -98,9 +98,17 @@ public static class JaliumHostingExtensions
     /// automatically-resolved <typeparamref name="TViewModel"/> as its
     /// <see cref="FrameworkElement.DataContext"/>.
     /// </summary>
+    /// <remarks>
+    /// ViewModel public properties and fields are preserved in addition to its
+    /// constructor because the binding engine resolves paths through reflection
+    /// in trimmed and NativeAOT applications.
+    /// </remarks>
     public static IServiceCollection AddView<
         [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TView,
-        [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TViewModel>(
+        [DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicConstructors |
+            DynamicallyAccessedMemberTypes.PublicProperties |
+            DynamicallyAccessedMemberTypes.PublicFields)] TViewModel>(
         this IServiceCollection services)
         where TView : class
         where TViewModel : class
@@ -123,7 +131,10 @@ public static class JaliumHostingExtensions
     /// it directly, without going through <c>AddView&lt;TView, TViewModel&gt;()</c>).
     /// </summary>
     public static IServiceCollection AddViewModel<
-        [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TViewModel>(
+        [DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicConstructors |
+            DynamicallyAccessedMemberTypes.PublicProperties |
+            DynamicallyAccessedMemberTypes.PublicFields)] TViewModel>(
         this IServiceCollection services)
         where TViewModel : class
     {
@@ -148,7 +159,7 @@ public static class JaliumHostingExtensions
     // ── Convention-based bulk discovery (AddControllersWithViews-style) ─────
 
     /// <summary>
-    /// Scans the calling assembly for Views (classes whose name ends with
+    /// Discovers Views in the calling assembly (classes whose name ends with
     /// <c>Page</c>/<c>Window</c>/<c>UserControl</c>/<c>View</c> and that
     /// derive from <see cref="FrameworkElement"/>) and ViewModels (classes
     /// whose name ends with <c>ViewModel</c>), registers them with the
@@ -162,8 +173,10 @@ public static class JaliumHostingExtensions
     /// collection for fluent chaining. Name matching: <c>FooPage</c> pairs
     /// with <c>FooViewModel</c>, <c>MainWindow</c> pairs with
     /// <c>MainWindowViewModel</c>, etc.
+    /// The JALXAML source generator supplies the type catalog used in trimmed
+    /// and NativeAOT applications, so those builds do not enumerate assembly
+    /// metadata at runtime.
     /// </remarks>
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Defers to ViewDiscovery.Discover which enumerates exported types via reflection. Use AddView<TView, TViewModel>() for AOT-safe registration.")]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static IServiceCollection AddViewsAndViewModels(this IServiceCollection services)
     {
@@ -176,9 +189,8 @@ public static class JaliumHostingExtensions
 
     /// <summary>
     /// Overload accepting explicit assemblies. Every assembly listed is
-    /// scanned; duplicates are ignored.
+    /// discovered; duplicates are ignored.
     /// </summary>
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Defers to ViewDiscovery.Discover which enumerates exported types via reflection. Use AddView<TView, TViewModel>() for AOT-safe registration.")]
     public static IServiceCollection AddViewsAndViewModels(
         this IServiceCollection services,
         params Assembly[] assemblies)
@@ -204,7 +216,6 @@ public static class JaliumHostingExtensions
     /// or disable auto-pairing. Calling-assembly fallback still applies when
     /// <paramref name="configure"/> leaves <see cref="ViewDiscoveryOptions.Assemblies"/> empty.
     /// </summary>
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Defers to ViewDiscovery.Discover which enumerates exported types via reflection. Use AddView<TView, TViewModel>() for AOT-safe registration.")]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static IServiceCollection AddViewsAndViewModels(
         this IServiceCollection services,
@@ -224,11 +235,10 @@ public static class JaliumHostingExtensions
     }
 
     /// <summary>
-    /// Scans and registers only View types (no ViewModel discovery / pairing).
+    /// Discovers and registers only View types (no ViewModel discovery / pairing).
     /// Useful when ViewModels live in a separate assembly and are registered
     /// manually.
     /// </summary>
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Defers to ViewDiscovery which enumerates exported types via reflection. Use AddView<TView, TViewModel>() for AOT-safe registration.")]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static IServiceCollection AddViews(this IServiceCollection services)
     {
@@ -242,7 +252,6 @@ public static class JaliumHostingExtensions
     /// <summary>
     /// Overload of <see cref="AddViews(IServiceCollection)"/> with options callback.
     /// </summary>
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Defers to ViewDiscovery which enumerates exported types via reflection. Use AddView<TView, TViewModel>() for AOT-safe registration.")]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static IServiceCollection AddViews(
         this IServiceCollection services,
@@ -262,11 +271,10 @@ public static class JaliumHostingExtensions
     }
 
     /// <summary>
-    /// Scans and registers only ViewModel types. Pair symmetry with
+    /// Discovers and registers only ViewModel types. Pair symmetry with
     /// <see cref="AddViews(IServiceCollection)"/>; combine the two when Views
     /// and ViewModels live in separate assemblies.
     /// </summary>
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Defers to ViewDiscovery which enumerates exported types via reflection. Use service registration directly for AOT-safe usage.")]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static IServiceCollection AddViewModels(this IServiceCollection services)
     {
@@ -280,7 +288,6 @@ public static class JaliumHostingExtensions
     /// <summary>
     /// Overload of <see cref="AddViewModels(IServiceCollection)"/> with options callback.
     /// </summary>
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Defers to ViewDiscovery which enumerates exported types via reflection. Use service registration directly for AOT-safe usage.")]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static IServiceCollection AddViewModels(
         this IServiceCollection services,
@@ -303,10 +310,9 @@ public static class JaliumHostingExtensions
 
     /// <summary>
     /// Fluent <see cref="AppBuilder"/> wrapper over
-    /// <see cref="AddViewsAndViewModels(IServiceCollection)"/>. Scans the
+    /// <see cref="AddViewsAndViewModels(IServiceCollection)"/>. Discovers the
     /// calling assembly by default.
     /// </summary>
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Defers to ViewDiscovery which enumerates exported types via reflection. Use AddView<TView, TViewModel>() for AOT-safe registration.")]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static AppBuilder AddViewsAndViewModels(this AppBuilder builder)
     {
@@ -320,7 +326,6 @@ public static class JaliumHostingExtensions
     /// <summary>
     /// Fluent <see cref="AppBuilder"/> wrapper accepting explicit assemblies.
     /// </summary>
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Defers to ViewDiscovery which enumerates exported types via reflection. Use AddView<TView, TViewModel>() for AOT-safe registration.")]
     public static AppBuilder AddViewsAndViewModels(this AppBuilder builder, params Assembly[] assemblies)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -342,7 +347,6 @@ public static class JaliumHostingExtensions
     /// <summary>
     /// Fluent <see cref="AppBuilder"/> wrapper with configuration callback.
     /// </summary>
-    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("Defers to ViewDiscovery which enumerates exported types via reflection. Use AddView<TView, TViewModel>() for AOT-safe registration.")]
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static AppBuilder AddViewsAndViewModels(this AppBuilder builder, Action<ViewDiscoveryOptions> configure)
     {

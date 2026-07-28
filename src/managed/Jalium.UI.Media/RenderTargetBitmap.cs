@@ -10,6 +10,7 @@ public sealed partial class RenderTargetBitmap : BitmapSource
     private byte[] _pixelBuffer;
     private readonly int _pixelWidth;
     private readonly int _pixelHeight;
+    private readonly int _stride;
     private readonly double _dpiX;
     private readonly double _dpiY;
 
@@ -70,7 +71,9 @@ public sealed partial class RenderTargetBitmap : BitmapSource
         _pixelHeight = pixelHeight;
         _dpiX = dpiX > 0 ? dpiX : 96.0;
         _dpiY = dpiY > 0 ? dpiY : 96.0;
-        _pixelBuffer = new byte[pixelWidth * pixelHeight * 4]; // BGRA32
+        _stride = PixelBufferLayout.GetMinimumStride(pixelWidth);
+        _pixelBuffer = new byte[
+            PixelBufferLayout.GetRequiredByteCount(pixelWidth, pixelHeight, _stride)]; // BGRA32
     }
 
     /// <summary>
@@ -121,22 +124,42 @@ public sealed partial class RenderTargetBitmap : BitmapSource
     /// </summary>
     public override void CopyPixels(Int32Rect sourceRect, byte[] pixels, int stride, int offset)
     {
-        if (pixels == null) throw new ArgumentNullException(nameof(pixels));
+        ArgumentNullException.ThrowIfNull(pixels);
 
-        var srcStride = _pixelWidth * 4;
         var startX = sourceRect.X;
         var startY = sourceRect.Y;
         var width = sourceRect.Width == 0 ? _pixelWidth : sourceRect.Width;
         var height = sourceRect.Height == 0 ? _pixelHeight : sourceRect.Height;
 
-        if (startX < 0 || startY < 0 || startX + width > _pixelWidth || startY + height > _pixelHeight)
+        if (startX < 0 || startY < 0 || width < 0 || height < 0 ||
+            startX > _pixelWidth - width || startY > _pixelHeight - height)
+        {
             throw new ArgumentOutOfRangeException(nameof(sourceRect), "Source rectangle exceeds bitmap dimensions.");
+        }
+
+        var rowBytes = checked(width * PixelBufferLayout.BytesPerPixel);
+        if (stride < rowBytes)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(stride),
+                "Destination stride is smaller than the requested row width.");
+        }
+
+        if (offset < 0)
+            throw new ArgumentOutOfRangeException(nameof(offset));
+
+        var requiredBytes = height == 0
+            ? (long)offset
+            : (long)offset + ((long)(height - 1) * stride) + rowBytes;
+        if (requiredBytes > pixels.Length)
+            throw new ArgumentException("Destination pixel buffer is too small.", nameof(pixels));
 
         for (var y = 0; y < height; y++)
         {
-            var srcOffset = ((startY + y) * srcStride) + (startX * 4);
-            var dstOffset = offset + (y * stride);
-            Array.Copy(_pixelBuffer, srcOffset, pixels, dstOffset, Math.Min(width * 4, stride));
+            var srcOffset = checked(((startY + y) * _stride) +
+                                    (startX * PixelBufferLayout.BytesPerPixel));
+            var dstOffset = checked(offset + (y * stride));
+            Array.Copy(_pixelBuffer, srcOffset, pixels, dstOffset, rowBytes);
         }
     }
 
@@ -152,7 +175,7 @@ public sealed partial class RenderTargetBitmap : BitmapSource
     {
         if (x < 0 || x >= _pixelWidth || y < 0 || y >= _pixelHeight) return;
 
-        var offset = (y * _pixelWidth + x) * 4;
+        var offset = (y * _stride) + (x * PixelBufferLayout.BytesPerPixel);
         _pixelBuffer[offset] = color.B;
         _pixelBuffer[offset + 1] = color.G;
         _pixelBuffer[offset + 2] = color.R;

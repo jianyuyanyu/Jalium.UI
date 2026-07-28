@@ -114,14 +114,9 @@ public sealed class DependencyProperty
     /// <remarks>
     /// NOTE — divergence from WPF: WPF's <c>IsValidValue</c> is the conjunction
     /// <c>IsValidType(value) &amp;&amp; (ValidateValueCallback == null || ValidateValueCallback(value))</c>.
-    /// This implementation intentionally runs ONLY the callback and does NOT perform the
-    /// <see cref="IsValidType"/> type-assignability check, so a type-incompatible value (including a
-    /// <see langword="null"/> for a non-nullable value type) passes this gate. Null/mismatch safety for
-    /// value-type properties is instead enforced at the write paths (TemplateBinding/Style transfers, the
-    /// <c>SetLayerValueCore</c> backstop, <c>SetCurrentValue</c>, local promotion) and by value-type
-    /// default synthesis at registration. Folding <see cref="IsValidType"/> into this method (so
-    /// <c>SetValue</c> throws on an illegal value, full WPF parity) is a deliberate larger follow-up that
-    /// would change framework-wide throw semantics and needs separate regression vetting.
+    /// This method retains Jalium's callback-only behavior for source compatibility. Property-store
+    /// boundaries and metadata registration therefore combine this method with <see cref="IsValidType"/>
+    /// explicitly; callers that need to determine whether a value can actually be stored must do the same.
     /// </remarks>
     public bool IsValidValue(object? value)
     {
@@ -293,17 +288,28 @@ public sealed class DependencyProperty
 
     private static void ValidateDefaultValue(PropertyMetadata? metadata, Type propertyType, Type ownerType, string name, ValidateValueCallback? validateValueCallback)
     {
-        if (validateValueCallback is null || metadata is null)
+        if (metadata is null)
             return;
+
+        var defaultValue = metadata.DefaultValue;
+
+        // Preserve Jalium's established null-default behavior for value types. GetEffectiveDefaultValue
+        // synthesizes default(T) for non-nullable value types, while Nullable<T> legitimately remains null.
+        if (defaultValue is null && propertyType.IsValueType)
+            return;
+
+        var targetType = Nullable.GetUnderlyingType(propertyType) ?? propertyType;
+        if (defaultValue is not null && !targetType.IsInstanceOfType(defaultValue))
+        {
+            throw new ArgumentException(
+                $"Default value of dependency property '{ownerType.Name}.{name}' has type " +
+                $"'{defaultValue.GetType().FullName}', but the property type is '{propertyType.FullName}'.");
+        }
 
         // WPF rejects registrations whose default value already fails the validator —
         // catch the inconsistency at registration time rather than letting every read
         // of the unset value silently return an illegal default.
-        var defaultValue = metadata.DefaultValue;
-        if (defaultValue is null && propertyType.IsValueType)
-            return;
-
-        if (!validateValueCallback(defaultValue))
+        if (validateValueCallback is not null && !validateValueCallback(defaultValue))
         {
             throw new ArgumentException(
                 $"Default value of dependency property '{ownerType.Name}.{name}' is not valid according to its ValidateValueCallback.");

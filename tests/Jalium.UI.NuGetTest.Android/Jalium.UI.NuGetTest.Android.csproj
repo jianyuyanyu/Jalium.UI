@@ -9,10 +9,11 @@
     <SupportedOSPlatformVersion>24</SupportedOSPlatformVersion>
     <RootNamespace>Jalium.UI.NuGetTest.Android</RootNamespace>
     <IsPackable>false</IsPackable>
+    <JaliumPackageVersion Condition="'$(JaliumPackageVersion)' == ''">$(Version)</JaliumPackageVersion>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Jalium.UI.Android" Version="26.10.0-preview" />
+    <PackageReference Include="Jalium.UI.Android" Version="$(JaliumPackageVersion)" />
   </ItemGroup>
 
 </Project>

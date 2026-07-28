@@ -335,6 +335,48 @@ public class VirtualizationPipelineTests
     }
 
     [Fact]
+    public void InfiniteMeasureThenFiniteArrange_RequestsViewportRecovery()
+    {
+        var listBox = new TestListBox
+        {
+            Width = 320,
+            MinHeight = 240,
+        };
+        VirtualizingPanel.SetCacheLength(
+            listBox,
+            new VirtualizationCacheLength(0));
+        for (var index = 0; index < 500; index++)
+        {
+            listBox.Items.Add($"Item {index}");
+        }
+
+        // A virtualized list nested in an outer ScrollViewer is initially
+        // measured with an unbounded scroll axis. Its MinHeight supplies a
+        // finite arrange slot later in the same layout pass.
+        listBox.Measure(
+            new Size(320, double.PositiveInfinity));
+        listBox.Arrange(new Rect(0, 0, 320, 240));
+
+        var host = Assert.IsType<VirtualizingStackPanel>(
+            listBox.Host);
+        Assert.Single(host.Children);
+
+        // Arrange is the first point at which the real viewport is known.
+        // It must request a corrective measure without waiting for a scroll.
+        Assert.False(host.IsMeasureValid);
+
+        host.Measure(
+            new Size(320, double.PositiveInfinity));
+        host.Arrange(new Rect(0, 0, 320, 240));
+
+        Assert.InRange(host.Children.Count, 2, 20);
+        Assert.NotNull(
+            listBox.ItemContainerGenerator.ContainerFromIndex(1));
+        Assert.Null(
+            listBox.ItemContainerGenerator.ContainerFromIndex(100));
+    }
+
+    [Fact]
     public void LazyItemsSource_IsNotReenumeratedByVirtualizedResizeOrScroll()
     {
         var source = new CountingEnumerable(100);
@@ -528,6 +570,57 @@ public class VirtualizationPipelineTests
         host.Arrange(new Rect(0, 0, 320, 120));
 
         Assert.All(host.Children.OfType<ContentPresenter>(), presenter => Assert.Same(styleB, presenter.Style));
+    }
+
+    [Fact]
+    public void ViewportRecycling_PreservesFixedContainerStyleWithoutReapplyingIt()
+    {
+        var style = new Style(typeof(StyleApplicationProbePresenter));
+        style.Setters.Add(
+            new Setter(
+                StyleApplicationProbePresenter.ProbeProperty,
+                true));
+        var control = new StyleApplicationProbeItemsControl
+        {
+            Width = 320,
+            Height = 120,
+            ItemContainerStyle = style,
+            ItemsSource = Enumerable.Range(0, 300)
+                .Select(i => $"Item {i}")
+                .ToList(),
+        };
+        VirtualizingPanel.SetCacheLength(
+            control,
+            new VirtualizationCacheLength(0));
+
+        control.Measure(new Size(320, 120));
+        control.Arrange(new Rect(0, 0, 320, 120));
+        var host = Assert.IsType<VirtualizingStackPanel>(control.Host);
+        var firstViewport = host.Children
+            .OfType<StyleApplicationProbePresenter>()
+            .ToArray();
+        Assert.NotEmpty(firstViewport);
+        Assert.All(
+            firstViewport,
+            presenter => Assert.Equal(1, presenter.ProbeChangeCount));
+
+        // The first disjoint jump pools the initial viewport and the second
+        // consumes it for different items. A fixed container style should stay
+        // attached throughout instead of being cleared and fully applied again.
+        host.SetVerticalOffset(2400);
+        host.Measure(new Size(320, 120));
+        host.Arrange(new Rect(0, 0, 320, 120));
+        host.SetVerticalOffset(4800);
+        host.Measure(new Size(320, 120));
+        host.Arrange(new Rect(0, 0, 320, 120));
+
+        Assert.All(
+            firstViewport,
+            presenter =>
+            {
+                Assert.Same(style, presenter.Style);
+                Assert.Equal(1, presenter.ProbeChangeCount);
+            });
     }
 
     [Fact]
@@ -1282,6 +1375,47 @@ public class VirtualizationPipelineTests
             => item is string text && text.StartsWith("A ", StringComparison.Ordinal)
                 ? styleA
                 : styleB;
+    }
+
+    private sealed class StyleApplicationProbeItemsControl : ItemsControl
+    {
+        public StyleApplicationProbeItemsControl()
+        {
+            ItemsPanel = new ItemsPanelTemplate
+            {
+                PanelType = typeof(VirtualizingStackPanel)
+            };
+        }
+
+        public Panel? Host => ItemsHost;
+
+        protected override FrameworkElement GetContainerForItem(object item) =>
+            new StyleApplicationProbePresenter
+            {
+                Height = ItemHeight
+            };
+    }
+
+    private sealed class StyleApplicationProbePresenter : ContentPresenter
+    {
+        public static readonly DependencyProperty ProbeProperty =
+            DependencyProperty.Register(
+                nameof(Probe),
+                typeof(bool),
+                typeof(StyleApplicationProbePresenter),
+                new PropertyMetadata(
+                    false,
+                    static (dependencyObject, _) =>
+                        ((StyleApplicationProbePresenter)dependencyObject)
+                        .ProbeChangeCount++));
+
+        public bool Probe
+        {
+            get => (bool)(GetValue(ProbeProperty) ?? false);
+            set => SetValue(ProbeProperty, value);
+        }
+
+        public int ProbeChangeCount { get; private set; }
     }
 
     private sealed class PersistentContentVirtualizingItemsControl : ItemsControl

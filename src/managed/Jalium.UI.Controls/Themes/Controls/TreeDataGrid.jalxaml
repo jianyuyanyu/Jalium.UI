@@ -7,6 +7,7 @@
     <!-- ============================================== -->
     <Style TargetType="TreeDataGrid">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="RowHeight" Value="30" />
@@ -80,6 +81,7 @@
     <!-- ============================================== -->
     <Style TargetType="TreeDataGridRow">
         <Setter Property="Background" Value="Transparent" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="Template">
             <ControlTemplate TargetType="TreeDataGridRow">
                 <Border Name="PART_RowBorder"

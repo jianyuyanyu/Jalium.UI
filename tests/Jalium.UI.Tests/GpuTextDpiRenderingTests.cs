@@ -30,6 +30,132 @@ public sealed class GpuTextDpiRenderingTests
     public void Vulkan_AnisotropicSmallText_PreservesGlyphHeightAndStems() =>
         AssertAnisotropicSmallTextContract(RenderBackend.Vulkan);
 
+    [RequiresWindowsBackendFact(RenderBackend.Vulkan)]
+    public void Vulkan_AtlasGrowth_ReemitsGlyphsDroppedByFullInitialAtlas() =>
+        AssertAtlasGrowthReemitsDroppedGlyphs(RenderBackend.Vulkan);
+
+    [RequiresWindowsBackendFact(RenderBackend.D3D12)]
+    public void D3D12_AtlasGrowth_ReemitsGlyphsDroppedByFullInitialAtlas() =>
+        AssertAtlasGrowthReemitsDroppedGlyphs(RenderBackend.D3D12);
+
+    private static void AssertAtlasGrowthReemitsDroppedGlyphs(RenderBackend backend)
+    {
+        using var window = new HiddenNativeWindow(Width, Height);
+        using var context = new RenderContext(backend);
+        using var target = context.CreateRenderTarget(window.Hwnd, Width, Height);
+        using var blackBrush = context.CreateSolidBrush(0f, 0f, 0f, 1f);
+        using var whiteBrush = context.CreateSolidBrush(1f, 1f, 1f, 1f);
+        using var sentinelFormat = context.CreateTextFormat("Consolas", 20f);
+
+        const string warmupText =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        var warmupFormats = new List<NativeTextFormat>();
+        var sawAtlasRetry = false;
+        try
+        {
+            for (var size = 9; size <= 30; size++)
+            {
+                var format = context.CreateTextFormat("Segoe UI", size);
+                format.SetTextRenderingMode(2);
+                format.SetTextHintingMode(1);
+                warmupFormats.Add(format);
+            }
+
+            sentinelFormat.SetTextRenderingMode(2);
+            sentinelFormat.SetTextHintingMode(1);
+
+            for (var frame = 0; frame < 4; frame++)
+            {
+                target.SetFullInvalidation();
+                Assert.True(
+                    TryBeginDrawWithRetry(target),
+                    $"{target.Backend}: atlas-growth frame {frame} remained busy.");
+                target.Clear(0f, 0f, 0f);
+                foreach (var format in warmupFormats)
+                {
+                    // Opaque black still rasterizes and caches every glyph but
+                    // remains invisible on the black capture background.
+                    target.DrawText(
+                        warmupText, format, 0f, 0f, Width, Height, blackBrush);
+                }
+
+                // This glyph is deliberately requested after the warm-up has
+                // exhausted the initial atlas. It must be retried after growth,
+                // not retained forever as an invalid cache entry.
+                target.DrawText(
+                    "@", sentinelFormat, 440f, 112f, 64f, 40f, whiteBrush);
+                if (frame == 3)
+                {
+                    Assert.Equal(JaliumResult.Ok, target.RequestReadback());
+                }
+
+                var endResult = target.TryEndDraw();
+                if (backend == RenderBackend.Vulkan &&
+                    endResult == JaliumResult.PresentFailed)
+                {
+                    sawAtlasRetry = true;
+                }
+                else
+                {
+                    Assert.Equal(JaliumResult.Ok, endResult);
+                }
+
+                if (frame == 1)
+                {
+                    Assert.True(target.TryQueryGpuStats(out var stats));
+                    Assert.True(
+                        stats.GlyphSlotsTotal > 1024,
+                        $"{backend}: stress run did not grow the initial atlas " +
+                        $"(capacity={stats.GlyphSlotsTotal}).");
+                }
+            }
+
+            var pixels = new byte[Width * Height * 4];
+            Assert.Equal(
+                JaliumResult.Ok,
+                target.FetchReadback(
+                    pixels,
+                    Width * 4u,
+                    out var capturedWidth,
+                    out var capturedHeight));
+            Assert.Equal(Width, capturedWidth);
+            Assert.Equal(Height, capturedHeight);
+
+            var brightPixelCount = 0;
+            for (var y = 108; y < Height; y++)
+            {
+                for (var x = 432; x < Width; x++)
+                {
+                    var offset = (y * Width + x) * 4;
+                    if (Math.Max(
+                            pixels[offset],
+                            Math.Max(pixels[offset + 1], pixels[offset + 2])) > 16)
+                    {
+                        brightPixelCount++;
+                    }
+                }
+            }
+
+            Assert.True(
+                brightPixelCount >= 8,
+                $"{backend}: glyph requested after atlas overflow remained missing " +
+                $"after growth ({brightPixelCount} bright pixels).");
+            if (backend == RenderBackend.Vulkan)
+            {
+                Assert.True(
+                    sawAtlasRetry,
+                    "Vulkan: atlas overflow was presented without requesting a full retry.");
+            }
+        }
+        finally
+        {
+            foreach (var format in warmupFormats)
+            {
+                format.Dispose();
+            }
+        }
+    }
+
     private static void AssertAnisotropicSmallTextContract(RenderBackend backend)
     {
         using var window = new HiddenNativeWindow(Width, Height);
@@ -190,7 +316,10 @@ public sealed class GpuTextDpiRenderingTests
             // in production so Vulkan does not seed this frame from its
             // retained pre-DPI image.
             target.SetFullInvalidation();
-            Assert.True(target.TryBeginDraw());
+            Assert.True(
+                TryBeginDrawWithRetry(target),
+                $"{target.Backend}: TryBeginDraw remained busy at dpi={dpi}, " +
+                $"frame={frame}.");
             target.Clear(0f, 0f, 0f);
             if (transform is not null)
             {
@@ -243,6 +372,27 @@ public sealed class GpuTextDpiRenderingTests
             ? new PixelBounds(minX, minY, maxX - minX + 1, maxY - minY + 1)
             : new PixelBounds(0, 0, 0, 0);
         return new TextCapture(pixels, bounds);
+    }
+
+    private static bool TryBeginDrawWithRetry(RenderTarget target)
+    {
+        // TryBeginDraw deliberately reports transient swap-chain pressure
+        // instead of blocking indefinitely. Window retries through its frame
+        // scheduler; pixel tests need the same bounded contract when the full
+        // GPU suite happens to miss a composition cycle.
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        do
+        {
+            if (target.TryBeginDraw())
+            {
+                return true;
+            }
+
+            Thread.Sleep(1);
+        }
+        while (stopwatch.ElapsedMilliseconds < 250);
+
+        return false;
     }
 
     private readonly record struct PixelBounds(int X, int Y, int Width, int Height);

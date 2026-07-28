@@ -1,5 +1,9 @@
 #include "jalium_internal.h"
+#include "jalium_abi_guard.h"
 #include "jalium_string_util.h"
+
+#include <cmath>
+#include <new>
 
 // ============================================================================
 // C API Implementation
@@ -23,13 +27,19 @@ JALIUM_API JaliumBrush* jalium_brush_create_linear_gradient(
     const JaliumGradientStop* stops,
     uint32_t stopCount)
 {
-    if (!ctx || !stops || stopCount == 0) return nullptr;
-
-    auto backend = jalium::GetBackendFromContext(ctx);
-    if (!backend) return nullptr;
-
-    auto brush = backend->CreateLinearGradientBrush(startX, startY, endX, endY, stops, stopCount);
-    return reinterpret_cast<JaliumBrush*>(brush);
+    if (!ctx || !stops || stopCount == 0 ||
+        stopCount > jalium::kMaxGradientStopCount) {
+        return nullptr;
+    }
+    try {
+        auto backend = jalium::GetBackendFromContext(ctx);
+        if (!backend) return nullptr;
+        auto brush = backend->CreateLinearGradientBrush(
+            startX, startY, endX, endY, stops, stopCount);
+        return reinterpret_cast<JaliumBrush*>(brush);
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 JALIUM_API JaliumBrush* jalium_brush_create_radial_gradient(
@@ -39,13 +49,20 @@ JALIUM_API JaliumBrush* jalium_brush_create_radial_gradient(
     const JaliumGradientStop* stops,
     uint32_t stopCount)
 {
-    if (!ctx || !stops || stopCount == 0) return nullptr;
-
-    auto backend = jalium::GetBackendFromContext(ctx);
-    if (!backend) return nullptr;
-
-    auto brush = backend->CreateRadialGradientBrush(centerX, centerY, radiusX, radiusY, originX, originY, stops, stopCount);
-    return reinterpret_cast<JaliumBrush*>(brush);
+    if (!ctx || !stops || stopCount == 0 ||
+        stopCount > jalium::kMaxGradientStopCount) {
+        return nullptr;
+    }
+    try {
+        auto backend = jalium::GetBackendFromContext(ctx);
+        if (!backend) return nullptr;
+        auto brush = backend->CreateRadialGradientBrush(
+            centerX, centerY, radiusX, radiusY, originX, originY,
+            stops, stopCount);
+        return reinterpret_cast<JaliumBrush*>(brush);
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 JALIUM_API void jalium_brush_destroy(JaliumBrush* brush) {
@@ -61,18 +78,30 @@ JALIUM_API JaliumTextFormat* jalium_text_format_create(
     int32_t fontWeight,
     int32_t fontStyle)
 {
-    if (!ctx || !fontFamily || fontSize <= 0) return nullptr;
+    if (!ctx || !fontFamily || !std::isfinite(fontSize) ||
+        fontSize <= jalium::kMinManagedFontSize ||
+        fontSize > jalium::kMaxManagedFontSize) {
+        return nullptr;
+    }
 
-    auto backend = jalium::GetBackendFromContext(ctx);
-    if (!backend) return nullptr;
-
-#if defined(_WIN32)
-    auto format = backend->CreateTextFormat(fontFamily, fontSize, fontWeight, fontStyle);
-#else
-    auto wFamily = jalium::ManagedToWString(fontFamily);
-    auto format = backend->CreateTextFormat(wFamily.c_str(), fontSize, fontWeight, fontStyle);
-#endif
-    return reinterpret_cast<JaliumTextFormat*>(format);
+    try {
+        uint32_t familyLength = 0;
+        if (!jalium::ManagedUtf16LengthBounded(
+                fontFamily,
+                jalium::kMaxManagedFontFamilyCodeUnits,
+                &familyLength)) {
+            return nullptr;
+        }
+        auto backend = jalium::GetBackendFromContext(ctx);
+        if (!backend) return nullptr;
+        auto wFamily = jalium::ManagedToWString(fontFamily, familyLength);
+        auto format = backend->CreateTextFormat(
+            wFamily.c_str(), fontSize, fontWeight, fontStyle);
+        return reinterpret_cast<JaliumTextFormat*>(format);
+    } catch (...) {
+        // C++ exceptions must never unwind through the public C ABI.
+        return nullptr;
+    }
 }
 
 JALIUM_API void jalium_text_format_destroy(JaliumTextFormat* format) {
@@ -145,20 +174,36 @@ JALIUM_API JaliumResult jalium_text_format_hit_test_point(
     float pointX, float pointY,
     JaliumTextHitTestResult* result)
 {
-    if (!format || !text || !result) return JALIUM_ERROR_INVALID_ARGUMENT;
-#if defined(_WIN32)
-    return reinterpret_cast<jalium::TextFormat*>(format)->HitTestPoint(
-        text, textLength, maxWidth, maxHeight, pointX, pointY, result);
-#else
-    auto wstr = jalium::ManagedToWString(text, textLength);
-    JaliumResult status = reinterpret_cast<jalium::TextFormat*>(format)->HitTestPoint(
-        wstr.c_str(), static_cast<uint32_t>(wstr.size()), maxWidth, maxHeight, pointX, pointY, result);
-    if (status == JALIUM_OK) {
-        result->textPosition = jalium::ManagedWStringIndexToUtf16Index(
-            text, textLength, result->textPosition);
+    if (!format || !text || !result ||
+        textLength > jalium::kMaxManagedTextCodeUnits) {
+        return JALIUM_ERROR_INVALID_ARGUMENT;
     }
-    return status;
+    *result = {};
+    try {
+#if defined(_WIN32)
+        JaliumResult status =
+            reinterpret_cast<jalium::TextFormat*>(format)->HitTestPoint(
+                text, textLength, maxWidth, maxHeight,
+                pointX, pointY, result);
+#else
+        auto wstr = jalium::ManagedToWString(text, textLength);
+        JaliumResult status =
+            reinterpret_cast<jalium::TextFormat*>(format)->HitTestPoint(
+                wstr.c_str(), static_cast<uint32_t>(wstr.size()),
+                maxWidth, maxHeight, pointX, pointY, result);
+        if (status == JALIUM_OK) {
+            result->textPosition = jalium::ManagedWStringIndexToUtf16Index(
+                text, textLength, result->textPosition);
+        }
 #endif
+        return status;
+    } catch (const std::bad_alloc&) {
+        *result = {};
+        return JALIUM_ERROR_OUT_OF_MEMORY;
+    } catch (...) {
+        *result = {};
+        return JALIUM_ERROR_UNKNOWN;
+    }
 }
 
 JALIUM_API JaliumResult jalium_text_format_hit_test_text_position(
@@ -168,23 +213,40 @@ JALIUM_API JaliumResult jalium_text_format_hit_test_text_position(
     uint32_t textPosition, int32_t isTrailingHit,
     JaliumTextHitTestResult* result)
 {
-    if (!format || !text || !result) return JALIUM_ERROR_INVALID_ARGUMENT;
-#if defined(_WIN32)
-    return reinterpret_cast<jalium::TextFormat*>(format)->HitTestTextPosition(
-        text, textLength, maxWidth, maxHeight, textPosition, isTrailingHit, result);
-#else
-    auto wstr = jalium::ManagedToWString(text, textLength);
-    uint32_t wideTextPosition = jalium::ManagedUtf16IndexToWStringIndex(
-        text, textLength, textPosition);
-    JaliumResult status = reinterpret_cast<jalium::TextFormat*>(format)->HitTestTextPosition(
-        wstr.c_str(), static_cast<uint32_t>(wstr.size()), maxWidth, maxHeight,
-        wideTextPosition, isTrailingHit, result);
-    if (status == JALIUM_OK) {
-        result->textPosition = jalium::ManagedWStringIndexToUtf16Index(
-            text, textLength, result->textPosition);
+    if (!format || !text || !result ||
+        textLength > jalium::kMaxManagedTextCodeUnits ||
+        textPosition > textLength) {
+        return JALIUM_ERROR_INVALID_ARGUMENT;
     }
-    return status;
+    *result = {};
+    try {
+#if defined(_WIN32)
+        JaliumResult status =
+            reinterpret_cast<jalium::TextFormat*>(format)->
+                HitTestTextPosition(
+                    text, textLength, maxWidth, maxHeight, textPosition,
+                    isTrailingHit, result);
+#else
+        auto wstr = jalium::ManagedToWString(text, textLength);
+        uint32_t wideTextPosition = jalium::ManagedUtf16IndexToWStringIndex(
+            text, textLength, textPosition);
+        JaliumResult status =
+            reinterpret_cast<jalium::TextFormat*>(format)->HitTestTextPosition(
+                wstr.c_str(), static_cast<uint32_t>(wstr.size()),
+                maxWidth, maxHeight, wideTextPosition, isTrailingHit, result);
+        if (status == JALIUM_OK) {
+            result->textPosition = jalium::ManagedWStringIndexToUtf16Index(
+                text, textLength, result->textPosition);
+        }
 #endif
+        return status;
+    } catch (const std::bad_alloc&) {
+        *result = {};
+        return JALIUM_ERROR_OUT_OF_MEMORY;
+    } catch (...) {
+        *result = {};
+        return JALIUM_ERROR_UNKNOWN;
+    }
 }
 
 JALIUM_API JaliumResult jalium_text_format_measure_text(
@@ -195,18 +257,29 @@ JALIUM_API JaliumResult jalium_text_format_measure_text(
     float maxHeight,
     JaliumTextMetrics* metrics)
 {
-    if (!format || !text || !metrics) {
+    if (!format || !text || !metrics ||
+        textLength > jalium::kMaxManagedTextCodeUnits) {
         return JALIUM_ERROR_INVALID_ARGUMENT;
     }
 
+    *metrics = {};
+    try {
 #if defined(_WIN32)
-    return reinterpret_cast<jalium::TextFormat*>(format)->MeasureText(
-        text, textLength, maxWidth, maxHeight, metrics);
+        return reinterpret_cast<jalium::TextFormat*>(format)->MeasureText(
+            text, textLength, maxWidth, maxHeight, metrics);
 #else
-    auto wstr = jalium::ManagedToWString(text, textLength);
-    return reinterpret_cast<jalium::TextFormat*>(format)->MeasureText(
-        wstr.c_str(), static_cast<uint32_t>(wstr.size()), maxWidth, maxHeight, metrics);
+        auto wstr = jalium::ManagedToWString(text, textLength);
+        return reinterpret_cast<jalium::TextFormat*>(format)->MeasureText(
+            wstr.c_str(), static_cast<uint32_t>(wstr.size()),
+            maxWidth, maxHeight, metrics);
 #endif
+    } catch (const std::bad_alloc&) {
+        *metrics = {};
+        return JALIUM_ERROR_OUT_OF_MEMORY;
+    } catch (...) {
+        *metrics = {};
+        return JALIUM_ERROR_UNKNOWN;
+    }
 }
 
 JALIUM_API JaliumResult jalium_text_format_get_font_metrics(

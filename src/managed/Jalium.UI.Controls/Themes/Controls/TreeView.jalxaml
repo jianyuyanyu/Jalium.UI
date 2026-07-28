@@ -7,6 +7,7 @@
     <!-- ============================================== -->
     <Style TargetType="TreeView">
         <Setter Property="Background" Value="{ThemeResource SurfaceBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="CornerRadius" Value="12" />
@@ -48,6 +49,7 @@
     <!-- ============================================== -->
     <Style TargetType="TreeSelector">
         <Setter Property="Background" Value="{ThemeResource ControlBackground}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="10,6,6,6" />

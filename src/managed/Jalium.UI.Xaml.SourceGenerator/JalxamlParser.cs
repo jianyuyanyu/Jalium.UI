@@ -439,7 +439,7 @@ public static class JalxamlParser
         }
 
         // Track every element type for AOT pinning (legacy metadata path used by the SG to
-        // emit `RegisterType<T>()` calls in the ModuleInitializer). The synthetic Razor
+        // emit `RegisterType(typeof(T))` calls in the ModuleInitializer). The synthetic Razor
         // wrappers have no element-named CLR type (RazorSectionHost is referenced directly
         // by the emitted `new` instead), so they must never enter the referenced-type set.
         if (!isSynthetic)
@@ -663,6 +663,20 @@ public static class JalxamlParser
                 var parts = local.Split('.');
                 var owner = parts[0];
                 var prop = parts.Length > 1 ? parts[1] : string.Empty;
+
+                // Attached-property owners are referenced only by their XAML spelling in
+                // the generated SetAttachedProperty call. Keep them in the same AOT root
+                // set as element types so RegisterType(typeof(T)) preserves public Set/Get
+                // methods and makes the owner resolvable without Assembly.GetType.
+                //
+                // XML default namespaces do not apply to unprefixed attributes, so
+                // NamespaceURI is empty for Grid.Row. Use the in-scope default namespace
+                // for type resolution while leaving the AST attribute namespace unchanged.
+                var ownerNamespace = !string.IsNullOrEmpty(ns)
+                    ? ns
+                    : reader.LookupNamespace(prefix ?? string.Empty) ?? string.Empty;
+                AddReferencedElement(result, owner, ownerNamespace);
+
                 node.Attributes.Add(new JalxamlAstAttribute
                 {
                     Kind = JalxamlAttributeKind.Attached,
@@ -801,6 +815,29 @@ public static class JalxamlParser
                 continue;
 
             AddReferencedElement(result, elementName, namespaceUri);
+        }
+
+        // Preserve attached-property owners in the runtime-fallback path as well. This is
+        // the metadata-only equivalent of CaptureAttributes above for documents that the
+        // streaming XML parser cannot consume because of structural Razor content.
+        var attachedPropertyMatches = System.Text.RegularExpressions.Regex.Matches(
+            content,
+            @"(?<![\w:])(?:(?<prefix>[A-Za-z_][\w]*):)?(?<owner>[A-Za-z_][\w]*)\.(?<property>[A-Za-z_][\w]*)\s*=");
+        foreach (System.Text.RegularExpressions.Match m in attachedPropertyMatches)
+        {
+            var owner = m.Groups["owner"].Value;
+            if (string.IsNullOrEmpty(owner))
+                continue;
+
+            var prefix = m.Groups["prefix"].Value;
+            var namespaceUri = defaultXmlns;
+            if (!string.IsNullOrEmpty(prefix) &&
+                !prefixToXmlns.TryGetValue(prefix, out namespaceUri!))
+            {
+                namespaceUri = string.Empty;
+            }
+
+            AddReferencedElement(result, owner, namespaceUri);
         }
 
         var dataTypeMatches = System.Text.RegularExpressions.Regex.Matches(

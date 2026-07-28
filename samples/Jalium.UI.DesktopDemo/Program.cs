@@ -3,6 +3,7 @@ using Jalium.UI.Controls;
 using Jalium.UI.Hosting;
 using Jalium.UI.Interop;
 using Jalium.UI.Media;
+using Jalium.UI.Media.Imaging;
 using Jalium.UI.Notifications;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Linq;
 using Jalium.UI.Media;
 
 namespace Jalium.UI;
@@ -45,6 +46,38 @@ internal sealed class LayoutManager
     private bool _isUpdating;
     private int _layoutIterations;
     private const int MaxLayoutIterations = 250;
+    // Iteration count that means "this tree is fighting itself" rather than
+    // "a couple of invalidations settled". Well clear of any legitimate pass.
+    private const int RunawayLayoutIterationThreshold = 32;
+    private bool _reportedRunawayLayout;
+
+    /// <summary>
+    /// Names the elements driving a pass that will not settle. A tree that keeps
+    /// re-invalidating itself was previously invisible: the loop just truncated at
+    /// <see cref="MaxLayoutIterations"/> and the frame shipped with whatever
+    /// geometry it had, so an oscillation showed up as jitter on screen with
+    /// nothing in any log to point at it.
+    /// </summary>
+    [Conditional("DEBUG")]
+    private void ReportRunawayLayoutIfNeeded()
+    {
+        if (_reportedRunawayLayout || _layoutIterations < RunawayLayoutIterationThreshold)
+        {
+            return;
+        }
+
+        _reportedRunawayLayout = true;
+
+        var culprits = _measureQueue.Concat(_arrangeQueue)
+            .Distinct()
+            .Take(5)
+            .Select(e => $"{e.GetType().Name}(depth={GetCachedDepth(e)})");
+
+        Debug.WriteLine(
+            $"[Jalium.Layout] layout has not settled after {_layoutIterations} iterations " +
+            $"(cap {MaxLayoutIterations}); still queued: {string.Join(", ", culprits)}. " +
+            "Something in this subtree invalidates layout from inside measure or arrange.");
+    }
 
     /// <summary>
     /// Queues an element for re-measurement.
@@ -114,6 +147,7 @@ internal sealed class LayoutManager
 
         _isUpdating = true;
         _layoutIterations = 0;
+        _reportedRunawayLayout = false;
         int measuredItems = 0;
         int arrangedItems = 0;
         // Wall-clock breakdown so DevTools can answer "is layout slow because
@@ -149,6 +183,7 @@ internal sealed class LayoutManager
                    && _layoutIterations < MaxLayoutIterations)
             {
                 _layoutIterations++;
+                ReportRunawayLayoutIfNeeded();
 
                 // Process measure queue: sort by depth (shallowest first).
                 if (_measureQueue.Count > 0)
@@ -235,8 +270,16 @@ internal sealed class LayoutManager
         source.Clear();
     }
 
+    // Both propagations stop at a layout-isolated element: its host lays it out from
+    // a rectangle the host derives itself, so nothing above the host can be affected
+    // by it. The element is already queued by the caller before this runs, so it is
+    // never starved. Walking to the root anyway is what turned a scroll bar fading
+    // in — or appearing — into a whole extra window-wide measure and arrange round.
     private void PropagateInvalidArrangeUp(UIElement element)
     {
+        if (element.IsLayoutIsolated)
+            return;
+
         var parent = element.VisualParent as UIElement;
         while (parent != null)
         {
@@ -244,12 +287,19 @@ internal sealed class LayoutManager
                 parent.MarkArrangeInvalid();
             _arrangeQueue.Add(parent);
 
+            // The host itself still has to run: stop once it is queued.
+            if (parent.IsLayoutIsolated)
+                return;
+
             parent = parent.VisualParent as UIElement;
         }
     }
 
     private void PropagateInvalidMeasureUp(UIElement element)
     {
+        if (element.IsLayoutIsolated)
+            return;
+
         var parent = element.VisualParent as UIElement;
         while (parent != null)
         {
@@ -257,6 +307,9 @@ internal sealed class LayoutManager
                 parent.MarkMeasureInvalid();
             _measureQueue.Add(parent);
             _arrangeQueue.Add(parent);
+
+            if (parent.IsLayoutIsolated)
+                return;
 
             parent = parent.VisualParent as UIElement;
         }

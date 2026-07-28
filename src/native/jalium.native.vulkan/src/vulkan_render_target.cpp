@@ -3040,6 +3040,32 @@ JaliumResult VulkanRenderTarget::EndDraw()
         return JALIUM_ERROR_PRESENT_FAILED;
     }
 
+#ifdef _WIN32
+    // GenerateGlyphs cannot resize the atlas while recording because that
+    // would invalidate UVs already emitted earlier in this frame. If it ran
+    // out of room, discard this incomplete replay before it reaches the
+    // retained-frame baseline, grow the CPU atlas now, and report the same
+    // transient status used by swapchain repair. Managed keeps the damage and
+    // schedules a full retry; the next recording then sees the larger atlas.
+    //
+    // Applying the grow here is safe even with another GPU frame in flight:
+    // only the CPU bitmap/cache changes. EnsureTextAtlasImage replaces the GPU
+    // image on the retry through the existing fence-gated image graveyard.
+    if (impl_ && impl_->glyphAtlas_ && impl_->glyphAtlas_->NeedsGrow()) {
+        impl_->glyphAtlas_->ApplyPendingGrowthOrReset();
+        if (impellerEngine_) impellerEngine_->ClearBatches();
+        if (velloEngine_) velloEngine_->ClearBatches();
+        ReleaseRecordedExternalVideoSurfaces();
+        gpuReplayCommands_.clear();
+        impl_->readbackPending_ = false;
+        cpuRasterNeededLastFrame_ = cpuRasterNeeded_;
+        isDrawing_.store(false, std::memory_order_release);
+        dirtyRects_.clear();
+        fullInvalidation_ = true;
+        return JALIUM_ERROR_PRESENT_FAILED;
+    }
+#endif
+
     // Fold any engine batches still pending after the LAST replay command into
     // a tail span: path work at the very end of the frame — or a frame that is
     // engine-only — still renders, and output order for such frames is

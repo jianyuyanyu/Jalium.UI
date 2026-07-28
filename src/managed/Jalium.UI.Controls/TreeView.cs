@@ -172,7 +172,7 @@ public class TreeView : ItemsControl
 
     public TreeView()
     {
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         Focusable = true;
 
         if (ItemsPanel == null)
@@ -727,7 +727,7 @@ public class TreeViewItem : HeaderedItemsControl
 
     public TreeViewItem()
     {
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         Focusable = true;
         ((System.Collections.Specialized.INotifyCollectionChanged)Items).CollectionChanged += OnChildItemsChanged;
         AddHandler(KeyDownEvent, new KeyEventHandler(OnKeyDownHandler));

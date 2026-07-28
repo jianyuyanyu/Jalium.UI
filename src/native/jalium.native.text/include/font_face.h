@@ -29,6 +29,11 @@ class CffFontProgram;
 
 namespace jalium {
 
+// A font is attacker-controlled binary input. Bound both direct parser entry
+// points and provider disk reads before any allocation proportional to the
+// file size. The limit is deliberately well above known system CJK collections.
+inline constexpr size_t kMaxFontFileBytes = 512u * 1024u * 1024u;
+
 // Font-unit outline of one glyph, in the sfnt y-UP coordinate system. Curves
 // are ALREADY flattened to line segments; the rasterizer applies scale + y-flip.
 struct GlyphOutline {

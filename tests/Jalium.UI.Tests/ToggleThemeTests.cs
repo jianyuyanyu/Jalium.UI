@@ -117,12 +117,6 @@ public class ToggleThemeTests
 
         try
         {
-            var uncheckedBorder = Assert.IsType<SolidColorBrush>(app.Resources["ToggleUncheckedBorder"]);
-            var checkedBorder = Assert.IsType<LinearGradientBrush>(app.Resources["ToggleCheckedBorder"]);
-            var checkedBackground = Assert.IsAssignableFrom<Brush>(app.Resources["ToggleCheckedBackground"]);
-            var disabledBackground = Assert.IsAssignableFrom<Brush>(app.Resources["ToggleDisabledBackground"]);
-            var disabledBorder = Assert.IsAssignableFrom<Brush>(app.Resources["ToggleDisabledBorder"]);
-
             var toggleSwitch = new ToggleSwitch();
             toggleSwitch.Style = Assert.IsType<Style>(app.Resources[typeof(ToggleSwitch)]);
             var host = new StackPanel { Width = 320, Height = 80 };
@@ -132,21 +126,89 @@ public class ToggleThemeTests
             host.Arrange(new Rect(0, 0, 320, 80));
             toggleSwitch.ApplyTemplate();
 
-            Assert.Equal(2, checkedBorder.GradientStops.Count);
             var track = Assert.IsType<Border>(toggleSwitch.FindName("PART_SwitchTrack"));
-            Assert.IsType<Ellipse>(toggleSwitch.FindName("PART_SwitchThumb"));
+            var thumb = Assert.IsType<Ellipse>(toggleSwitch.FindName("PART_SwitchThumb"));
+            var darkOffThumbColor = Assert.IsType<SolidColorBrush>(thumb.Fill).Color;
+
+            ThemeManager.ApplyTheme(ThemeVariant.Light);
+
+            var uncheckedBorder = Assert.IsType<SolidColorBrush>(app.Resources["ToggleUncheckedBorder"]);
+            var checkedBorder = Assert.IsType<LinearGradientBrush>(app.Resources["ToggleCheckedBorder"]);
+            var checkedBackground = Assert.IsAssignableFrom<Brush>(app.Resources["ToggleCheckedBackground"]);
+            var disabledBackground = Assert.IsAssignableFrom<Brush>(app.Resources["ToggleDisabledBackground"]);
+            var disabledBorder = Assert.IsAssignableFrom<Brush>(app.Resources["ToggleDisabledBorder"]);
+            var offThumb = Assert.IsAssignableFrom<Brush>(app.Resources["TextSecondary"]);
+            var onThumb = Assert.IsAssignableFrom<Brush>(app.Resources["TextOnAccent"]);
+            var disabledThumb = Assert.IsAssignableFrom<Brush>(app.Resources["TextDisabled"]);
+
+            Assert.Equal(2, checkedBorder.GradientStops.Count);
             Assert.Same(toggleSwitch.OffBackground, track.Background);
             Assert.Same(uncheckedBorder, track.BorderBrush);
+            Assert.Same(offThumb, thumb.Fill);
+            Assert.NotEqual(darkOffThumbColor, Assert.IsType<SolidColorBrush>(thumb.Fill).Color);
+            Assert.NotEqual(
+                Assert.IsType<SolidColorBrush>(track.Background).Color,
+                Assert.IsType<SolidColorBrush>(thumb.Fill).Color);
 
             toggleSwitch.IsOn = true;
 
             Assert.Same(checkedBackground, track.Background);
             Assert.Same(checkedBorder, track.BorderBrush);
+            Assert.Same(onThumb, thumb.Fill);
 
             toggleSwitch.IsEnabled = false;
 
             Assert.Same(disabledBackground, track.Background);
             Assert.Same(disabledBorder, track.BorderBrush);
+            Assert.Same(disabledThumb, thumb.Fill);
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Fact]
+    public void ToggleSwitch_WhenTurnedOffWhileHovered_ShouldRestoreOffTrackAfterPointerLeaves()
+    {
+        ResetApplicationState();
+        ThemeLoader.Initialize();
+        var app = new Application();
+
+        try
+        {
+            var uncheckedBackground = Assert.IsAssignableFrom<Brush>(app.Resources["ToggleUncheckedBackground"]);
+            var uncheckedBorder = Assert.IsAssignableFrom<Brush>(app.Resources["ToggleUncheckedBorder"]);
+            var checkedHoverBackground = Assert.IsAssignableFrom<Brush>(app.Resources["ToggleCheckedBackgroundHover"]);
+            var uncheckedHoverBackground = Assert.IsAssignableFrom<Brush>(app.Resources["ToggleUncheckedBackgroundHover"]);
+
+            var toggleSwitch = new ToggleSwitch { IsOn = true };
+            toggleSwitch.Style = Assert.IsType<Style>(app.Resources[typeof(ToggleSwitch)]);
+            var host = new StackPanel { Width = 320, Height = 80 };
+            host.Children.Add(toggleSwitch);
+
+            host.Measure(new Size(320, 80));
+            host.Arrange(new Rect(0, 0, 320, 80));
+            toggleSwitch.ApplyTemplate();
+
+            var track = Assert.IsType<Border>(toggleSwitch.FindName("PART_SwitchTrack"));
+            var customOnBackground = new SolidColorBrush(Color.FromRgb(0x11, 0x72, 0x62));
+            toggleSwitch.OnBackground = customOnBackground;
+            Assert.Same(customOnBackground, track.Background);
+
+            toggleSwitch.SetIsMouseOver(true);
+            Assert.Same(checkedHoverBackground, track.Background);
+
+            toggleSwitch.IsOn = false;
+            Assert.Same(uncheckedHoverBackground, track.Background);
+
+            toggleSwitch.SetIsMouseOver(false);
+            Assert.Same(uncheckedBackground, track.Background);
+            Assert.Same(uncheckedBorder, track.BorderBrush);
+
+            var customOffBackground = new SolidColorBrush(Color.FromRgb(0x31, 0x32, 0x36));
+            toggleSwitch.OffBackground = customOffBackground;
+            Assert.Same(customOffBackground, track.Background);
         }
         finally
         {

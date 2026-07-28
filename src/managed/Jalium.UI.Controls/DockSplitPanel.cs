@@ -15,7 +15,7 @@ public class DockSplitPanel : Panel
     public DockSplitPanel()
     {
         ClipToBounds = true;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
     }
 
     #region Dependency Properties

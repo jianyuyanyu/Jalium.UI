@@ -194,6 +194,143 @@ public sealed class ClipboardParityTests
         Assert.Equal("IEND", System.Text.Encoding.ASCII.GetString(png, png.Length - 8, 4));
     }
 
+    [Fact]
+    public unsafe void UnicodeClipboardDecoder_RequiresBoundedNullTerminatedUtf16()
+    {
+        char[] characters = ['O', 'K', '\0', 'X'];
+        fixed (char* pointer = characters)
+        {
+            Assert.Equal(
+                "OK",
+                ClipboardBackend.DecodeUnicodeClipboardText(
+                    (nint)pointer,
+                    (nuint)(characters.Length * sizeof(char))));
+            Assert.Null(ClipboardBackend.DecodeUnicodeClipboardText(
+                (nint)pointer,
+                2 * sizeof(char)));
+            Assert.Null(ClipboardBackend.DecodeUnicodeClipboardText((nint)pointer, 5));
+            Assert.Null(ClipboardBackend.DecodeUnicodeClipboardText(
+                (nint)pointer,
+                (nuint)ClipboardBackend.MaxClipboardPayloadBytes + 2));
+        }
+
+        Assert.True(ClipboardBackend.TryGetUnicodeClipboardByteCount(0, out int emptyByteCount));
+        Assert.Equal(sizeof(char), emptyByteCount);
+        Assert.False(ClipboardBackend.TryGetUnicodeClipboardByteCount(int.MaxValue, out _));
+    }
+
+    [Fact]
+    public unsafe void DibLayoutReader_RejectsTruncationOverflowAndOutOfRangePixels()
+    {
+        byte[] truncated = new byte[20];
+        fixed (byte* pointer = truncated)
+        {
+            Assert.False(ClipboardBackend.TryReadClipboardDibLayout(
+                (nint)pointer,
+                (nuint)truncated.Length,
+                out _));
+        }
+
+        byte[] dib = new byte[48];
+        BinaryPrimitives.WriteInt32LittleEndian(dib.AsSpan(0, 4), 40);
+        BinaryPrimitives.WriteInt32LittleEndian(dib.AsSpan(4, 4), 2);
+        BinaryPrimitives.WriteInt32LittleEndian(dib.AsSpan(8, 4), 1);
+        BinaryPrimitives.WriteInt16LittleEndian(dib.AsSpan(12, 2), 1);
+        BinaryPrimitives.WriteInt16LittleEndian(dib.AsSpan(14, 2), 32);
+        fixed (byte* pointer = dib)
+        {
+            Assert.True(ClipboardBackend.TryReadClipboardDibLayout(
+                (nint)pointer,
+                (nuint)dib.Length,
+                out ClipboardBackend.ClipboardDibLayout layout));
+            Assert.Equal(2, layout.Width);
+            Assert.Equal(1, layout.AbsoluteHeight);
+            Assert.Equal(8, layout.SourceStride);
+            Assert.Equal(8, layout.SourceDataSize);
+
+            BinaryPrimitives.WriteInt32LittleEndian(dib.AsSpan(4, 4), int.MaxValue);
+            Assert.False(ClipboardBackend.TryReadClipboardDibLayout(
+                (nint)pointer,
+                nuint.MaxValue,
+                out _));
+
+            BinaryPrimitives.WriteInt32LittleEndian(dib.AsSpan(4, 4), 2);
+            Assert.False(ClipboardBackend.TryReadClipboardDibLayout(
+                (nint)pointer,
+                47,
+                out _));
+        }
+    }
+
+    [Fact]
+    public void ImageLayoutAndPngHeader_RejectOversizedOrOverflowingAllocations()
+    {
+        Assert.True(ClipboardBackend.TryGetClipboardImageLayout(
+            2,
+            3,
+            12,
+            out int packedStride,
+            out int sourceByteCount,
+            out int packedByteCount));
+        Assert.Equal(8, packedStride);
+        Assert.Equal(36, sourceByteCount);
+        Assert.Equal(24, packedByteCount);
+
+        Assert.False(ClipboardBackend.TryGetClipboardImageLayout(
+            int.MaxValue,
+            2,
+            int.MaxValue,
+            out _,
+            out _,
+            out _));
+        Assert.False(ClipboardBackend.TryGetClipboardImageLayout(
+            8192,
+            8192,
+            8192 * 4,
+            out _,
+            out _,
+            out _));
+
+        byte[] png = ClipboardBackend.EncodePng(
+            1,
+            1,
+            4,
+            [0x30, 0x20, 0x10, 0xFF]);
+        BinaryPrimitives.WriteInt32BigEndian(png.AsSpan(16, 4), int.MaxValue);
+        Assert.False(ClipboardBackend.TryReadPngBgraLayout(
+            png,
+            out _,
+            out _,
+            out _,
+            out _));
+        Assert.Null(ClipboardBackend.DecodePng(png));
+    }
+
+    [Fact]
+    public void FileDropPayloadSizing_RejectsInvalidPathsAndUnboundedLists()
+    {
+        Assert.True(ClipboardBackend.TryGetFileDropPayloadSize(
+            [@"C:\one.txt", @"D:\two.txt"],
+            out int validSize));
+        Assert.InRange(validSize, 1, ClipboardBackend.MaxClipboardPayloadBytes);
+
+        Assert.False(ClipboardBackend.TryGetFileDropPayloadSize([null!], out _));
+        Assert.False(ClipboardBackend.TryGetFileDropPayloadSize(["bad\0path"], out _));
+        Assert.False(ClipboardBackend.TryGetFileDropPayloadSize(
+            [new string('x', ClipboardBackend.MaxClipboardPathChars + 1)],
+            out _));
+        Assert.False(ClipboardBackend.TryGetFileDropPayloadSize(
+            Enumerable.Repeat("x", ClipboardBackend.MaxClipboardFileCount + 1).ToArray(),
+            out _));
+
+        string largePath = new('x', ClipboardBackend.MaxClipboardPathChars);
+        int repeatedPathCount =
+            ClipboardBackend.MaxClipboardPayloadBytes / ((largePath.Length + 1) * sizeof(char)) + 1;
+        Assert.False(ClipboardBackend.TryGetFileDropPayloadSize(
+            Enumerable.Repeat(largePath, repeatedPathCount).ToArray(),
+            out _));
+    }
+
     [Theory]
     [InlineData(-1)]
     [InlineData(6)]

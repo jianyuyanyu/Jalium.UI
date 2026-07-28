@@ -355,39 +355,18 @@ public partial class ContentElement : DependencyObject, IInputElement, IAnimatab
             return false;
         }
 
-        if (s_touchCaptures.TryGetValue(touchDevice.Id, out TouchCaptureRecord previous))
-        {
-            if (ReferenceEquals(previous.Element, this))
-            {
-                return true;
-            }
-
-            previous.Element._touchesCaptured?.Remove(previous.Device);
-            previous.Element.RaiseTouchCaptureEvent(previous.Device, captured: false);
-            previous.Element.NotifyTouchStateChanged();
-        }
-
-        s_touchCaptures[touchDevice.Id] = new TouchCaptureRecord(this, touchDevice);
-        (_touchesCaptured ??= new List<TouchDevice>()).Add(touchDevice);
-        RaiseTouchCaptureEvent(touchDevice, captured: true);
-        NotifyTouchStateChanged();
-        return true;
+        return touchDevice.Capture(this);
     }
 
     public bool ReleaseTouchCapture(TouchDevice touchDevice)
     {
         ArgumentNullException.ThrowIfNull(touchDevice);
-        if (!s_touchCaptures.TryGetValue(touchDevice.Id, out TouchCaptureRecord capture) ||
-            !ReferenceEquals(capture.Element, this))
+        if (!ReferenceEquals(touchDevice.Captured, this))
         {
             return false;
         }
 
-        s_touchCaptures.Remove(touchDevice.Id);
-        _touchesCaptured?.Remove(touchDevice);
-        RaiseTouchCaptureEvent(touchDevice, captured: false);
-        NotifyTouchStateChanged();
-        return true;
+        return touchDevice.Capture(null);
     }
 
     public void ReleaseAllTouchCaptures()
@@ -400,6 +379,33 @@ public partial class ContentElement : DependencyObject, IInputElement, IAnimatab
         foreach (TouchDevice device in _touchesCaptured.ToArray())
         {
             ReleaseTouchCapture(device);
+        }
+    }
+
+    private static void OnTouchDeviceCaptureChanged(
+        TouchDevice device,
+        IInputElement? previous,
+        IInputElement? current)
+    {
+        _ = previous;
+
+        if (s_touchCaptures.TryGetValue(device.Id, out TouchCaptureRecord existing) &&
+            (!ReferenceEquals(existing.Device, device) ||
+             !ReferenceEquals(existing.Element, current)))
+        {
+            s_touchCaptures.Remove(device.Id);
+            existing.Element._touchesCaptured?.Remove(existing.Device);
+            existing.Element.NotifyTouchStateChanged();
+        }
+
+        if (current is ContentElement element &&
+            (!s_touchCaptures.TryGetValue(device.Id, out existing) ||
+             !ReferenceEquals(existing.Device, device) ||
+             !ReferenceEquals(existing.Element, element)))
+        {
+            s_touchCaptures[device.Id] = new TouchCaptureRecord(element, device);
+            (element._touchesCaptured ??= new List<TouchDevice>()).Add(device);
+            element.NotifyTouchStateChanged();
         }
     }
 
@@ -1222,6 +1228,8 @@ public partial class ContentElement : DependencyObject, IInputElement, IAnimatab
 
     static ContentElement()
     {
+        TouchDevice.CaptureChanged += OnTouchDeviceCaptureChanged;
+
         RegisterClassHandler(PreviewKeyDownEvent, new KeyEventHandler((s, e) => ((ContentElement)s).OnPreviewKeyDown(e)));
         RegisterClassHandler(KeyDownEvent, new KeyEventHandler((s, e) => ((ContentElement)s).OnKeyDown(e)));
         RegisterClassHandler(PreviewKeyUpEvent, new KeyEventHandler((s, e) => ((ContentElement)s).OnPreviewKeyUp(e)));

@@ -279,7 +279,7 @@ public class TreeSelector : ItemsControl
     public TreeSelector()
     {
         Focusable = true;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
 
         if (ItemsPanel == null)
         {
@@ -1551,7 +1551,7 @@ public class TreeSelectorItem : HeaderedItemsControl
     public TreeSelectorItem()
     {
         Focusable = true;
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
 
         ((System.Collections.Specialized.INotifyCollectionChanged)Items).CollectionChanged += OnChildItemsChanged;
         AddHandler(KeyDownEvent, new KeyEventHandler(OnKeyDownHandler));

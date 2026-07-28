@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -528,6 +529,22 @@ bool D3D12DirectRenderer::OnResize(UINT newWidth, UINT newHeight)
     msaaColorBuffer_.Reset();
     msaaWidth_ = 0;
     msaaHeight_ = 0;
+
+    // The path renderer keeps a shared MSAA color/depth/resolve scratch set.
+    // EnsureStencilDepthBuffer grows that set to the largest path extent seen
+    // between resizes so oversized captures do not cause per-frame allocation
+    // churn. ResizeBuffers has already drained the GPU here, so this is the safe
+    // boundary to discard a former ultrawide allocation. Otherwise every later
+    // path frame still clears/resolves the historical maximum after shrinking.
+    pathMsaaColor_.Reset();
+    pathMsaaDepth_.Reset();
+    pathResolveTexture_.Reset();
+    pathMsaaWidth_ = 0;
+    pathMsaaHeight_ = 0;
+    pathMsaaColorState_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    pathResolveTexState_ = D3D12_RESOURCE_STATE_COMMON;
+    pathMsaaUsedThisFrame_ = false;
+    pathScratchFenceValue_ = 0;
 
     // Update viewport dimensions (will be applied in next BeginFrame)
     viewportWidth_ = newWidth;
@@ -2947,9 +2964,170 @@ void D3D12DirectRenderer::RecordDrawCommands()
     const UINT pathContentH =
         (pathInCapture && captureViewportH_ > 0) ? captureViewportH_ : viewportHeight_;
 
-    auto enterPathMode = [&]() {
+    // Damage-scoped stencil scratch work. A retained partial frame gives every
+    // emitted batch the window dirty clip as its scissor. Previously even that
+    // tiny path run cleared and resolved the entire full-window 4x/8x FP16
+    // scratch, then shaded a fullscreen resolve triangle. On an iGPU this turns
+    // a button hover into tens of megabytes of memory traffic.
+    //
+    // Compute one conservative union for each consecutive path run. The union
+    // must be known before the first draw because the scratch color + stencil
+    // are cleared only once for the run; clearing individual batch scissors
+    // would erase earlier overlapping paths and break painter order.
+    const D3D12_RECT fullPathRect = {
+        0, 0, static_cast<LONG>(pathContentW), static_cast<LONG>(pathContentH)
+    };
+    D3D12_RECT activePathDamage = fullPathRect;
+
+    auto computePathRunDamage = [&](size_t firstBatch) -> D3D12_RECT {
+        D3D12_RECT damage = {
+            static_cast<LONG>(pathContentW),
+            static_cast<LONG>(pathContentH),
+            0,
+            0
+        };
+        bool hasDrawablePath = false;
+
+        // Device-space AABB of one draw's color writes: the path's local-space
+        // bounds pushed through the draw's pixel transform, padded one pixel for
+        // boundary MSAA samples. The cover pass writes color only where the
+        // stencil pass left non-zero winding — strictly inside these bounds — so
+        // the clear/resolve/blit damage never needs to include the fan wedge the
+        // stencil pass touches outside them: the cover quad spans that wedge and
+        // resets its stencil to 0 itself (see BuildStencilPathGeometry), and
+        // scratch color outside the damage is never resolved, so stale texels
+        // there can never leak into the target.
+        auto tryGeometryRect = [&](const StencilPathDraw& draw,
+                                   D3D12_RECT& out) -> bool {
+            const StencilPathGeometry* g = draw.geom.get();
+            if (!g || !g->hasBounds) return false;
+
+            const float xs[2] = { g->boundsMinX, g->boundsMaxX };
+            const float ys[2] = { g->boundsMinY, g->boundsMaxY };
+            float minX = std::numeric_limits<float>::infinity();
+            float minY = std::numeric_limits<float>::infinity();
+            float maxX = -std::numeric_limits<float>::infinity();
+            float maxY = -std::numeric_limits<float>::infinity();
+            for (int ix = 0; ix < 2; ++ix) {
+                for (int iy = 0; iy < 2; ++iy) {
+                    const float px = draw.m11 * xs[ix] + draw.m21 * ys[iy] + draw.dx;
+                    const float py = draw.m12 * xs[ix] + draw.m22 * ys[iy] + draw.dy;
+                    minX = (std::min)(minX, px);
+                    maxX = (std::max)(maxX, px);
+                    minY = (std::min)(minY, py);
+                    maxY = (std::max)(maxY, py);
+                }
+            }
+            if (!std::isfinite(minX) || !std::isfinite(minY) ||
+                !std::isfinite(maxX) || !std::isfinite(maxY))
+                return false;
+
+            // 1px pad for edge samples, clamp to the path-content extent (this
+            // also keeps the LONG casts in range for arbitrary transforms).
+            minX = (std::max)(minX - 1.0f, 0.0f);
+            minY = (std::max)(minY - 1.0f, 0.0f);
+            maxX = (std::min)(maxX + 1.0f, static_cast<float>(pathContentW));
+            maxY = (std::min)(maxY + 1.0f, static_cast<float>(pathContentH));
+            if (!(minX < maxX) || !(minY < maxY)) {
+                out = D3D12_RECT{ 0, 0, 0, 0 };  // fully off-extent
+                return true;
+            }
+            out = D3D12_RECT{
+                static_cast<LONG>(std::floor(minX)),
+                static_cast<LONG>(std::floor(minY)),
+                static_cast<LONG>(std::ceil(maxX)),
+                static_cast<LONG>(std::ceil(maxY))
+            };
+            return true;
+        };
+
+        for (size_t i = firstBatch;
+             i < batches_.size() && batches_[i].type == DrawBatchType::StencilPath;
+             ++i) {
+            const auto& candidate = batches_[i];
+            if (candidate.instanceOffset >= stencilPathDraws_.size()) continue;
+            const auto& draw = stencilPathDraws_[candidate.instanceOffset];
+            if (draw.fillVertexCount == 0 || draw.coverVertexCount == 0) continue;
+
+            hasDrawablePath = true;
+
+            // Tightest safe rect for this draw: geometry bounds ∩ batch scissor.
+            // An un-clipped batch used to force the whole run to the full
+            // content extent — on a promoted full frame (scrolling) that made
+            // every path run clear+resolve+blit the entire window-sized MSAA
+            // scratch, and that bandwidth scales with window area. Geometry
+            // bounds keep the damage at the actual glyph/icon footprint. A draw
+            // with no usable bounds (defensive: cached geometry predating the
+            // bounds field, or a non-finite transform) falls back to the old
+            // conservative behavior.
+            D3D12_RECT geomRect;
+            const bool hasGeomRect = tryGeometryRect(draw, geomRect);
+            if (!candidate.hasScissor && !hasGeomRect) return fullPathRect;
+
+            D3D12_RECT contribution;
+            if (hasGeomRect) {
+                contribution = geomRect;
+                if (candidate.hasScissor) {
+                    contribution.left   = (std::max)(contribution.left,   candidate.scissor.left);
+                    contribution.top    = (std::max)(contribution.top,    candidate.scissor.top);
+                    contribution.right  = (std::min)(contribution.right,  candidate.scissor.right);
+                    contribution.bottom = (std::min)(contribution.bottom, candidate.scissor.bottom);
+                }
+            } else {
+                contribution = candidate.scissor;
+            }
+
+            D3D12_RECT clipped = {
+                (std::max)(0L, contribution.left),
+                (std::max)(0L, contribution.top),
+                (std::min)(static_cast<LONG>(pathContentW), contribution.right),
+                (std::min)(static_cast<LONG>(pathContentH), contribution.bottom)
+            };
+            if (clipped.left >= clipped.right || clipped.top >= clipped.bottom)
+                continue;
+
+            damage.left   = (std::min)(damage.left, clipped.left);
+            damage.top    = (std::min)(damage.top, clipped.top);
+            damage.right  = (std::max)(damage.right, clipped.right);
+            damage.bottom = (std::max)(damage.bottom, clipped.bottom);
+        }
+
+        if (!hasDrawablePath || damage.left >= damage.right || damage.top >= damage.bottom)
+            return D3D12_RECT{ 0, 0, 0, 0 };
+        return damage;
+    };
+
+    // ResolveSubresourceRegion lives on command-list v1. Cache the optional QI
+    // for this flush; old runtimes fall back to a full resolve while retaining
+    // the damage-scoped clear and blit, so correctness never depends on v1.
+    ComPtr<ID3D12GraphicsCommandList1> partialResolveCommandList;
+    bool partialResolveInterfaceQueried = false;
+
+    auto enterPathMode = [&](const D3D12_RECT& damageRect) {
         if (pathActiveOnMsaa) return;
+        if (damageRect.left >= damageRect.right || damageRect.top >= damageRect.bottom)
+            return;
         if (!EnsureStencilDepthBuffer(pathContentW, pathContentH)) return;
+        // EnsureStencilDepthBuffer can DECLINE a mid-frame regrow (its
+        // pathMsaaUsedThisFrame_ guard) and still return true with an
+        // allocation smaller than the requested content extent — a
+        // window-sized path run followed by an OVERSIZED effect capture in
+        // the same frame. The damage rects are clamped to the CONTENT
+        // extent, so clamp once more to the actual allocation: a clear or
+        // ResolveSubresourceRegion rect that leaves the resource is a D3D12
+        // validation error (and device-removal fodder on some drivers). The
+        // pre-damage code was legal here only because it cleared the whole
+        // view and resolved the whole subresource; the clipped-for-one-frame
+        // rendering this clamp produces matches that old behavior.
+        D3D12_RECT allocClamped = damageRect;
+        allocClamped.right = (std::min)(allocClamped.right,
+            static_cast<LONG>((std::min)(pathContentW, pathMsaaWidth_)));
+        allocClamped.bottom = (std::min)(allocClamped.bottom,
+            static_cast<LONG>((std::min)(pathContentH, pathMsaaHeight_)));
+        if (allocClamped.left >= allocClamped.right ||
+            allocClamped.top >= allocClamped.bottom)
+            return;
+        activePathDamage = allocClamped;
         // [#921] The pathMsaa* scratch is about to be bound into the open command
         // list; block any further mid-frame regrow of it (see
         // EnsureStencilDepthBuffer's pathMsaaUsedThisFrame_ guard).
@@ -2991,9 +3169,10 @@ void D3D12DirectRenderer::RecordDrawCommands()
         // transparent and stencil to 0 so old contents don't leak.
         if (!pathScratchClearedThisFrame) {
             float clearColor[4] = { 0, 0, 0, 0 };
-            commandList_->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+            commandList_->ClearRenderTargetView(
+                rtvHandle, clearColor, 1, &activePathDamage);
             commandList_->ClearDepthStencilView(dsvHandle,
-                D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+                D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 1, &activePathDamage);
             pathScratchClearedThisFrame = true;
         }
 
@@ -3016,10 +3195,25 @@ void D3D12DirectRenderer::RecordDrawCommands()
             pathResolveTexState_, D3D12_RESOURCE_STATE_RESOLVE_DEST);
         commandList_->ResourceBarrier(2, preBarriers);
 
-        commandList_->ResolveSubresource(
-            pathResolveTexture_.Get(), 0,
-            pathMsaaColor_.Get(), 0,
-            DXGI_FORMAT_R16G16B16A16_FLOAT);
+        if (!partialResolveInterfaceQueried) {
+            partialResolveInterfaceQueried = true;
+            (void)commandList_.As(&partialResolveCommandList);
+        }
+        if (partialResolveCommandList) {
+            partialResolveCommandList->ResolveSubresourceRegion(
+                pathResolveTexture_.Get(), 0,
+                static_cast<UINT>(activePathDamage.left),
+                static_cast<UINT>(activePathDamage.top),
+                pathMsaaColor_.Get(), 0,
+                &activePathDamage,
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOLVE_MODE_AVERAGE);
+        } else {
+            commandList_->ResolveSubresource(
+                pathResolveTexture_.Get(), 0,
+                pathMsaaColor_.Get(), 0,
+                DXGI_FORMAT_R16G16B16A16_FLOAT);
+        }
 
         D3D12_RESOURCE_BARRIER postBarriers[2];
         postBarriers[0] = MakeTransitionBarrier(pathMsaaColor_.Get(),
@@ -3074,9 +3268,8 @@ void D3D12DirectRenderer::RecordDrawCommands()
             // relying on RT-bounds clipping); outside capture it is the window.
             commandList_->OMSetRenderTargets(1, &blitRtv, FALSE, nullptr);
             D3D12_VIEWPORT blitViewport = { 0, 0, (float)pathContentW, (float)pathContentH, 0, 1 };
-            D3D12_RECT blitScissor = { 0, 0, (LONG)pathContentW, (LONG)pathContentH };
             commandList_->RSSetViewports(1, &blitViewport);
-            commandList_->RSSetScissorRects(1, &blitScissor);
+            commandList_->RSSetScissorRects(1, &activePathDamage);
 
             commandList_->SetGraphicsRootSignature(pathResolveRootSig_.Get());
             ID3D12DescriptorHeap* heaps[] = { srvHeap_.Get() };
@@ -3150,7 +3343,8 @@ void D3D12DirectRenderer::RecordDrawCommands()
 
         if (batch.type == DrawBatchType::StencilPath) {
             if (!stencilPathReady_) continue;
-            enterPathMode();
+            if (!pathActiveOnMsaa)
+                enterPathMode(computePathRunDamage(batchIdx));
             if (!pathActiveOnMsaa) continue;  // EnsureStencilDepthBuffer failed
 
             // Apply scissor for this path. The default (no per-batch clip) must
@@ -4258,12 +4452,26 @@ bool D3D12DirectRenderer::CaptureSnapshot()
     cl->ResourceBarrier(2, barriers);
     snapshotState_ = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
-    // Re-bind render target
-    auto rtvHandle = GetSwapChainRtvHandle();
+    // CaptureSnapshot always copies the swap-chain back buffer because that is
+    // the backdrop source. It must nevertheless restore the render target that
+    // was active on entry. In particular, a BackdropEffect can be rendered
+    // while its owning element is already being captured for a DropShadowEffect.
+    // Rebinding the swap chain here leaks every following capture-local batch
+    // onto the main target with the capture viewport/constants.
+    const bool inCapture = inOffscreenCapture_ || inRetainedCapture_;
+    auto rtvHandle = inCapture ? captureRtv_ : GetSwapChainRtvHandle();
     cl->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
-    D3D12_VIEWPORT vp = { 0, 0, (float)viewportWidth_, (float)viewportHeight_, 0, 1 };
-    D3D12_RECT scissor = { 0, 0, (LONG)viewportWidth_, (LONG)viewportHeight_ };
+    const UINT activeViewportW = inCapture ? captureViewportW_ : viewportWidth_;
+    const UINT activeViewportH = inCapture ? captureViewportH_ : viewportHeight_;
+    D3D12_VIEWPORT vp = { 0, 0, (float)activeViewportW, (float)activeViewportH, 0, 1 };
+    D3D12_RECT scissor = scissorStack_.empty()
+        ? D3D12_RECT{ 0, 0, (LONG)activeViewportW, (LONG)activeViewportH }
+        : scissorStack_.top();
+    scissor.left = std::clamp(scissor.left, 0L, (LONG)activeViewportW);
+    scissor.top = std::clamp(scissor.top, 0L, (LONG)activeViewportH);
+    scissor.right = std::clamp(scissor.right, scissor.left, (LONG)activeViewportW);
+    scissor.bottom = std::clamp(scissor.bottom, scissor.top, (LONG)activeViewportH);
     cl->RSSetViewports(1, &vp);
     cl->RSSetScissorRects(1, &scissor);
 
@@ -5813,11 +6021,41 @@ bool D3D12DirectRenderer::TryDrawSnapshotBackdropQuad(float x, float y, float w,
     const float uvScaleX = w * invSnapW;
     const float uvScaleY = h * invSnapH;
 
+    // The snapshot always uses surface-space coordinates above. The destination
+    // is different when this immediate pass is nested inside an effect/layer
+    // capture: normal batched content is shifted into capture-local space by
+    // the current transform, and this quad must follow the same mapping.
+    const bool inCapture = inOffscreenCapture_ || inRetainedCapture_;
+    float targetX = x;
+    float targetY = y;
+    float targetW = w;
+    float targetH = h;
+    if (inCapture && !transformStack_.empty()) {
+        const auto& t = transformStack_.top();
+        auto transformPoint = [&t](float px, float py, float& outX, float& outY) {
+            outX = px * t.m11 + py * t.m21 + t.dx;
+            outY = px * t.m12 + py * t.m22 + t.dy;
+        };
+
+        float x0, y0, x1, y1, x2, y2, x3, y3;
+        transformPoint(x, y, x0, y0);
+        transformPoint(x + w, y, x1, y1);
+        transformPoint(x + w, y + h, x2, y2);
+        transformPoint(x, y + h, x3, y3);
+
+        const float right = std::max(std::max(x0, x1), std::max(x2, x3));
+        const float bottom = std::max(std::max(y0, y1), std::max(y2, y3));
+        targetX = std::min(std::min(x0, x1), std::min(x2, x3));
+        targetY = std::min(std::min(y0, y1), std::min(y2, y3));
+        targetW = right - targetX;
+        targetH = bottom - targetY;
+    }
+
     // Rounded-clip rect + radii in PHYSICAL pixels (SV_Position space).
-    const float clipL = x * dpiScale_;
-    const float clipT = y * dpiScale_;
-    const float clipR = (x + w) * dpiScale_;
-    const float clipB = (y + h) * dpiScale_;
+    const float clipL = targetX * dpiScale_;
+    const float clipT = targetY * dpiScale_;
+    const float clipR = (targetX + targetW) * dpiScale_;
+    const float clipB = (targetY + targetH) * dpiScale_;
 
     // ---- b0 constants (must match SnapshotBackdropConstants in the PS) ----
     float constants[24] = {
@@ -5879,22 +6117,34 @@ bool D3D12DirectRenderer::TryDrawSnapshotBackdropQuad(float x, float y, float w,
     cl->SetPipelineState(pso);
     cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    D3D12_VIEWPORT vp = { 0, 0, (float)viewportWidth_, (float)viewportHeight_, 0, 1 };
+    const UINT activeViewportW = inCapture ? captureViewportW_ : viewportWidth_;
+    const UINT activeViewportH = inCapture ? captureViewportH_ : viewportHeight_;
+    D3D12_VIEWPORT vp = { 0, 0, (float)activeViewportW, (float)activeViewportH, 0, 1 };
     D3D12_RECT scissor = scissorStack_.empty()
-        ? D3D12_RECT{ 0, 0, (LONG)viewportWidth_, (LONG)viewportHeight_ }
+        ? D3D12_RECT{ 0, 0, (LONG)activeViewportW, (LONG)activeViewportH }
         : scissorStack_.top();
+    scissor.left = std::clamp(scissor.left, 0L, (LONG)activeViewportW);
+    scissor.top = std::clamp(scissor.top, 0L, (LONG)activeViewportH);
+    scissor.right = std::clamp(scissor.right, scissor.left, (LONG)activeViewportW);
+    scissor.bottom = std::clamp(scissor.bottom, scissor.top, (LONG)activeViewportH);
     cl->RSSetViewports(1, &vp);
     cl->RSSetScissorRects(1, &scissor);
 
-    auto rtvHandle = GetSwapChainRtvHandle();
+    auto rtvHandle = inCapture ? captureRtv_ : GetSwapChainRtvHandle();
     cl->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     cl->SetGraphicsRootConstantBufferView(0, cbGpuAddr);
 
+    const float targetScreenW = inCapture
+        ? currentFrameConstants_.screenWidth
+        : (float)viewportWidth_ / dpiScale_;
+    const float targetScreenH = inCapture
+        ? currentFrameConstants_.screenHeight
+        : (float)viewportHeight_ / dpiScale_;
     float geomConstants[8] = {
-        x, y, w, h,
-        (float)viewportWidth_ / dpiScale_,
-        (float)viewportHeight_ / dpiScale_,
+        targetX, targetY, targetW, targetH,
+        targetScreenW,
+        targetScreenH,
         0.0f, 0.0f
     };
     cl->SetGraphicsRoot32BitConstants(2, 8, geomConstants, 0);
@@ -5905,9 +6155,9 @@ bool D3D12DirectRenderer::TryDrawSnapshotBackdropQuad(float x, float y, float w,
 
     cl->DrawInstanced(6, 1, 0, 0);
 
-    // The full-screen quad bypasses the batch renderer; the next batched draw
-    // re-binds its own PSO/scissor via RecordDrawCommands, but bump drawOrder_
-    // so a following CaptureSnapshot re-copies (this pass wrote the back buffer).
+    // The immediate quad bypasses the batch renderer. Bump drawOrder_ so a
+    // following CaptureSnapshot re-copies after this pass wrote the active
+    // render target (the swap chain normally, or an enclosing capture).
     drawOrder_++;
     return true;
 }

@@ -1,16 +1,10 @@
 <Solution>
   <Folder Name="/src/" />
-  <Folder Name="/src/managed/">
-    <Project Path="src/managed/Jalium.UI.Controls/Jalium.UI.Controls.csproj" />
-    <Project Path="src/managed/Jalium.UI.Core/Jalium.UI.Core.csproj" />
-    <Project Path="src/managed/Jalium.UI.Gpu/Jalium.UI.Gpu.csproj" />
-    <Project Path="src/managed/Jalium.UI.Input/Jalium.UI.Input.csproj" />
-    <Project Path="src/managed/Jalium.UI.Interop/Jalium.UI.Interop.csproj" />
-    <Project Path="src/managed/Jalium.UI.Managed/Jalium.UI.Managed.csproj" />
-    <Project Path="src/managed/Jalium.UI.Media/Jalium.UI.Media.csproj" />
-    <Project Path="src/managed/Jalium.UI.Xaml.SourceGenerator/Jalium.UI.Xaml.SourceGenerator.csproj" />
-    <Project Path="src/managed/Jalium.UI.Xaml/Jalium.UI.Xaml.csproj" />
-  </Folder>
+  <!-- Shared/build-only projects are intentionally discovered through the
+       entry-point ProjectReference graphs below. Listing them as independent
+       solution roots creates duplicate project instances with different
+       target-framework globals, which can race on the same obj/bin outputs. -->
+  <Folder Name="/src/managed/" />
   <Folder Name="/src/packaging/">
     <Project Path="src/packaging/Jalium.UI/Jalium.UI.csproj" />
     <Project Path="src/packaging/Jalium.UI.Desktop/Jalium.UI.Desktop.csproj" />

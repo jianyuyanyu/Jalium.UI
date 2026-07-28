@@ -29,6 +29,8 @@ namespace Jalium.UI.Controls.Automation.Uia;
 
 internal static unsafe class UiaOleAut
 {
+    private const int MaxManagedSafeArrayElements = 1_048_576;
+
     internal const ushort VT_I4 = 3;
     internal const ushort VT_R8 = 5;
     internal const ushort VT_UNKNOWN = 13;
@@ -50,6 +52,19 @@ internal static unsafe class UiaOleAut
 
     [DllImport("oleaut32.dll")]
     internal static extern int SafeArrayGetUBound(nint psa, uint nDim, out int plUbound);
+
+    internal static bool TryGetManagedElementCount(int lowerBound, int upperBound, out int count)
+    {
+        long count64 = (long)upperBound - lowerBound + 1;
+        if (count64 <= 0 || count64 > MaxManagedSafeArrayElements)
+        {
+            count = 0;
+            return count64 == 0;
+        }
+
+        count = (int)count64;
+        return true;
+    }
 }
 
 /// <summary>Marshals <see cref="int"/>[] &lt;-&gt; SAFEARRAY(VT_I4). Used by GetRuntimeId.</summary>
@@ -63,10 +78,26 @@ internal static unsafe class SafeArrayInt32Marshaller
         if (psa == 0) throw new OutOfMemoryException();
         if (managed.Length > 0)
         {
-            int hr = UiaOleAut.SafeArrayAccessData(psa, out nint pData);
-            if (hr < 0) { UiaOleAut.SafeArrayDestroy(psa); Marshal.ThrowExceptionForHR(hr); }
-            try { managed.AsSpan().CopyTo(new Span<int>((void*)pData, managed.Length)); }
-            finally { UiaOleAut.SafeArrayUnaccessData(psa); }
+            try
+            {
+                int hr = UiaOleAut.SafeArrayAccessData(psa, out nint pData);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                try
+                {
+                    if (pData == 0)
+                        throw new InvalidOperationException("SAFEARRAY returned a null data pointer.");
+                    managed.AsSpan().CopyTo(new Span<int>((void*)pData, managed.Length));
+                }
+                finally
+                {
+                    UiaOleAut.SafeArrayUnaccessData(psa);
+                }
+            }
+            catch
+            {
+                UiaOleAut.SafeArrayDestroy(psa);
+                throw;
+            }
         }
         return psa;
     }
@@ -76,11 +107,15 @@ internal static unsafe class SafeArrayInt32Marshaller
         if (unmanaged == 0) return null;
         if (UiaOleAut.SafeArrayGetLBound(unmanaged, 1, out int lb) < 0) return null;
         if (UiaOleAut.SafeArrayGetUBound(unmanaged, 1, out int ub) < 0) return null;
-        int count = ub - lb + 1;
-        if (count <= 0) return [];
+        if (!UiaOleAut.TryGetManagedElementCount(lb, ub, out int count)) return null;
+        if (count == 0) return [];
         var result = new int[count];
         if (UiaOleAut.SafeArrayAccessData(unmanaged, out nint pData) < 0) return null;
-        try { new Span<int>((void*)pData, count).CopyTo(result); }
+        try
+        {
+            if (pData == 0) return null;
+            new Span<int>((void*)pData, count).CopyTo(result);
+        }
         finally { UiaOleAut.SafeArrayUnaccessData(unmanaged); }
         return result;
     }
@@ -106,10 +141,26 @@ internal static unsafe class SafeArrayDoubleMarshaller
         if (psa == 0) throw new OutOfMemoryException();
         if (managed.Length > 0)
         {
-            int hr = UiaOleAut.SafeArrayAccessData(psa, out nint pData);
-            if (hr < 0) { UiaOleAut.SafeArrayDestroy(psa); Marshal.ThrowExceptionForHR(hr); }
-            try { managed.AsSpan().CopyTo(new Span<double>((void*)pData, managed.Length)); }
-            finally { UiaOleAut.SafeArrayUnaccessData(psa); }
+            try
+            {
+                int hr = UiaOleAut.SafeArrayAccessData(psa, out nint pData);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                try
+                {
+                    if (pData == 0)
+                        throw new InvalidOperationException("SAFEARRAY returned a null data pointer.");
+                    managed.AsSpan().CopyTo(new Span<double>((void*)pData, managed.Length));
+                }
+                finally
+                {
+                    UiaOleAut.SafeArrayUnaccessData(psa);
+                }
+            }
+            catch
+            {
+                UiaOleAut.SafeArrayDestroy(psa);
+                throw;
+            }
         }
         return psa;
     }
@@ -119,11 +170,15 @@ internal static unsafe class SafeArrayDoubleMarshaller
         if (unmanaged == 0) return null;
         if (UiaOleAut.SafeArrayGetLBound(unmanaged, 1, out int lb) < 0) return null;
         if (UiaOleAut.SafeArrayGetUBound(unmanaged, 1, out int ub) < 0) return null;
-        int count = ub - lb + 1;
-        if (count <= 0) return [];
+        if (!UiaOleAut.TryGetManagedElementCount(lb, ub, out int count)) return null;
+        if (count == 0) return [];
         var result = new double[count];
         if (UiaOleAut.SafeArrayAccessData(unmanaged, out nint pData) < 0) return null;
-        try { new Span<double>((void*)pData, count).CopyTo(result); }
+        try
+        {
+            if (pData == 0) return null;
+            new Span<double>((void*)pData, count).CopyTo(result);
+        }
         finally { UiaOleAut.SafeArrayUnaccessData(unmanaged); }
         return result;
     }
@@ -150,20 +205,33 @@ internal static unsafe class SafeArrayTextRangeMarshaller
         if (psa == 0) throw new OutOfMemoryException();
         if (managed.Length > 0)
         {
-            int hr = UiaOleAut.SafeArrayAccessData(psa, out nint pData);
-            if (hr < 0) { UiaOleAut.SafeArrayDestroy(psa); Marshal.ThrowExceptionForHR(hr); }
             try
             {
-                // Write raw interface pointers straight into the vector (FADF_UNKNOWN). We transfer
-                // the single CCW reference from ConvertToUnmanaged into the slot; SafeArrayDestroy
-                // Releases each stored pointer, so we neither AddRef again nor Free here.
-                var slots = (nint*)pData;
-                for (int i = 0; i < managed.Length; i++)
-                    slots[i] = managed[i] is null
-                        ? 0
-                        : (nint)ComInterfaceMarshaller<IUiaTextRangeProvider>.ConvertToUnmanaged(managed[i]);
+                int hr = UiaOleAut.SafeArrayAccessData(psa, out nint pData);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                try
+                {
+                    if (pData == 0)
+                        throw new InvalidOperationException("SAFEARRAY returned a null data pointer.");
+                    // Write raw interface pointers straight into the vector (FADF_UNKNOWN). We transfer
+                    // the single CCW reference from ConvertToUnmanaged into the slot; SafeArrayDestroy
+                    // Releases each stored pointer, so we neither AddRef again nor Free here.
+                    var slots = (nint*)pData;
+                    for (int i = 0; i < managed.Length; i++)
+                        slots[i] = managed[i] is null
+                            ? 0
+                            : (nint)ComInterfaceMarshaller<IUiaTextRangeProvider>.ConvertToUnmanaged(managed[i]);
+                }
+                finally
+                {
+                    UiaOleAut.SafeArrayUnaccessData(psa);
+                }
             }
-            finally { UiaOleAut.SafeArrayUnaccessData(psa); }
+            catch
+            {
+                UiaOleAut.SafeArrayDestroy(psa);
+                throw;
+            }
         }
         return psa;
     }
@@ -173,12 +241,13 @@ internal static unsafe class SafeArrayTextRangeMarshaller
         if (unmanaged == 0) return null;
         if (UiaOleAut.SafeArrayGetLBound(unmanaged, 1, out int lb) < 0) return null;
         if (UiaOleAut.SafeArrayGetUBound(unmanaged, 1, out int ub) < 0) return null;
-        int count = ub - lb + 1;
-        if (count <= 0) return [];
+        if (!UiaOleAut.TryGetManagedElementCount(lb, ub, out int count)) return null;
+        if (count == 0) return [];
         var result = new IUiaTextRangeProvider[count];
         if (UiaOleAut.SafeArrayAccessData(unmanaged, out nint pData) < 0) return null;
         try
         {
+            if (pData == 0) return null;
             // Each slot is an IUnknown* owned by the SAFEARRAY; wrapping it in an RCW takes its own
             // reference, so read the borrowed pointer without adding or releasing one here.
             var slots = (nint*)pData;
@@ -211,20 +280,33 @@ internal static unsafe class SafeArrayProviderMarshaller
         if (psa == 0) throw new OutOfMemoryException();
         if (managed.Length > 0)
         {
-            int hr = UiaOleAut.SafeArrayAccessData(psa, out nint pData);
-            if (hr < 0) { UiaOleAut.SafeArrayDestroy(psa); Marshal.ThrowExceptionForHR(hr); }
             try
             {
-                // Write raw interface pointers straight into the vector (FADF_UNKNOWN). We transfer
-                // the single CCW reference from ConvertToUnmanaged into the slot; SafeArrayDestroy
-                // Releases each stored pointer, so we neither AddRef again nor Free here.
-                var slots = (nint*)pData;
-                for (int i = 0; i < managed.Length; i++)
-                    slots[i] = managed[i] is null
-                        ? 0
-                        : (nint)ComInterfaceMarshaller<IRawElementProviderSimple>.ConvertToUnmanaged(managed[i]);
+                int hr = UiaOleAut.SafeArrayAccessData(psa, out nint pData);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                try
+                {
+                    if (pData == 0)
+                        throw new InvalidOperationException("SAFEARRAY returned a null data pointer.");
+                    // Write raw interface pointers straight into the vector (FADF_UNKNOWN). We transfer
+                    // the single CCW reference from ConvertToUnmanaged into the slot; SafeArrayDestroy
+                    // Releases each stored pointer, so we neither AddRef again nor Free here.
+                    var slots = (nint*)pData;
+                    for (int i = 0; i < managed.Length; i++)
+                        slots[i] = managed[i] is null
+                            ? 0
+                            : (nint)ComInterfaceMarshaller<IRawElementProviderSimple>.ConvertToUnmanaged(managed[i]);
+                }
+                finally
+                {
+                    UiaOleAut.SafeArrayUnaccessData(psa);
+                }
             }
-            finally { UiaOleAut.SafeArrayUnaccessData(psa); }
+            catch
+            {
+                UiaOleAut.SafeArrayDestroy(psa);
+                throw;
+            }
         }
         return psa;
     }
@@ -234,12 +316,13 @@ internal static unsafe class SafeArrayProviderMarshaller
         if (unmanaged == 0) return null;
         if (UiaOleAut.SafeArrayGetLBound(unmanaged, 1, out int lb) < 0) return null;
         if (UiaOleAut.SafeArrayGetUBound(unmanaged, 1, out int ub) < 0) return null;
-        int count = ub - lb + 1;
-        if (count <= 0) return [];
+        if (!UiaOleAut.TryGetManagedElementCount(lb, ub, out int count)) return null;
+        if (count == 0) return [];
         var result = new IRawElementProviderSimple[count];
         if (UiaOleAut.SafeArrayAccessData(unmanaged, out nint pData) < 0) return null;
         try
         {
+            if (pData == 0) return null;
             // Each slot is an IUnknown* owned by the SAFEARRAY; wrapping it in an RCW takes its own
             // reference, so read the borrowed pointer without adding or releasing one here.
             var slots = (nint*)pData;

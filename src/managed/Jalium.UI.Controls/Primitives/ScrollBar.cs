@@ -12,6 +12,18 @@ namespace Jalium.UI.Controls.Primitives;
 /// </summary>
 public class ScrollBar : RangeBase
 {
+    /// <summary>
+    /// Set by a host that creates this bar and lays it out at a rectangle it derives
+    /// itself, without consulting this bar's DesiredSize (see
+    /// <see cref="ScrollViewer"/>). Such a bar cannot affect its host's layout, so
+    /// its invalidations — including the ones the auto-hide animation raises by
+    /// toggling the line buttons — are not propagated past the host.
+    /// </summary>
+    internal bool IsHostOwnedLayout { get; init; }
+
+    /// <inheritdoc />
+    internal override bool IsLayoutIsolated => IsHostOwnedLayout;
+
     public static readonly RoutedCommand LineUpCommand = new("LineUp", typeof(ScrollBar));
     public static readonly RoutedCommand LineDownCommand = new("LineDown", typeof(ScrollBar));
     public static readonly RoutedCommand LineLeftCommand = new("LineLeft", typeof(ScrollBar));
@@ -246,7 +258,7 @@ public class ScrollBar : RangeBase
     public ScrollBar()
     {
         // Set default values for range base
-        SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         Maximum = 100;
         SmallChange = 1;
         LargeChange = 10;
@@ -396,7 +408,7 @@ public class ScrollBar : RangeBase
             // and Arrange invalidation on every pointer move.
             HandlesThumbDragInternally = false
         };
-        _track.SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        _track.SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         _track.Thumb = new Thumb
         {
             Style = s_internalThumbStyle,
@@ -408,7 +420,7 @@ public class ScrollBar : RangeBase
             Width = double.NaN,
             Height = double.NaN
         };
-        _track.Thumb.SetCurrentValue(UIElement.TransitionPropertyProperty, "None");
+        _track.Thumb.SetCurrentValue(UIElement.TransitionPropertyProperty, TransitionPropertyCollection.None());
         _track.Thumb.Cursor = Jalium.UI.Input.Cursors.Arrow;
         _track.Thumb.DragStarted += OnThumbDragStarted;
         _track.Thumb.DragDelta += OnThumbDragDelta;
