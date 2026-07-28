@@ -10,7 +10,7 @@
 This audit reviewed the managed framework, controls and themes, XAML/JALXAML loader, native ABI, text and media parsers, GPU backends, platform hosts, packaging, samples, and test infrastructure. It found and fixed:
 
 - 3 P0 issues: packed-pixel integer overflow, a restrictive-XAML policy bypass, and undefined behavior in the CFF parser.
-- 12 P1 issues: unsafe DLL search, GPU/ABI lifetime and bounds defects, dependency-property type corruption, binding/diagnostic retention, touch capture lifetime, UIA SAFEARRAY bounds, clipboard and media payload bounds, font/text geometry bounds, parallel-build races, package/dependency defects, and C ABI exception/encoding hazards.
+- 13 P1 issues: unsafe DLL search, GPU/ABI lifetime and bounds defects, dependency-property type corruption, binding/diagnostic retention, touch capture lifetime, UIA SAFEARRAY bounds, clipboard and media payload bounds, font/text geometry bounds, parallel-build races, package/dependency defects, C ABI exception/encoding hazards, and cross-thread native dispatcher wake termination.
 - 5 P2 issues: theme cache/event lifetime, whole-file audio buffering, SHA-1 signature defaults, Linux parity gaps, and stale sample/API usage.
 
 The audit delta was reconstructed independently from a heavily modified working tree and validated in a clean clone. Before these two reports, that isolated delta contained 157 implementation, build, and test paths (143 modified and 14 added), with 7,172 insertions and 1,329 deletions. Pre-existing user files and a separate concurrent virtualization task were excluded.
@@ -128,6 +128,7 @@ The baseline workspace already contained unrelated uncommitted and untracked wor
 | AUD-018 | P2 | Linux native/test manifests and X11/Wayland transfer coverage were incomplete | Fixed |
 | AUD-019 | P1 | C++ exceptions and invalid UTF-8 could cross or corrupt C ABI operations | Fixed |
 | AUD-020 | P2 | Samples used stale namespaces and application/navigation APIs | Fixed |
+| AUD-021 | P1 | A recycled Linux thread identity could deliver a native dispatcher wake to the wrong managed owner | Fixed |
 
 ## Detailed findings
 
@@ -351,13 +352,24 @@ The baseline workspace already contained unrelated uncommitted and untracked wor
 - **Validation:** seven representative sample builds plus AotWindow passed.
 - **Compatibility / performance:** sample-only source updates; no runtime API change.
 
+### AUD-021 — A recycled Linux thread identity could deliver a native dispatcher wake to the wrong managed owner
+
+- **Severity / status:** P1, fixed.
+- **Affected files, types, platforms:** `DispatcherCore.EnsureNativeWake`, `DispatcherCore.ProcessQueue`, and Linux native dispatcher eventfd delivery; Linux glibc/musl, especially hosts with short-lived managed UI/test threads.
+- **Root cause:** Linux identifies its platform thread by native thread identity, which the OS can recycle after a short-lived managed thread exits. A stale dispatcher eventfd could then be drained by a new managed thread with the recycled native identity. The callback entered `ProcessQueue`, `VerifyAccess` threw, and the exception crossed a reverse P/Invoke boundary, terminating the process.
+- **Reproduction / evidence:** an arm64 CI crash dump captured `NativePlatformEventPump.PollEvents -> NativeDispatcherWake callback -> DispatcherCore.ProcessQueue -> VerifyAccess`, with the callback dispatcher and active modal-loop dispatcher owned by different managed `Thread` objects.
+- **Fix / actual changes:** native wake callbacks now enter `ProcessNativeWake`, which verifies managed owner-thread identity before processing and drops stale foreign delivery.
+- **Tests:** `NativeWakeCallbackNeverProcessesAnotherThreadsDispatcherQueue` deliberately invokes one dispatcher's wake callback from another thread and proves the queued operation remains owner-only. The thumb-routing regression also clears process-global mouse capture before establishing its isolated input state.
+- **Validation:** full Windows managed suite passed with 4,452 tests; the full glibc portable suite passed with 4,357 tests; the exact affected trio passed under musl x64.
+- **Compatibility / performance:** correct owner-thread wakes are unchanged. Only stale or foreign callback delivery is ignored; this prevents a process-terminating exception without moving dispatcher work off its owner.
+
 ## Final validation ledger
 
 ### Clean isolated audit snapshot
 
 - `dotnet build Jalium.UI.slnx -c Release --no-restore -m`: passed, 0 errors, 27 existing warnings.
 - `msbuild src/native/Jalium.Native.sln /m /p:Configuration=Release /p:Platform=x64`: passed, 0 errors. The temporary clone path caused 11 `MSB8029` intermediate-directory warnings; these are path-placement warnings, not source failures.
-- `dotnet test tests/Jalium.UI.Tests/Jalium.UI.Tests.csproj -c Release --no-build --no-restore`: 4,451 passed, 0 failed, 11 skipped, total 4,462, 32 s.
+- `dotnet test tests/Jalium.UI.Tests/Jalium.UI.Tests.csproj -c Release --no-build --no-restore`: 4,452 passed, 0 failed, 11 skipped, total 4,463, 33 s.
 - The 11 skips are all `DeviceRemovalInjectionTests`; their optional harness project is not tracked at the baseline commit. The tests use a discovery-time fact attribute that skips only when the executable cannot be located and run unchanged when it exists.
 
 ### Mixed workspace / optional harness validation
@@ -370,6 +382,7 @@ The baseline workspace already contained unrelated uncommitted and untracked wor
 ### Linux and native
 
 - Managed Linux direct VSTest under X11: 4,464 passed, 0 failed, 30 skipped, total 4,494.
+- Post-fix portable Linux software suite under X11: 4,357 passed, 0 failed, 17 skipped, total 4,374; exact affected musl x64 tests: 3/3 passed.
 - Native Linux CTest: 13/13 passed after providing explicit deterministic font data.
 - X11 and Wayland clipboard/drag-drop smoke: passed.
 - ASan/UBSan/leak-enabled font corpus: 2,562 DejaVu cases plus 2,562 Nimbus CFF/OpenType cases, passed.
@@ -395,6 +408,7 @@ The baseline workspace already contained unrelated uncommitted and untracked wor
 - Package source-generator/build-task and RID assets are now visible to consumers as intended.
 - `System.Security.Cryptography.Xml` is updated from 10.0.9 to 10.0.10 in the remaining lagging project.
 - The optional device-loss harness is conditionally referenced; its tests become explicit skips only in source snapshots that do not contain the project.
+- Native dispatcher wakes delivered to a recycled foreign managed thread are ignored instead of entering that dispatcher's queue.
 
 ## Known warning debt and residual risks
 
@@ -409,7 +423,7 @@ The baseline workspace already contained unrelated uncommitted and untracked wor
 - Android NDK build, emulator/device runtime, Activity lifecycle, camera permissions, and Surface recreation: Android SDK/NDK environment was unavailable.
 - macOS and Metal compilation/runtime: no macOS host.
 - Physical Linux GPU/display-server/driver matrix: validation used WSL2, Xvfb, and the available Vulkan/software paths.
-- ARM64, musl, and non-x86 native ABI/runtime.
+- Physical ARM64 and non-x86 native ABI/runtime; CI cross/emulated glibc/musl coverage does not substitute for physical hardware.
 - Broad screenshot/pixel-golden comparison across D3D12, Vulkan, software, and Metal.
 - Cold/hot application start, window-to-first-frame, frame-time, draw-call, barrier, GPU-memory, layout-allocation, large-control virtualization, and long-running handle-leak benchmarks. No claim is made for those categories.
 - Manual exhaustive matrix of every public control under every theme, locale, RTL/IME, high-DPI, multi-monitor, accessibility tool, and input device.
