@@ -40,6 +40,68 @@ public sealed class ThreadingDispatcherParityTests
         });
     }
 
+    [Fact]
+    public void NativeWakeCallbackNeverProcessesAnotherThreadsDispatcherQueue()
+    {
+        Exception? workerFailure = null;
+        WpfDispatcher? ownerDispatcher = null;
+        int operationRan = 0;
+        using var ready = new ManualResetEventSlim();
+        using var releaseOwner = new ManualResetEventSlim();
+
+        var ownerThread = new Thread(() =>
+        {
+            try
+            {
+                ownerDispatcher = WpfDispatcher.CurrentDispatcher;
+                ownerDispatcher.BeginInvoke(() => Volatile.Write(ref operationRan, 1));
+                ready.Set();
+
+                if (!releaseOwner.Wait(TimeSpan.FromSeconds(5)))
+                    throw new TimeoutException("Foreign wake test did not release the dispatcher owner.");
+
+                ownerDispatcher.CoreDispatcher.ProcessNativeWake();
+            }
+            catch (Exception ex)
+            {
+                workerFailure = ex;
+            }
+            finally
+            {
+                ownerDispatcher?.DisposeCore();
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "ThreadingDispatcherParityTests.NativeWakeOwner",
+        };
+
+        ownerThread.Start();
+        try
+        {
+            Assert.True(
+                ready.Wait(TimeSpan.FromSeconds(5)),
+                "Dispatcher owner did not initialize within the timeout.");
+
+            ownerDispatcher!.CoreDispatcher.ProcessNativeWake();
+            Assert.Equal(0, Volatile.Read(ref operationRan));
+        }
+        finally
+        {
+            releaseOwner.Set();
+            Assert.True(
+                ownerThread.Join(TimeSpan.FromSeconds(5)),
+                "Dispatcher owner did not exit within the timeout.");
+        }
+
+        if (workerFailure is not null)
+        {
+            ExceptionDispatchInfo.Capture(workerFailure).Throw();
+        }
+
+        Assert.Equal(1, Volatile.Read(ref operationRan));
+    }
+
     // xUnit reuses worker threads, whose dispatcher may retain work posted by a prior test.
     // This contract needs a controlled two-item queue to assert exact priority order.
     private static void RunOnFreshDispatcherThread(Action<WpfDispatcher> action)
