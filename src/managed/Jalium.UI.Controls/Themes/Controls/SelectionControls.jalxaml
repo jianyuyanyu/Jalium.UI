@@ -130,6 +130,7 @@
                                        RadiusY="14" />
 							<ScrollViewer Margin="4"
                                           MaxHeight="{TemplateBinding MaxDropDownHeight}"
+                                          IsOverlayScrollBarEnabled="True"
                                           VerticalScrollBarVisibility="Auto"
                                           HorizontalScrollBarVisibility="Disabled">
 								<ItemsPresenter />

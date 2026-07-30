@@ -48,6 +48,31 @@ public class ScrollViewerInertiaTests
     }
 
     [Fact]
+    public void ScrollViewer_VerticalSmoothWheel_ShouldPreserveHorizontalOffset()
+    {
+        var viewer = CreateConfiguredViewer(
+            initialVerticalOffset: 100,
+            extentHeight: 2000,
+            viewportHeight: 100,
+            extentWidth: 1000,
+            viewportWidth: 100);
+        viewer.HorizontalScrollBarVisibility = ScrollBarVisibility.Auto;
+        viewer.ScrollToHorizontalOffset(350);
+
+        viewer.RaiseEvent(CreateMouseWheel(
+            new Point(8, 8),
+            -120,
+            ModifierKeys.None,
+            timestamp: 1));
+
+        Assert.True(GetPrivateField<bool>(viewer, "_isSmoothScrolling"));
+        InvokePrivateMethod(viewer, "AdvanceSmoothScrollByMilliseconds", 16L);
+
+        Assert.Equal(350.0, viewer.HorizontalOffset, precision: 3);
+        Assert.True(viewer.VerticalOffset > 100);
+    }
+
+    [Fact]
     public void ScrollViewer_WheelOverScrollBarTrack_ShouldMatchContentWheelDistance()
     {
         var contentViewer = CreateConfiguredViewer(initialVerticalOffset: 100);
@@ -350,11 +375,14 @@ public class ScrollViewerInertiaTests
         return (T)value!;
     }
 
-    private static void InvokePrivateMethod(ScrollViewer viewer, string methodName)
+    private static void InvokePrivateMethod(
+        ScrollViewer viewer,
+        string methodName,
+        params object?[]? arguments)
     {
         var method = typeof(ScrollViewer).GetMethod(methodName, BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.NotNull(method);
-        method!.Invoke(viewer, null);
+        method!.Invoke(viewer, arguments);
     }
 
     private static bool InvokePrivateMethodReturningBool(ScrollViewer viewer, string methodName)

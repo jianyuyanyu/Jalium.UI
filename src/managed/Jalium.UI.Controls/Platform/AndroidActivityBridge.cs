@@ -419,7 +419,7 @@ public static class AndroidActivityBridge
 
                 if (!detached)
                 {
-                    Console.Error.WriteLine(
+                    System.Diagnostics.Debug.WriteLine(
                         "[AndroidActivityBridge] Stopping retained the native Surface because detach was incomplete.");
                     return CompleteFailedStopAttempt(terminalOnFailure);
                 }
@@ -797,21 +797,21 @@ public static class AndroidActivityBridge
         try
         {
             BackendPreloader.SoftwareInit();
-            Console.Error.WriteLine("[PreloadNativeBackends] Software backend registered OK");
+            System.Diagnostics.Debug.WriteLine("[PreloadNativeBackends] Software backend registered OK");
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[PreloadNativeBackends] software init failed: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"[PreloadNativeBackends] software init failed: {ex.Message}");
         }
 
         try
         {
             BackendPreloader.VulkanInit();
-            Console.Error.WriteLine("[PreloadNativeBackends] Vulkan backend registered OK");
+            System.Diagnostics.Debug.WriteLine("[PreloadNativeBackends] Vulkan backend registered OK");
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[PreloadNativeBackends] vulkan init failed (non-fatal): {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"[PreloadNativeBackends] vulkan init failed (non-fatal): {ex.Message}");
         }
     }
 
@@ -898,7 +898,7 @@ public static class AndroidActivityBridge
                     // surfaceChanged attached (or re-attached) a Surface while
                     // the replay was pending. A stale replay must never tear
                     // down that healthy Surface via the replacement path below.
-                    Console.Error.WriteLine(
+                    System.Diagnostics.Debug.WriteLine(
                         "[AndroidActivityBridge] Surface attach retry abandoned: a Surface is already attached.");
                     return;
                 }
@@ -928,7 +928,7 @@ public static class AndroidActivityBridge
                         // not prove that it released the Surface. Keep the old
                         // native reference and refuse the replacement; releasing
                         // it here would reintroduce the real-device UAF.
-                        Console.Error.WriteLine(
+                        System.Diagnostics.Debug.WriteLine(
                             "[AndroidActivityBridge] Surface replacement deferred because detach was incomplete.");
                         return;
                     }
@@ -1081,7 +1081,7 @@ public static class AndroidActivityBridge
 
             if (s_attachRetryCount >= MaxAttachRetryAttempts)
             {
-                Console.Error.WriteLine(
+                System.Diagnostics.Debug.WriteLine(
                     $"[AndroidActivityBridge] Surface attach still failing after {MaxAttachRetryAttempts} retries (activity generation {activityGeneration}); giving up, awaiting next surfaceChanged.");
                 return;
             }
@@ -1108,7 +1108,7 @@ public static class AndroidActivityBridge
             return;
         }
 
-        Console.Error.WriteLine(
+        System.Diagnostics.Debug.WriteLine(
             $"[AndroidActivityBridge] Scheduling surface attach retry {attempt}/{MaxAttachRetryAttempts} in {AttachRetryDelayMs} ms (activity generation {activityGeneration}).");
 
         // Dedicated short-lived thread instead of a timer: every timer flavour
@@ -1127,7 +1127,7 @@ public static class AndroidActivityBridge
                 {
                     if (activityGeneration != s_activeActivityGeneration)
                     {
-                        Console.Error.WriteLine(
+                        System.Diagnostics.Debug.WriteLine(
                             $"[AndroidActivityBridge] Surface attach retry {attempt}/{MaxAttachRetryAttempts} abandoned: activity generation {activityGeneration} superseded.");
                         return;
                     }
@@ -1139,7 +1139,7 @@ public static class AndroidActivityBridge
                         // replaying the failed one would tear it down or
                         // displace it. abortIfSurfaceAttached below closes the
                         // remaining race window on the attach side.
-                        Console.Error.WriteLine(
+                        System.Diagnostics.Debug.WriteLine(
                             $"[AndroidActivityBridge] Surface attach retry {attempt}/{MaxAttachRetryAttempts} abandoned: a replacement Surface is already present.");
                         return;
                     }
@@ -1148,7 +1148,7 @@ public static class AndroidActivityBridge
                 bool attached = OnNativeWindowCreatedCore(
                     nativeWindow, width, height, activityGeneration,
                     retryRunningStage: true, abortIfSurfaceAttached: true);
-                Console.Error.WriteLine(
+                System.Diagnostics.Debug.WriteLine(
                     $"[AndroidActivityBridge] Surface attach retry {attempt}/{MaxAttachRetryAttempts} {(attached ? "succeeded" : "failed")} (activity generation {activityGeneration}).");
                 // On failure the replay's own attach-cleanup path has already
                 // chained the next ScheduleFailedAttachRetry or logged the
@@ -1277,7 +1277,7 @@ public static class AndroidActivityBridge
                 // DetachAndroidSurface already closed the render gate. Retain
                 // native ownership until a later replacement/destroy can prove
                 // teardown; leaking temporarily is safer than Surface UAF.
-                Console.Error.WriteLine(
+                System.Diagnostics.Debug.WriteLine(
                     "[AndroidActivityBridge] Native Surface retained because detach was incomplete.");
                 return;
             }
@@ -1549,7 +1549,7 @@ public static class AndroidActivityBridge
     }
 
     private static void LogCallbackFailure(string stage, Exception exception)
-        => Console.Error.WriteLine($"[AndroidActivityBridge] {stage} failed: {exception}");
+        => System.Diagnostics.Debug.WriteLine($"[AndroidActivityBridge] {stage} failed: {exception}");
 
     [DllImport("android", EntryPoint = "ANativeWindow_acquire")]
     private static extern void ANativeWindowAcquire(nint nativeWindow);

@@ -49,7 +49,7 @@ public class ToolBarOverflowPanel : Panel
         var totalHeight = 0.0;
         var maxWidth = 0.0;
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             child.Measure(availableSize);
 
@@ -87,7 +87,7 @@ public class ToolBarOverflowPanel : Panel
         var currentY = 0.0;
         var currentRowHeight = 0.0;
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             var childWidth = child.DesiredSize.Width;
             var childHeight = child.DesiredSize.Height;

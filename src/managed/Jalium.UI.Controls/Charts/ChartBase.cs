@@ -1,4 +1,5 @@
-using System.Collections.ObjectModel;
+using System.Collections;
+using System.Collections.Specialized;
 using Jalium.UI.Controls.Themes;
 using Jalium.UI.Interop;
 using Jalium.UI.Media;
@@ -47,6 +48,10 @@ public delegate void ChartDataPointEventHandler(object sender, ChartDataPointEve
 /// </summary>
 public abstract class ChartBase : Control
 {
+    private IEnumerable? _seriesSource;
+    private INotifyCollectionChanged? _seriesNotifier;
+    private HashSet<ChartSeries>? _mentoredSeries;
+
     #region Static Brushes
 
     private static readonly SolidColorBrush s_defaultTitleForeground = new(Color.FromRgb(240, 240, 240));
@@ -310,6 +315,105 @@ public abstract class ChartBase : Control
     #endregion
 
     #region Methods
+
+    /// <summary>
+    /// Tracks a collection of non-visual series as children of this chart for binding
+    /// context purposes.
+    /// </summary>
+    protected void SetSeriesSource(IEnumerable? seriesSource)
+    {
+        if (ReferenceEquals(_seriesSource, seriesSource))
+        {
+            SynchronizeSeriesMentors();
+            InvalidateVisual();
+            return;
+        }
+
+        if (_seriesNotifier != null)
+        {
+            CollectionChangedEventManager.RemoveHandler(
+                _seriesNotifier,
+                OnSeriesCollectionChanged);
+        }
+
+        _seriesSource = seriesSource;
+        _seriesNotifier = seriesSource as INotifyCollectionChanged;
+
+        if (_seriesNotifier != null)
+        {
+            CollectionChangedEventManager.AddHandler(
+                _seriesNotifier,
+                OnSeriesCollectionChanged);
+        }
+
+        SynchronizeSeriesMentors();
+        InvalidateVisual();
+    }
+
+    /// <summary>
+    /// Handles a dependency-property change for a chart's series collection.
+    /// </summary>
+    protected static void OnSeriesCollectionPropertyChanged(
+        DependencyObject d,
+        DependencyPropertyChangedEventArgs e)
+    {
+        if (d is ChartBase chart)
+        {
+            chart.SetSeriesSource(e.NewValue as IEnumerable);
+        }
+    }
+
+    /// <summary>
+    /// Handles a dependency-property change for a chart with one series object.
+    /// </summary>
+    protected static void OnSeriesPropertyChanged(
+        DependencyObject d,
+        DependencyPropertyChangedEventArgs e)
+    {
+        if (d is ChartBase chart)
+        {
+            chart.SetSeriesSource(e.NewValue is ChartSeries series ? new[] { series } : null);
+        }
+    }
+
+    private void OnSeriesCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        SynchronizeSeriesMentors();
+        InvalidateVisual();
+    }
+
+    private void SynchronizeSeriesMentors()
+    {
+        var current = new HashSet<ChartSeries>(ReferenceEqualityComparer.Instance);
+        if (_seriesSource != null)
+        {
+            foreach (var item in _seriesSource)
+            {
+                if (item is ChartSeries series)
+                {
+                    current.Add(series);
+                }
+            }
+        }
+
+        if (_mentoredSeries != null)
+        {
+            foreach (var series in _mentoredSeries)
+            {
+                if (!current.Contains(series) && ReferenceEquals(series.BindingMentor, this))
+                {
+                    series.SetBindingMentor(null);
+                }
+            }
+        }
+
+        foreach (var series in current)
+        {
+            series.SetBindingMentor(this);
+        }
+
+        _mentoredSeries = current.Count == 0 ? null : current;
+    }
 
     /// <summary>
     /// Computes the plot area rectangle within the control bounds.

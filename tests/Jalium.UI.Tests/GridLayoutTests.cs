@@ -200,6 +200,178 @@ public class GridLayoutTests
     }
 
     [Fact]
+    public void Grid_ArrangeAtDifferentWidth_RedistributesWithoutMeasuringChildren()
+    {
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(
+            new ColumnDefinition { Width = GridLength.Star });
+        grid.ColumnDefinitions.Add(
+            new ColumnDefinition { Width = new GridLength(376) });
+
+        var content = new MeasureConstraintProbe();
+        grid.Children.Add(content);
+
+        grid.Measure(new Size(1000, 200));
+        Assert.Single(content.Constraints);
+        Assert.Equal(624, content.Constraints[0].Width, 3);
+
+        // Arrange may receive a different width, but it must only redistribute
+        // the measured tracks. Measuring the subtree here overwrites
+        // ScrollViewer/IScrollInfo extent state halfway through arrange.
+        grid.Arrange(new Rect(0, 0, 1200, 200));
+
+        Assert.Single(content.Constraints);
+        Assert.Equal(824, content.VisualBounds.Width, 3);
+        Assert.True(content.IsMeasureValid);
+        Assert.False(grid.IsMeasureValid);
+        Assert.Equal(
+            824,
+            grid.ColumnDefinitions[0].ActualWidth,
+            3);
+    }
+
+    [Fact]
+    public void Grid_HeightOnlyArrange_ReusesUnboundedMeasureForViewportRecovery()
+    {
+        var grid = new Grid();
+        var content = new MeasureConstraintProbe();
+        grid.Children.Add(content);
+
+        grid.Measure(
+            new Size(300, double.PositiveInfinity));
+        Assert.Single(content.Constraints);
+
+        grid.Arrange(new Rect(0, 0, 300, 200));
+
+        Assert.Single(content.Constraints);
+        Assert.Equal(200, content.VisualBounds.Height, 3);
+        Assert.Equal(
+            double.PositiveInfinity,
+            content.Constraints[0].Height);
+    }
+
+    [Fact]
+    public void Grid_HeightOnlyArrange_ReallocatesZeroStarRowFromItsMinimum()
+    {
+        var grid = new Grid();
+        grid.RowDefinitions.Add(new RowDefinition
+        {
+            Height = new GridLength(0, GridUnitType.Star)
+        });
+        grid.RowDefinitions.Add(
+            new RowDefinition { Height = GridLength.Star });
+
+        var content = new Border { Height = 80 };
+        grid.Children.Add(content);
+
+        grid.Measure(
+            new Size(300, double.PositiveInfinity));
+        grid.Arrange(new Rect(0, 0, 300, 200));
+
+        Assert.Equal(0, grid.RowDefinitions[0].ActualHeight, 3);
+        Assert.Equal(200, grid.RowDefinitions[1].ActualHeight, 3);
+    }
+
+    [Fact]
+    public void Grid_MixedAutoAndStarSpan_DoesNotAbsorbScrollableExtentIntoAutoRows()
+    {
+        var grid = new Grid();
+        grid.RowDefinitions.Add(
+            new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(
+            new RowDefinition { Height = GridLength.Star });
+        grid.RowDefinitions.Add(
+            new RowDefinition { Height = GridLength.Auto });
+
+        var header = new Border { Height = 40 };
+        var scrollableContent = new ScrollExtentProbe();
+        var footer = new Border { Height = 30 };
+        Grid.SetRow(scrollableContent, 0);
+        Grid.SetRowSpan(scrollableContent, 3);
+        Grid.SetRow(footer, 2);
+        grid.Children.Add(scrollableContent);
+        grid.Children.Add(header);
+        grid.Children.Add(footer);
+
+        grid.Measure(new Size(500, 800));
+        grid.Arrange(new Rect(0, 0, 500, 800));
+
+        Assert.DoesNotContain(
+            scrollableContent.Constraints,
+            constraint =>
+                double.IsPositiveInfinity(constraint.Height));
+        Assert.Equal(40, grid.RowDefinitions[0].ActualHeight, 3);
+        Assert.Equal(730, grid.RowDefinitions[1].ActualHeight, 3);
+        Assert.Equal(30, grid.RowDefinitions[2].ActualHeight, 3);
+        Assert.Equal(800, grid.DesiredSize.Height, 3);
+    }
+
+    [Fact]
+    public void Grid_StarMinMaxBounds_RedistributeSpaceAcrossRemainingTracks()
+    {
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = GridLength.Star,
+            MinWidth = 80
+        });
+        grid.ColumnDefinitions.Add(
+            new ColumnDefinition { Width = GridLength.Star });
+        grid.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = GridLength.Star,
+            MaxWidth = 30
+        });
+
+        grid.Measure(new Size(180, 40));
+        grid.Arrange(new Rect(0, 0, 180, 40));
+
+        Assert.Equal(80, grid.ColumnDefinitions[0].ActualWidth, 3);
+        Assert.Equal(70, grid.ColumnDefinitions[1].ActualWidth, 3);
+        Assert.Equal(30, grid.ColumnDefinitions[2].ActualWidth, 3);
+    }
+
+    [Fact]
+    public void Grid_SpanningStarChild_ContributesToDesiredSize()
+    {
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(
+            new ColumnDefinition { Width = GridLength.Star });
+        grid.ColumnDefinitions.Add(
+            new ColumnDefinition { Width = GridLength.Star });
+
+        var content = new Border { Width = 180, Height = 24 };
+        Grid.SetColumnSpan(content, 2);
+        grid.Children.Add(content);
+
+        grid.Measure(new Size(500, 100));
+
+        Assert.Equal(180, grid.DesiredSize.Width, 3);
+        Assert.Equal(24, grid.DesiredSize.Height, 3);
+    }
+
+    [Fact]
+    public void Grid_CellAttachedPropertyChange_InvalidatesParentMeasure()
+    {
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(
+            new ColumnDefinition { Width = GridLength.Star });
+        grid.ColumnDefinitions.Add(
+            new ColumnDefinition { Width = GridLength.Star });
+        var child = new Border { Width = 20, Height = 20 };
+        grid.Children.Add(child);
+        grid.Measure(new Size(200, 40));
+        grid.Arrange(new Rect(0, 0, 200, 40));
+
+        Assert.True(grid.IsMeasureValid);
+
+        Grid.SetColumn(child, 1);
+
+        Assert.False(grid.IsMeasureValid);
+        Assert.False(grid.IsArrangeValid);
+    }
+
+    [Fact]
     public void WrapPanel_WithBareGridChildren_SizesToContent_DoesNotBalloon()
     {
         // Reproduces the chip-explosion scenario: bare Grid wrappers inside a horizontal WrapPanel
@@ -232,4 +404,20 @@ public class GridLayoutTests
             return new Size(50, 40);
         }
     }
+
+    private sealed class ScrollExtentProbe : FrameworkElement
+    {
+        public List<Size> Constraints { get; } = [];
+
+        protected override Size MeasureOverride(Size availableSize)
+        {
+            Constraints.Add(availableSize);
+            return new Size(
+                100,
+                double.IsPositiveInfinity(availableSize.Height)
+                    ? 8000
+                    : Math.Min(8000, availableSize.Height));
+        }
+    }
+
 }

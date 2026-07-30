@@ -410,6 +410,14 @@ void D3D12DirectRenderer::Shutdown()
     readbackDataSize_ = 0;
     readbackPending_ = false;
     readbackReady_ = false;
+    compositionResizeScratch_.Reset();
+    compositionResizeScratchWidth_ = 0;
+    compositionResizeScratchHeight_ = 0;
+    compositionResizeScratchState_ = D3D12_RESOURCE_STATE_COPY_DEST;
+    compositionResizeScratchContentWidth_ = 0;
+    compositionResizeScratchContentHeight_ = 0;
+    compositionResizeScratchContentValid_ = false;
+    compositionResizePlacementRecorded_ = false;
 
     velloRenderer_.reset();
 
@@ -546,11 +554,47 @@ bool D3D12DirectRenderer::OnResize(UINT newWidth, UINT newHeight)
     pathMsaaUsedThisFrame_ = false;
     pathScratchFenceValue_ = 0;
 
+    compositionResizeScratch_.Reset();
+    compositionResizeScratchWidth_ = 0;
+    compositionResizeScratchHeight_ = 0;
+    compositionResizeScratchState_ = D3D12_RESOURCE_STATE_COPY_DEST;
+    compositionResizeScratchContentWidth_ = 0;
+    compositionResizeScratchContentHeight_ = 0;
+    compositionResizeScratchContentValid_ = false;
+    compositionResizePlacementRecorded_ = false;
+
     // Update viewport dimensions (will be applied in next BeginFrame)
     viewportWidth_ = newWidth;
     viewportHeight_ = newHeight;
+    pendingLogicalResizeWidth_ = 0;
+    pendingLogicalResizeHeight_ = 0;
+    logicalResizePending_ = false;
 
     return true;
+}
+
+void D3D12DirectRenderer::OnLogicalResize(UINT newWidth, UINT newHeight)
+{
+    // BeginFrame receives the same dimensions and remains the authoritative
+    // viewport setter. This marker exists to reclaim grossly oversized shared
+    // scratch only after BeginFrame has waited its owning fence.
+    pendingLogicalResizeWidth_ = newWidth;
+    pendingLogicalResizeHeight_ = newHeight;
+    logicalResizePending_ = true;
+}
+
+void D3D12DirectRenderer::SetCompositionResizePlacement(
+    bool anchorRight,
+    bool anchorBottom,
+    UINT surfaceWidth,
+    UINT surfaceHeight,
+    bool logicalFrameUpdated)
+{
+    compositionAnchorRight_ = anchorRight;
+    compositionAnchorBottom_ = anchorBottom;
+    compositionSurfaceWidth_ = surfaceWidth;
+    compositionSurfaceHeight_ = surfaceHeight;
+    compositionLogicalFrameUpdated_ = logicalFrameUpdated;
 }
 
 // ============================================================================
@@ -923,6 +967,7 @@ bool D3D12DirectRenderer::BeginFrame(UINT frameIndex, UINT width, UINT height,
     currentFrame_ = frameIndex;
     viewportWidth_ = width;
     viewportHeight_ = height;
+    compositionResizePlacementRecorded_ = false;
 
     auto& fr = frames_[currentFrame_];
 
@@ -1000,6 +1045,41 @@ bool D3D12DirectRenderer::BeginFrame(UINT frameIndex, UINT width, UINT height,
         if (fence_->GetCompletedValue() < effectScratchFenceValue_) {
             lastFrameGpuWaitNs_ = accumulatingFrameWaitNs_;
             return false;
+        }
+    }
+
+    // A logical DirectComposition clip resize deliberately retains the swap-chain
+    // buffers, so OnResize is not available as the old unconditional scratch-
+    // reclamation boundary. Reclaim path MSAA only when it is at least 2x
+    // oversized on one axis. This makes a long interactive shrink logarithmic
+    // (usually zero or one reallocations, never one per WM_SIZE), while still
+    // releasing an ultrawide high-water allocation after the window becomes narrow.
+    //
+    // This point is safe: the pathScratchFenceValue_ wait immediately above has
+    // proved that no submitted command list still references these resources.
+    if (logicalResizePending_) {
+        const UINT logicalWidth = pendingLogicalResizeWidth_;
+        const UINT logicalHeight = pendingLogicalResizeHeight_;
+        logicalResizePending_ = false;
+
+        const bool widthGrosslyOversized =
+            logicalWidth > 0 &&
+            static_cast<uint64_t>(pathMsaaWidth_) >
+                static_cast<uint64_t>(logicalWidth) * 2ull;
+        const bool heightGrosslyOversized =
+            logicalHeight > 0 &&
+            static_cast<uint64_t>(pathMsaaHeight_) >
+                static_cast<uint64_t>(logicalHeight) * 2ull;
+        if (widthGrosslyOversized || heightGrosslyOversized) {
+            pathMsaaColor_.Reset();
+            pathMsaaDepth_.Reset();
+            pathResolveTexture_.Reset();
+            pathMsaaWidth_ = 0;
+            pathMsaaHeight_ = 0;
+            pathMsaaColorState_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            pathResolveTexState_ = D3D12_RESOURCE_STATE_COMMON;
+            pathMsaaUsedThisFrame_ = false;
+            pathScratchFenceValue_ = 0;
         }
     }
 
@@ -1361,13 +1441,17 @@ JaliumResult D3D12DirectRenderer::EndFrame(bool useDirtyRects, const std::vector
     }
     inFrame_ = false;
 
-    // Parity-verification back-buffer readback: when armed, record the copy
-    // NOW — after every draw of this frame is recorded, while the back buffer
-    // is still in RENDER_TARGET state, and before the PRESENT transition +
-    // ExecuteCommandLists below — so the captured bytes are exactly this
-    // frame's final presented contents. The fence value is latched after this
-    // frame's queue Signal further down.
-    const bool readbackRecorded = readbackPending_ && RecordBackBufferReadbackCopy();
+    if (compositionAnchorRight_ || compositionAnchorBottom_) {
+        compositionResizePlacementRecorded_ =
+            RecordCompositionResizePlacementCopy();
+    }
+
+    // Parity-verification back-buffer readback: record after composition
+    // placement has restored the canonical logical frame at top-left, but
+    // before the PRESENT transition. The captured dimensions remain exactly
+    // RenderTarget.Width x RenderTarget.Height.
+    const bool readbackRecorded =
+        readbackPending_ && RecordBackBufferReadbackCopy();
     readbackPending_ = false;
 
     // Transition back buffer RENDER_TARGET → PRESENT (matching the original
@@ -1577,12 +1661,29 @@ bool D3D12DirectRenderer::RecordBackBufferReadbackCopy()
     ID3D12Resource* backBuffer = renderTargets_[currentFrame_].Get();
     if (!backBuffer) return false;
 
-    D3D12_RESOURCE_DESC bbDesc = backBuffer->GetDesc();
+    const D3D12_RESOURCE_DESC bbDesc = backBuffer->GetDesc();
+    if (viewportWidth_ == 0 || viewportHeight_ == 0 ||
+        viewportWidth_ > bbDesc.Width || viewportHeight_ > bbDesc.Height) {
+        return false;
+    }
+
+    // Readback is a window-content API, not a swap-chain-capacity API. Build
+    // the destination footprint for the logical source region so callers still
+    // receive exactly RenderTarget.Width x RenderTarget.Height pixels.
+    D3D12_RESOURCE_DESC captureDesc = bbDesc;
+    captureDesc.Width = viewportWidth_;
+    captureDesc.Height = viewportHeight_;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
     UINT numRows = 0;
     UINT64 rowSizeInBytes = 0;
     UINT64 totalBytes = 0;
-    device_->GetCopyableFootprints(&bbDesc, 0, 1, 0, &footprint, &numRows, &rowSizeInBytes, &totalBytes);
+    device_->GetCopyableFootprints(
+        &captureDesc,
+        0, 1, 0,
+        &footprint,
+        &numRows,
+        &rowSizeInBytes,
+        &totalBytes);
     if (totalBytes == 0 || totalBytes == UINT64_MAX) return false;
 
     // Lazily (re)create the READBACK-heap buffer. Grow-only: a too-small
@@ -1617,8 +1718,8 @@ bool D3D12DirectRenderer::RecordBackBufferReadbackCopy()
         readbackBufferCapacity_ = totalBytes;
     }
 
-    readbackWidth_ = static_cast<uint32_t>(bbDesc.Width);
-    readbackHeight_ = static_cast<uint32_t>(bbDesc.Height);
+    readbackWidth_ = viewportWidth_;
+    readbackHeight_ = viewportHeight_;
     readbackRowPitch_ = footprint.Footprint.RowPitch;
     readbackDataSize_ = totalBytes;
 
@@ -1634,11 +1735,207 @@ bool D3D12DirectRenderer::RecordBackBufferReadbackCopy()
     src.pResource = backBuffer;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.SubresourceIndex = 0;
-    commandList_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    D3D12_BOX sourceBox = {
+        0, 0, 0,
+        viewportWidth_,
+        viewportHeight_,
+        1
+    };
+    commandList_->CopyTextureRegion(
+        &dst,
+        0, 0, 0,
+        &src,
+        &sourceBox);
 
     auto toRenderTarget = MakeTransitionBarrier(
         backBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     commandList_->ResourceBarrier(1, &toRenderTarget);
+    return true;
+}
+
+bool D3D12DirectRenderer::RecordCompositionResizePlacementCopy()
+{
+    if (!device_ || !commandList_) return false;
+    if (!compositionAnchorRight_ && !compositionAnchorBottom_) return false;
+
+    ID3D12Resource* backBuffer = renderTargets_[currentFrame_].Get();
+    if (!backBuffer) return false;
+
+    const D3D12_RESOURCE_DESC backBufferDesc = backBuffer->GetDesc();
+    if (viewportWidth_ == 0 || viewportHeight_ == 0 ||
+        compositionSurfaceWidth_ < viewportWidth_ ||
+        compositionSurfaceHeight_ < viewportHeight_ ||
+        compositionSurfaceWidth_ > backBufferDesc.Width ||
+        compositionSurfaceHeight_ > backBufferDesc.Height) {
+        return false;
+    }
+
+    const UINT destinationX = compositionAnchorRight_
+        ? compositionSurfaceWidth_ - viewportWidth_
+        : 0;
+    const UINT destinationY = compositionAnchorBottom_
+        ? compositionSurfaceHeight_ - viewportHeight_
+        : 0;
+    if (destinationX == 0 && destinationY == 0) return false;
+
+    // Copying overlapping regions inside one texture is invalid. Stage the
+    // logical frame through a reusable default-heap texture, then place that
+    // exact image against the stationary physical edge of the reserved
+    // composition buffer. All operations run on the frame's command list, so
+    // one scratch resource is sufficient for every in-flight back buffer.
+    if (!compositionResizeScratch_) {
+        D3D12_HEAP_PROPERTIES heapProps = {};
+        heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC scratchDesc = backBufferDesc;
+        scratchDesc.Width = compositionSurfaceWidth_;
+        scratchDesc.Height = compositionSurfaceHeight_;
+        scratchDesc.DepthOrArraySize = 1;
+        scratchDesc.MipLevels = 1;
+        scratchDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+        HRESULT createHr = device_->CreateCommittedResource(
+            &heapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &scratchDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            IID_PPV_ARGS(&compositionResizeScratch_));
+        if (FAILED(createHr)) {
+            compositionResizeScratch_.Reset();
+            return false;
+        }
+
+        compositionResizeScratch_->SetName(
+            L"JaliumCompositionResizeAnchorScratch");
+        compositionResizeScratchWidth_ = compositionSurfaceWidth_;
+        compositionResizeScratchHeight_ = compositionSurfaceHeight_;
+        compositionResizeScratchState_ = D3D12_RESOURCE_STATE_COPY_DEST;
+        compositionResizeScratchContentWidth_ = 0;
+        compositionResizeScratchContentHeight_ = 0;
+        compositionResizeScratchContentValid_ = false;
+    }
+
+    if (compositionResizeScratchWidth_ < viewportWidth_ ||
+        compositionResizeScratchHeight_ < viewportHeight_) {
+        return false;
+    }
+
+    D3D12_TEXTURE_COPY_LOCATION scratchLocation = {};
+    scratchLocation.pResource = compositionResizeScratch_.Get();
+    scratchLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    scratchLocation.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION backBufferLocation = {};
+    backBufferLocation.pResource = backBuffer;
+    backBufferLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    backBufferLocation.SubresourceIndex = 0;
+    D3D12_BOX logicalFrameBox = {
+        0, 0, 0,
+        viewportWidth_,
+        viewportHeight_,
+        1
+    };
+
+    const bool refreshCanonicalFrame =
+        compositionLogicalFrameUpdated_ ||
+        !compositionResizeScratchContentValid_ ||
+        compositionResizeScratchContentWidth_ != viewportWidth_ ||
+        compositionResizeScratchContentHeight_ != viewportHeight_;
+
+    if (compositionResizeScratchState_ != D3D12_RESOURCE_STATE_COPY_DEST) {
+        auto scratchToCopyDest = MakeTransitionBarrier(
+            compositionResizeScratch_.Get(),
+            compositionResizeScratchState_,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        commandList_->ResourceBarrier(1, &scratchToCopyDest);
+        compositionResizeScratchState_ = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+
+    if (refreshCanonicalFrame) {
+        auto backBufferToCopySource = MakeTransitionBarrier(
+            backBuffer,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+        commandList_->ResourceBarrier(1, &backBufferToCopySource);
+        commandList_->CopyTextureRegion(
+            &scratchLocation,
+            0, 0, 0,
+            &backBufferLocation,
+            &logicalFrameBox);
+
+        auto scratchToCopySource = MakeTransitionBarrier(
+            compositionResizeScratch_.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+        auto backBufferToCopyDest = MakeTransitionBarrier(
+            backBuffer,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_RESOURCE_BARRIER copyBarriers[] = {
+            scratchToCopySource,
+            backBufferToCopyDest
+        };
+        commandList_->ResourceBarrier(
+            static_cast<UINT>(std::size(copyBarriers)),
+            copyBarriers);
+        compositionResizeScratchContentWidth_ = viewportWidth_;
+        compositionResizeScratchContentHeight_ = viewportHeight_;
+        compositionResizeScratchContentValid_ = true;
+    } else {
+        auto scratchToCopySource = MakeTransitionBarrier(
+            compositionResizeScratch_.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+        auto backBufferToCopyDest = MakeTransitionBarrier(
+            backBuffer,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_RESOURCE_BARRIER reuseBarriers[] = {
+            scratchToCopySource,
+            backBufferToCopyDest
+        };
+        commandList_->ResourceBarrier(
+            static_cast<UINT>(std::size(reuseBarriers)),
+            reuseBarriers);
+    }
+    compositionResizeScratchState_ = D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+    // Keep both placements coherent. The top-left copy is the ordinary
+    // post-resize layout used when the modal loop ends; the capacity-edge copy
+    // is selected by the matching DirectComposition visual offset while dragging.
+    // A second
+    // no-dirty frame can therefore never expose stale contents from whichever
+    // flip-sequential back buffer DXGI rotates in next.
+    commandList_->CopyTextureRegion(
+        &backBufferLocation,
+        0, 0, 0,
+        &scratchLocation,
+        &logicalFrameBox);
+
+    commandList_->CopyTextureRegion(
+        &backBufferLocation,
+        destinationX,
+        destinationY,
+        0,
+        &scratchLocation,
+        &logicalFrameBox);
+
+    auto backBufferToRenderTarget = MakeTransitionBarrier(
+        backBuffer,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_RENDER_TARGET);
+    auto scratchToCopyDest = MakeTransitionBarrier(
+        compositionResizeScratch_.Get(),
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_RESOURCE_BARRIER restoreBarriers[] = {
+        backBufferToRenderTarget,
+        scratchToCopyDest
+    };
+    commandList_->ResourceBarrier(
+        static_cast<UINT>(std::size(restoreBarriers)),
+        restoreBarriers);
+    compositionResizeScratchState_ = D3D12_RESOURCE_STATE_COPY_DEST;
     return true;
 }
 
@@ -3810,7 +4107,9 @@ bool D3D12DirectRenderer::EnsureSnapshotTexture()
         return false;
     }
 
-    if (snapshotTexture_ && snapshotW_ == viewportWidth_ && snapshotH_ == viewportHeight_) {
+    if (snapshotTexture_ &&
+        snapshotW_ >= viewportWidth_ &&
+        snapshotH_ >= viewportHeight_) {
         return true;
     }
 
@@ -3822,8 +4121,24 @@ bool D3D12DirectRenderer::EnsureSnapshotTexture()
     WaitForGpuIdle();
 
     snapshotTexture_.Reset();
+    UINT allocationWidth = viewportWidth_;
+    UINT allocationHeight = viewportHeight_;
+    if (renderTargets_[currentFrame_]) {
+        const D3D12_RESOURCE_DESC backBufferDesc =
+            renderTargets_[currentFrame_]->GetDesc();
+        allocationWidth = (std::max)(
+            allocationWidth,
+            static_cast<UINT>(backBufferDesc.Width));
+        allocationHeight = (std::max)(
+            allocationHeight,
+            backBufferDesc.Height);
+    }
     auto heapProps = MakeHeapProps(D3D12_HEAP_TYPE_DEFAULT);
-    auto desc = MakeTexture2DDesc(viewportWidth_, viewportHeight_, swapChainFormat_, D3D12_RESOURCE_FLAG_NONE);
+    auto desc = MakeTexture2DDesc(
+        allocationWidth,
+        allocationHeight,
+        swapChainFormat_,
+        D3D12_RESOURCE_FLAG_NONE);
     if (FAILED(device_->CreateCommittedResource(
             &heapProps,
             D3D12_HEAP_FLAG_NONE,
@@ -3839,8 +4154,8 @@ bool D3D12DirectRenderer::EnsureSnapshotTexture()
     }
     snapshotTexture_->SetName(L"JaliumSnapshotTexture");  // [JALIUM-921 diag]
 
-    snapshotW_ = viewportWidth_;
-    snapshotH_ = viewportHeight_;
+    snapshotW_ = allocationWidth;
+    snapshotH_ = allocationHeight;
     snapshotValid_ = false;
     snapshotState_ = D3D12_RESOURCE_STATE_COMMON;
     return true;
@@ -4443,8 +4758,24 @@ bool D3D12DirectRenderer::CaptureSnapshot()
     cl->ResourceBarrier(2, barriers);
     snapshotState_ = D3D12_RESOURCE_STATE_COPY_DEST;
 
-    // Copy entire back buffer to snapshot
-    cl->CopyResource(snapshotTexture_.Get(), backBuffer);
+    // The swap-chain allocation can be larger than the logical source region
+    // during live resize. Copy only the visible 1:1 viewport into the top-left
+    // of the grow-only snapshot texture; CopyResource requires equal resource
+    // dimensions and would be invalid in that configuration.
+    D3D12_TEXTURE_COPY_LOCATION sourceLocation = {};
+    sourceLocation.pResource = backBuffer;
+    sourceLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    sourceLocation.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION destinationLocation = {};
+    destinationLocation.pResource = snapshotTexture_.Get();
+    destinationLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destinationLocation.SubresourceIndex = 0;
+    D3D12_BOX sourceBox = { 0, 0, 0, w, h, 1 };
+    cl->CopyTextureRegion(
+        &destinationLocation,
+        0, 0, 0,
+        &sourceLocation,
+        &sourceBox);
 
     // Transition back
     barriers[0] = MakeTransitionBarrier(backBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);

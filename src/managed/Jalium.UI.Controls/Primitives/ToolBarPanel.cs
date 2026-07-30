@@ -42,7 +42,7 @@ public class ToolBarPanel : StackPanel
             ? new Size(double.PositiveInfinity, availableSize.Height)
             : new Size(availableSize.Width, double.PositiveInfinity);
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             child.Measure(childConstraint);
 
@@ -63,7 +63,7 @@ public class ToolBarPanel : StackPanel
         var isHorizontal = Orientation == Orientation.Horizontal;
         var offset = 0.0;
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             if (isHorizontal)
             {

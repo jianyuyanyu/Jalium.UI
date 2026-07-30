@@ -1104,7 +1104,7 @@ public partial class Application : Jalium.UI.Threading.DispatcherObject, IQueryA
                 // must already see Stopping and must not Invoke this dispatcher.
                 if (!AndroidActivityBridge.MarkUiThreadStopping())
                 {
-                    Console.Error.WriteLine(
+                    System.Diagnostics.Debug.WriteLine(
                         "[Application] Android shutdown was deferred because Surface/Window teardown did not complete.");
                     return;
                 }

@@ -25,6 +25,8 @@ public class DependencyObject : DispatcherObject
     private Dictionary<DependencyProperty, BindingExpressionBase>? _bindings;
     private Dictionary<DependencyProperty, AnimatedPropertyValue>? _animatedValues;
     private Dictionary<DependencyProperty, Brush>? _mutableRenderBrushValues;
+    private WeakReference<FrameworkElement>? _bindingMentor;
+    private List<WeakReference<DependencyObject>>? _bindingMentees;
 
     // Source-compatibility shims for Jalium's historical public Visual tree surface. They are
     // deliberately fields (and a callable delegate field), so metadata verification sees only
@@ -494,6 +496,110 @@ public class DependencyObject : DispatcherObject
     }
 
     /// <summary>
+    /// Gets the framework element that supplies an inherited binding context for this
+    /// non-visual dependency object.
+    /// </summary>
+    /// <remarks>
+    /// Some dependency objects are owned by a visual control without participating in
+    /// either its visual or logical tree (for example, chart series). A weak mentor lets
+    /// bindings on those objects resolve the owner's <see cref="FrameworkElement.DataContext"/>
+    /// without turning configuration objects into visuals or keeping the owner alive.
+    /// </remarks>
+    internal FrameworkElement? BindingMentor
+    {
+        get
+        {
+            if (_bindingMentor?.TryGetTarget(out var mentor) == true)
+            {
+                return mentor;
+            }
+
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Sets the framework element that supplies this object's inherited binding context.
+    /// </summary>
+    /// <remarks>
+    /// Bindings are detached before the mentor changes so subscriptions to the previous
+    /// mentor are removed, then activated again against the new context.
+    /// </remarks>
+    internal void SetBindingMentor(FrameworkElement? mentor)
+    {
+        var previousMentor = BindingMentor;
+        if (ReferenceEquals(previousMentor, mentor) &&
+            (mentor != null || _bindingMentor == null))
+        {
+            return;
+        }
+
+        var bindings = _bindings?.Values.ToArray();
+        if (bindings != null)
+        {
+            foreach (var expression in bindings)
+            {
+                expression.Deactivate();
+            }
+        }
+
+        previousMentor?.RemoveBindingMentee(this);
+        _bindingMentor = mentor == null
+            ? null
+            : new WeakReference<FrameworkElement>(mentor);
+        mentor?.AddBindingMentee(this);
+
+        if (bindings != null)
+        {
+            foreach (var expression in bindings)
+            {
+                expression.Activate();
+            }
+        }
+    }
+
+    private void AddBindingMentee(DependencyObject mentee)
+    {
+        _bindingMentees ??= new List<WeakReference<DependencyObject>>();
+
+        for (int i = _bindingMentees.Count - 1; i >= 0; i--)
+        {
+            if (!_bindingMentees[i].TryGetTarget(out var existing))
+            {
+                _bindingMentees.RemoveAt(i);
+            }
+            else if (ReferenceEquals(existing, mentee))
+            {
+                return;
+            }
+        }
+
+        _bindingMentees.Add(new WeakReference<DependencyObject>(mentee));
+    }
+
+    private void RemoveBindingMentee(DependencyObject mentee)
+    {
+        if (_bindingMentees == null)
+        {
+            return;
+        }
+
+        for (int i = _bindingMentees.Count - 1; i >= 0; i--)
+        {
+            if (!_bindingMentees[i].TryGetTarget(out var existing) ||
+                ReferenceEquals(existing, mentee))
+            {
+                _bindingMentees.RemoveAt(i);
+            }
+        }
+
+        if (_bindingMentees.Count == 0)
+        {
+            _bindingMentees = null;
+        }
+    }
+
+    /// <summary>
     /// Removes the binding from a dependency property.
     /// </summary>
     /// <param name="dp">The dependency property to unbind.</param>
@@ -532,21 +638,56 @@ public class DependencyObject : DispatcherObject
     /// </summary>
     internal void ReactivateBindings()
     {
-        if (_bindings is not { } bindings)
-            return;
-
-        foreach (var expression in bindings.Values)
+        if (_bindings is { } bindings)
         {
-            // Only reactivate if not already active (deferred bindings that couldn't activate earlier)
-            if (!expression.IsActive)
+            foreach (var expression in bindings.Values)
             {
-                expression.Activate();
+                // Only reactivate if not already active (deferred bindings that couldn't activate earlier)
+                if (!expression.IsActive)
+                {
+                    expression.Activate();
+                }
+                else
+                {
+                    // For already active bindings, update the target to get latest value
+                    expression.UpdateTarget();
+                }
             }
-            else
+        }
+
+        ReactivateBindingMentees();
+    }
+
+    private void ReactivateBindingMentees()
+    {
+        if (_bindingMentees == null)
+        {
+            return;
+        }
+
+        // Work from a snapshot because reactivation may replace a series collection and
+        // consequently add or remove mentor relationships.
+        var mentees = _bindingMentees.ToArray();
+        foreach (var weakMentee in mentees)
+        {
+            if (weakMentee.TryGetTarget(out var mentee) &&
+                ReferenceEquals(mentee.BindingMentor, this))
             {
-                // For already active bindings, update the target to get latest value
-                expression.UpdateTarget();
+                mentee.ReactivateBindings();
             }
+        }
+
+        for (int i = _bindingMentees.Count - 1; i >= 0; i--)
+        {
+            if (!_bindingMentees[i].TryGetTarget(out _))
+            {
+                _bindingMentees.RemoveAt(i);
+            }
+        }
+
+        if (_bindingMentees.Count == 0)
+        {
+            _bindingMentees = null;
         }
     }
 

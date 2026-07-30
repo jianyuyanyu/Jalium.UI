@@ -52,7 +52,7 @@ public class TabPanel : Panel
         var maxWidth = 0.0;
         var maxHeight = 0.0;
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             child.Measure(availableSize);
 
@@ -121,7 +121,7 @@ public class TabPanel : Panel
         var headersPerRow = 0;
         _numRows = 1;
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             var childWidth = child.DesiredSize.Width;
             var childHeight = child.DesiredSize.Height;
@@ -149,7 +149,7 @@ public class TabPanel : Panel
     {
         var x = 0.0;
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             child.Arrange(new Rect(x, 0, child.DesiredSize.Width, finalSize.Height));
             x += child.DesiredSize.Width;
@@ -160,7 +160,7 @@ public class TabPanel : Panel
     {
         var y = 0.0;
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             child.Arrange(new Rect(0, y, finalSize.Width, child.DesiredSize.Height));
             y += child.DesiredSize.Height;
@@ -174,7 +174,7 @@ public class TabPanel : Panel
         var currentRowWidth = 0.0;
         var maxRowWidth = finalSize.Width;
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             var childWidth = child.DesiredSize.Width;
 

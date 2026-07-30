@@ -1518,7 +1518,7 @@ public class VirtualizingStackPanel : VirtualizingPanel, IScrollInfo
         double axis = 0;
         double cross = 0;
         bool sawVisible = false;
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             child.Visibility = Visibility.Visible;
             child.Measure(availableSize);
@@ -1547,7 +1547,7 @@ public class VirtualizingStackPanel : VirtualizingPanel, IScrollInfo
         var spacing = EffectiveSpacing;
         var offset = -_computedOffset;
         bool sawVisible = false;
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             if (sawVisible) offset += spacing;
             var axisExtent = GetAxisSize(child.DesiredSize);

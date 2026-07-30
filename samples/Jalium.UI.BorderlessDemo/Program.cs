@@ -32,8 +32,8 @@ public class BorderlessDemoApp : Application
     protected override void OnStartup(StartupEventArgs e)
     {
         _startedAt = DateTime.Now;
-        Console.WriteLine($"[OnStartup] args=[{string.Join(", ", e.Args)}]");
-        Console.WriteLine($"[OnStartup] started at {_startedAt:HH:mm:ss.fff}");
+        System.Diagnostics.Debug.WriteLine($"[OnStartup] args=[{string.Join(", ", e.Args)}]");
+        System.Diagnostics.Debug.WriteLine($"[OnStartup] started at {_startedAt:HH:mm:ss.fff}");
 
         MainWindow = new BorderlessMainWindow();
 
@@ -43,14 +43,14 @@ public class BorderlessDemoApp : Application
     protected override void OnExit(ExitEventArgs e)
     {
         var elapsed = DateTime.Now - _startedAt;
-        Console.WriteLine($"[OnExit] exitCode={e.ApplicationExitCode}, elapsed={elapsed.TotalSeconds:F2}s");
+        System.Diagnostics.Debug.WriteLine($"[OnExit] exitCode={e.ApplicationExitCode}, elapsed={elapsed.TotalSeconds:F2}s");
 
         base.OnExit(e);
     }
 
     protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
     {
-        Console.WriteLine($"[OnSessionEnding] reason={e.ReasonSessionEnding}");
+        System.Diagnostics.Debug.WriteLine($"[OnSessionEnding] reason={e.ReasonSessionEnding}");
         base.OnSessionEnding(e);
     }
 }

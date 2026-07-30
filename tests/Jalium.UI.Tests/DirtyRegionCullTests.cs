@@ -34,6 +34,7 @@ public class DirtyRegionCullTests
     {
         public readonly List<UIElement> DirtyElements = new();
         public readonly List<Rect> DirtyRects = new();
+        public bool ShouldTrackLayoutDirtyBounds { get; set; } = true;
 
         public void AddChild(UIElement child) => AddVisualChild(child);
         public void Reset() { DirtyElements.Clear(); DirtyRects.Clear(); }
@@ -116,6 +117,20 @@ public class DirtyRegionCullTests
         row.Arrange(Inside(20));
 
         Assert.Contains(row, host.DirtyElements);
+    }
+
+    [Fact]
+    public void FullInvalidationHost_SkipsPerElementLayoutDirtyRegistration()
+    {
+        var (host, clip) = BuildClipTree();
+        var row = AddRow(clip, Inside(10));
+        host.Reset();
+        host.ShouldTrackLayoutDirtyBounds = false;
+
+        row.Arrange(Inside(20));
+
+        Assert.Empty(host.DirtyElements);
+        Assert.Empty(host.DirtyRects);
     }
 
     [Fact]

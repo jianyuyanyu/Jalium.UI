@@ -262,6 +262,40 @@ public class ComboBoxRenderingTests
         }
     }
 
+    [Fact]
+    public void ComboBox_DropDownItems_ShouldNotReserveInactiveScrollBarGutter()
+    {
+        ResetApplicationState();
+        var app = new Application();
+
+        try
+        {
+            var host = new Grid { Width = 200, Height = 100 };
+            var comboBox = new ComboBox { Width = 172 };
+            comboBox.Items.Add("Option one");
+            comboBox.Items.Add("Option two");
+            comboBox.Items.Add("Option three");
+            host.Children.Add(comboBox);
+
+            host.Measure(new Size(200, 100));
+            host.Arrange(new Rect(0, 0, 200, 100));
+
+            var popup = Assert.IsType<Popup>(FindVisualDescendant<Popup>(comboBox));
+            var popupChild = Assert.IsAssignableFrom<Visual>(popup.Child);
+            var scrollViewer = Assert.IsType<ScrollViewer>(
+                FindVisualDescendant<ScrollViewer>(popupChild));
+
+            // Desktop Auto scroll bars reserve a 12-DIP gutter even while collapsed.
+            // A drop-down overlays its occasional scroll bar so short lists fill the
+            // popup all the way to its right inset.
+            Assert.True(scrollViewer.IsOverlayScrollBarEnabled);
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
     /// <summary>
     /// 娴嬭瘯鏄惧紡璁剧疆 Height 鍜?MinHeight 鐨勪紭鍏堢骇
     /// </summary>
@@ -519,6 +553,26 @@ public class ComboBoxRenderingTests
             // 杩斿洖姝ｇ‘鐨勫€硷紙鐩存帴璁＄畻鐨勶級
             return directResult;
         }
+    }
+
+    private static T? FindVisualDescendant<T>(Visual root)
+        where T : Visual
+    {
+        if (root is T match)
+        {
+            return match;
+        }
+
+        for (int i = 0; i < root.VisualChildrenCount; i++)
+        {
+            if (root.GetVisualChild(i) is Visual child &&
+                FindVisualDescendant<T>(child) is { } descendant)
+            {
+                return descendant;
+            }
+        }
+
+        return null;
     }
 }
 

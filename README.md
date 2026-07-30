@@ -22,7 +22,7 @@ WPF-inspired APIs, JALXAML with Razor extensions, and native rendering on Window
 
 > [!IMPORTANT]
 > Jalium.UI is under active development. The current source/release line is
-> **v26.10.7**; APIs can still evolve between minor versions. Keep every
+> **v26.10.8**; APIs can still evolve between minor versions. Keep every
 > `Jalium.UI.*` package on the same version.
 
 | Platform | Entry package and runtime | Windowing | Renderer | Current scope |

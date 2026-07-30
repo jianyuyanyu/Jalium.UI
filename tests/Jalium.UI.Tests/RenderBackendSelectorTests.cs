@@ -66,4 +66,69 @@ public sealed class RenderBackendSelectorTests
         Assert.True(RenderBackendSelector.TryParseBackend("metal", out var metal));
         Assert.Equal(RenderBackend.Metal, metal);
     }
+
+    [Fact]
+    public void ResolveGpuPreference_DefaultsToHighPerformanceForD3D12OnWindows()
+    {
+        var preference = RenderBackendSelector.ResolveGpuPreference(
+            RenderBackend.D3D12,
+            preferenceOverride: "",
+            isWindows: true);
+
+        Assert.Equal(GpuPreference.HighPerformance, preference);
+    }
+
+    [Theory]
+    [InlineData(RenderBackend.Vulkan, true)]
+    [InlineData(RenderBackend.Software, true)]
+    [InlineData(RenderBackend.D3D12, false)]
+    public void ResolveGpuPreference_KeepsAutoOutsideWindowsD3D12(
+        RenderBackend backend,
+        bool isWindows)
+    {
+        var preference = RenderBackendSelector.ResolveGpuPreference(
+            backend,
+            preferenceOverride: "",
+            isWindows: isWindows);
+
+        Assert.Equal(GpuPreference.Auto, preference);
+    }
+
+    [Theory]
+    [InlineData("auto", GpuPreference.Auto)]
+    [InlineData("system", GpuPreference.Auto)]
+    [InlineData("discrete", GpuPreference.HighPerformance)]
+    [InlineData("high_performance", GpuPreference.HighPerformance)]
+    [InlineData("integrated", GpuPreference.MinimumPower)]
+    [InlineData("minimum_power", GpuPreference.MinimumPower)]
+    public void ResolveGpuPreference_ExplicitOverrideWins(
+        string value,
+        GpuPreference expected)
+    {
+        var preference = RenderBackendSelector.ResolveGpuPreference(
+            RenderBackend.D3D12,
+            preferenceOverride: value,
+            isWindows: true);
+
+        Assert.Equal(expected, preference);
+    }
+
+    [Theory]
+    [InlineData(GpuPreference.HighPerformance, GpuPreference.MinimumPower)]
+    [InlineData(GpuPreference.MinimumPower, GpuPreference.HighPerformance)]
+    public void GetFallbackGpuPreference_UsesTheOtherHardwareClass(
+        GpuPreference current,
+        GpuPreference expected)
+    {
+        Assert.Equal(
+            expected,
+            RenderBackendSelector.GetFallbackGpuPreference(current));
+    }
+
+    [Fact]
+    public void GetFallbackGpuPreference_DoesNotOverrideExplicitAuto()
+    {
+        Assert.Null(
+            RenderBackendSelector.GetFallbackGpuPreference(GpuPreference.Auto));
+    }
 }

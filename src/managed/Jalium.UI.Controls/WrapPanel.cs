@@ -158,7 +158,7 @@ public class WrapPanel : Panel
         int itemsOnLine = 0;
         int lineCount = 0;
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             if (child is not FrameworkElement fe) continue;
 

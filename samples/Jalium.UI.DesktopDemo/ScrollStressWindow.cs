@@ -82,7 +82,7 @@ internal static class ScrollStressWindow
         // 优先从用户图库加载真实 JPG。 没有则退回合成图。
         var result = new List<BitmapImage>();
         var realPath = @"C:\Users\suppe\OneDrive\图片\01.jpg";
-        Console.WriteLine($"[ScrollStress] File.Exists({realPath}) = {File.Exists(realPath)}");
+        System.Diagnostics.Debug.WriteLine($"[ScrollStress] File.Exists({realPath}) = {File.Exists(realPath)}");
         try
         {
             if (File.Exists(realPath))
@@ -92,7 +92,7 @@ internal static class ScrollStressWindow
                 // 原 JPG 是 3840×2160 / 32MB BGRA — 240 张全 GPU 上传会 380MB,
                 // 大概率第一帧 OOM/timeout 导致窗口空白。
                 var fullSize = BitmapImage.FromFile(realPath);
-                Console.WriteLine($"[ScrollStress] full image: {fullSize.PixelWidth}x{fullSize.PixelHeight} raw={fullSize.RawPixelData?.Length ?? 0}");
+                System.Diagnostics.Debug.WriteLine($"[ScrollStress] full image: {fullSize.PixelWidth}x{fullSize.PixelHeight} raw={fullSize.RawPixelData?.Length ?? 0}");
 
                 var rawPixels = fullSize.RawPixelData!;
                 int srcW = fullSize.PixelWidth;
@@ -103,7 +103,7 @@ internal static class ScrollStressWindow
                 int dstW = 512;
                 int dstH = (int)((long)srcH * dstW / srcW);
                 byte[] smallPixels = NearestDownscale(rawPixels, srcW, srcH, srcStride, dstW, dstH);
-                Console.WriteLine($"[ScrollStress] downscaled to {dstW}x{dstH}, {smallPixels.Length} bytes per copy");
+                System.Diagnostics.Debug.WriteLine($"[ScrollStress] downscaled to {dstW}x{dstH}, {smallPixels.Length} bytes per copy");
 
                 for (int i = 0; i < SourceImageCount; ++i)
                 {
@@ -114,10 +114,10 @@ internal static class ScrollStressWindow
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[ScrollStress] LoadFromFile FAILED: {ex.GetType().Name}: {ex.Message}");
-            Console.WriteLine(ex.StackTrace);
+            System.Diagnostics.Debug.WriteLine($"[ScrollStress] LoadFromFile FAILED: {ex.GetType().Name}: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine(ex.StackTrace);
         }
-        Console.WriteLine("[ScrollStress] falling back to synthetic images");
+        System.Diagnostics.Debug.WriteLine("[ScrollStress] falling back to synthetic images");
         return BuildSyntheticImages(SourceImageCount);
     }
 

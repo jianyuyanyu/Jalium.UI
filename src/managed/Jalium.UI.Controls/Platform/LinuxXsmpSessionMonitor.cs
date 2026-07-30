@@ -164,7 +164,7 @@ internal sealed class LinuxXsmpSessionMonitor : IDisposable
             if (_connection == 0)
             {
                 if (Environment.GetEnvironmentVariable("JALIUM_XSMP_DEBUG") == "1")
-                    Console.Error.WriteLine("[XSMP] " + connectionError);
+                    System.Diagnostics.Debug.WriteLine("[XSMP] " + connectionError);
                 return false;
             }
 

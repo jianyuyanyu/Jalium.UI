@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using Jalium.UI;
 using Jalium.UI.Media;
@@ -71,7 +72,7 @@ public static class TextMeasurement
     // CreateTextFormat 失败负缓存（key → 失败时刻 TickCount64，受 _lock 保护）。文本测量是每帧热路径：
     // 一个持续失败的字体配置若不记录，就会每帧重复 P/Invoke + 抛异常 + 静默吞掉，既卡顿又零证据。
     // 记录后：冷却期内直接返回 null（走近似度量回退），冷却期后允许一次重试；首次失败按 key 打一条
-    // Console.Error 日志（含字体族/字号/异常消息），重试再失败不重复打。key 含 context.Generation
+    // Debug.WriteLine 日志（含字体族/字号/异常消息），重试再失败不重复打。key 含 context.Generation
     // （见 BuildCacheKey），因此渲染上下文换代后负缓存自然失效、新上下文可重新尝试真实创建。
     private const int MaxFailedFormatEntries = 64;
     private const long FailedFormatRetryDelayMs = 5000;
@@ -212,9 +213,11 @@ public static class TextMeasurement
         public LinkedListNode<MeasureKey> LruNode { get; }
     }
 
-    private static readonly Dictionary<MeasureKey, MeasureCacheEntry> _measureCache = new();
+    private static readonly ConcurrentDictionary<MeasureKey, MeasureCacheEntry> _measureCache = new();
     private static readonly LinkedList<MeasureKey> _measureLruKeys = new();
     private static readonly object _measureLock = new();
+    [ThreadStatic]
+    private static int t_measureCacheHits;
 
     /// <summary>
     /// Measures text and populates the FormattedText with accurate metrics.
@@ -263,14 +266,32 @@ public static class TextMeasurement
             (float)maxWidth,
             (float)maxHeight);
 
-        lock (_measureLock)
+        if (_measureCache.TryGetValue(measureKey, out var cachedEntry))
         {
-            if (_measureCache.TryGetValue(measureKey, out var cachedEntry))
+            // Warm measurement hits must not wait behind another thread's cache
+            // insertion/trim. Refresh LRU order periodically and only when the
+            // maintenance gate is immediately available; skipping one touch can
+            // at worst make eviction order approximate, never change metrics.
+            if ((unchecked(++t_measureCacheHits) & 31) == 0 &&
+                Monitor.TryEnter(_measureLock))
             {
-                TouchMeasureKey(cachedEntry.LruNode);
-                ApplyMetrics(formattedText, cachedEntry.Metrics);
-                return true;
+                try
+                {
+                    if (_measureCache.TryGetValue(measureKey, out var currentEntry) &&
+                        ReferenceEquals(currentEntry, cachedEntry) &&
+                        ReferenceEquals(cachedEntry.LruNode.List, _measureLruKeys))
+                    {
+                        TouchMeasureKey(cachedEntry.LruNode);
+                    }
+                }
+                finally
+                {
+                    Monitor.Exit(_measureLock);
+                }
             }
+
+            ApplyMetrics(formattedText, cachedEntry.Metrics);
+            return true;
         }
 
         var metrics = NormalizeTrailingWhitespaceMetrics(
@@ -363,7 +384,7 @@ public static class TextMeasurement
         while (_measureCache.Count > MaxMeasureCacheEntries && _measureLruKeys.First is { } oldest)
         {
             _measureLruKeys.RemoveFirst();
-            _measureCache.Remove(oldest.Value);
+            _measureCache.TryRemove(oldest.Value, out _);
         }
     }
 
@@ -710,7 +731,7 @@ public static class TextMeasurement
                 _failedFormatKeys[key] = now;
                 if (firstFailure)
                 {
-                    Console.Error.WriteLine(
+                    System.Diagnostics.Debug.WriteLine(
                         $"[TextMeasurement] CreateTextFormat failed for '{fontFamily}' " +
                         $"{fontSize.ToString("0.###", CultureInfo.InvariantCulture)}px " +
                         $"(weight={fontWeight}, style={fontStyle}); using approximate metrics: {ex.Message}");

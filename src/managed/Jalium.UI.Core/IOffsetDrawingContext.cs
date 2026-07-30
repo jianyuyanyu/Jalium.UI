@@ -52,7 +52,11 @@ public interface IClipDrawingContext
 public interface IClipBoundsDrawingContext
 {
     /// <summary>
-    /// Gets the current effective clip bounds, or null when unclipped.
+    /// Gets the current effective clip bounds in the drawing context's current
+    /// managed coordinate space, or null when unclipped. When a native
+    /// scale/rotate/skew transform is active, implementations map a surface-space
+    /// clip back through that transform so the result remains comparable with
+    /// <see cref="IOffsetDrawingContext.Offset"/> and the next child's local bounds.
     /// </summary>
     Rect? CurrentClipBounds { get; }
 }

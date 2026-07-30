@@ -1,4 +1,5 @@
 using System.Collections;
+using System.Runtime.ExceptionServices;
 using Jalium.UI;
 using Jalium.UI.Controls;
 using Jalium.UI.Data;
@@ -129,42 +130,82 @@ public class FrameworkElementLifecycleParityTests
     [Fact]
     public void VisualChildrenAddedToLoadedParent_ShareOneLoadedDispatcherOperation()
     {
-        var dispatcher = Jalium.UI.Threading.Dispatcher.CurrentDispatcher;
-        dispatcher.ProcessQueue();
-        var postedLoadedOperations = 0;
-        Jalium.UI.Threading.DispatcherHookEventHandler handler = (_, args) =>
+        RunOnFreshDispatcherThread(() =>
         {
-            if (args.Operation?.Priority ==
-                Jalium.UI.Threading.DispatcherPriority.Loaded)
+            var dispatcher = Jalium.UI.Threading.Dispatcher.CurrentDispatcher;
+            var postedLoadedOperations = 0;
+            Jalium.UI.Threading.DispatcherHookEventHandler handler = (_, args) =>
             {
-                postedLoadedOperations++;
+                if (args.Operation?.Priority ==
+                    Jalium.UI.Threading.DispatcherPriority.Loaded)
+                {
+                    postedLoadedOperations++;
+                }
+            };
+            dispatcher.Hooks.OperationPosted += handler;
+            try
+            {
+                var host = new VisualOnlyLoadedHost();
+                host.SetLoadedState(true);
+                var children = Enumerable.Range(0, 24)
+                    .Select(_ => new ProbeElement(default))
+                    .ToArray();
+
+                foreach (var child in children)
+                {
+                    host.Add(child);
+                }
+
+                Assert.Equal(1, postedLoadedOperations);
+                Assert.All(children, child => Assert.False(child.IsLoaded));
+
+                dispatcher.ProcessQueue();
+
+                Assert.All(children, child => Assert.True(child.IsLoaded));
             }
+            finally
+            {
+                dispatcher.Hooks.OperationPosted -= handler;
+            }
+        });
+    }
+
+    // xUnit reuses worker threads, whose dispatchers may retain work posted by
+    // unrelated tests. This contract needs a pristine queue to assert that the
+    // 24 children coalesce into exactly one Loaded-priority operation.
+    private static void RunOnFreshDispatcherThread(Action action)
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            Jalium.UI.Threading.Dispatcher? dispatcher = null;
+            try
+            {
+                dispatcher = Jalium.UI.Threading.Dispatcher.CurrentDispatcher;
+                action();
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+            }
+            finally
+            {
+                dispatcher?.DisposeCore();
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "FrameworkElementLifecycleParityTests.LoadedQueue",
         };
-        dispatcher.Hooks.OperationPosted += handler;
-        try
+
+        thread.Start();
+        Assert.True(
+            thread.Join(TimeSpan.FromSeconds(5)),
+            "Fresh dispatcher test thread did not exit within the timeout.");
+
+        if (failure is not null)
         {
-            var host = new VisualOnlyLoadedHost();
-            host.SetLoadedState(true);
-            var children = Enumerable.Range(0, 24)
-                .Select(_ => new ProbeElement(default))
-                .ToArray();
-
-            foreach (var child in children)
-            {
-                host.Add(child);
-            }
-
-            Assert.Equal(1, postedLoadedOperations);
-            Assert.All(children, child => Assert.False(child.IsLoaded));
-
-            dispatcher.ProcessQueue();
-
-            Assert.All(children, child => Assert.True(child.IsLoaded));
-        }
-        finally
-        {
-            dispatcher.Hooks.OperationPosted -= handler;
-            dispatcher.ProcessQueue();
+            ExceptionDispatchInfo.Capture(failure).Throw();
         }
     }
 

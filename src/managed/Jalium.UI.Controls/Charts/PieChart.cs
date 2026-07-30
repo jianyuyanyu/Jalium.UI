@@ -36,7 +36,7 @@ public class PieChart : ChartBase
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Content)]
     public static readonly DependencyProperty SeriesProperty =
         DependencyProperty.Register(nameof(Series), typeof(PieSeries), typeof(PieChart),
-            new PropertyMetadata(null, OnVisualPropertyChanged));
+            new PropertyMetadata(null, OnSeriesPropertyChanged));
 
     /// <summary>
     /// Identifies the InnerRadiusRatio dependency property.

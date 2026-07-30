@@ -9,58 +9,90 @@ namespace Jalium.UI.Controls;
 /// </summary>
 public class Grid : Panel
 {
+    private const double LayoutEpsilon = 0.001;
+
     private static readonly ConditionalWeakTable<UIElement, SharedSizeScopeState> s_sharedSizeScopes = new();
-    private static readonly Pen s_gridLinePen = new(new SolidColorBrush(Color.FromArgb(160, 96, 96, 96)), 1);
+    private static readonly Pen s_gridLinePen =
+        new(new SolidColorBrush(Color.FromArgb(160, 96, 96, 96)), 1);
+
     private SharedSizeScopeState? _sharedSizeState;
     private RowDefinitionCollection? _rowDefinitions;
     private ColumnDefinitionCollection? _columnDefinitions;
     private RowDefinition[]? _effectiveRowDefinitions;
     private ColumnDefinition[]? _effectiveColumnDefinitions;
+
+    // Reused track storage. The first eight fields deliberately retain their
+    // historical names because layout diagnostics inspect them.
     private double[]? _rowHeights;
     private double[]? _columnWidths;
     private double[]? _rowStarValues;
     private double[]? _columnStarValues;
     private double[]? _rowContent;
     private double[]? _columnContent;
+    private double[]? _rowSlots;
+    private double[]? _columnSlots;
+    private double[]? _rowOffsets;
+    private double[]? _columnOffsets;
+    private double[]? _localSharedRows;
+    private double[]? _localSharedColumns;
+    private double[]? _rowArrangeBase;
+    private double[]? _columnArrangeBase;
+
+    private CellLayout[]? _cells;
+    private int _cellCount;
+    private int _layoutVersion;
+    private int _solvedVersion = -1;
+    private int _solvedChildrenCount = -1;
+    private Size _solvedConstraint;
+    private bool _hasSolvedLayout;
+    private double _correctionMeasureWidth = double.NaN;
+    private double _correctionArrangeWidth = double.NaN;
 
     #region Attached Properties
 
     /// <summary>Identifies whether an element is the scope for shared row and column sizing.</summary>
     public static readonly DependencyProperty IsSharedSizeScopeProperty =
-        DependencyProperty.RegisterAttached("IsSharedSizeScope", typeof(bool), typeof(Grid),
+        DependencyProperty.RegisterAttached(
+            "IsSharedSizeScope",
+            typeof(bool),
+            typeof(Grid),
             new PropertyMetadata(false, OnIsSharedSizeScopeChanged));
 
-    /// <summary>
-    /// Identifies the Row attached property.
-    /// </summary>
+    /// <summary>Identifies the Row attached property.</summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
     public static readonly DependencyProperty RowProperty =
-        DependencyProperty.RegisterAttached("Row", typeof(int), typeof(Grid),
-            new PropertyMetadata(0));
+        DependencyProperty.RegisterAttached(
+            "Row",
+            typeof(int),
+            typeof(Grid),
+            new PropertyMetadata(0, OnCellPropertyChanged));
 
-    /// <summary>
-    /// Identifies the Column attached property.
-    /// </summary>
+    /// <summary>Identifies the Column attached property.</summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
     public static readonly DependencyProperty ColumnProperty =
-        DependencyProperty.RegisterAttached("Column", typeof(int), typeof(Grid),
-            new PropertyMetadata(0));
+        DependencyProperty.RegisterAttached(
+            "Column",
+            typeof(int),
+            typeof(Grid),
+            new PropertyMetadata(0, OnCellPropertyChanged));
 
-    /// <summary>
-    /// Identifies the RowSpan attached property.
-    /// </summary>
+    /// <summary>Identifies the RowSpan attached property.</summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
     public static readonly DependencyProperty RowSpanProperty =
-        DependencyProperty.RegisterAttached("RowSpan", typeof(int), typeof(Grid),
-            new PropertyMetadata(1));
+        DependencyProperty.RegisterAttached(
+            "RowSpan",
+            typeof(int),
+            typeof(Grid),
+            new PropertyMetadata(1, OnCellPropertyChanged));
 
-    /// <summary>
-    /// Identifies the ColumnSpan attached property.
-    /// </summary>
+    /// <summary>Identifies the ColumnSpan attached property.</summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
     public static readonly DependencyProperty ColumnSpanProperty =
-        DependencyProperty.RegisterAttached("ColumnSpan", typeof(int), typeof(Grid),
-            new PropertyMetadata(1));
+        DependencyProperty.RegisterAttached(
+            "ColumnSpan",
+            typeof(int),
+            typeof(Grid),
+            new PropertyMetadata(1, OnCellPropertyChanged));
 
     public static bool GetIsSharedSizeScope(UIElement element)
     {
@@ -74,113 +106,128 @@ public class Grid : Panel
         element.SetValue(IsSharedSizeScopeProperty, value);
     }
 
-    /// <summary>
-    /// Gets the value of the Row attached property for a given element.
-    /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
-    public static int GetRow(UIElement element) =>
-        (int)(element.GetValue(RowProperty) ?? 0);
+    public static int GetRow(UIElement element)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        return (int)(element.GetValue(RowProperty) ?? 0);
+    }
 
-    /// <summary>
-    /// Sets the value of the Row attached property for a given element.
-    /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
-    public static void SetRow(UIElement element, int value) =>
+    public static void SetRow(UIElement element, int value)
+    {
+        ArgumentNullException.ThrowIfNull(element);
         element.SetValue(RowProperty, value);
+    }
 
-    /// <summary>
-    /// Gets the value of the Column attached property for a given element.
-    /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
-    public static int GetColumn(UIElement element) =>
-        (int)(element.GetValue(ColumnProperty) ?? 0);
+    public static int GetColumn(UIElement element)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        return (int)(element.GetValue(ColumnProperty) ?? 0);
+    }
 
-    /// <summary>
-    /// Sets the value of the Column attached property for a given element.
-    /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
-    public static void SetColumn(UIElement element, int value) =>
+    public static void SetColumn(UIElement element, int value)
+    {
+        ArgumentNullException.ThrowIfNull(element);
         element.SetValue(ColumnProperty, value);
+    }
 
-    /// <summary>
-    /// Gets the value of the RowSpan attached property for a given element.
-    /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
-    public static int GetRowSpan(UIElement element) =>
-        (int)(element.GetValue(RowSpanProperty) ?? 1);
+    public static int GetRowSpan(UIElement element)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        return (int)(element.GetValue(RowSpanProperty) ?? 1);
+    }
 
-    /// <summary>
-    /// Sets the value of the RowSpan attached property for a given element.
-    /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
-    public static void SetRowSpan(UIElement element, int value) =>
+    public static void SetRowSpan(UIElement element, int value)
+    {
+        ArgumentNullException.ThrowIfNull(element);
         element.SetValue(RowSpanProperty, Math.Max(1, value));
+    }
 
-    /// <summary>
-    /// Gets the value of the ColumnSpan attached property for a given element.
-    /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
-    public static int GetColumnSpan(UIElement element) =>
-        (int)(element.GetValue(ColumnSpanProperty) ?? 1);
+    public static int GetColumnSpan(UIElement element)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        return (int)(element.GetValue(ColumnSpanProperty) ?? 1);
+    }
 
-    /// <summary>
-    /// Sets the value of the ColumnSpan attached property for a given element.
-    /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
-    public static void SetColumnSpan(UIElement element, int value) =>
+    public static void SetColumnSpan(UIElement element, int value)
+    {
+        ArgumentNullException.ThrowIfNull(element);
         element.SetValue(ColumnSpanProperty, Math.Max(1, value));
+    }
+
+    private static void OnCellPropertyChanged(
+        DependencyObject dependencyObject,
+        DependencyPropertyChangedEventArgs args)
+    {
+        if (dependencyObject is not UIElement child)
+            return;
+
+        var parent = child.VisualParent as Grid;
+        if (parent is null && child is FrameworkElement frameworkElement)
+            parent = frameworkElement.Parent as Grid;
+
+        parent?.InvalidateLayoutState(definitionsChanged: false);
+    }
 
     #endregion
 
     #region Dependency Properties
 
-    /// <summary>
-    /// Identifies the RowSpacing dependency property.
-    /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
     public static readonly DependencyProperty RowSpacingProperty =
-        DependencyProperty.Register(nameof(RowSpacing), typeof(double), typeof(Grid),
+        DependencyProperty.Register(
+            nameof(RowSpacing),
+            typeof(double),
+            typeof(Grid),
             new PropertyMetadata(0.0, OnLayoutPropertyChanged));
 
-    /// <summary>
-    /// Identifies the ColumnSpacing dependency property.
-    /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
     public static readonly DependencyProperty ColumnSpacingProperty =
-        DependencyProperty.Register(nameof(ColumnSpacing), typeof(double), typeof(Grid),
+        DependencyProperty.Register(
+            nameof(ColumnSpacing),
+            typeof(double),
+            typeof(Grid),
             new PropertyMetadata(0.0, OnLayoutPropertyChanged));
 
-    /// <summary>Identifies the debug grid-line visibility property.</summary>
     public static readonly DependencyProperty ShowGridLinesProperty =
-        DependencyProperty.Register(nameof(ShowGridLines), typeof(bool), typeof(Grid),
+        DependencyProperty.Register(
+            nameof(ShowGridLines),
+            typeof(bool),
+            typeof(Grid),
             new PropertyMetadata(false, OnShowGridLinesChanged));
 
-    private static void OnLayoutPropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    private static void OnLayoutPropertyChanged(
+        DependencyObject dependencyObject,
+        DependencyPropertyChangedEventArgs args)
     {
-        if (d is Grid grid)
-        {
-            grid.InvalidateMeasure();
-        }
+        if (dependencyObject is Grid grid)
+            grid.InvalidateLayoutState(definitionsChanged: false);
     }
 
-    private static void OnShowGridLinesChanged(DependencyObject d, DependencyPropertyChangedEventArgs e) =>
-        ((Grid)d).InvalidateVisual();
+    private static void OnShowGridLinesChanged(
+        DependencyObject dependencyObject,
+        DependencyPropertyChangedEventArgs args) =>
+        ((Grid)dependencyObject).InvalidateVisual();
 
-    private static void OnIsSharedSizeScopeChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    private static void OnIsSharedSizeScopeChanged(
+        DependencyObject dependencyObject,
+        DependencyPropertyChangedEventArgs args)
     {
-        if (d is UIElement element)
-        {
+        if (dependencyObject is UIElement element)
             InvalidateSharedSizeDescendants(element);
-        }
     }
 
     #endregion
 
     #region Properties
 
-    /// <summary>
-    /// Gets or sets the collection of row definitions.
-    /// </summary>
     public RowDefinitionCollection RowDefinitions
     {
         get => _rowDefinitions ??= new RowDefinitionCollection(this);
@@ -191,7 +238,9 @@ public class Grid : Panel
                 if (ReferenceEquals(value.Owner, this))
                     return;
 
-                throw new ArgumentException("The collection already belongs to another Grid.", nameof(value));
+                throw new ArgumentException(
+                    "The collection already belongs to another Grid.",
+                    nameof(value));
             }
 
             if (_rowDefinitions is not null)
@@ -208,9 +257,6 @@ public class Grid : Panel
         }
     }
 
-    /// <summary>
-    /// Gets or sets the collection of column definitions.
-    /// </summary>
     public ColumnDefinitionCollection ColumnDefinitions
     {
         get => _columnDefinitions ??= new ColumnDefinitionCollection(this);
@@ -221,7 +267,9 @@ public class Grid : Panel
                 if (ReferenceEquals(value.Owner, this))
                     return;
 
-                throw new ArgumentException("The collection already belongs to another Grid.", nameof(value));
+                throw new ArgumentException(
+                    "The collection already belongs to another Grid.",
+                    nameof(value));
             }
 
             if (_columnDefinitions is not null)
@@ -240,7 +288,6 @@ public class Grid : Panel
 
     /// <summary>
     /// Gets or sets the uniform distance in device-independent pixels between adjacent rows.
-    /// Spacing is inserted between rows only and never leads, trails, or inflates spanned cells.
     /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Layout)]
     public double RowSpacing
@@ -259,47 +306,33 @@ public class Grid : Panel
         set => SetValue(ColumnSpacingProperty, value);
     }
 
-    /// <summary>Gets or sets whether debugging lines are drawn between grid cells.</summary>
     public bool ShowGridLines
     {
         get => (bool)(GetValue(ShowGridLinesProperty) ?? false);
         set => SetValue(ShowGridLinesProperty, value);
     }
 
-    public bool ShouldSerializeColumnDefinitions() => _columnDefinitions is { Count: > 0 };
+    public bool ShouldSerializeColumnDefinitions() =>
+        _columnDefinitions is { Count: > 0 };
 
-    public bool ShouldSerializeRowDefinitions() => _rowDefinitions is { Count: > 0 };
+    public bool ShouldSerializeRowDefinitions() =>
+        _rowDefinitions is { Count: > 0 };
 
-    private static double SanitizeSpacing(double value) =>
-        (double.IsNaN(value) || double.IsInfinity(value) || value < 0) ? 0 : value;
+    internal void OnDefinitionChanged() =>
+        InvalidateLayoutState(definitionsChanged: true);
 
-    private static double GetTrackSpanSize(
-        double[] trackSizes,
-        int start,
-        int span,
-        double spacing)
+    private void InvalidateLayoutState(bool definitionsChanged)
     {
-        double size = Math.Max(0, span - 1) * spacing;
-        for (var index = start; index < start + span; index++)
+        if (definitionsChanged)
         {
-            size += trackSizes[index];
+            _effectiveRowDefinitions = null;
+            _effectiveColumnDefinitions = null;
+            _sharedSizeState?.Remove(this);
+            _sharedSizeState = null;
         }
 
-        return size;
-    }
-
-    private static bool IsSharedStar(RowDefinition definition) =>
-        definition.Height.IsStar && definition.SharedSizeGroup != null;
-
-    private static bool IsSharedStar(ColumnDefinition definition) =>
-        definition.Width.IsStar && definition.SharedSizeGroup != null;
-
-    internal void OnDefinitionChanged()
-    {
-        _effectiveRowDefinitions = null;
-        _effectiveColumnDefinitions = null;
-        _sharedSizeState?.Remove(this);
-        _sharedSizeState = null;
+        _layoutVersion++;
+        _hasSolvedLayout = false;
         InvalidateMeasure();
         InvalidateArrange();
         InvalidateVisual();
@@ -309,595 +342,1340 @@ public class Grid : Panel
 
     #region Layout
 
-    /// <inheritdoc />
-    protected override Size MeasureOverride(Size availableSize)
-    {
-        // 让所有 Row/ColumnDefinition 知道自己的 owner Grid，这样 Width/Height 等
-        // 运行时被改变时（例如 OpenTabsCol.Width = new GridLength(160)）能反向通知
-        // Grid 重新 layout — 否则 framework 完全不知道 column/row 尺寸变了。
-        var explicitRows = _rowDefinitions;
-        var explicitColumns = _columnDefinitions;
-        var explicitRowCount = explicitRows?.Count ?? 0;
-        var explicitColumnCount = explicitColumns?.Count ?? 0;
-        for (int i = 0; i < explicitRowCount; i++) explicitRows![i].OwnerGrid = this;
-        for (int i = 0; i < explicitColumnCount; i++) explicitColumns![i].OwnerGrid = this;
+    /// <summary>
+    /// Solves both axes as one transaction. Width is resolved before content
+    /// height so wrapping controls always see their committed cell width.
+    /// </summary>
+    protected override Size MeasureOverride(Size availableSize) =>
+        SolveLayout(NormalizeConstraint(availableSize), calculateDesiredSize: true);
 
-        // Ensure at least one row and column
-        var rowCount = Math.Max(1, explicitRowCount);
-        var columnCount = Math.Max(1, explicitColumnCount);
-
-        var rowSpacing = SanitizeSpacing(RowSpacing);
-        var columnSpacing = SanitizeSpacing(ColumnSpacing);
-        var totalRowSpacing = Math.Max(0, rowCount - 1) * rowSpacing;
-        var totalColumnSpacing = Math.Max(0, columnCount - 1) * columnSpacing;
-
-        // Initialize row and column sizes
-        var rowHeights = GetClearedBuffer(ref _rowHeights, rowCount);
-        var columnWidths = GetClearedBuffer(ref _columnWidths, columnCount);
-        var rowStarValues = GetClearedBuffer(ref _rowStarValues, rowCount);
-        var columnStarValues = GetClearedBuffer(ref _columnStarValues, columnCount);
-
-        // Content (max child desired) per track. A star track FILLS its proportional allocation
-        // when arranged, but at measure time it must report only the size its content needs — same
-        // as the infinite-constraint "treat star as Auto" path below. Reporting the full allocation
-        // as the grid's DesiredSize makes the grid demand all available space, which balloons it
-        // inside content-sizing parents (WrapPanel / horizontal StackPanel / auto-sized
-        // Border|Button). These arrays capture the content size so the final return can use it for
-        // star tracks measured under a finite constraint; ArrangeOverride still fills from finalSize.
-        var rowContent = GetClearedBuffer(ref _rowContent, rowCount);
-        var columnContent = GetClearedBuffer(ref _columnContent, columnCount);
-
-        // Get definitions (use default if not defined)
-        var rowDefs = GetEffectiveRowDefinitions(rowCount);
-        var columnDefs = GetEffectiveColumnDefinitions(columnCount);
-
-        // First pass: Calculate auto and fixed sizes
-        for (int i = 0; i < rowCount; i++)
-        {
-            var def = rowDefs[i];
-            if (def.Height.IsAbsolute)
-            {
-                rowHeights[i] = Math.Clamp(def.Height.Value, def.MinHeight, def.MaxHeight);
-            }
-            else if (def.Height.IsStar && string.IsNullOrEmpty(def.SharedSizeGroup))
-            {
-                rowStarValues[i] = def.Height.Value;
-            }
-        }
-
-        for (int i = 0; i < columnCount; i++)
-        {
-            var def = columnDefs[i];
-            if (def.Width.IsAbsolute)
-            {
-                columnWidths[i] = Math.Clamp(def.Width.Value, def.MinWidth, def.MaxWidth);
-            }
-            else if (def.Width.IsStar && string.IsNullOrEmpty(def.SharedSizeGroup))
-            {
-                columnStarValues[i] = def.Width.Value;
-            }
-        }
-
-        // Measure children in auto rows/columns
-        foreach (UIElement child in Children)
-        {
-            if (child is not FrameworkElement fe) continue;
-
-            var row = Math.Min(GetRow(child), rowCount - 1);
-            var column = Math.Min(GetColumn(child), columnCount - 1);
-            var rowSpan = Math.Min(GetRowSpan(child), rowCount - row);
-            var columnSpan = Math.Min(GetColumnSpan(child), columnCount - column);
-
-            // Check if child is in any auto row/column
-            bool inAutoRow = false;
-            bool inAutoColumn = false;
-            for (int i = row; i < row + rowSpan; i++)
-            {
-                if (rowDefs[i].Height.IsAuto || IsSharedStar(rowDefs[i])) inAutoRow = true;
-            }
-            for (int i = column; i < column + columnSpan; i++)
-            {
-                if (columnDefs[i].Width.IsAuto || IsSharedStar(columnDefs[i])) inAutoColumn = true;
-            }
-
-            if (inAutoRow || inAutoColumn)
-            {
-                // Measure with available space
-                fe.Measure(new Size(
-                    inAutoColumn ? double.PositiveInfinity : availableSize.Width,
-                    inAutoRow ? double.PositiveInfinity : availableSize.Height));
-
-                // Update auto sizes. For single-cell items the desired size feeds the auto row/col directly.
-                // For spanned auto items the internal spacing belongs to the child, so subtract it out
-                // before distributing the remaining desired size across the spanned auto tracks.
-                if (inAutoRow && rowSpan == 1)
-                {
-                    var def = rowDefs[row];
-                    if (def.Height.IsAuto || IsSharedStar(def))
-                    {
-                        rowHeights[row] = Math.Max(rowHeights[row],
-                            Math.Clamp(fe.DesiredSize.Height, def.MinHeight, def.MaxHeight));
-                    }
-                }
-
-                if (inAutoColumn && columnSpan == 1)
-                {
-                    var def = columnDefs[column];
-                    if (def.Width.IsAuto || IsSharedStar(def))
-                    {
-                        columnWidths[column] = Math.Max(columnWidths[column],
-                            Math.Clamp(fe.DesiredSize.Width, def.MinWidth, def.MaxWidth));
-                    }
-                }
-            }
-        }
-
-        // Calculate remaining space for star sizing (spacing lives between rows/columns, not inside tracks)
-        double fixedRowHeight = rowHeights.Sum();
-        double fixedColumnWidth = columnWidths.Sum();
-        double totalRowStars = rowStarValues.Sum();
-        double totalColumnStars = columnStarValues.Sum();
-
-        double availableRowSpace = double.IsPositiveInfinity(availableSize.Height)
-            ? double.PositiveInfinity
-            : Math.Max(0, availableSize.Height - fixedRowHeight - totalRowSpacing);
-        double availableColumnSpace = double.IsPositiveInfinity(availableSize.Width)
-            ? double.PositiveInfinity
-            : Math.Max(0, availableSize.Width - fixedColumnWidth - totalColumnSpacing);
-
-        // Resolve finite star columns before measuring star-as-auto rows. Row sizing
-        // depends on the child's final wrapping width; passing the whole Grid width
-        // here makes a child in the second column measure once across every column
-        // and then again at its real cell width.
-        if (totalColumnStars > 0 &&
-            !double.IsPositiveInfinity(availableColumnSpace))
-        {
-            double starUnitWidth = availableColumnSpace / totalColumnStars;
-            for (int i = 0; i < columnCount; i++)
-            {
-                if (columnStarValues[i] > 0)
-                {
-                    var def = columnDefs[i];
-                    columnWidths[i] = Math.Clamp(
-                        starUnitWidth * columnStarValues[i],
-                        def.MinWidth,
-                        def.MaxWidth);
-                }
-            }
-        }
-
-        // Distribute star space
-        // When available size is infinite (e.g. inside ScrollViewer), treat star as Auto (WPF behavior)
-        if (totalRowStars > 0)
-        {
-            if (double.IsPositiveInfinity(availableRowSpace))
-            {
-                // Treat star rows as Auto: measure children and use their desired height
-                foreach (UIElement child in Children)
-                {
-                    if (child is not FrameworkElement fe) continue;
-                    var row = Math.Min(GetRow(child), rowCount - 1);
-                    var rowSpan = Math.Min(GetRowSpan(child), rowCount - row);
-                    var column = Math.Min(GetColumn(child), columnCount - 1);
-                    var columnSpan = Math.Min(
-                        GetColumnSpan(child),
-                        columnCount - column);
-                    bool inStarRow = false;
-                    for (int i = row; i < row + rowSpan; i++)
-                    {
-                        if (rowStarValues[i] > 0) { inStarRow = true; break; }
-                    }
-                    if (inStarRow)
-                    {
-                        var measureWidth =
-                            double.IsPositiveInfinity(availableColumnSpace)
-                                ? double.PositiveInfinity
-                                : GetTrackSpanSize(
-                                    columnWidths,
-                                    column,
-                                    columnSpan,
-                                    columnSpacing);
-                        fe.Measure(new Size(
-                            measureWidth,
-                            double.PositiveInfinity));
-                        if (rowSpan == 1)
-                        {
-                            var def = rowDefs[row];
-                            rowHeights[row] = Math.Max(rowHeights[row],
-                                Math.Clamp(fe.DesiredSize.Height, def.MinHeight, def.MaxHeight));
-                        }
-                    }
-                }
-            }
-            else
-            {
-                double starUnitHeight = availableRowSpace / totalRowStars;
-                for (int i = 0; i < rowCount; i++)
-                {
-                    if (rowStarValues[i] > 0)
-                    {
-                        var def = rowDefs[i];
-                        rowHeights[i] = Math.Clamp(starUnitHeight * rowStarValues[i], def.MinHeight, def.MaxHeight);
-                    }
-                }
-            }
-        }
-
-        if (totalColumnStars > 0)
-        {
-            if (double.IsPositiveInfinity(availableColumnSpace))
-            {
-                // Treat star columns as Auto: measure children and use their desired width
-                foreach (UIElement child in Children)
-                {
-                    if (child is not FrameworkElement fe) continue;
-                    var column = Math.Min(GetColumn(child), columnCount - 1);
-                    var columnSpan = Math.Min(GetColumnSpan(child), columnCount - column);
-                    var row = Math.Min(GetRow(child), rowCount - 1);
-                    var rowSpan = Math.Min(GetRowSpan(child), rowCount - row);
-                    bool inStarColumn = false;
-                    for (int i = column; i < column + columnSpan; i++)
-                    {
-                        if (columnStarValues[i] > 0) { inStarColumn = true; break; }
-                    }
-                    if (inStarColumn)
-                    {
-                        var measureHeight =
-                            double.IsPositiveInfinity(availableRowSpace)
-                                ? double.PositiveInfinity
-                                : GetTrackSpanSize(
-                                    rowHeights,
-                                    row,
-                                    rowSpan,
-                                    rowSpacing);
-                        fe.Measure(new Size(
-                            double.PositiveInfinity,
-                            measureHeight));
-                        if (columnSpan == 1)
-                        {
-                            var def = columnDefs[column];
-                            columnWidths[column] = Math.Max(columnWidths[column],
-                                Math.Clamp(fe.DesiredSize.Width, def.MinWidth, def.MaxWidth));
-                        }
-                    }
-                }
-            }
-        }
-
-        var treatStarRowsAsAuto = totalRowStars > 0 && double.IsPositiveInfinity(availableRowSpace);
-        var treatStarColumnsAsAuto = totalColumnStars > 0 && double.IsPositiveInfinity(availableColumnSpace);
-
-        // Measure all children with their final available sizes.
-        // A spanned cell owns the spacing between the tracks it crosses, so the available
-        // size includes (span - 1) gap(s) along each axis.
-        foreach (UIElement child in Children)
-        {
-            if (child is not FrameworkElement fe) continue;
-
-            var row = Math.Min(GetRow(child), rowCount - 1);
-            var column = Math.Min(GetColumn(child), columnCount - 1);
-            var rowSpan = Math.Min(GetRowSpan(child), rowCount - row);
-            var columnSpan = Math.Min(GetColumnSpan(child), columnCount - column);
-
-            double cellWidth = 0;
-            double cellHeight = 0;
-
-            for (int i = column; i < column + columnSpan; i++)
-                cellWidth += columnWidths[i];
-            for (int i = row; i < row + rowSpan; i++)
-                cellHeight += rowHeights[i];
-
-            cellWidth += Math.Max(0, columnSpan - 1) * columnSpacing;
-            cellHeight += Math.Max(0, rowSpan - 1) * rowSpacing;
-
-            var needsUnconstrainedHeight = false;
-            for (var index = row; index < row + rowSpan; index++)
-            {
-                if (rowDefs[index].Height.IsAuto || IsSharedStar(rowDefs[index]) ||
-                    (treatStarRowsAsAuto && rowStarValues[index] > 0))
-                {
-                    needsUnconstrainedHeight = true;
-                    break;
-                }
-            }
-
-            // Once columns have their final constrained widths, auto-height content must be
-            // measured without the provisional row height. Wrapped text otherwise remains
-            // clipped to the one-line height discovered during the initial infinite-width pass.
-            fe.Measure(new Size(
-                cellWidth,
-                needsUnconstrainedHeight ? double.PositiveInfinity : cellHeight));
-
-            // Capture content size for single-span children so star tracks can report a
-            // content-based DesiredSize (see the rowContent/columnContent declaration). Spanned
-            // children are skipped, consistent with the auto-track reconciliation below.
-            if (rowSpan == 1)
-                rowContent[row] = Math.Max(rowContent[row], fe.DesiredSize.Height);
-            if (columnSpan == 1)
-                columnContent[column] = Math.Max(columnContent[column], fe.DesiredSize.Width);
-
-            // Reconcile auto (and star-as-auto) definitions with final constrained measure.
-            // This is important for wrapped text: final column width can increase required row height.
-            if (rowSpan == 1)
-            {
-                var rowDef = rowDefs[row];
-                if (rowDef.Height.IsAuto || IsSharedStar(rowDef) ||
-                    (treatStarRowsAsAuto && rowStarValues[row] > 0))
-                {
-                    rowHeights[row] = Math.Max(
-                        rowHeights[row],
-                        Math.Clamp(fe.DesiredSize.Height, rowDef.MinHeight, rowDef.MaxHeight));
-                }
-            }
-
-            if (columnSpan == 1)
-            {
-                var columnDef = columnDefs[column];
-                if (columnDef.Width.IsAuto || IsSharedStar(columnDef) ||
-                    (treatStarColumnsAsAuto && columnStarValues[column] > 0))
-                {
-                    columnWidths[column] = Math.Max(
-                        columnWidths[column],
-                        Math.Clamp(fe.DesiredSize.Width, columnDef.MinWidth, columnDef.MaxWidth));
-                }
-            }
-        }
-
-        ApplySharedSizes(rowDefs, columnDefs, rowHeights, columnWidths);
-
-        // Store auto sizes (and star-as-auto sizes) in definitions so ArrangeOverride can read them
-        for (int i = 0; i < rowCount; i++)
-        {
-            if (rowDefs[i].Height.IsAuto || (treatStarRowsAsAuto && rowStarValues[i] > 0) ||
-                !string.IsNullOrWhiteSpace(rowDefs[i].SharedSizeGroup))
-                rowDefs[i].ActualHeight = rowHeights[i];
-        }
-        for (int i = 0; i < columnCount; i++)
-        {
-            if (columnDefs[i].Width.IsAuto || (treatStarColumnsAsAuto && columnStarValues[i] > 0) ||
-                !string.IsNullOrWhiteSpace(columnDefs[i].SharedSizeGroup))
-                columnDefs[i].ActualWidth = columnWidths[i];
-        }
-
-        // Return the grid's DESIRED size. Absolute/Auto tracks (and star tracks treated as Auto
-        // under an infinite constraint) already hold their fixed/content size in row/columnWidths.
-        // A star track measured under a FINITE constraint, however, holds its full proportional
-        // ALLOCATION — returning that would make the grid demand all available space and balloon
-        // inside content-sizing parents. For those tracks report the content size instead; the
-        // allocation is still applied at arrange (ArrangeOverride), so stretch-to-fill is unaffected.
-        // (Spacing contributes to the grid's outer bounds regardless.)
-        double desiredWidth = totalColumnSpacing;
-        for (int i = 0; i < columnCount; i++)
-        {
-            var def = columnDefs[i];
-            desiredWidth += (def.Width.IsStar && !treatStarColumnsAsAuto && string.IsNullOrWhiteSpace(def.SharedSizeGroup))
-                ? Math.Clamp(columnContent[i], def.MinWidth, def.MaxWidth)
-                : columnWidths[i];
-        }
-
-        double desiredHeight = totalRowSpacing;
-        for (int i = 0; i < rowCount; i++)
-        {
-            var def = rowDefs[i];
-            desiredHeight += (def.Height.IsStar && !treatStarRowsAsAuto && string.IsNullOrWhiteSpace(def.SharedSizeGroup))
-                ? Math.Clamp(rowContent[i], def.MinHeight, def.MaxHeight)
-                : rowHeights[i];
-        }
-
-        return new Size(desiredWidth, desiredHeight);
-    }
-
-    /// <inheritdoc />
+    /// <summary>
+    /// Reuses the intrinsic measurements produced by MeasureOverride and only
+    /// redistributes tracks for the committed arrange size. Arrange must never
+    /// measure the subtree: virtualizing panels and ScrollViewer publish their
+    /// extent during measure, and overwriting it halfway through arrange corrupts
+    /// the viewport and can clamp an active scroll offset back to zero.
+    /// </summary>
     protected override Size ArrangeOverride(Size finalSize)
     {
-        var rowCount = Math.Max(1, _rowDefinitions?.Count ?? 0);
-        var columnCount = Math.Max(1, _columnDefinitions?.Count ?? 0);
+        finalSize = NormalizeConstraint(finalSize);
 
+        var structureChanged =
+            !_hasSolvedLayout ||
+            _solvedVersion != _layoutVersion ||
+            _solvedChildrenCount != Children.Count;
+        var widthChanged =
+            !AreClose(_solvedConstraint.Width, finalSize.Width);
+        var heightChanged =
+            !AreClose(_solvedConstraint.Height, finalSize.Height);
+
+        if (structureChanged)
+        {
+            // A derived Grid can change definitions or cell coordinates while
+            // entering ArrangeOverride. Keep the old transaction untouched and
+            // let LayoutManager run the queued measure before rendering.
+            InvalidateMeasure();
+            return finalSize;
+        }
+
+        var measuredGridWidth = _solvedConstraint.Width;
+        var requestWidthCorrection =
+            widthChanged &&
+            (!AreClose(
+                 measuredGridWidth,
+                 _correctionMeasureWidth) ||
+             !AreClose(
+                 finalSize.Width,
+                 _correctionArrangeWidth));
+
+        if (widthChanged || heightChanged)
+        {
+            ResolveArrangeTracks(finalSize);
+        }
+
+        var rowSlots = _rowSlots!;
+        var columnSlots = _columnSlots!;
+        var rowOffsets = _rowOffsets!;
+        var columnOffsets = _columnOffsets!;
         var rowSpacing = SanitizeSpacing(RowSpacing);
         var columnSpacing = SanitizeSpacing(ColumnSpacing);
-        var totalRowSpacing = Math.Max(0, rowCount - 1) * rowSpacing;
-        var totalColumnSpacing = Math.Max(0, columnCount - 1) * columnSpacing;
+        var queuedWidthCorrection = false;
 
-        // Get definitions
-        var rowDefs = GetEffectiveRowDefinitions(rowCount);
-        var columnDefs = GetEffectiveColumnDefinitions(columnCount);
-
-        // Calculate final row heights and column widths
-        var rowHeights = GetClearedBuffer(ref _rowHeights, rowCount);
-        var columnWidths = GetClearedBuffer(ref _columnWidths, columnCount);
-        var rowStarValues = GetClearedBuffer(ref _rowStarValues, rowCount);
-        var columnStarValues = GetClearedBuffer(ref _columnStarValues, columnCount);
-
-        double fixedRowHeight = 0;
-        double fixedColumnWidth = 0;
-        double totalRowStars = 0;
-        double totalColumnStars = 0;
-
-        // First pass: fixed and auto sizes
-        for (int i = 0; i < rowCount; i++)
+        for (var index = 0; index < _cellCount; index++)
         {
-            var def = rowDefs[i];
-            if (!string.IsNullOrWhiteSpace(def.SharedSizeGroup))
+            ref readonly var cell = ref _cells![index];
+            var rect = new Rect(
+                columnOffsets[cell.Column],
+                rowOffsets[cell.Row],
+                GetTrackSpanSize(
+                    columnSlots,
+                    cell.Column,
+                    cell.ColumnSpan,
+                    columnSpacing),
+                GetTrackSpanSize(
+                    rowSlots,
+                    cell.Row,
+                    cell.RowSpan,
+                    rowSpacing));
+
+            cell.Element.Arrange(rect);
+
+            if (requestWidthCorrection &&
+                cell.Element.Visibility != Visibility.Collapsed &&
+                !AreClose(cell.MeasuredWidth, rect.Width))
             {
-                rowHeights[i] = Math.Max(def.ActualHeight, def.MinHeight);
-                fixedRowHeight += rowHeights[i];
-            }
-            else if (def.Height.IsAbsolute)
-            {
-                rowHeights[i] = Math.Clamp(def.Height.Value, def.MinHeight, def.MaxHeight);
-                fixedRowHeight += rowHeights[i];
-            }
-            else if (def.Height.IsAuto)
-            {
-                // Use the measured auto size
-                rowHeights[i] = Math.Clamp(def.ActualHeight, def.MinHeight, def.MaxHeight);
-                fixedRowHeight += rowHeights[i];
-            }
-            else if (def.Height.IsStar)
-            {
-                rowStarValues[i] = def.Height.Value;
-                totalRowStars += def.Height.Value;
+                queuedWidthCorrection = true;
             }
         }
 
-        for (int i = 0; i < columnCount; i++)
+        if (queuedWidthCorrection)
         {
-            var def = columnDefs[i];
-            if (!string.IsNullOrWhiteSpace(def.SharedSizeGroup))
-            {
-                columnWidths[i] = Math.Max(def.ActualWidth, def.MinWidth);
-                fixedColumnWidth += columnWidths[i];
-            }
-            else if (def.Width.IsAbsolute)
-            {
-                columnWidths[i] = Math.Clamp(def.Width.Value, def.MinWidth, def.MaxWidth);
-                fixedColumnWidth += columnWidths[i];
-            }
-            else if (def.Width.IsAuto)
-            {
-                columnWidths[i] = Math.Clamp(def.ActualWidth, def.MinWidth, def.MaxWidth);
-                fixedColumnWidth += columnWidths[i];
-            }
-            else if (def.Width.IsStar)
-            {
-                columnStarValues[i] = def.Width.Value;
-                totalColumnStars += def.Width.Value;
-            }
-        }
+            _correctionMeasureWidth = measuredGridWidth;
+            _correctionArrangeWidth = finalSize.Width;
 
-        // Distribute star space (reserve inter-track spacing before handing remainder to stars)
-        double availableRowSpace = Math.Max(0, finalSize.Height - fixedRowHeight - totalRowSpacing);
-        double availableColumnSpace = Math.Max(0, finalSize.Width - fixedColumnWidth - totalColumnSpacing);
-
-        if (totalRowStars > 0)
-        {
-            if (double.IsPositiveInfinity(availableRowSpace))
-            {
-                // Use measured sizes from MeasureOverride (star treated as Auto)
-                for (int i = 0; i < rowCount; i++)
-                {
-                    if (rowStarValues[i] > 0)
-                        rowHeights[i] = rowDefs[i].ActualHeight;
-                }
-            }
-            else
-            {
-                double starUnitHeight = availableRowSpace / totalRowStars;
-                double allocatedStarHeight = 0;
-                int lastStarRow = -1;
-                for (int i = 0; i < rowCount; i++)
-                {
-                    if (rowStarValues[i] > 0)
-                    {
-                        var def = rowDefs[i];
-                        rowHeights[i] = Math.Clamp(starUnitHeight * rowStarValues[i], def.MinHeight, def.MaxHeight);
-                        allocatedStarHeight += rowHeights[i];
-                        lastStarRow = i;
-                    }
-                }
-                // Give remaining pixels to last star row to avoid floating-point gaps
-                if (lastStarRow >= 0)
-                {
-                    double remainder = availableRowSpace - allocatedStarHeight;
-                    if (Math.Abs(remainder) > 0.001)
-                    {
-                        var def = rowDefs[lastStarRow];
-                        rowHeights[lastStarRow] = Math.Clamp(rowHeights[lastStarRow] + remainder, def.MinHeight, def.MaxHeight);
-                    }
-                }
-            }
-        }
-
-        if (totalColumnStars > 0)
-        {
-            if (double.IsPositiveInfinity(availableColumnSpace))
-            {
-                // Use measured sizes from MeasureOverride (star treated as Auto)
-                for (int i = 0; i < columnCount; i++)
-                {
-                    if (columnStarValues[i] > 0)
-                        columnWidths[i] = columnDefs[i].ActualWidth;
-                }
-            }
-            else
-            {
-                double starUnitWidth = availableColumnSpace / totalColumnStars;
-                double allocatedStarWidth = 0;
-                int lastStarColumn = -1;
-                for (int i = 0; i < columnCount; i++)
-                {
-                    if (columnStarValues[i] > 0)
-                    {
-                        var def = columnDefs[i];
-                        columnWidths[i] = Math.Clamp(starUnitWidth * columnStarValues[i], def.MinWidth, def.MaxWidth);
-                        allocatedStarWidth += columnWidths[i];
-                        lastStarColumn = i;
-                    }
-                }
-                // Give remaining pixels to last star column to avoid floating-point gaps
-                if (lastStarColumn >= 0)
-                {
-                    double remainder = availableColumnSpace - allocatedStarWidth;
-                    if (Math.Abs(remainder) > 0.001)
-                    {
-                        var def = columnDefs[lastStarColumn];
-                        columnWidths[lastStarColumn] = Math.Clamp(columnWidths[lastStarColumn] + remainder, def.MinWidth, def.MaxWidth);
-                    }
-                }
-            }
-        }
-
-        // Calculate track starts. rowStarts[i] is the Y of the i-th row's top edge including
-        // the cumulative spacing between rows 0..i-1. Same for columns. A spanned cell uses
-        // rightEdge(lastCol) - leftEdge(firstCol) so it naturally includes the internal gaps.
-        var rowStarts = new double[rowCount];
-        var columnStarts = new double[columnCount];
-
-        double rowCursor = 0;
-        for (int i = 0; i < rowCount; i++)
-        {
-            rowStarts[i] = rowCursor;
-            rowDefs[i].ActualHeight = rowHeights[i];
-            rowDefs[i].Offset = rowCursor;
-            rowCursor += rowHeights[i];
-            if (i < rowCount - 1) rowCursor += rowSpacing;
-        }
-
-        double columnCursor = 0;
-        for (int i = 0; i < columnCount; i++)
-        {
-            columnStarts[i] = columnCursor;
-            columnDefs[i].ActualWidth = columnWidths[i];
-            columnDefs[i].Offset = columnCursor;
-            columnCursor += columnWidths[i];
-            if (i < columnCount - 1) columnCursor += columnSpacing;
-        }
-
-        // Arrange children
-        foreach (UIElement child in Children)
-        {
-            if (child is not FrameworkElement fe) continue;
-
-            var row = Math.Clamp(GetRow(child), 0, rowCount - 1);
-            var column = Math.Clamp(GetColumn(child), 0, columnCount - 1);
-            var rowSpan = Math.Clamp(GetRowSpan(child), 1, rowCount - row);
-            var columnSpan = Math.Clamp(GetColumnSpan(child), 1, columnCount - column);
-
-            var lastRow = row + rowSpan - 1;
-            var lastColumn = column + columnSpan - 1;
-
-            double x = columnStarts[column];
-            double y = rowStarts[row];
-            double width = columnStarts[lastColumn] + columnWidths[lastColumn] - x;
-            double height = rowStarts[lastRow] + rowHeights[lastRow] - y;
-
-            var cellRect = new Rect(x, y, width, height);
-            fe.Arrange(cellRect);
-            // Note: Do NOT call SetVisualBounds here - ArrangeCore already handles margin
+            // Invalidate this Grid, rather than only the resized child. That
+            // guarantees LayoutManager propagates the correction through the
+            // ancestors which supply the new available width. The next normal
+            // measure transaction then reaches the entire cell subtree with
+            // coherent constraints before rendering. Never call Measure here:
+            // doing so would overwrite ScrollViewer/IScrollInfo extent state
+            // halfway through arrange.
+            InvalidateMeasure();
         }
 
         return finalSize;
     }
+
+    private void ResolveArrangeTracks(Size finalSize)
+    {
+        var rowCount = Math.Max(1, _rowDefinitions?.Count ?? 0);
+        var columnCount =
+            Math.Max(1, _columnDefinitions?.Count ?? 0);
+        var rows = GetEffectiveRowDefinitions(rowCount);
+        var columns =
+            GetEffectiveColumnDefinitions(columnCount);
+        var rowStars =
+            GetClearedBuffer(ref _rowStarValues, rowCount);
+        var rowArrangeBase =
+            GetBuffer(ref _rowArrangeBase, rowCount);
+        var columnStars =
+            GetClearedBuffer(ref _columnStarValues, columnCount);
+        var columnArrangeBase =
+            GetBuffer(ref _columnArrangeBase, columnCount);
+        var rowSlots = GetBuffer(ref _rowSlots, rowCount);
+        var rowOffsets = GetBuffer(ref _rowOffsets, rowCount);
+        var columnSlots =
+            GetBuffer(ref _columnSlots, columnCount);
+        var columnOffsets =
+            GetBuffer(ref _columnOffsets, columnCount);
+
+        for (var index = 0; index < rowCount; index++)
+        {
+            if (IsFlexible(rows[index], unbounded: false))
+            {
+                // Unbounded measure treated this star row as content-sized.
+                // Finite arrange must start again at its minimum, including
+                // the valid 0* case, before redistributing viewport height.
+                rowArrangeBase[index] = GetMin(rows[index]);
+                rowStars[index] =
+                    GetStarWeight(rows[index].Height);
+            }
+            else
+            {
+                rowArrangeBase[index] = _rowHeights![index];
+            }
+        }
+
+        for (var index = 0; index < columnCount; index++)
+        {
+            if (IsFlexible(columns[index], unbounded: false))
+            {
+                columnArrangeBase[index] =
+                    GetMin(columns[index]);
+                columnStars[index] =
+                    GetStarWeight(columns[index].Width);
+            }
+            else
+            {
+                columnArrangeBase[index] =
+                    _columnWidths![index];
+            }
+        }
+
+        ResolveColumns(
+            columns,
+            columnArrangeBase,
+            columnStars,
+            finalSize.Width,
+            SanitizeSpacing(ColumnSpacing),
+            columnSlots);
+        ResolveRows(
+            rows,
+            rowArrangeBase,
+            rowStars,
+            finalSize.Height,
+            SanitizeSpacing(RowSpacing),
+            rowSlots);
+        ComputeOffsets(
+            rows,
+            columns,
+            rowSlots,
+            columnSlots,
+            rowOffsets,
+            columnOffsets,
+            SanitizeSpacing(RowSpacing),
+            SanitizeSpacing(ColumnSpacing));
+
+        _solvedConstraint = finalSize;
+        _solvedVersion = _layoutVersion;
+        _solvedChildrenCount = Children.Count;
+        _hasSolvedLayout = true;
+    }
+
+    private Size SolveLayout(Size constraint, bool calculateDesiredSize)
+    {
+        if (!AreClose(constraint.Width, _correctionMeasureWidth))
+        {
+            _correctionMeasureWidth = double.NaN;
+            _correctionArrangeWidth = double.NaN;
+        }
+
+        var explicitRows = _rowDefinitions;
+        var explicitColumns = _columnDefinitions;
+        var rowCount = Math.Max(1, explicitRows?.Count ?? 0);
+        var columnCount = Math.Max(1, explicitColumns?.Count ?? 0);
+
+        EnsureDefinitionOwners(explicitRows, explicitColumns);
+
+        var rows = GetEffectiveRowDefinitions(rowCount);
+        var columns = GetEffectiveColumnDefinitions(columnCount);
+        BuildCells(rowCount, columnCount);
+
+        var rowHeights = GetClearedBuffer(ref _rowHeights, rowCount);
+        var columnWidths = GetClearedBuffer(ref _columnWidths, columnCount);
+        var rowStars = GetClearedBuffer(ref _rowStarValues, rowCount);
+        var columnStars = GetClearedBuffer(ref _columnStarValues, columnCount);
+        var rowContent = GetClearedBuffer(ref _rowContent, rowCount);
+        var columnContent = GetClearedBuffer(ref _columnContent, columnCount);
+        var rowSlots = GetClearedBuffer(ref _rowSlots, rowCount);
+        var columnSlots = GetClearedBuffer(ref _columnSlots, columnCount);
+        var rowOffsets = GetClearedBuffer(ref _rowOffsets, rowCount);
+        var columnOffsets = GetClearedBuffer(ref _columnOffsets, columnCount);
+
+        var rowSpacing = SanitizeSpacing(RowSpacing);
+        var columnSpacing = SanitizeSpacing(ColumnSpacing);
+        var unboundedWidth = double.IsPositiveInfinity(constraint.Width);
+        var unboundedHeight = double.IsPositiveInfinity(constraint.Height);
+
+        // Establish a provisional vertical allocation first. Intrinsic-width
+        // measurement can then honor a finite fixed/star row instead of
+        // needlessly offering infinity on both axes.
+        InitializeRows(rows, rowHeights, rowStars, unboundedHeight);
+        ResolveRows(
+            rows,
+            rowHeights,
+            rowStars,
+            constraint.Height,
+            rowSpacing,
+            rowSlots);
+
+        // Phase 1: intrinsic widths for Auto and star-as-Auto columns.
+        InitializeColumns(
+            columns,
+            columnWidths,
+            columnStars,
+            unboundedWidth);
+
+        for (var index = 0; index < _cellCount; index++)
+        {
+            ref readonly var cell = ref _cells![index];
+            if (!ShouldMeasureUnboundedColumn(
+                    columns,
+                    cell.Column,
+                    cell.ColumnSpan,
+                    unboundedWidth))
+            {
+                continue;
+            }
+
+            var height = ShouldMeasureUnboundedRow(
+                    rows,
+                    cell.Row,
+                    cell.RowSpan,
+                    unboundedHeight)
+                ? double.PositiveInfinity
+                : GetTrackSpanSize(
+                    rowSlots,
+                    cell.Row,
+                    cell.RowSpan,
+                    rowSpacing);
+
+            cell.Element.Measure(new Size(double.PositiveInfinity, height));
+            GrowMeasuredColumns(
+                columns,
+                columnWidths,
+                cell,
+                cell.Element.DesiredSize.Width,
+                columnSpacing,
+                unboundedWidth);
+        }
+
+        ResolveColumns(
+            columns,
+            columnWidths,
+            columnStars,
+            constraint.Width,
+            columnSpacing,
+            columnSlots);
+
+        // Phase 2: Auto and star-as-Auto rows are measured at the resolved
+        // horizontal cell width. This makes wrapped text deterministic.
+        InitializeRows(rows, rowHeights, rowStars, unboundedHeight);
+        MeasureContentRows(
+            rows,
+            columns,
+            rowHeights,
+            columnSlots,
+            rowSpacing,
+            columnSpacing,
+            unboundedHeight);
+
+        // Shared groups use local intrinsic contributions. The shared maximum
+        // can widen a column, so rows are measured once more at that width.
+        if (HasSharedSizeGroups(rows, columns))
+        {
+            var localRows = GetBuffer(ref _localSharedRows, rowCount);
+            var localColumns = GetBuffer(
+                ref _localSharedColumns,
+                columnCount);
+            Array.Copy(rowHeights, localRows, rowCount);
+            Array.Copy(columnWidths, localColumns, columnCount);
+
+            var sharedChanges = ApplySharedSizes(
+                rows,
+                columns,
+                localRows,
+                localColumns,
+                rowHeights,
+                columnWidths);
+
+            if (sharedChanges.ColumnsChanged)
+            {
+                ResolveColumns(
+                    columns,
+                    columnWidths,
+                    columnStars,
+                    constraint.Width,
+                    columnSpacing,
+                    columnSlots);
+
+                InitializeRows(
+                    rows,
+                    rowHeights,
+                    rowStars,
+                    unboundedHeight);
+                MeasureContentRows(
+                    rows,
+                    columns,
+                    rowHeights,
+                    columnSlots,
+                    rowSpacing,
+                    columnSpacing,
+                    unboundedHeight);
+                Array.Copy(rowHeights, localRows, rowCount);
+
+                // Keep local column contributions separate from the maximum
+                // applied above, otherwise a smaller member would permanently
+                // retain a removed larger member's contribution.
+                Array.Copy(localColumns, columnWidths, columnCount);
+                ApplySharedSizes(
+                    rows,
+                    columns,
+                    localRows,
+                    localColumns,
+                    rowHeights,
+                    columnWidths);
+            }
+        }
+        else
+        {
+            _sharedSizeState?.Remove(this);
+            _sharedSizeState = null;
+        }
+
+        ResolveColumns(
+            columns,
+            columnWidths,
+            columnStars,
+            constraint.Width,
+            columnSpacing,
+            columnSlots);
+        ResolveRows(
+            rows,
+            rowHeights,
+            rowStars,
+            constraint.Height,
+            rowSpacing,
+            rowSlots);
+
+        InitializeDesiredColumns(
+            columns,
+            columnWidths,
+            columnContent,
+            unboundedWidth);
+        InitializeDesiredRows(
+            rows,
+            rowHeights,
+            rowContent,
+            unboundedHeight);
+
+        // Phase 3: every child finishes with the exact constraint represented
+        // by the committed track snapshot. Repeated equal constraints are
+        // short-circuited by UIElement.Measure.
+        for (var index = 0; index < _cellCount; index++)
+        {
+            ref var cell = ref _cells![index];
+            var width = GetTrackSpanSize(
+                columnSlots,
+                cell.Column,
+                cell.ColumnSpan,
+                columnSpacing);
+            var height = ShouldMeasureUnboundedRow(
+                    rows,
+                    cell.Row,
+                    cell.RowSpan,
+                    unboundedHeight)
+                ? double.PositiveInfinity
+                : GetTrackSpanSize(
+                    rowSlots,
+                    cell.Row,
+                    cell.RowSpan,
+                    rowSpacing);
+
+            cell.Element.Measure(new Size(width, height));
+            cell.MeasuredWidth = width;
+
+            GrowDesiredColumns(
+                columns,
+                columnContent,
+                cell,
+                cell.Element.DesiredSize.Width,
+                columnSpacing);
+            GrowDesiredRows(
+                rows,
+                rowContent,
+                cell,
+                cell.Element.DesiredSize.Height,
+                rowSpacing);
+        }
+
+        ComputeOffsets(
+            rows,
+            columns,
+            rowSlots,
+            columnSlots,
+            rowOffsets,
+            columnOffsets,
+            rowSpacing,
+            columnSpacing);
+
+        _solvedConstraint = constraint;
+        _solvedVersion = _layoutVersion;
+        _solvedChildrenCount = Children.Count;
+        _hasSolvedLayout = true;
+
+        if (!calculateDesiredSize)
+            return constraint;
+
+        return new Size(
+            SumDesiredColumns(
+                columns,
+                columnWidths,
+                columnContent,
+                columnSpacing,
+                unboundedWidth),
+            SumDesiredRows(
+                rows,
+                rowHeights,
+                rowContent,
+                rowSpacing,
+                unboundedHeight));
+    }
+
+    private void BuildCells(int rowCount, int columnCount)
+    {
+        var childCount = Children.Count;
+        if (_cells is null || _cells.Length < childCount)
+            _cells = new CellLayout[Math.Max(4, childCount)];
+
+        _cellCount = 0;
+        foreach (var child in Children.EnumerateStruct())
+        {
+            var row = Math.Clamp(GetRow(child), 0, rowCount - 1);
+            var column = Math.Clamp(
+                GetColumn(child),
+                0,
+                columnCount - 1);
+            var rowSpan = Math.Clamp(
+                GetRowSpan(child),
+                1,
+                rowCount - row);
+            var columnSpan = Math.Clamp(
+                GetColumnSpan(child),
+                1,
+                columnCount - column);
+
+            _cells[_cellCount++] = new CellLayout(
+                child,
+                row,
+                column,
+                rowSpan,
+                columnSpan);
+        }
+    }
+
+    private void MeasureContentRows(
+        RowDefinition[] rows,
+        ColumnDefinition[] columns,
+        double[] rowHeights,
+        double[] columnSlots,
+        double rowSpacing,
+        double columnSpacing,
+        bool unboundedHeight)
+    {
+        for (var index = 0; index < _cellCount; index++)
+        {
+            ref readonly var cell = ref _cells![index];
+            if (!ShouldMeasureUnboundedRow(
+                    rows,
+                    cell.Row,
+                    cell.RowSpan,
+                    unboundedHeight))
+            {
+                continue;
+            }
+
+            var width = GetTrackSpanSize(
+                columnSlots,
+                cell.Column,
+                cell.ColumnSpan,
+                columnSpacing);
+            cell.Element.Measure(
+                new Size(width, double.PositiveInfinity));
+
+            GrowMeasuredRows(
+                rows,
+                rowHeights,
+                cell,
+                cell.Element.DesiredSize.Height,
+                rowSpacing,
+                unboundedHeight);
+        }
+    }
+
+    private static void InitializeRows(
+        RowDefinition[] definitions,
+        double[] sizes,
+        double[] starValues,
+        bool unbounded)
+    {
+        Array.Clear(sizes);
+        Array.Clear(starValues);
+
+        for (var index = 0; index < definitions.Length; index++)
+        {
+            var definition = definitions[index];
+            var min = GetMin(definition);
+            var max = GetMax(definition, min);
+
+            if (definition.Height.IsAbsolute)
+            {
+                sizes[index] = ClampTrack(
+                    definition.Height.Value,
+                    min,
+                    max);
+            }
+            else
+            {
+                sizes[index] = min;
+                if (IsFlexible(definition, unbounded))
+                    starValues[index] = GetStarWeight(
+                        definition.Height);
+            }
+        }
+    }
+
+    private static void InitializeColumns(
+        ColumnDefinition[] definitions,
+        double[] sizes,
+        double[] starValues,
+        bool unbounded)
+    {
+        Array.Clear(sizes);
+        Array.Clear(starValues);
+
+        for (var index = 0; index < definitions.Length; index++)
+        {
+            var definition = definitions[index];
+            var min = GetMin(definition);
+            var max = GetMax(definition, min);
+
+            if (definition.Width.IsAbsolute)
+            {
+                sizes[index] = ClampTrack(
+                    definition.Width.Value,
+                    min,
+                    max);
+            }
+            else
+            {
+                sizes[index] = min;
+                if (IsFlexible(definition, unbounded))
+                    starValues[index] = GetStarWeight(
+                        definition.Width);
+            }
+        }
+    }
+
+    private static void InitializeDesiredRows(
+        RowDefinition[] definitions,
+        double[] measured,
+        double[] desired,
+        bool unbounded)
+    {
+        for (var index = 0; index < definitions.Length; index++)
+        {
+            desired[index] =
+                definitions[index].Height.IsAbsolute ||
+                IsContentSized(definitions[index], unbounded)
+                    ? measured[index]
+                    : GetMin(definitions[index]);
+        }
+    }
+
+    private static void InitializeDesiredColumns(
+        ColumnDefinition[] definitions,
+        double[] measured,
+        double[] desired,
+        bool unbounded)
+    {
+        for (var index = 0; index < definitions.Length; index++)
+        {
+            desired[index] =
+                definitions[index].Width.IsAbsolute ||
+                IsContentSized(definitions[index], unbounded)
+                    ? measured[index]
+                    : GetMin(definitions[index]);
+        }
+    }
+
+    private static void ResolveRows(
+        RowDefinition[] definitions,
+        double[] measured,
+        double[] starValues,
+        double available,
+        double spacing,
+        double[] result)
+    {
+        ResolveTracks(
+            definitions,
+            columns: null,
+            measured,
+            starValues,
+            available,
+            spacing,
+            result);
+    }
+
+    private static void ResolveColumns(
+        ColumnDefinition[] definitions,
+        double[] measured,
+        double[] starValues,
+        double available,
+        double spacing,
+        double[] result)
+    {
+        ResolveTracks(
+            rows: null,
+            definitions,
+            measured,
+            starValues,
+            available,
+            spacing,
+            result);
+    }
+
+    /// <summary>
+    /// Resolves weighted tracks with iterative min/max redistribution. A track
+    /// that hits a bound is removed before the remaining space is divided,
+    /// avoiding the last-track correction and threshold drift of the old Grid.
+    /// </summary>
+    private static void ResolveTracks(
+        RowDefinition[]? rows,
+        ColumnDefinition[]? columns,
+        double[] measured,
+        double[] starValues,
+        double available,
+        double spacing,
+        double[] result)
+    {
+        var count = rows?.Length ?? columns!.Length;
+        Array.Copy(measured, result, count);
+
+        if (double.IsPositiveInfinity(available))
+            return;
+
+        var spacingTotal = Math.Max(0, count - 1) * spacing;
+        var flexibleTarget = Math.Max(0, available - spacingTotal);
+        var totalWeight = 0.0;
+
+        for (var index = 0; index < count; index++)
+        {
+            if (starValues[index] > 0)
+            {
+                result[index] = double.NaN;
+                totalWeight += starValues[index];
+            }
+            else
+            {
+                flexibleTarget -= result[index];
+            }
+        }
+
+        if (totalWeight <= 0)
+            return;
+
+        // Resolve one or more bounded tracks per iteration. Track counts are
+        // normally tiny, and this keeps the hot path allocation-free.
+        while (totalWeight > 0)
+        {
+            var changed = false;
+            var distributable = Math.Max(0, flexibleTarget);
+
+            for (var index = 0; index < count; index++)
+            {
+                if (!double.IsNaN(result[index]))
+                    continue;
+
+                var candidate =
+                    distributable * starValues[index] / totalWeight;
+                var min = GetTrackMin(rows, columns, index);
+                var max = GetTrackMax(
+                    rows,
+                    columns,
+                    index,
+                    min);
+
+                if (candidate < min - LayoutEpsilon)
+                {
+                    result[index] = min;
+                }
+                else if (candidate > max + LayoutEpsilon)
+                {
+                    result[index] = max;
+                }
+                else
+                {
+                    continue;
+                }
+
+                flexibleTarget -= result[index];
+                totalWeight -= starValues[index];
+                changed = true;
+            }
+
+            if (changed)
+                continue;
+
+            for (var index = 0; index < count; index++)
+            {
+                if (double.IsNaN(result[index]))
+                {
+                    result[index] = Math.Clamp(
+                        Math.Max(0, flexibleTarget) *
+                        starValues[index] /
+                        totalWeight,
+                        GetTrackMin(rows, columns, index),
+                        GetTrackMax(
+                            rows,
+                            columns,
+                            index,
+                            GetTrackMin(rows, columns, index)));
+                }
+            }
+
+            break;
+        }
+    }
+
+    private static void GrowMeasuredRows(
+        RowDefinition[] definitions,
+        double[] sizes,
+        in CellLayout cell,
+        double desired,
+        double spacing,
+        bool unbounded)
+    {
+        GrowTracks(
+            definitions,
+            columns: null,
+            sizes,
+            cell.Row,
+            cell.RowSpan,
+            desired,
+            spacing,
+            TrackGrowthKind.ContentSized,
+            useStarWeight: false,
+            unbounded);
+    }
+
+    private static void GrowMeasuredColumns(
+        ColumnDefinition[] definitions,
+        double[] sizes,
+        in CellLayout cell,
+        double desired,
+        double spacing,
+        bool unbounded)
+    {
+        GrowTracks(
+            rows: null,
+            definitions,
+            sizes,
+            cell.Column,
+            cell.ColumnSpan,
+            desired,
+            spacing,
+            TrackGrowthKind.ContentSized,
+            useStarWeight: false,
+            unbounded);
+    }
+
+    private static void GrowDesiredRows(
+        RowDefinition[] definitions,
+        double[] sizes,
+        in CellLayout cell,
+        double desired,
+        double spacing)
+    {
+        GrowDesiredTracks(
+            definitions,
+            columns: null,
+            sizes,
+            cell.Row,
+            cell.RowSpan,
+            desired,
+            spacing);
+    }
+
+    private static void GrowDesiredColumns(
+        ColumnDefinition[] definitions,
+        double[] sizes,
+        in CellLayout cell,
+        double desired,
+        double spacing)
+    {
+        GrowDesiredTracks(
+            rows: null,
+            definitions,
+            sizes,
+            cell.Column,
+            cell.ColumnSpan,
+            desired,
+            spacing);
+    }
+
+    private static void GrowDesiredTracks(
+        RowDefinition[]? rows,
+        ColumnDefinition[]? columns,
+        double[] sizes,
+        int start,
+        int span,
+        double desired,
+        double spacing)
+    {
+        // Spanning content first grows star tracks. Auto tracks already carry
+        // their intrinsic contribution, so this avoids charging the same
+        // content to both Auto and Star.
+        GrowTracks(
+            rows,
+            columns,
+            sizes,
+            start,
+            span,
+            desired,
+            spacing,
+            TrackGrowthKind.Star,
+            useStarWeight: true,
+            unbounded: false);
+
+        GrowTracks(
+            rows,
+            columns,
+            sizes,
+            start,
+            span,
+            desired,
+            spacing,
+            TrackGrowthKind.NonAbsolute,
+            useStarWeight: false,
+            unbounded: false);
+    }
+
+    private static void GrowTracks(
+        RowDefinition[]? rows,
+        ColumnDefinition[]? columns,
+        double[] sizes,
+        int start,
+        int span,
+        double desired,
+        double spacing,
+        TrackGrowthKind growthKind,
+        bool useStarWeight,
+        bool unbounded)
+    {
+        desired = SanitizeDesired(desired);
+        var requiredTrackSize = Math.Max(
+            0,
+            desired - Math.Max(0, span - 1) * spacing);
+        var current = 0.0;
+
+        for (var index = start; index < start + span; index++)
+            current += sizes[index];
+
+        var remaining = requiredTrackSize - current;
+        while (remaining > LayoutEpsilon)
+        {
+            var totalWeight = 0.0;
+            for (var index = start; index < start + span; index++)
+            {
+                var maximum =
+                    GetTrackMax(rows, columns, index);
+                if (CanGrowTrack(
+                        rows,
+                        columns,
+                        index,
+                        growthKind,
+                        unbounded) &&
+                    sizes[index] < maximum - LayoutEpsilon)
+                {
+                    totalWeight += Math.Max(
+                        LayoutEpsilon,
+                        GetTrackGrowthWeight(
+                            rows,
+                            columns,
+                            index,
+                            useStarWeight));
+                }
+            }
+
+            if (totalWeight <= 0)
+                break;
+
+            var consumed = 0.0;
+            for (var index = start; index < start + span; index++)
+            {
+                if (!CanGrowTrack(
+                        rows,
+                        columns,
+                        index,
+                        growthKind,
+                        unbounded))
+                {
+                    continue;
+                }
+
+                var room =
+                    GetTrackMax(rows, columns, index) -
+                    sizes[index];
+                if (room <= LayoutEpsilon)
+                    continue;
+
+                var weight = Math.Max(
+                    LayoutEpsilon,
+                    GetTrackGrowthWeight(
+                        rows,
+                        columns,
+                        index,
+                        useStarWeight));
+                var increase = Math.Min(
+                    room,
+                    remaining * weight / totalWeight);
+                sizes[index] += increase;
+                consumed += increase;
+            }
+
+            if (consumed <= LayoutEpsilon)
+                break;
+
+            remaining -= consumed;
+        }
+    }
+
+    private static bool CanGrowTrack(
+        RowDefinition[]? rows,
+        ColumnDefinition[]? columns,
+        int index,
+        TrackGrowthKind growthKind,
+        bool unbounded)
+    {
+        if (growthKind == TrackGrowthKind.ContentSized)
+        {
+            return rows is not null
+                ? IsContentSized(rows[index], unbounded)
+                : IsContentSized(columns![index], unbounded);
+        }
+
+        var length = GetTrackLength(rows, columns, index);
+        return growthKind == TrackGrowthKind.Star
+            ? length.IsStar
+            : !length.IsAbsolute;
+    }
+
+    private static double GetTrackGrowthWeight(
+        RowDefinition[]? rows,
+        ColumnDefinition[]? columns,
+        int index,
+        bool useStarWeight)
+    {
+        if (!useStarWeight)
+            return 1;
+
+        return Math.Max(
+            1,
+            GetStarWeight(GetTrackLength(rows, columns, index)));
+    }
+
+    private static GridLength GetTrackLength(
+        RowDefinition[]? rows,
+        ColumnDefinition[]? columns,
+        int index) =>
+        rows is not null
+            ? rows[index].Height
+            : columns![index].Width;
+
+    private static double GetTrackMin(
+        RowDefinition[]? rows,
+        ColumnDefinition[]? columns,
+        int index) =>
+        rows is not null
+            ? GetMin(rows[index])
+            : GetMin(columns![index]);
+
+    private static double GetTrackMax(
+        RowDefinition[]? rows,
+        ColumnDefinition[]? columns,
+        int index)
+    {
+        var minimum = GetTrackMin(rows, columns, index);
+        return GetTrackMax(
+            rows,
+            columns,
+            index,
+            minimum);
+    }
+
+    private static double GetTrackMax(
+        RowDefinition[]? rows,
+        ColumnDefinition[]? columns,
+        int index,
+        double minimum) =>
+        rows is not null
+            ? GetMax(rows[index], minimum)
+            : GetMax(columns![index], minimum);
+
+    /// <summary>
+    /// Returns whether a row span needs an unbounded intrinsic measurement.
+    /// A mixed Auto + flexible Star span is measured against its finite slot:
+    /// the Star track absorbs the remaining viewport. Letting the Auto member
+    /// see infinity would charge the entire descendant extent to Auto and
+    /// expand a window-sized Grid to the full height of scrollable content.
+    /// </summary>
+    private static bool ShouldMeasureUnboundedRow(
+        RowDefinition[] definitions,
+        int start,
+        int span,
+        bool unbounded)
+    {
+        var containsContentSizedTrack = false;
+        for (var index = start; index < start + span; index++)
+        {
+            if (IsContentSized(definitions[index], unbounded))
+                containsContentSizedTrack = true;
+
+            if (CanAbsorbContent(definitions[index], unbounded))
+                return false;
+        }
+
+        return containsContentSizedTrack;
+    }
+
+    private static bool ShouldMeasureUnboundedColumn(
+        ColumnDefinition[] definitions,
+        int start,
+        int span,
+        bool unbounded)
+    {
+        var containsContentSizedTrack = false;
+        for (var index = start; index < start + span; index++)
+        {
+            if (IsContentSized(definitions[index], unbounded))
+                containsContentSizedTrack = true;
+
+            if (CanAbsorbContent(definitions[index], unbounded))
+                return false;
+        }
+
+        return containsContentSizedTrack;
+    }
+
+    private static bool CanAbsorbContent(
+        RowDefinition definition,
+        bool unbounded)
+    {
+        var minimum = GetMin(definition);
+        return IsFlexible(definition, unbounded) &&
+               GetStarWeight(definition.Height) > 0 &&
+               GetMax(definition, minimum) >
+               minimum + LayoutEpsilon;
+    }
+
+    private static bool CanAbsorbContent(
+        ColumnDefinition definition,
+        bool unbounded)
+    {
+        var minimum = GetMin(definition);
+        return IsFlexible(definition, unbounded) &&
+               GetStarWeight(definition.Width) > 0 &&
+               GetMax(definition, minimum) >
+               minimum + LayoutEpsilon;
+    }
+
+    private static bool IsContentSized(
+        RowDefinition definition,
+        bool unbounded) =>
+        definition.Height.IsAuto ||
+        (definition.Height.IsStar &&
+         (unbounded ||
+          !string.IsNullOrWhiteSpace(definition.SharedSizeGroup)));
+
+    private static bool IsContentSized(
+        ColumnDefinition definition,
+        bool unbounded) =>
+        definition.Width.IsAuto ||
+        (definition.Width.IsStar &&
+         (unbounded ||
+          !string.IsNullOrWhiteSpace(definition.SharedSizeGroup)));
+
+    private static bool IsFlexible(
+        RowDefinition definition,
+        bool unbounded) =>
+        definition.Height.IsStar &&
+        !unbounded &&
+        string.IsNullOrWhiteSpace(definition.SharedSizeGroup);
+
+    private static bool IsFlexible(
+        ColumnDefinition definition,
+        bool unbounded) =>
+        definition.Width.IsStar &&
+        !unbounded &&
+        string.IsNullOrWhiteSpace(definition.SharedSizeGroup);
+
+    private static double SumDesiredRows(
+        RowDefinition[] definitions,
+        double[] measured,
+        double[] content,
+        double spacing,
+        bool unbounded)
+    {
+        var result = Math.Max(0, definitions.Length - 1) * spacing;
+        for (var index = 0; index < definitions.Length; index++)
+        {
+            result +=
+                definitions[index].Height.IsAbsolute ||
+                IsContentSized(definitions[index], unbounded)
+                    ? measured[index]
+                    : Math.Clamp(
+                        content[index],
+                        GetMin(definitions[index]),
+                        GetMax(
+                            definitions[index],
+                            GetMin(definitions[index])));
+        }
+
+        return result;
+    }
+
+    private static double SumDesiredColumns(
+        ColumnDefinition[] definitions,
+        double[] measured,
+        double[] content,
+        double spacing,
+        bool unbounded)
+    {
+        var result = Math.Max(0, definitions.Length - 1) * spacing;
+        for (var index = 0; index < definitions.Length; index++)
+        {
+            result +=
+                definitions[index].Width.IsAbsolute ||
+                IsContentSized(definitions[index], unbounded)
+                    ? measured[index]
+                    : Math.Clamp(
+                        content[index],
+                        GetMin(definitions[index]),
+                        GetMax(
+                            definitions[index],
+                            GetMin(definitions[index])));
+        }
+
+        return result;
+    }
+
+    private static void ComputeOffsets(
+        RowDefinition[] rows,
+        ColumnDefinition[] columns,
+        double[] rowSlots,
+        double[] columnSlots,
+        double[] rowOffsets,
+        double[] columnOffsets,
+        double rowSpacing,
+        double columnSpacing)
+    {
+        var cursor = 0.0;
+        for (var index = 0; index < rows.Length; index++)
+        {
+            rowOffsets[index] = cursor;
+            rows[index].ActualHeight = rowSlots[index];
+            rows[index].Offset = cursor;
+            cursor += rowSlots[index];
+            if (index < rows.Length - 1)
+                cursor += rowSpacing;
+        }
+
+        cursor = 0;
+        for (var index = 0; index < columns.Length; index++)
+        {
+            columnOffsets[index] = cursor;
+            columns[index].ActualWidth = columnSlots[index];
+            columns[index].Offset = cursor;
+            cursor += columnSlots[index];
+            if (index < columns.Length - 1)
+                cursor += columnSpacing;
+        }
+    }
+
+    private static double GetTrackSpanSize(
+        double[] trackSizes,
+        int start,
+        int span,
+        double spacing)
+    {
+        var result = Math.Max(0, span - 1) * spacing;
+        for (var index = start; index < start + span; index++)
+            result += trackSizes[index];
+
+        return result;
+    }
+
+    private static double GetMin(RowDefinition definition) =>
+        SanitizeMinimum(definition.MinHeight);
+
+    private static double GetMin(ColumnDefinition definition) =>
+        SanitizeMinimum(definition.MinWidth);
+
+    private static double GetMax(
+        RowDefinition definition,
+        double minimum) =>
+        SanitizeMaximum(definition.MaxHeight, minimum);
+
+    private static double GetMax(
+        ColumnDefinition definition,
+        double minimum) =>
+        SanitizeMaximum(definition.MaxWidth, minimum);
+
+    private static double ClampTrack(
+        double value,
+        double minimum,
+        double maximum)
+    {
+        if (!double.IsFinite(value))
+            value = 0;
+
+        return Math.Clamp(Math.Max(0, value), minimum, maximum);
+    }
+
+    private static double SanitizeMinimum(double value) =>
+        double.IsFinite(value) && value > 0 ? value : 0;
+
+    private static double SanitizeMaximum(
+        double value,
+        double minimum)
+    {
+        if (double.IsNaN(value) ||
+            double.IsPositiveInfinity(value))
+        {
+            return double.PositiveInfinity;
+        }
+
+        if (double.IsNegativeInfinity(value))
+            return minimum;
+
+        return Math.Max(minimum, value);
+    }
+
+    private static double GetStarWeight(GridLength length) =>
+        double.IsFinite(length.Value) && length.Value > 0
+            ? length.Value
+            : 0;
+
+    private static double SanitizeSpacing(double value) =>
+        double.IsFinite(value) && value > 0 ? value : 0;
+
+    private static double SanitizeDesired(double value) =>
+        double.IsFinite(value) && value > 0 ? value : 0;
+
+    private static bool AreClose(double left, double right)
+    {
+        if (left == right)
+            return true;
+
+        return double.IsFinite(left) &&
+               double.IsFinite(right) &&
+               Math.Abs(left - right) <= LayoutEpsilon;
+    }
+
+    private static Size NormalizeConstraint(Size size) =>
+        new(
+            NormalizeConstraintLength(size.Width),
+            NormalizeConstraintLength(size.Height));
+
+    private static double NormalizeConstraintLength(double value)
+    {
+        if (double.IsPositiveInfinity(value))
+            return value;
+
+        return double.IsFinite(value) && value > 0 ? value : 0;
+    }
+
+    private static void EnsureDefinitionOwners(
+        RowDefinitionCollection? rows,
+        ColumnDefinitionCollection? columns)
+    {
+        if (rows is not null)
+        {
+            for (var index = 0; index < rows.Count; index++)
+                rows[index].OwnerGrid = rows.Owner;
+        }
+
+        if (columns is not null)
+        {
+            for (var index = 0; index < columns.Count; index++)
+                columns[index].OwnerGrid = columns.Owner;
+        }
+    }
+
+    #endregion
+
+    #region Rendering and shared sizing
 
     protected override void OnPostRender(DrawingContext drawingContext)
     {
@@ -906,17 +1684,27 @@ public class Grid : Panel
             return;
 
         var rowSpacing = SanitizeSpacing(RowSpacing);
-        for (var index = 1; index < RowDefinitions.Count; index++)
+        var rowCount = _rowDefinitions?.Count ?? 0;
+        for (var index = 1; index < rowCount; index++)
         {
-            var y = RowDefinitions[index].Offset - rowSpacing / 2;
-            drawingContext.DrawLine(s_gridLinePen, new Point(0, y), new Point(RenderSize.Width, y));
+            var y = _rowDefinitions![index].Offset - rowSpacing / 2;
+            drawingContext.DrawLine(
+                s_gridLinePen,
+                new Point(0, y),
+                new Point(RenderSize.Width, y));
         }
 
         var columnSpacing = SanitizeSpacing(ColumnSpacing);
-        for (var index = 1; index < ColumnDefinitions.Count; index++)
+        var columnCount = _columnDefinitions?.Count ?? 0;
+        for (var index = 1; index < columnCount; index++)
         {
-            var x = ColumnDefinitions[index].Offset - columnSpacing / 2;
-            drawingContext.DrawLine(s_gridLinePen, new Point(x, 0), new Point(x, RenderSize.Height));
+            var x =
+                _columnDefinitions![index].Offset -
+                columnSpacing / 2;
+            drawingContext.DrawLine(
+                s_gridLinePen,
+                new Point(x, 0),
+                new Point(x, RenderSize.Height));
         }
     }
 
@@ -927,68 +1715,132 @@ public class Grid : Panel
         base.OnVisualParentChanged(oldParent);
     }
 
-    private void ApplySharedSizes(
+    private SharedSizeChanges ApplySharedSizes(
         RowDefinition[] rowDefinitions,
         ColumnDefinition[] columnDefinitions,
+        double[] localRows,
+        double[] localColumns,
         double[] rowHeights,
         double[] columnWidths)
     {
+        Array.Copy(localRows, rowHeights, rowDefinitions.Length);
+        Array.Copy(
+            localColumns,
+            columnWidths,
+            columnDefinitions.Length);
+
         var scopeElement = FindSharedSizeScope();
-        if (scopeElement == null)
+        if (scopeElement is null)
         {
             _sharedSizeState?.Remove(this);
             _sharedSizeState = null;
-            return;
+            return default;
         }
 
-        var state = s_sharedSizeScopes.GetValue(scopeElement, static _ => new SharedSizeScopeState());
+        var state = s_sharedSizeScopes.GetValue(
+            scopeElement,
+            static _ => new SharedSizeScopeState());
         if (!ReferenceEquals(state, _sharedSizeState))
         {
             _sharedSizeState?.Remove(this);
             _sharedSizeState = state;
         }
 
-        var contributions = new Dictionary<string, double>(StringComparer.Ordinal);
-        for (var index = 0; index < rowDefinitions.Length; index++)
-        {
-            var definition = rowDefinitions[index];
-            if (string.IsNullOrWhiteSpace(definition.SharedSizeGroup))
-                continue;
+        var contributions =
+            new Dictionary<string, double>(StringComparer.Ordinal);
 
-            var contribution = rowHeights[index];
-            AddContribution(contributions, definition.SharedSizeGroup, contribution);
+        for (var index = 0;
+             index < rowDefinitions.Length;
+             index++)
+        {
+            var group = rowDefinitions[index].SharedSizeGroup;
+            if (!string.IsNullOrWhiteSpace(group))
+                AddContribution(
+                    contributions,
+                    group,
+                    localRows[index]);
         }
 
-        for (var index = 0; index < columnDefinitions.Length; index++)
+        for (var index = 0;
+             index < columnDefinitions.Length;
+             index++)
         {
-            var definition = columnDefinitions[index];
-            if (string.IsNullOrWhiteSpace(definition.SharedSizeGroup))
-                continue;
-
-            var contribution = columnWidths[index];
-            AddContribution(contributions, definition.SharedSizeGroup, contribution);
+            var group =
+                columnDefinitions[index].SharedSizeGroup;
+            if (!string.IsNullOrWhiteSpace(group))
+                AddContribution(
+                    contributions,
+                    group,
+                    localColumns[index]);
         }
 
         var maxima = state.Update(this, contributions);
-        for (var index = 0; index < rowDefinitions.Length; index++)
+        var rowsChanged = false;
+        var columnsChanged = false;
+
+        for (var index = 0;
+             index < rowDefinitions.Length;
+             index++)
         {
-            var definition = rowDefinitions[index];
-            if (!string.IsNullOrWhiteSpace(definition.SharedSizeGroup) &&
-                maxima.TryGetValue(definition.SharedSizeGroup, out var maximum))
+            var group = rowDefinitions[index].SharedSizeGroup;
+            if (!string.IsNullOrWhiteSpace(group) &&
+                maxima.TryGetValue(group, out var maximum))
             {
+                rowsChanged |=
+                    Math.Abs(rowHeights[index] - maximum) >
+                    LayoutEpsilon;
                 rowHeights[index] = maximum;
             }
         }
 
-        for (var index = 0; index < columnDefinitions.Length; index++)
+        for (var index = 0;
+             index < columnDefinitions.Length;
+             index++)
         {
-            var definition = columnDefinitions[index];
-            if (!string.IsNullOrWhiteSpace(definition.SharedSizeGroup) &&
-                maxima.TryGetValue(definition.SharedSizeGroup, out var maximum))
+            var group =
+                columnDefinitions[index].SharedSizeGroup;
+            if (!string.IsNullOrWhiteSpace(group) &&
+                maxima.TryGetValue(group, out var maximum))
             {
+                columnsChanged |=
+                    Math.Abs(columnWidths[index] - maximum) >
+                    LayoutEpsilon;
                 columnWidths[index] = maximum;
             }
         }
+
+        return new SharedSizeChanges(
+            rowsChanged,
+            columnsChanged);
+    }
+
+    private static bool HasSharedSizeGroups(
+        RowDefinition[] rowDefinitions,
+        ColumnDefinition[] columnDefinitions)
+    {
+        for (var index = 0;
+             index < rowDefinitions.Length;
+             index++)
+        {
+            if (!string.IsNullOrWhiteSpace(
+                    rowDefinitions[index].SharedSizeGroup))
+            {
+                return true;
+            }
+        }
+
+        for (var index = 0;
+             index < columnDefinitions.Length;
+             index++)
+        {
+            if (!string.IsNullOrWhiteSpace(
+                    columnDefinitions[index].SharedSizeGroup))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static void AddContribution(
@@ -996,45 +1848,56 @@ public class Grid : Panel
         string key,
         double value)
     {
-        if (!double.IsFinite(value) || value < 0)
-            value = 0;
-
-        if (!contributions.TryGetValue(key, out var current) || value > current)
+        value = SanitizeDesired(value);
+        if (!contributions.TryGetValue(key, out var current) ||
+            value > current)
+        {
             contributions[key] = value;
+        }
     }
 
     private UIElement? FindSharedSizeScope()
     {
         DependencyObject? current = this;
-        var visited = new HashSet<DependencyObject>();
-        while (current != null && visited.Add(current))
+        const int MaxAncestorDepth = 1024;
+
+        for (var depth = 0;
+             current is not null && depth < MaxAncestorDepth;
+             depth++)
         {
-            if (current is UIElement element && GetIsSharedSizeScope(element))
+            if (current is UIElement element &&
+                GetIsSharedSizeScope(element))
+            {
                 return element;
+            }
 
             current = current switch
             {
                 FrameworkElement frameworkElement =>
-                    frameworkElement.Parent ?? frameworkElement.TemplatedParent,
+                    frameworkElement.Parent ??
+                    frameworkElement.TemplatedParent,
                 Visual visual => visual.VisualParent,
-                _ => null
+                _ => null,
             };
         }
 
         return null;
     }
 
-    private static void InvalidateSharedSizeDescendants(UIElement element)
+    private static void InvalidateSharedSizeDescendants(
+        UIElement element)
     {
         if (element is Grid grid)
         {
             grid._sharedSizeState?.Remove(grid);
             grid._sharedSizeState = null;
-            grid.InvalidateMeasure();
-            grid.InvalidateArrange();
+            grid.InvalidateLayoutState(
+                definitionsChanged: false);
         }
 
-        for (var index = 0; index < element.VisualChildrenCount; index++)
+        for (var index = 0;
+             index < element.VisualChildrenCount;
+             index++)
         {
             if (element.GetVisualChild(index) is UIElement child)
                 InvalidateSharedSizeDescendants(child);
@@ -1043,63 +1906,120 @@ public class Grid : Panel
 
     private RowDefinition[] GetEffectiveRowDefinitions(int count)
     {
-        if (_effectiveRowDefinitions is { } cached && cached.Length == count)
+        if (_effectiveRowDefinitions is { } cached &&
+            cached.Length == count)
         {
             return cached;
         }
 
-        var defs = new RowDefinition[count];
-        var explicitDefinitions = _rowDefinitions;
-        var explicitCount = explicitDefinitions?.Count ?? 0;
-        for (int i = 0; i < count; i++)
+        var definitions = new RowDefinition[count];
+        var explicitCount = _rowDefinitions?.Count ?? 0;
+        for (var index = 0; index < count; index++)
         {
-            // RowDefinition already defaults to 1*; setting Height to the same
-            // value would unnecessarily allocate a local dependency-property store.
-            defs[i] = i < explicitCount ? explicitDefinitions![i] : new RowDefinition();
+            definitions[index] = index < explicitCount
+                ? _rowDefinitions![index]
+                : new RowDefinition();
         }
-        return _effectiveRowDefinitions = defs;
+
+        return _effectiveRowDefinitions = definitions;
     }
 
     private ColumnDefinition[] GetEffectiveColumnDefinitions(int count)
     {
-        if (_effectiveColumnDefinitions is { } cached && cached.Length == count)
+        if (_effectiveColumnDefinitions is { } cached &&
+            cached.Length == count)
         {
             return cached;
         }
 
-        var defs = new ColumnDefinition[count];
-        var explicitDefinitions = _columnDefinitions;
-        var explicitCount = explicitDefinitions?.Count ?? 0;
-        for (int i = 0; i < count; i++)
+        var definitions = new ColumnDefinition[count];
+        var explicitCount = _columnDefinitions?.Count ?? 0;
+        for (var index = 0; index < count; index++)
         {
-            defs[i] = i < explicitCount ? explicitDefinitions![i] : new ColumnDefinition();
+            definitions[index] = index < explicitCount
+                ? _columnDefinitions![index]
+                : new ColumnDefinition();
         }
-        return _effectiveColumnDefinitions = defs;
+
+        return _effectiveColumnDefinitions = definitions;
     }
 
-    private static double[] GetClearedBuffer(ref double[]? buffer, int count)
+    private static double[] GetClearedBuffer(
+        ref double[]? buffer,
+        int count)
+    {
+        var result = GetBuffer(ref buffer, count);
+        Array.Clear(result);
+        return result;
+    }
+
+    private static double[] GetBuffer(
+        ref double[]? buffer,
+        int count)
     {
         if (buffer is null || buffer.Length != count)
-        {
-            return buffer = new double[count];
-        }
+            buffer = new double[count];
 
-        Array.Clear(buffer);
         return buffer;
     }
 
+    private enum TrackGrowthKind
+    {
+        ContentSized,
+        Star,
+        NonAbsolute
+    }
+
+    private struct CellLayout
+    {
+        public CellLayout(
+            UIElement element,
+            int row,
+            int column,
+            int rowSpan,
+            int columnSpan)
+        {
+            Element = element;
+            Row = row;
+            Column = column;
+            RowSpan = rowSpan;
+            ColumnSpan = columnSpan;
+            MeasuredWidth = double.NaN;
+        }
+
+        public UIElement Element { get; }
+        public int Row { get; }
+        public int Column { get; }
+        public int RowSpan { get; }
+        public int ColumnSpan { get; }
+        public double MeasuredWidth { get; set; }
+    }
+
+    private readonly record struct SharedSizeChanges(
+        bool RowsChanged,
+        bool ColumnsChanged);
+
     private sealed class SharedSizeScopeState
     {
-        private readonly Dictionary<Grid, Dictionary<string, double>> _contributions = new();
-        private readonly Dictionary<string, double> _maxima = new(StringComparer.Ordinal);
+        private readonly Dictionary<
+            Grid,
+            Dictionary<string, double>> _contributions = new();
+        private readonly Dictionary<string, double> _maxima =
+            new(StringComparer.Ordinal);
 
         public IReadOnlyDictionary<string, double> Update(
             Grid grid,
             Dictionary<string, double> contributions)
         {
-            var affected = new HashSet<string>(contributions.Keys, StringComparer.Ordinal);
-            if (_contributions.TryGetValue(grid, out var previous))
+            var affected = new HashSet<string>(
+                contributions.Keys,
+                StringComparer.Ordinal);
+            if (_contributions.TryGetValue(
+                    grid,
+                    out var previous))
+            {
                 affected.UnionWith(previous.Keys);
+            }
 
             _contributions[grid] = contributions;
             Recompute(affected, grid);
@@ -1114,18 +2034,28 @@ public class Grid : Panel
             Recompute(previous.Keys, grid);
         }
 
-        private void Recompute(IEnumerable<string> keys, Grid changedGrid)
+        private void Recompute(
+            IEnumerable<string> keys,
+            Grid changedGrid)
         {
             foreach (var key in keys.Distinct())
             {
-                _maxima.TryGetValue(key, out var previousMaximum);
+                _maxima.TryGetValue(
+                    key,
+                    out var previousMaximum);
                 var maximum = 0.0;
                 var hasContribution = false;
-                foreach (var gridContributions in _contributions.Values)
+
+                foreach (var gridContributions
+                         in _contributions.Values)
                 {
-                    if (gridContributions.TryGetValue(key, out var contribution))
+                    if (gridContributions.TryGetValue(
+                            key,
+                            out var contribution))
                     {
-                        maximum = Math.Max(maximum, contribution);
+                        maximum = Math.Max(
+                            maximum,
+                            contribution);
                         hasContribution = true;
                     }
                 }
@@ -1135,12 +2065,18 @@ public class Grid : Panel
                 else
                     _maxima.Remove(key);
 
-                if (Math.Abs(previousMaximum - maximum) <= 0.001)
-                    continue;
-
-                foreach (var participatingGrid in _contributions.Keys)
+                if (Math.Abs(previousMaximum - maximum) <=
+                    LayoutEpsilon)
                 {
-                    if (!ReferenceEquals(participatingGrid, changedGrid))
+                    continue;
+                }
+
+                foreach (var participatingGrid
+                         in _contributions.Keys)
+                {
+                    if (!ReferenceEquals(
+                            participatingGrid,
+                            changedGrid))
                     {
                         participatingGrid.InvalidateMeasure();
                         participatingGrid.InvalidateArrange();

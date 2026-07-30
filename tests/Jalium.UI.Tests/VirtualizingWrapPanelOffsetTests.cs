@@ -152,6 +152,35 @@ public class VirtualizingWrapPanelOffsetTests
     }
 
     [Fact]
+    public void ResponsiveItemWidthChange_UsesTheSameMeasureWidthForWrapCount()
+    {
+        var (_, panel) = CreatePanel();
+        const double spacing = 12;
+        const double narrowWidth = 777;
+        const double wideWidth = 781;
+
+        panel.HorizontalSpacing = spacing;
+        panel.ItemWidth = (narrowWidth - spacing) / 2;
+        ResizePanelUntilSettled(
+            panel,
+            new Size(narrowWidth, Viewport.Height));
+        Assert.Equal(2000, panel.ExtentHeight, precision: 3);
+
+        // A responsive derived panel computes the new item width from the
+        // incoming 781px constraint before calling the base measure. Combining
+        // that new three-column item width with the old 777px arrange snapshot
+        // produces a transient two-column realization.
+        panel.ItemWidth = (wideWidth - (2 * spacing)) / 3;
+        panel.Measure(new Size(wideWidth, Viewport.Height));
+        panel.Arrange(
+            new Rect(0, 0, wideWidth, Viewport.Height));
+
+        Assert.Equal(1360, panel.ExtentHeight, precision: 3);
+        Assert.True(panel.IsMeasureValid);
+        Assert.True(panel.IsArrangeValid);
+    }
+
+    [Fact]
     public void ScrollOwnerShrink_CapsAStaleWideMeasureImmediately()
     {
         var (_, panel) = CreatePanel();

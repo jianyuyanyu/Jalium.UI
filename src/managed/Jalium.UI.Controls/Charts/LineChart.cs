@@ -26,7 +26,7 @@ public class LineChart : AxisChartBase
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Content)]
     public static readonly DependencyProperty SeriesProperty =
         DependencyProperty.Register(nameof(Series), typeof(ObservableCollection<LineSeries>), typeof(LineChart),
-            new PropertyMetadata(null, OnVisualPropertyChanged));
+            new PropertyMetadata(null, OnSeriesCollectionPropertyChanged));
 
     /// <summary>
     /// Identifies the LineSmoothing dependency property.

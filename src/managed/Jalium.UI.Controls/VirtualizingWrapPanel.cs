@@ -21,6 +21,8 @@ namespace Jalium.UI.Controls;
 /// </summary>
 public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
 {
+    private const double WrapCountEpsilon = 1e-9;
+
     #region Dependency Properties
 
     /// <summary>Identifies the Orientation dependency property.</summary>
@@ -157,6 +159,11 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
     private double _measureProbeCrossAxis = double.NaN;
     private double _correctiveMeasureCrossAxis = double.NaN;
     private double _correctiveArrangeCrossAxis = double.NaN;
+    // A responsive derived panel can update its explicit cross-axis item size
+    // from the current measure constraint. In that case the old arranged width
+    // and the new item width are from different layout snapshots and must not
+    // be combined: doing so can calculate one fewer item per row for a frame.
+    private bool _acceptMeasureCrossAxisAfterItemSizeChange;
     private readonly List<int> _recycleBuffer = new();
     private ScrollViewer? _ancestorScrollViewer;
     private double _ancestorPanelStart = double.NaN;
@@ -258,7 +265,10 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
         // that transient width as the wrap width changes ItemsPerRow mid-scroll, collapses the
         // estimated extent, and clamps the active offset. The owning ScrollViewer's viewport is
         // the stable cross-axis constraint; the raw measure size still governs the scroll axis.
-        var layoutSize = StabilizeCrossAxisMeasureSize(availableSize);
+        var layoutSize = _acceptMeasureCrossAxisAfterItemSizeChange
+            ? availableSize
+            : StabilizeCrossAxisMeasureSize(availableSize);
+        _acceptMeasureCrossAxisAfterItemSizeChange = false;
         _viewport = UseAncestorScrollViewer
             ? GetAncestorViewport(layoutSize)
             : CoerceViewport(layoutSize);
@@ -1309,7 +1319,13 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
             return 1;
 
         var itemCount = Math.Max(1, GetItemCount());
-        var rawCount = Math.Floor((crossAxis + crossSpacing) / stride);
+        // Responsive panels commonly derive ItemWidth algebraically from the
+        // same cross-axis width. The inverse calculation can then produce
+        // 2.9999999999999996 for an exact three-item fit; flooring that value
+        // creates a visibly empty column until another layout pass happens.
+        var rawCount = Math.Floor(
+            ((crossAxis + crossSpacing) / stride) +
+            WrapCountEpsilon);
         if (double.IsInfinity(rawCount) || rawCount >= itemCount)
             return itemCount;
 
@@ -1379,7 +1395,7 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
             explicitWidth ? ItemWidth : double.PositiveInfinity,
             explicitHeight ? ItemHeight : double.PositiveInfinity);
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             child.Visibility = Visibility.Visible;
             child.Measure(childConstraint);
@@ -1451,7 +1467,7 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
         var explicitWidth = !double.IsNaN(ItemWidth) && ItemWidth > 0;
         var explicitHeight = !double.IsNaN(ItemHeight) && ItemHeight > 0;
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             var ds = child.DesiredSize;
             var width = explicitWidth ? ItemWidth : ds.Width;
@@ -1507,6 +1523,21 @@ public class VirtualizingWrapPanel : VirtualizingPanel, IScrollInfo
             if (e.Property == ItemWidthProperty || e.Property == ItemHeightProperty)
             {
                 panel.ResetResolvedAutoItemSize();
+
+                var crossAxisItemSizeChanged =
+                    (panel.Orientation == Orientation.Horizontal &&
+                     e.Property == ItemWidthProperty) ||
+                    (panel.Orientation == Orientation.Vertical &&
+                     e.Property == ItemHeightProperty);
+                if (crossAxisItemSizeChanged)
+                {
+                    // The new explicit item size may have been derived from
+                    // the incoming width by a responsive panel. Accept that
+                    // same width once instead of capping it to the previous
+                    // arrange snapshot.
+                    panel._acceptMeasureCrossAxisAfterItemSizeChange = true;
+                    panel.ClearCrossAxisCorrection();
+                }
             }
             panel.InvalidateMeasure();
         }

@@ -474,6 +474,39 @@ public class TitleBarHitTestTests
         Assert.Equal(workArea, maximized);
     }
 
+    [Theory]
+    [InlineData(-300, 0, 1200, 900)]       // left edge
+    [InlineData(0, 0, 1500, 900)]          // right edge
+    [InlineData(0, -200, 1200, 900)]       // top edge
+    [InlineData(0, 0, 1200, 1100)]         // bottom edge
+    [InlineData(-300, -200, 1200, 900)]    // top-left
+    public void NCCalcSize_InteractiveResize_RedrawsInsteadOfCopyingOldFrame(
+        int left,
+        int top,
+        int right,
+        int bottom)
+    {
+        var oldRect = (left: 0, top: 0, right: 1200, bottom: 900);
+        int actual = Window.ComputeNcCalcSizeResizeFlags(
+            (left, top, right, bottom),
+            oldRect);
+
+        Assert.Equal(0x0300, actual);
+    }
+
+    [Fact]
+    public void NCCalcSize_MoveDoesNotRequestResizeRedraw()
+    {
+        var oldRect = (left: 0, top: 0, right: 1200, bottom: 900);
+
+        Assert.Equal(0, Window.ComputeNcCalcSizeResizeFlags(
+            (left: 100, top: 50, right: 1300, bottom: 950),
+            oldRect));
+        Assert.Equal(0x0300, Window.ComputeNcCalcSizeResizeFlags(
+            (left: -100, top: 0, right: 1300, bottom: 900),
+            oldRect));
+    }
+
     [Fact]
     public void SnapProxy_MaxButton_FullHeight_BuildsProxyInsideDwmMaxRect()
     {

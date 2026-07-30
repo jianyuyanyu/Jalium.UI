@@ -7,7 +7,11 @@ namespace Jalium.UI.Interop;
 /// </summary>
 public enum GpuPreference
 {
-    /// <summary>Let the OS/driver decide (default).</summary>
+    /// <summary>
+    /// Use the framework default. Windows D3D12 prefers the high-performance
+    /// adapter; set <c>JALIUM_GPU_PREFERENCE=auto</c> to explicitly use the
+    /// OS/monitor-affinity ordering.
+    /// </summary>
     Auto = 0,
     /// <summary>Prefer discrete/high-performance GPU.</summary>
     HighPerformance = 1,

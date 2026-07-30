@@ -456,6 +456,113 @@ public class ChartTests
         Assert.Equal("Test", chart.Series[0].Title);
     }
 
+    [Fact]
+    public void LineChart_SeriesBinding_UsesChartDataContext()
+    {
+        var chart = new LineChart();
+        var series = new LineSeries();
+        series.SetBinding(
+            LineSeries.DataPointsProperty,
+            new Binding(nameof(ChartBindingSource.Points)));
+
+        // This is the same order used by generated JALXAML: the binding is installed
+        // before the non-visual series is added to the chart collection.
+        chart.Series.Add(series);
+
+        var first = new ChartBindingSource(("Jan", 42), ("Feb", 55));
+        chart.DataContext = first;
+        Assert.Same(first.Points, series.DataPoints);
+
+        var second = new ChartBindingSource(("Mar", 48), ("Apr", 67));
+        chart.DataContext = second;
+        Assert.Same(second.Points, series.DataPoints);
+    }
+
+    [Fact]
+    public void LineChart_SeriesBinding_ResolvesWhenDetachedSubtreeIsAttached()
+    {
+        var source = new ChartBindingSource(("Jan", 42), ("Feb", 55));
+        var chart = new LineChart();
+        var series = BindDataPoints(new LineSeries(), LineSeries.DataPointsProperty);
+
+        // Generated JALXAML builds bottom-up. At this point neither the chart nor its
+        // owning Border can see the page's already-established DataContext.
+        chart.Series.Add(series);
+        var detachedHost = new Border { Child = chart };
+
+        var pageRoot = new Grid { DataContext = source };
+        pageRoot.Children.Add(detachedHost);
+
+        Assert.Same(source.Points, series.DataPoints);
+    }
+
+    [Fact]
+    public void AllChartSeriesOwners_ProvideBindingContext()
+    {
+        var source = new ChartBindingSource(("A", 10), ("B", 20));
+
+        var lineChart = new LineChart();
+        var lineSeries = BindDataPoints(new LineSeries(), LineSeries.DataPointsProperty);
+        lineChart.Series.Add(lineSeries);
+        lineChart.DataContext = source;
+        Assert.Same(source.Points, lineSeries.DataPoints);
+
+        var barChart = new BarChart();
+        var barSeries = BindDataPoints(new BarSeries(), BarSeries.DataPointsProperty);
+        barChart.Series.Add(barSeries);
+        barChart.DataContext = source;
+        Assert.Same(source.Points, barSeries.DataPoints);
+
+        var scatterPlot = new ScatterPlot();
+        var scatterSeries = BindDataPoints(new ScatterSeries(), ScatterSeries.DataPointsProperty);
+        scatterPlot.Series.Add(scatterSeries);
+        scatterPlot.DataContext = source;
+        Assert.Same(source.Points, scatterSeries.DataPoints);
+
+        var pieChart = new PieChart();
+        var pieSeries = new PieSeries();
+        pieSeries.SetBinding(
+            PieSeries.DataPointsProperty,
+            new Binding(nameof(ChartBindingSource.PiePoints)));
+        pieChart.Series = pieSeries;
+        pieChart.DataContext = source;
+        Assert.Same(source.PiePoints, pieSeries.DataPoints);
+    }
+
+    private static TSeries BindDataPoints<TSeries>(
+        TSeries series,
+        DependencyProperty dataPointsProperty)
+        where TSeries : ChartSeries
+    {
+        series.SetBinding(
+            dataPointsProperty,
+            new Binding(nameof(ChartBindingSource.Points)));
+        return series;
+    }
+
+    private sealed class ChartBindingSource
+    {
+        public ChartBindingSource(params (string Category, double Value)[] values)
+        {
+            Points = new ObservableCollection<ChartDataPoint>(
+                values.Select(value => new ChartDataPoint
+                {
+                    XValue = value.Category,
+                    YValue = value.Value
+                }));
+            PiePoints = new ObservableCollection<PieDataPoint>(
+                values.Select(value => new PieDataPoint
+                {
+                    Label = value.Category,
+                    Value = value.Value
+                }));
+        }
+
+        public ObservableCollection<ChartDataPoint> Points { get; }
+
+        public ObservableCollection<PieDataPoint> PiePoints { get; }
+    }
+
     #endregion
 
     #region BarChart

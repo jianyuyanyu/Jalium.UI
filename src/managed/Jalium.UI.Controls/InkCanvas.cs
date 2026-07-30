@@ -2877,7 +2877,7 @@ public class InkCanvas : FrameworkElement, IAddChild
             double width = 0;
             double height = 0;
             var infinite = new Size(double.PositiveInfinity, double.PositiveInfinity);
-            foreach (UIElement child in Children)
+            foreach (UIElement child in Children.EnumerateStruct())
             {
                 child.Measure(infinite);
                 double left = GetLeft(child);
@@ -2893,7 +2893,7 @@ public class InkCanvas : FrameworkElement, IAddChild
 
         protected override Size ArrangeOverride(Size finalSize)
         {
-            foreach (UIElement child in Children)
+            foreach (UIElement child in Children.EnumerateStruct())
             {
                 double left = GetLeft(child);
                 double top = GetTop(child);

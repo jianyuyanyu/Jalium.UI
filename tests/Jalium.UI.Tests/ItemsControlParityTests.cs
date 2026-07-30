@@ -80,10 +80,14 @@ public sealed class ItemsControlParityTests
         Assert.Equal(1, control.CreateCalls);
         Assert.Equal(1, control.PrepareCalls);
         Assert.Equal("item", container.Content);
+        Assert.Equal("item", container.DataContext);
 
         control.ClearForTest(container, "item");
         Assert.Equal(1, control.ClearCalls);
         Assert.Null(container.Content);
+        Assert.Same(
+            DependencyProperty.UnsetValue,
+            container.ReadLocalValue(FrameworkElement.DataContextProperty));
     }
 
     [Fact]
@@ -102,6 +106,36 @@ public sealed class ItemsControlParityTests
         var container = Assert.IsType<ContentPresenter>(Assert.Single(control.Host!.Children));
         Assert.Same(selectedStyle, container.Style);
         Assert.Same(bindingGroup, container.BindingGroup);
+    }
+
+    [Fact]
+    public void GeneratedContainer_DataContextDrivesItemContainerStyleBindings()
+    {
+        var style = new Style(typeof(ContentPresenter));
+        style.Setters.Add(new Setter(
+            Canvas.LeftProperty,
+            new Binding(nameof(PositionedItem.Left))));
+        style.Setters.Add(new Setter(
+            Canvas.TopProperty,
+            new Binding(nameof(PositionedItem.Top))));
+
+        var item = new PositionedItem
+        {
+            Left = 42.5,
+            Top = 137.25,
+        };
+        var control = new ProbeItemsControl
+        {
+            ItemContainerStyle = style,
+        };
+        control.Items.Add(item);
+        Measure(control);
+
+        var container =
+            Assert.IsType<ContentPresenter>(Assert.Single(control.Host!.Children));
+        Assert.Same(item, container.DataContext);
+        Assert.Equal(item.Left, Canvas.GetLeft(container));
+        Assert.Equal(item.Top, Canvas.GetTop(container));
     }
 
     [Fact]
@@ -217,5 +251,12 @@ public sealed class ItemsControlParityTests
     private sealed class DisplayItem
     {
         public string Name { get; init; } = string.Empty;
+    }
+
+    private sealed class PositionedItem
+    {
+        public double Left { get; init; }
+
+        public double Top { get; init; }
     }
 }

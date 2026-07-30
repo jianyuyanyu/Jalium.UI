@@ -592,6 +592,21 @@ public class UIElementCollection : System.Collections.IList
     /// </summary>
     public virtual System.Collections.IEnumerator GetEnumerator() => _items.GetEnumerator();
 
+    /// <summary>
+    /// Returns an allocation-free enumerable for layout code in this assembly.
+    /// The public non-generic enumerator remains unchanged for WPF API parity.
+    /// </summary>
+    internal StructEnumerable EnumerateStruct() => new(_items);
+
+    internal readonly struct StructEnumerable
+    {
+        private readonly List<UIElement> _items;
+
+        internal StructEnumerable(List<UIElement> items) => _items = items;
+
+        public List<UIElement>.Enumerator GetEnumerator() => _items.GetEnumerator();
+    }
+
     int System.Collections.IList.Add(object? value)
     {
         UIElement element = Cast(value);

@@ -204,7 +204,7 @@ internal static partial class GalleryWindow
                     StartupDiagnostics.Mark(
                         "Gallery.DeferredSectionFailed",
                         blocksUiThread: true);
-                    Console.Error.WriteLine(
+                    System.Diagnostics.Debug.WriteLine(
                         $"[Gallery startup] Deferred section '{descriptor.StageName}' failed: {exception}");
                 }
             }
@@ -229,7 +229,7 @@ internal static partial class GalleryWindow
             // unexpected infrastructure failure observable and contained so it cannot
             // become an unobserved task exception or take down the already usable shell.
             StartupDiagnostics.Mark("Gallery.DeferredSectionsFailed", blocksUiThread: false);
-            Console.Error.WriteLine(
+            System.Diagnostics.Debug.WriteLine(
                 $"[Gallery startup] Deferred loading stopped unexpectedly: {exception}");
 
             try
@@ -284,7 +284,7 @@ internal static partial class GalleryWindow
             {
                 failureCount++;
                 StartupDiagnostics.Mark("Gallery.DeferredCardFailed", blocksUiThread: true);
-                Console.Error.WriteLine(
+                System.Diagnostics.Debug.WriteLine(
                     $"[Gallery startup] Deferred card '{card.StageName}' failed: {exception}");
             }
         }

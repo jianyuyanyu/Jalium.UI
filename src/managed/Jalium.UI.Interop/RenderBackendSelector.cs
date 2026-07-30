@@ -81,22 +81,42 @@ internal static class RenderBackendSelector
         }
     }
 
-    internal static GpuPreference GetPreferredGpuPreference()
-        => ResolveGpuPreference();
+    internal static GpuPreference GetPreferredGpuPreference(RenderBackend backend)
+        => ResolveGpuPreference(backend);
 
-    internal static GpuPreference ResolveGpuPreference(string? preferenceOverride = null)
+    internal static GpuPreference ResolveGpuPreference(
+        RenderBackend backend,
+        string? preferenceOverride = null,
+        bool? isWindows = null)
     {
         preferenceOverride ??= Environment.GetEnvironmentVariable(GpuPreferenceEnvironmentVariable)?.Trim();
+        isWindows ??= RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
-        var result = preferenceOverride?.Trim().ToLowerInvariant() switch
+        return preferenceOverride?.Trim().ToLowerInvariant() switch
         {
+            "auto" or "default" or "os" or "system" => GpuPreference.Auto,
             "high" or "high_performance" or "discrete" => GpuPreference.HighPerformance,
             "low" or "minimum_power" or "integrated" or "igpu" => GpuPreference.MinimumPower,
+            // A D3D12 UI process on a hybrid Windows machine must not silently
+            // inherit the scan-out adapter. That commonly pins rendering to an
+            // old integrated driver even when a discrete GPU is available. It
+            // also makes a TDR recovery recreate the device on the same failing
+            // adapter. Prefer the high-performance DXGI ordering by default;
+            // JALIUM_GPU_PREFERENCE=auto remains the explicit opt-in to
+            // monitor/OS affinity, while other backends keep their old policy.
+            _ when backend == RenderBackend.D3D12 && isWindows.Value
+                => GpuPreference.HighPerformance,
             _ => GpuPreference.Auto,
         };
-
-        return result;
     }
+
+    internal static GpuPreference? GetFallbackGpuPreference(GpuPreference preference)
+        => preference switch
+        {
+            GpuPreference.HighPerformance => GpuPreference.MinimumPower,
+            GpuPreference.MinimumPower => GpuPreference.HighPerformance,
+            _ => null,
+        };
 
     private static RenderBackend[] GetPreferredOrder(bool isWindows, bool isMacOS, bool isLinux, bool isAndroid = false)
     {

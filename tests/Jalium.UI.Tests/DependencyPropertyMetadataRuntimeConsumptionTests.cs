@@ -8,8 +8,10 @@ public sealed class DependencyPropertyMetadataRuntimeConsumptionTests
         var element = new CoercingElement();
 
         element.SetValue(CoerceOwner.ValueProperty, 4);
+        element.ResetCoerceInvocationCount();
 
         Assert.Equal(5, element.GetValue(CoerceOwner.ValueProperty));
+        Assert.Equal(1, element.CoerceInvocationCount);
     }
 
     [Fact]
@@ -38,8 +40,16 @@ public sealed class DependencyPropertyMetadataRuntimeConsumptionTests
         {
             ValueProperty.OverrideMetadata(
                 typeof(CoercingElement),
-                new PropertyMetadata(0, null, static (_, value) => (int)value! + 1));
+                new PropertyMetadata(0, null, static (owner, value) =>
+                {
+                    ((CoercingElement)owner).CoerceInvocationCount++;
+                    return (int)value! + 1;
+                }));
         }
+
+        internal int CoerceInvocationCount { get; private set; }
+
+        internal void ResetCoerceInvocationCount() => CoerceInvocationCount = 0;
     }
 
     private class InheritanceOwner : FrameworkElement

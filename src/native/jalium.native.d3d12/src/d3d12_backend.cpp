@@ -279,11 +279,19 @@ bool D3D12Backend::Initialize(void* preferredWindow) {
     // environment. Managed hosts call SetGpuPreference before device creation,
     // so an API request always wins.
     if (!gpuPreferenceWasSet_) {
-        gpuPreference_ = JALIUM_GPU_PREFERENCE_AUTO;
+        // Prefer a discrete/high-performance adapter for native hosts too.
+        // Auto used to follow the monitor's scan-out adapter, which pins hybrid
+        // systems to an integrated GPU and recreates a TDR-lost device on that
+        // same adapter. JALIUM_GPU_PREFERENCE=auto/default remains an explicit
+        // opt-in to the old monitor/OS affinity behavior.
+        gpuPreference_ = JALIUM_GPU_PREFERENCE_HIGH_PERFORMANCE;
         wchar_t* val = nullptr;
         size_t len = 0;
         if (_wdupenv_s(&val, &len, L"JALIUM_GPU_PREFERENCE") == 0 && val && *val != L'\0') {
-            if (_wcsicmp(val, L"integrated") == 0 || _wcsicmp(val, L"igpu") == 0
+            if (_wcsicmp(val, L"auto") == 0 || _wcsicmp(val, L"default") == 0
+                || _wcsicmp(val, L"os") == 0 || _wcsicmp(val, L"system") == 0) {
+                gpuPreference_ = JALIUM_GPU_PREFERENCE_AUTO;
+            } else if (_wcsicmp(val, L"integrated") == 0 || _wcsicmp(val, L"igpu") == 0
                 || _wcsicmp(val, L"low") == 0 || _wcsicmp(val, L"minimum_power") == 0) {
                 gpuPreference_ = JALIUM_GPU_PREFERENCE_MINIMUM_POWER;
             } else if (_wcsicmp(val, L"discrete") == 0 || _wcsicmp(val, L"high") == 0

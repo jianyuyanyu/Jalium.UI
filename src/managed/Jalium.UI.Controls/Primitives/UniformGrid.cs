@@ -142,7 +142,7 @@ public class UniformGrid : Panel
         var maxChildWidth = 0.0;
         var maxChildHeight = 0.0;
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             child.Measure(childAvailableSize);
             maxChildWidth = Math.Max(maxChildWidth, child.DesiredSize.Width);
@@ -173,7 +173,7 @@ public class UniformGrid : Panel
         var row = 0;
         var column = FirstColumn;
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             // Skip first column cells if specified
             while (row == 0 && column > 0 && column >= _computedColumns)
