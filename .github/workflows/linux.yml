@@ -222,9 +222,16 @@ jobs:
               --logger "trx;LogFileName=linux-vulkan-${{ matrix.rid }}.trx" \
               --logger "console;verbosity=detailed"
 
-      - name: Bootstrap current Jalium.UI.Build package for source consumers
+      - name: Bootstrap current build packages for source consumers
         run: |
           mkdir -p packages
+          dotnet pack src/managed/Jalium.UI.Xaml.SourceGenerator/Jalium.UI.Xaml.SourceGenerator.csproj \
+            -c Release -m:1 \
+            -p:JaliumBuildRoot="${{ runner.temp }}/jalium-source-generator-bootstrap" \
+            -p:BuildJaliumNativeProjects=false \
+            -p:BuildJaliumNativeStaticProjects=false \
+            -p:GeneratePackageOnBuild=false \
+            -p:PackageOutputPath="$GITHUB_WORKSPACE/packages"
           dotnet pack src/managed/Jalium.UI.Build/Jalium.UI.Build.csproj \
             -c Release -m:1 \
             -p:JaliumBuildRoot="${{ runner.temp }}/jalium-build-bootstrap" \
@@ -579,6 +586,13 @@ jobs:
                   --logger "console;verbosity=detailed"
 
               mkdir -p packages
+              dotnet pack src/managed/Jalium.UI.Xaml.SourceGenerator/Jalium.UI.Xaml.SourceGenerator.csproj \
+                -c Release -m:1 \
+                -p:JaliumBuildRoot="/artifacts/jalium-source-generator-bootstrap-${{ matrix.rid }}" \
+                -p:BuildJaliumNativeProjects=false \
+                -p:BuildJaliumNativeStaticProjects=false \
+                -p:GeneratePackageOnBuild=false \
+                -p:PackageOutputPath=/work/packages
               dotnet pack src/managed/Jalium.UI.Build/Jalium.UI.Build.csproj \
                 -c Release -m:1 \
                 -p:JaliumBuildRoot="/artifacts/jalium-build-bootstrap-${{ matrix.rid }}" \
