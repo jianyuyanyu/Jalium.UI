@@ -10,6 +10,13 @@
     <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
+  <ItemGroup Condition="'$(JaliumPlatform)' == 'android'">
+    <!-- Avoid collisions between Android.Widget types and the Jalium control
+         names registered by XamlReader and used by the converter layer. -->
+    <Using Remove="Android.App" />
+    <Using Remove="Android.Widget" />
+  </ItemGroup>
+
   <ItemGroup>
     <InternalsVisibleTo Include="Jalium.UI.Tests" />
   </ItemGroup>

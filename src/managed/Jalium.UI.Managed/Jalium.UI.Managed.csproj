@@ -20,6 +20,14 @@
     <Using Remove="System.Windows.Forms" />
   </ItemGroup>
 
+  <ItemGroup Condition="'$(JaliumPlatform)' == 'android'">
+    <!-- The Android SDK adds these as implicit global usings. They collide
+         with Jalium controls such as Button, ListView, and DatePicker in the
+         unified managed source set. Platform code uses explicit namespaces. -->
+    <Using Remove="Android.App" />
+    <Using Remove="Android.Widget" />
+  </ItemGroup>
+
   <ItemGroup>
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="..\Jalium.UI.Core\**\*.cs"
