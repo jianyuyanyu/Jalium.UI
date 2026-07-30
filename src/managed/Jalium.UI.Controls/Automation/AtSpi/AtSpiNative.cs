@@ -650,7 +650,7 @@ internal static class AtSpiTrace
     internal static void Log(string message)
     {
         if (s_enabled)
-            System.Diagnostics.Debug.WriteLine($"[Jalium.AT-SPI2] {message}");
+            Console.Error.WriteLine($"[Jalium.AT-SPI2] {message}");
     }
 
     private static bool IsEnabled()
