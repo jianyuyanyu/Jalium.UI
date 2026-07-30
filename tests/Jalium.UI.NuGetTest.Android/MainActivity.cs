@@ -15,10 +15,8 @@ namespace Jalium.UI.NuGetTest.Android;
     Theme = "@android:style/Theme.NoTitleBar.Fullscreen")]
 public class MainActivity : JaliumActivity
 {
-    protected override Application CreateApplication()
+    protected override JaliumApp CreateHostedApp()
     {
-        var app = new Application();
-
         var window = new Window
         {
             Title = "NuGet Package Test - Android",
@@ -53,7 +51,9 @@ public class MainActivity : JaliumActivity
         });
 
         window.Content = root;
-        app.MainWindow = window;
-        return app;
+
+        var builder = AppBuilder.CreateBuilder();
+        builder.ConfigureApplication(app => app.MainWindow = window);
+        return builder.Build();
     }
 }
