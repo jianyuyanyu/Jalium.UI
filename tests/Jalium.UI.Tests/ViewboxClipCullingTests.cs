@@ -12,7 +12,7 @@ namespace Jalium.UI.Tests;
 [Collection("Application")]
 public sealed class ViewboxClipCullingTests
 {
-    [Fact]
+    [RequiresWindowsFact]
     public void ViewboxAt257Percent_DoesNotCullVisibleChildInLowerHalf()
     {
         const int surfaceSize = 320;
