@@ -536,7 +536,7 @@ internal sealed partial class NativePlatformWindow : IPlatformWindow
             // on Android that terminates the process instead of behaving like a
             // normal managed dispatcher exception. Keep the native loop alive
             // and surface enough context in logcat for diagnosis.
-            Console.Error.WriteLine($"[NativePlatformWindow] event callback failed: {ex}");
+            System.Diagnostics.Debug.WriteLine($"[NativePlatformWindow] event callback failed: {ex}");
         }
     }
 

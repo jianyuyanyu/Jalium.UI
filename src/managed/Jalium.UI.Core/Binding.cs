@@ -876,6 +876,7 @@ public sealed class BindingExpression : BindingExpressionBase
     private DependencyObject? _sourceDependencyObject;
     private PropertyInfo? _sourceProperty;
     private object? _effectiveSource;
+    private WeakReference<FrameworkElement>? _dataContextElement;
     private bool _isUpdating;
     private bool _isLostFocusUpdate;
     private bool _isAsyncUpdatePending;
@@ -988,13 +989,13 @@ public sealed class BindingExpression : BindingExpressionBase
         if (ResolvedSource == null && _binding.Source == null)
         {
             Status = BindingStatus.Unattached;
-            if (Target is FrameworkElement pendingFe)
+            var pendingDataContextElement = GetDataContextElement();
+            if (pendingDataContextElement != null)
             {
                 // 防重 subscribe — 多次 Activate 失败时（XAML 解析时 + ReactivateBindings 时
                 // visual tree 仍未就绪等场景）不应叠加多份 handler，否则 DataContext 后续
                 // 就绪时 OnDataContextChanged 会被调用多次，徒增 SubscribeToSource 累积。
-                pendingFe.DataContextChanged -= OnDataContextChanged;
-                pendingFe.DataContextChanged += OnDataContextChanged;
+                SubscribeToDataContextChanges(pendingDataContextElement);
             }
             BindingDiagnostics.NotifyStatus(this, "Unattached — source not resolved");
             return;
@@ -1033,11 +1034,11 @@ public sealed class BindingExpression : BindingExpressionBase
         if (_binding.Converter != null || string.IsNullOrEmpty(_binding.PendingConverterKey))
             return;
 
-        if (Target is not FrameworkElement targetFe)
+        var targetFe = GetDataContextElement();
+        if (targetFe == null)
         {
-            // Non-FE targets (rare for binding, e.g. Freezable) cannot resolve resources
-            // through visual ancestors. Leave the key set; if the binding ever attaches
-            // to an FE later, we'll try again.
+            // A non-visual target without a mentor cannot resolve resources through
+            // framework ancestors. Leave the key set so a later mentor attachment can retry.
             return;
         }
 
@@ -1097,14 +1098,16 @@ public sealed class BindingExpression : BindingExpressionBase
     /// <inheritdoc />
     internal override void Deactivate()
     {
-        if (!IsActive)
-            return;
-
+        var wasActive = IsActive;
         IsActive = false;
         Status = BindingStatus.Inactive;
-        DetachFromBindingGroup();
+        if (wasActive)
+        {
+            DetachFromBindingGroup();
+        }
 
-        // Unsubscribe from source changes
+        // Unsubscribe even for an unattached expression: the unresolved-source path
+        // subscribes to DataContextChanged while IsActive is false.
         UnsubscribeFromSource();
     }
 
@@ -1611,8 +1614,9 @@ public sealed class BindingExpression : BindingExpressionBase
 
     private object? GetDataContext()
     {
-        // Walk up the visual tree to find the nearest DataContext
-        FrameworkElement? current = Target as FrameworkElement;
+        // Walk the target's framework tree, or the mentor supplied by an owning
+        // control for a non-visual dependency object, to find the nearest DataContext.
+        FrameworkElement? current = GetDataContextElement();
         while (current != null)
         {
             if (current.DataContext != null)
@@ -1621,6 +1625,9 @@ public sealed class BindingExpression : BindingExpressionBase
         }
         return null;
     }
+
+    private FrameworkElement? GetDataContextElement()
+        => Target as FrameworkElement ?? Target.BindingMentor;
 
     [UnconditionalSuppressMessage("Trimming", "IL2026:RequiresUnreferencedCode",
         Justification = "The JALXAML source generator registers application-local binding types through AotTypeRegistry.Register(Type), whose DAM contract preserves their public properties. PropertyAccessorRegistry keeps reflection only as the lookup mechanism for that preserved metadata or for explicitly registered external accessors.")]
@@ -1789,11 +1796,12 @@ public sealed class BindingExpression : BindingExpressionBase
             _sourceDependencyObject.PropertyChangedInternal += OnSourceDependencyPropertyChanged;
         }
 
-        // Also subscribe to DataContext changes
-        if (Target is FrameworkElement fe)
+        // Also subscribe to DataContext changes. Non-visual dependency objects can
+        // receive a framework mentor from their owning control.
+        var dataContextElement = GetDataContextElement();
+        if (dataContextElement != null)
         {
-            fe.DataContextChanged -= OnDataContextChanged;
-            fe.DataContextChanged += OnDataContextChanged;
+            SubscribeToDataContextChanges(dataContextElement);
         }
 
         // Subscribe to LostFocus for UpdateSourceTrigger.LostFocus
@@ -1840,10 +1848,11 @@ public sealed class BindingExpression : BindingExpressionBase
             _sourceDependencyObject = null;
         }
 
-        if (Target is FrameworkElement fe)
+        if (_dataContextElement?.TryGetTarget(out var dataContextElement) == true)
         {
-            fe.DataContextChanged -= OnDataContextChanged;
+            dataContextElement.DataContextChanged -= OnDataContextChanged;
         }
+        _dataContextElement = null;
 
         if (Target is UIElement targetElementUnsub)
         {
@@ -1858,6 +1867,19 @@ public sealed class BindingExpression : BindingExpressionBase
 
         UnsubscribeFromIntermediates();
         UnsubscribeFromConverter();
+    }
+
+    private void SubscribeToDataContextChanges(FrameworkElement element)
+    {
+        if (_dataContextElement?.TryGetTarget(out var previousElement) == true &&
+            !ReferenceEquals(previousElement, element))
+        {
+            previousElement.DataContextChanged -= OnDataContextChanged;
+        }
+
+        _dataContextElement = new WeakReference<FrameworkElement>(element);
+        element.DataContextChanged -= OnDataContextChanged;
+        element.DataContextChanged += OnDataContextChanged;
     }
 
     private void SubscribeToConverter()

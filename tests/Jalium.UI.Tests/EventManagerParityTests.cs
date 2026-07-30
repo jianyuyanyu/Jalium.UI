@@ -31,6 +31,29 @@ public sealed class EventManagerParityTests
     }
 
     [Fact]
+    public void EmptyClassHandlerResolutionIsCachedAndInvalidatedByRegistration()
+    {
+        var routedEvent = EventManager.RegisterRoutedEvent(
+            $"CachedEmptyClassHandler{Guid.NewGuid():N}",
+            RoutingStrategy.Bubble,
+            typeof(RoutedEventHandler),
+            typeof(ClassHandlerBase));
+
+        var first = EventManager.GetClassHandlers(routedEvent, typeof(ClassHandlerDerived));
+        var repeated = EventManager.GetClassHandlers(routedEvent, typeof(ClassHandlerDerived));
+
+        Assert.Same(first, repeated);
+        Assert.Empty(first);
+
+        RoutedEventHandler handler = static (_, _) => { };
+        EventManager.RegisterClassHandler(typeof(ClassHandlerBase), routedEvent, handler);
+
+        var refreshed = EventManager.GetClassHandlers(routedEvent, typeof(ClassHandlerDerived));
+        Assert.Single(refreshed);
+        Assert.Same(handler, refreshed[0].Handler);
+    }
+
+    [Fact]
     public void GetRoutedEventsReturnsDistinctSnapshotIncludingAddedOwners()
     {
         var name = $"ParityEvent{Guid.NewGuid():N}";

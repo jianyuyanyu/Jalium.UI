@@ -34,7 +34,7 @@ public class ScatterPlot : AxisChartBase
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Content)]
     public static readonly DependencyProperty SeriesProperty =
         DependencyProperty.Register(nameof(Series), typeof(ObservableCollection<ScatterSeries>), typeof(ScatterPlot),
-            new PropertyMetadata(null, OnVisualPropertyChanged));
+            new PropertyMetadata(null, OnSeriesCollectionPropertyChanged));
 
     /// <summary>
     /// Identifies the ShowTrendLine dependency property.

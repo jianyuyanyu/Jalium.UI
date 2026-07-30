@@ -468,7 +468,7 @@ public class WindowRenderSchedulingTests
     }
 
     [Fact]
-    public void Window_LiveResize_CoalescesNativeResizeAtFrameBoundary()
+    public void Window_D3D12LiveResize_UpdatesLogicalViewportBeforeReturning()
     {
         var window = new Window { Width = 300, Height = 200 };
         SetPrivateField(window, "_dispatcher", Dispatcher.GetForCurrentThread());
@@ -483,8 +483,9 @@ public class WindowRenderSchedulingTests
             InvokePrivateMethod(window, "OnSizeChanged", 320, 220);
             InvokePrivateMethod(window, "OnSizeChanged", 360, 240);
 
-            Assert.Equal(0, native.ResizeCalls);
-            Assert.True(GetPrivateField<bool>(window, "_hasPendingResize"));
+            Assert.Equal(2, native.ResizeCalls);
+            Assert.Equal(new[] { (320, 220), (360, 240) }, native.ResizeSizes);
+            Assert.False(GetPrivateField<bool>(window, "_hasPendingResize"));
             Assert.Equal(360, GetPrivateField<int>(window, "_pendingResizeWidth"));
             Assert.Equal(240, GetPrivateField<int>(window, "_pendingResizeHeight"));
             Assert.Equal(360, window.Width);
@@ -497,12 +498,10 @@ public class WindowRenderSchedulingTests
             Assert.True(HasRenderFlag(window, RenderFlag_Scheduled));
             Assert.False(HasRenderFlag(window, RenderFlag_DirtyBetween));
 
-            // Model RenderFrame's pre-BeginDraw safe point while the interactive
-            // sizing session is still active. Only the latest size is committed.
+            // The later frame boundary has no destructive resize left to perform.
             InvokePrivateMethod(window, "FlushPendingRenderTargetResize");
 
-            Assert.Equal(1, native.ResizeCalls);
-            Assert.Equal(new[] { (360, 240) }, native.ResizeSizes);
+            Assert.Equal(2, native.ResizeCalls);
             Assert.False(GetPrivateField<bool>(window, "_hasPendingResize"));
         }
         finally
@@ -678,6 +677,7 @@ public class WindowRenderSchedulingTests
         {
             // Queue the first WM_SIZE, then model the frame-clock operation that
             // consumed its DirtyBetween/Scheduled flags and entered RenderFrame.
+            SetPrivateField(window, "_renderState", RenderFlag_Rendering);
             InvokePrivateMethod(window, "OnSizeChanged", 320, 220);
             SetPrivateField(window, "_renderState", 0);
 
@@ -731,6 +731,26 @@ public class WindowRenderSchedulingTests
     }
 
     [Fact]
+    public void Window_FullLayout_ElidesOnlyUiThreadDirtyElementsWithinScope()
+    {
+        var window = new Window { Width = 300, Height = 200 };
+        var probe = new DirtyElementDuringMeasureElement(window);
+        window.Content = probe;
+
+        InvokePrivateMethod(window, "UpdateLayoutForRender");
+
+        var dirtyElements = (IDictionary)GetPrivateField<object>(window, "_dirtyElements");
+        Assert.False(dirtyElements.Contains(probe.UiThreadElement));
+        Assert.True(dirtyElements.Contains(probe.BackgroundElement));
+
+        var afterLayoutElement = new FrameworkElement();
+        window.AddDirtyElement(afterLayoutElement);
+
+        Assert.True(dirtyElements.Contains(afterLayoutElement));
+        Assert.False(GetPrivateField<bool>(window, "_elideUiThreadDirtyRectsDuringFullLayout"));
+    }
+
+    [Fact]
     public void Window_FullLayout_AlwaysClearsDirtyRectElisionAfterLayoutFailure()
     {
         var window = new Window
@@ -757,6 +777,36 @@ public class WindowRenderSchedulingTests
         Assert.False(Window.RequiresBackBufferConvergence(RenderBackend.D3D12, supportsPartialPresentation: false));
         Assert.False(Window.RequiresBackBufferConvergence(RenderBackend.Vulkan, supportsPartialPresentation: true));
         Assert.False(Window.RequiresBackBufferConvergence(RenderBackend.Software, supportsPartialPresentation: true));
+    }
+
+    [Fact]
+    public void Window_LiveResize_DebouncesAlternateBufferConvergence()
+    {
+        int normalDelay = Window.ComputeBackBufferConvergenceDelayMs(isSizing: false);
+        int liveResizeDelay = Window.ComputeBackBufferConvergenceDelayMs(isSizing: true);
+
+        Assert.Equal(1, normalDelay);
+        Assert.True(liveResizeDelay >= 32);
+        Assert.True(liveResizeDelay > normalDelay);
+    }
+
+    [Fact]
+    public void Window_LiveResize_ArmsConvergenceBehindDeadline()
+    {
+        var window = new Window { Width = 300, Height = 200 };
+        var native = new RenderTargetTestNative();
+        using var renderTarget = CreateRenderTarget(native, 300, 200, new nint(0x212F));
+        SetPrivateProperty(window, "RenderTarget", renderTarget);
+        SetPrivateField(window, "_isSizing", true);
+        long before = Environment.TickCount64;
+
+        InvokePrivateMethod(window, "HandlePresentedFrameFlush", false);
+
+        Assert.Equal(1, GetPrivateField<int>(window, "_partialPresentsToFlush"));
+        Assert.InRange(
+            GetPrivateField<long>(window, "_backBufferConvergenceNotBeforeTick"),
+            before + 32,
+            Environment.TickCount64 + 1000);
     }
 
     [Fact]
@@ -1030,6 +1080,33 @@ public class WindowRenderSchedulingTests
             if (!backgroundThread.Join(TimeSpan.FromSeconds(5)))
             {
                 throw new TimeoutException("Background dirty-rect thread did not exit.");
+            }
+            return new Size(100, 100);
+        }
+    }
+
+    private sealed class DirtyElementDuringMeasureElement : FrameworkElement
+    {
+        private readonly Window _window;
+
+        public DirtyElementDuringMeasureElement(Window window) => _window = window;
+
+        public FrameworkElement UiThreadElement { get; } = new();
+
+        public FrameworkElement BackgroundElement { get; } = new();
+
+        protected override Size MeasureOverride(Size availableSize)
+        {
+            _window.AddDirtyElement(UiThreadElement, new Rect(1, 2, 3, 4));
+            var backgroundThread = new Thread(() => _window.AddDirtyElement(BackgroundElement))
+            {
+                IsBackground = true,
+                Name = "WindowRenderSchedulingTests.DirtyElement",
+            };
+            backgroundThread.Start();
+            if (!backgroundThread.Join(TimeSpan.FromSeconds(5)))
+            {
+                throw new TimeoutException("Background dirty-element thread did not exit.");
             }
             return new Size(100, 100);
         }

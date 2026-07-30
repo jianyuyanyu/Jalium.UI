@@ -296,6 +296,18 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
     /// </summary>
     protected virtual void PrepareContainerForItem(FrameworkElement element, object item)
     {
+        // WPF ItemContainerGenerator semantics: a generated container's data
+        // context is the logical item. Apply it before ItemContainerStyle so
+        // bindings declared by that style (including Canvas.Left/Canvas.Top on
+        // a ContentPresenter) activate against the item immediately.
+        //
+        // An item that is already its own container keeps its existing
+        // DataContext and participates in normal inheritance instead.
+        if (!ReferenceEquals(element, item))
+        {
+            element.DataContext = item;
+        }
+
         ApplyItemContainerStyleAndBindingGroup(element, item);
 
         // Items that are already their own container must not be assigned back into
@@ -913,6 +925,12 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
         {
             ClearGeneratedContainerContent(element);
         }
+
+        // Symmetric with PrepareContainerForItem: release the old logical item
+        // before this generated container is discarded or rebound from the
+        // recycle pool. ClearValue restores normal DataContext inheritance
+        // without pinning a replacement local value.
+        element.ClearValue(FrameworkElement.DataContextProperty);
 
         // Visual-state hygiene for pooled containers: a recycled container must not inherit the
         // previous item's leftover transform/opacity/clip/visibility local values (typically left

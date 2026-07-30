@@ -116,7 +116,7 @@ public sealed class RenderContext : IDisposable
         RenderingEngine renderingEngine = RenderingEngine.Auto)
     {
         backend = NormalizeRequestedBackend(backend);
-        gpuPreference = NormalizeGpuPreference(gpuPreference);
+        gpuPreference = NormalizeGpuPreference(gpuPreference, backend);
 
         // Lazy load the chosen backend's native DLL right before we ask the
         // native registry to materialize a context. This is the single point
@@ -214,7 +214,7 @@ public sealed class RenderContext : IDisposable
         // back to the platform default.
         bool explicitBackend = backend != RenderBackend.Auto;
         backend = NormalizeRequestedBackend(backend);
-        gpuPreference = NormalizeGpuPreference(gpuPreference);
+        gpuPreference = NormalizeGpuPreference(gpuPreference, backend);
 
         // Only enforce (i.e. retire + replace a different-backend current context)
         // when the requested backend is genuinely available. If it is not, the
@@ -536,9 +536,11 @@ public sealed class RenderContext : IDisposable
             ? RenderBackendSelector.GetPreferredBackend()
             : backend;
 
-    private static GpuPreference NormalizeGpuPreference(GpuPreference preference)
+    private static GpuPreference NormalizeGpuPreference(
+        GpuPreference preference,
+        RenderBackend backend)
         => preference == GpuPreference.Auto
-            ? RenderBackendSelector.GetPreferredGpuPreference()
+            ? RenderBackendSelector.GetPreferredGpuPreference(backend)
             : preference;
 
     /// <inheritdoc />

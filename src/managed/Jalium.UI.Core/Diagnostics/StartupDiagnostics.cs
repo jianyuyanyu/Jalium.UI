@@ -32,7 +32,7 @@ public readonly struct StartupTraceScope : IDisposable
 
 /// <summary>
 /// Records process-startup phases and milestones without taking a dependency on the
-/// Generic Host or application logging. Text tracing is enabled by setting
+/// Generic Host or application logging. Debugger text tracing is enabled by setting
 /// <c>JALIUM_STARTUP_TRACE=1</c> and/or <c>JALIUM_STARTUP_TRACE_FILE</c>. EventPipe/ETW
 /// consumers can instead enable the <c>Jalium-UI-Startup</c> EventSource.
 /// </summary>
@@ -47,7 +47,7 @@ public static class StartupDiagnostics
     private const string TraceFileEnvironmentVariable = "JALIUM_STARTUP_TRACE_FILE";
 
     private static readonly object s_gate = new();
-    private static readonly bool s_consoleEnabled = IsEnabledValue(
+    private static readonly bool s_debugEnabled = IsEnabledValue(
         Environment.GetEnvironmentVariable(TraceEnvironmentVariable));
     private static readonly string? s_traceFilePath = NormalizeTraceFilePath(
         Environment.GetEnvironmentVariable(TraceFileEnvironmentVariable));
@@ -63,7 +63,7 @@ public static class StartupDiagnostics
     /// Gets whether structured text or EventSource startup tracing is currently enabled.
     /// </summary>
     public static bool IsEnabled =>
-        s_consoleEnabled ||
+        s_debugEnabled ||
         s_traceFilePath != null ||
         StartupEventSource.Log.IsEnabled();
 
@@ -244,7 +244,7 @@ public static class StartupDiagnostics
                     break;
             }
 
-            if (s_consoleEnabled || s_traceFilePath != null)
+            if (s_debugEnabled || s_traceFilePath != null)
             {
                 WriteTextRecord(
                     eventKind,
@@ -279,10 +279,11 @@ public static class StartupDiagnostics
     {
         lock (s_gate)
         {
-            if (s_consoleEnabled)
+            if (s_debugEnabled)
             {
+                using var debugWriter = new StringWriter(CultureInfo.InvariantCulture);
                 WriteTextRecordCore(
-                    Console.Error,
+                    debugWriter,
                     eventKind,
                     stageName,
                     utcTimestamp,
@@ -293,6 +294,7 @@ public static class StartupDiagnostics
                     isThreadPoolThread,
                     uiThreadState,
                     blocksUiThread);
+                Debug.WriteLine(debugWriter.ToString().TrimEnd('\r', '\n'));
             }
 
             var fileWriter = GetTraceFileWriter();

@@ -13,7 +13,7 @@ public class DataGridCellsPanel : VirtualizingPanel
         var width = 0.0;
         var height = 0.0;
         var childConstraint = new Size(double.PositiveInfinity, availableSize.Height);
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             child.Measure(childConstraint);
             width += child.DesiredSize.Width;
@@ -26,7 +26,7 @@ public class DataGridCellsPanel : VirtualizingPanel
     protected override Size ArrangeOverride(Size finalSize)
     {
         var x = 0.0;
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             var width = child.DesiredSize.Width;
             child.Arrange(new Rect(x, 0, width, finalSize.Height));

@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Jalium.UI.Controls.Primitives;
 using Jalium.UI.Input;
@@ -14,7 +13,9 @@ namespace Jalium.UI.Controls;
 public partial class ScrollViewer : ContentControl
 {
     private const string ScrollBarAutoHideEnvironmentVariable = "JALIUM_SCROLLBAR_AUTOHIDE";
-    private static readonly bool s_isScrollBarAutoHideEnabledByDefault = DetermineDefaultScrollBarAutoHide();
+    private static readonly bool s_isScrollBarAutoHideEnabledByDefault =
+        DetermineDefaultScrollBarAutoHide(
+            Environment.GetEnvironmentVariable(ScrollBarAutoHideEnvironmentVariable));
 
     /// <inheritdoc />
     protected override Jalium.UI.Automation.Peers.AutomationPeer? OnCreateAutomationPeer()
@@ -382,9 +383,8 @@ public partial class ScrollViewer : ContentControl
         set => SetValue(IsOverlayScrollBarEnabledProperty, value);
     }
 
-    private static bool DetermineDefaultScrollBarAutoHide()
+    internal static bool DetermineDefaultScrollBarAutoHide(string? environmentValue)
     {
-        var environmentValue = Environment.GetEnvironmentVariable(ScrollBarAutoHideEnvironmentVariable);
         if (!string.IsNullOrWhiteSpace(environmentValue))
         {
             switch (environmentValue.Trim().ToLowerInvariant())
@@ -402,29 +402,11 @@ public partial class ScrollViewer : ContentControl
             }
         }
 
-        // Mobile scroll bars are transient edge indicators. Keep that platform
-        // default even for Gallery/sample process names; the environment variable
-        // above remains the explicit override for diagnostics.
-        if (OperatingSystem.IsAndroid() || OperatingSystem.IsIOS())
-        {
-            return true;
-        }
-
-        try
-        {
-            using var process = Process.GetCurrentProcess();
-            if (!string.IsNullOrWhiteSpace(process.ProcessName) &&
-                process.ProcessName.Contains("gallery", StringComparison.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-        }
-        catch
-        {
-            // Ignore and fall back to command line probing.
-        }
-
-        return !Environment.CommandLine.Contains("gallery", StringComparison.OrdinalIgnoreCase);
+        // Auto-hide is the documented default for every host. Applications that
+        // need persistent scroll bars can opt out per viewer, or process-wide via
+        // JALIUM_SCROLLBAR_AUTOHIDE=0. Inferring policy from a process/command name
+        // made the same control behave differently inside Gallery applications.
+        return true;
     }
 
     /// <inheritdoc />
@@ -648,6 +630,8 @@ public partial class ScrollViewer : ContentControl
         AddHandler(MouseDownEvent, new Input.MouseButtonEventHandler(HandleMouseDown));
         AddHandler(MouseMoveEvent, new Input.MouseEventHandler(HandleMouseMove));
         AddHandler(MouseUpEvent, new Input.MouseButtonEventHandler(HandleMouseUp));
+        AddHandler(MouseEnterEvent, new Input.MouseEventHandler(OnAutoHideRegionMouseEnter));
+        AddHandler(MouseLeaveEvent, new Input.MouseEventHandler(OnAutoHideRegionMouseLeave));
         AddHandler(PointerDownEvent, new Input.PointerDownEventHandler(HandlePointerDown));
         // Nested viewers all see PointerDown and become gesture candidates. An
         // ancestor must still observe handled moves to keep its baseline in
@@ -819,11 +803,23 @@ public partial class ScrollViewer : ContentControl
         OnPointerCancel(e);
     }
 
+    private void OnAutoHideRegionMouseEnter(object sender, Input.MouseEventArgs e)
+    {
+        if (!ReferenceEquals(sender, this))
+            return;
+
+        // Entering content reveals only the collapsed/slim presentation. The
+        // ScrollBar's own MouseEnter handler is the exclusive expansion trigger.
+        ApplyScrollBarAutoHideVisualState();
+    }
+
     private void OnScrollBarMouseEnter(object sender, Input.MouseEventArgs e)
     {
         if (!ReferenceEquals(sender, _verticalScrollBar) && !ReferenceEquals(sender, _horizontalScrollBar))
             return;
 
+        // A direct ScrollBar MouseEnter means hit testing selected the bar rather
+        // than the content behind/beside it. Content hover alone must not expand.
         RevealAutoHideScrollBarsTemporarily();
     }
 
@@ -832,9 +828,19 @@ public partial class ScrollViewer : ContentControl
         if (!ReferenceEquals(sender, _verticalScrollBar) && !ReferenceEquals(sender, _horizontalScrollBar))
             return;
 
-        // Keep WinUI-like timing: leaving the bar starts the idle countdown,
-        // then slim mode is applied when the auto-hide timer elapses.
+        // Moving from the bar into the content remains inside the overall viewer,
+        // but it resumes the normal idle countdown instead of staying expanded.
         RestartScrollBarAutoHideTimer();
+    }
+
+    private void OnAutoHideRegionMouseLeave(object sender, Input.MouseEventArgs e)
+    {
+        if (!ReferenceEquals(sender, this))
+            return;
+
+        // The complete ScrollViewer (content plus scroll-bar gutters) is the
+        // outside boundary. Leaving it bypasses the idle delay and starts fading.
+        HideAutoHideScrollBarsIfEligible();
     }
 
     private void OnPointerDown(PointerDownEventArgs e)
@@ -1852,6 +1858,7 @@ public partial class ScrollViewer : ContentControl
             }
 
             scrollBar.StartAutoHideVisualTransition(0.0);
+            scrollBar.StartAutoHideVisibilityTransition(0.0);
             return;
         }
 
@@ -1868,6 +1875,7 @@ public partial class ScrollViewer : ContentControl
             }
 
             scrollBar.StartAutoHideVisualTransition(0.0);
+            scrollBar.StartAutoHideVisibilityTransition(1.0);
             return;
         }
 
@@ -1876,7 +1884,9 @@ public partial class ScrollViewer : ContentControl
             scrollBar.Visibility = Visibility.Visible;
         }
 
-        bool keepExpanded = _areAutoHideScrollBarsRevealed || ShouldKeepAutoHideScrollBarVisible(scrollBar);
+        bool keepExpanded =
+            _areAutoHideScrollBarsRevealed ||
+            ShouldKeepAutoHideScrollBarVisible(scrollBar);
         bool shouldUseSlimThumb = !keepExpanded;
         var targetProgress = shouldUseSlimThumb ? 1.0 : 0.0;
 
@@ -1890,6 +1900,12 @@ public partial class ScrollViewer : ContentControl
         // Always request a visual transition to the target progress.
         // StartAutoHideVisualTransition is idempotent — it early-exits when already at target.
         scrollBar.StartAutoHideVisualTransition(targetProgress);
+
+        // Shape and visibility are independent on desktop:
+        // outside = hidden, content = visible/slim, scrollbar = visible/expanded.
+        // Overlay indicators retain their existing scroll-driven visibility model.
+        var targetVisibility = scrollBar.IsOverlayStyle || IsMouseOver ? 1.0 : 0.0;
+        scrollBar.StartAutoHideVisibilityTransition(targetVisibility);
     }
 
     private static bool SupportsAutoHide(ScrollBarVisibility visibilityMode)
@@ -2942,8 +2958,7 @@ public partial class ScrollViewer : ContentControl
                 // Smooth animated scroll through IScrollInfo
                 var delta = ComputeMouseWheelDelta(e.Delta, LineScrollAmount, _viewportHeight);
 
-                if (!_isSmoothScrolling)
-                    _smoothTargetY = _verticalOffset;
+                InitializeSmoothScrollTargetsIfNeeded();
                 _smoothTargetY = Math.Clamp(_smoothTargetY + delta, 0, ScrollableHeight);
                 StartSmoothScroll();
             }
@@ -2982,8 +2997,7 @@ public partial class ScrollViewer : ContentControl
                 if (useSmoothWheelInertia)
                 {
                     // Smooth animated scroll: accumulate target, animate toward it
-                    if (!_isSmoothScrolling)
-                        _smoothTargetY = _verticalOffset;
+                    InitializeSmoothScrollTargetsIfNeeded();
                     _smoothTargetY = Math.Clamp(_smoothTargetY + delta, 0, ScrollableHeight);
                     StartSmoothScroll();
                 }
@@ -3013,8 +3027,7 @@ public partial class ScrollViewer : ContentControl
 
                 if (useSmoothWheelInertia)
                 {
-                    if (!_isSmoothScrolling)
-                        _smoothTargetX = _horizontalOffset;
+                    InitializeSmoothScrollTargetsIfNeeded();
                     _smoothTargetX = Math.Clamp(_smoothTargetX + delta, 0, ScrollableWidth);
                     StartSmoothScroll();
                 }
@@ -3027,6 +3040,21 @@ public partial class ScrollViewer : ContentControl
                 e.Handled = true;
             }
         }
+    }
+
+    /// <summary>
+    /// Starts a new smooth-scroll session from the currently committed position on
+    /// both axes. Every animation tick advances both targets, even when the wheel
+    /// changed only one axis, so leaving the other target at its default/stale value
+    /// would pull that axis back toward zero.
+    /// </summary>
+    private void InitializeSmoothScrollTargetsIfNeeded()
+    {
+        if (_isSmoothScrolling)
+            return;
+
+        _smoothTargetX = _horizontalOffset;
+        _smoothTargetY = _verticalOffset;
     }
 
     private void StartSmoothScroll()

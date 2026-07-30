@@ -208,7 +208,7 @@ public class ToastNotificationHost : Panel
         var spacing = Spacing;
         var totalHeight = 0.0;
 
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             child.Measure(new Size(toastWidth, double.PositiveInfinity));
             if (totalHeight > 0)
@@ -254,7 +254,7 @@ public class ToastNotificationHost : Panel
         {
             // Stack from top down
             double y = margin;
-            foreach (UIElement child in Children)
+            foreach (UIElement child in Children.EnumerateStruct())
             {
                 var desiredHeight = child.DesiredSize.Height;
                 child.Arrange(new Rect(x, y, toastWidth, desiredHeight));

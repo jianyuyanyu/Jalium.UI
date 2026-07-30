@@ -5,6 +5,21 @@
 #include <Windows.h>
 #include <atomic>
 
+// Hybrid-graphics process hints. In NativeAOT builds this object is linked into
+// the executable, so these become the well-known application exports consumed
+// by NVIDIA Optimus and AMD PowerXpress. The explicit IDXGIAdapter selection in
+// D3D12Backend remains authoritative; the exports also cover components that
+// create a default graphics device before Jalium initializes.
+//
+// selectany lets a native host provide its own value without a duplicate-symbol
+// failure when it statically links Jalium.
+extern "C" {
+    __declspec(selectany) __declspec(dllexport)
+        unsigned long NvOptimusEnablement = 0x00000001;
+    __declspec(selectany) __declspec(dllexport)
+        int AmdPowerXpressRequestHighPerformance = 1;
+}
+
 // Use atomic flag to avoid mutex issues during initialization
 static std::atomic<bool> s_registered{false};
 

@@ -53,6 +53,40 @@ public class ProgressBarThemeTests
     }
 
     [Fact]
+    public void ProgressBar_ImplicitThemeStyle_ShouldRenderTrackAndIndicatorAsCapsules()
+    {
+        ResetApplicationState();
+        var app = new Application();
+
+        try
+        {
+            var progressBar = new ProgressBar
+            {
+                Width = 200,
+                Height = 10,
+                Value = 25
+            };
+            var host = new Grid { Width = 240, Height = 40 };
+            host.Children.Add(progressBar);
+
+            host.Measure(new Size(240, 40));
+            host.Arrange(new Rect(0, 0, 240, 40));
+
+            var track = Assert.IsType<Shapes.Rectangle>(progressBar.FindName("PART_Track"));
+            var indicator = Assert.IsType<Border>(progressBar.FindName("PART_Indicator"));
+
+            Assert.True(track.RadiusX >= track.RenderSize.Height / 2);
+            Assert.True(track.RadiusY >= track.RenderSize.Height / 2);
+            Assert.True(indicator.CornerRadius.TopLeft >= indicator.RenderSize.Height / 2);
+            Assert.Equal(BorderShape.RoundedRectangle, indicator.Shape);
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Fact]
     public void ProgressBar_InternalResolvers_ShouldUseThemeResources()
     {
         ResetApplicationState();

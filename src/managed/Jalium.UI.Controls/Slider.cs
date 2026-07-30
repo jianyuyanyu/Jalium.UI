@@ -22,8 +22,6 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
     private static readonly SolidColorBrush s_accentPressedBrush = new(Color.FromRgb(0, 100, 190));
     private static readonly SolidColorBrush s_tickBrush = new(Color.FromRgb(100, 100, 100));
     private static readonly Pen s_tickPen = new(s_tickBrush, 1);
-    private static readonly SolidColorBrush s_whiteBrush = new(ThemeColors.CheckMark);
-    private static readonly Pen s_thumbBorderPen = new(s_whiteBrush, 2);
     private static readonly RoutedCommand s_decreaseLarge = new(nameof(DecreaseLarge), typeof(Slider));
     private static readonly RoutedCommand s_decreaseSmall = new(nameof(DecreaseSmall), typeof(Slider));
     private static readonly RoutedCommand s_increaseLarge = new(nameof(IncreaseLarge), typeof(Slider));
@@ -264,7 +262,8 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
     #region Private Fields
 
     private bool _isDragging;
-    private Point _dragStartPoint;
+    private Point _dragPointerPosition;
+    private Point _dragPointerOffsetFromThumbCenter;
     private const double ThumbSize = 16.0;
     private const double TrackThickness = 4.0;
 
@@ -321,7 +320,10 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
         Focus();
 
         var position = touchArgs.GetTouchPoint(this).Position;
-        SetValueFromPosition(position);
+        if (!GetThumbRect().Contains(position))
+        {
+            SetValueFromPosition(position);
+        }
         OnThumbDragStarted(new DragStartedEventArgs(position.X, position.Y));
         InvalidateVisual();
 
@@ -333,8 +335,10 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
         if (!_isDragging || e is not TouchEventArgs touchArgs) return;
         if (touchArgs.TouchDevice.Id != _activeTouchId) return;
         var position = touchArgs.GetTouchPoint(this).Position;
-        OnThumbDragDelta(new DragDeltaEventArgs(position.X - _dragStartPoint.X, position.Y - _dragStartPoint.Y));
-        _dragStartPoint = position;
+        OnThumbDragDelta(new DragDeltaEventArgs(
+            position.X - _dragPointerPosition.X,
+            position.Y - _dragPointerPosition.Y));
+        _dragPointerPosition = position;
         e.Handled = true;
     }
 
@@ -538,8 +542,8 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
             if (_isDragging)
             {
                 OnThumbDragCompleted(new DragCompletedEventArgs(
-                    e.GetPosition(this).X - _dragStartPoint.X,
-                    e.GetPosition(this).Y - _dragStartPoint.Y,
+                    e.GetPosition(this).X - _dragPointerPosition.X,
+                    e.GetPosition(this).Y - _dragPointerPosition.Y,
                     false));
                 ReleaseMouseCapture();
             }
@@ -552,8 +556,10 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
         if (_isDragging)
         {
             var position = e.GetPosition(this);
-            OnThumbDragDelta(new DragDeltaEventArgs(position.X - _dragStartPoint.X, position.Y - _dragStartPoint.Y));
-            _dragStartPoint = position;
+            OnThumbDragDelta(new DragDeltaEventArgs(
+                position.X - _dragPointerPosition.X,
+                position.Y - _dragPointerPosition.Y));
+            _dragPointerPosition = position;
             e.Handled = true;
         }
     }
@@ -645,29 +651,35 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
     protected virtual void OnThumbDragStarted(DragStartedEventArgs e)
     {
         _isDragging = true;
-        _dragStartPoint = new Point(e.HorizontalOffset, e.VerticalOffset);
+        _dragPointerPosition = new Point(e.HorizontalOffset, e.VerticalOffset);
+
+        var thumbRect = GetThumbRect();
+        _dragPointerOffsetFromThumbCenter = new Point(
+            _dragPointerPosition.X - (thumbRect.X + thumbRect.Width / 2),
+            _dragPointerPosition.Y - (thumbRect.Y + thumbRect.Height / 2));
+
         UpdateAutoToolTip();
         InvalidateVisual();
     }
 
     protected virtual void OnThumbDragDelta(DragDeltaEventArgs e)
     {
-        var trackLength = Orientation == Orientation.Horizontal
-            ? RenderSize.Width - ThumbSize
-            : RenderSize.Height - ThumbSize;
-        if (trackLength <= 0 || Maximum <= Minimum) return;
-        var pixelDelta = Orientation == Orientation.Horizontal ? e.HorizontalChange : -e.VerticalChange;
-        if (IsDirectionReversed) pixelDelta = -pixelDelta;
-        var target = Value + pixelDelta / trackLength * (Maximum - Minimum);
-        Value = IsSnapToTickEnabled
-            ? SnapValue(target, pixelDelta >= 0 ? 1 : -1)
-            : Math.Clamp(target, Minimum, Maximum);
+        var pointerPosition = new Point(
+            _dragPointerPosition.X + e.HorizontalChange,
+            _dragPointerPosition.Y + e.VerticalChange);
+        var anchoredThumbCenter = new Point(
+            pointerPosition.X - _dragPointerOffsetFromThumbCenter.X,
+            pointerPosition.Y - _dragPointerOffsetFromThumbCenter.Y);
+
+        SetValueFromPosition(anchoredThumbCenter);
+        _dragPointerPosition = pointerPosition;
         UpdateAutoToolTip();
     }
 
     protected virtual void OnThumbDragCompleted(DragCompletedEventArgs e)
     {
         _isDragging = false;
+        _dragPointerOffsetFromThumbCenter = default;
         ToolTipService.HideToolTip(this);
         InvalidateVisual();
     }
@@ -883,9 +895,6 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
 
         // Draw thumb circle
         dc.DrawEllipse(thumbBrush, null, new Point(centerX, centerY), radius, radius);
-
-        // Draw thumb border
-        dc.DrawEllipse(null, s_thumbBorderPen, new Point(centerX, centerY), radius - 1, radius - 1);
     }
 
     #endregion

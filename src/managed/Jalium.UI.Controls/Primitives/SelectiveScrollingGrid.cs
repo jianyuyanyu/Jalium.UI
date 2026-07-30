@@ -67,7 +67,7 @@ public class SelectiveScrollingGrid : Grid
         var baseResult = base.ArrangeOverride(finalSize);
 
         // Apply scroll offsets to children based on their SelectiveScrollingOrientation
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             var orientation = GetSelectiveScrollingOrientation(child);
 

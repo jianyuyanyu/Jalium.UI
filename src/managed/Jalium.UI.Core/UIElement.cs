@@ -273,6 +273,18 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     }
 
     /// <summary>
+    /// Returns whether this element currently has an instance handler for the
+    /// specified routed event. This is used by high-frequency direct events to
+    /// avoid allocating event arguments when dispatch would have no observers.
+    /// </summary>
+    internal bool HasRoutedEventHandler(RoutedEvent routedEvent)
+    {
+        return _eventHandlers != null
+            && _eventHandlers.TryGetValue(routedEvent, out var handlers)
+            && handlers.Count != 0;
+    }
+
+    /// <summary>
     /// Raises the specified routed event.
     /// </summary>
     /// <param name="e">The event arguments.</param>
@@ -1171,6 +1183,11 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     // 的值存储 Dictionary 写入竞争；字段读的撕裂等级与这些调用方本就在读的其他
     // 布局字段相同（良性）。由静态 OnEffectChanged 回调维护。
     private IEffect? _effectForDirtyBounds;
+    // RenderTransform is queried while walking every ancestor for dirty bounds,
+    // clipping, and render matrices. Because this DP is not inherited, its
+    // effective value can be mirrored exactly by its changed callback. The
+    // mirror also keeps background dirty registration out of DP dictionaries.
+    private Transform? _renderTransformForBounds;
     // 最近一次脏区计算为本元素提交的未 clip 屏幕 AABB（Window.ComputeDirtyRegions
     // 在 present 前写，AddDirtyElement 注册时读作 PrevPaintedBounds）。用于擦除
     // "先改值后失效 + 长空闲后不连续跳变 + 新 AABB 不含旧 AABB"场景下上次画过的
@@ -1853,7 +1870,7 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
                 double offY = vb.Y + ro.Y;
 
                 Matrix level;
-                var rt = ui.RenderTransform;
+                var rt = ui._renderTransformForBounds;
                 if (rt != null)
                 {
                     var size = ui._renderSize;
@@ -1916,7 +1933,7 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
                 double offY = vb.Y;
 
                 Matrix level;
-                var rt = ui.RenderTransform;
+                var rt = ui._renderTransformForBounds;
                 if (rt != null)
                 {
                     var size = ui._renderSize;
@@ -1954,7 +1971,7 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
         Visual? current = this;
         while (current != null && current is not IWindowHost)
         {
-            if (current is UIElement ui && ui.RenderTransform != null)
+            if (current is UIElement ui && ui._renderTransformForBounds != null)
                 return true;
             current = current.VisualParent;
         }
@@ -2004,7 +2021,9 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
                 // bail on the FIRST such ancestor, any successful (found=true) result guarantees
                 // the entire self→ancestor chain is offset/transform-free, so every GetScreenBounds
                 // below is a pure layout origin and the intersection is exact.
-                if (ui.RenderTransform != null || ui.RenderOffset.X != 0 || ui.RenderOffset.Y != 0)
+                if (ui._renderTransformForBounds != null ||
+                    ui.RenderOffset.X != 0 ||
+                    ui.RenderOffset.Y != 0)
                     return false;
 
                 var clip = ui.GetLayoutClip();
@@ -2170,7 +2189,12 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
             double deltaY = finalRect.Y - _previousFinalRect.Y;
             if (deltaX != 0 || deltaY != 0)
             {
-                Rect translationOldDirtyBounds = GetDirtyRenderBounds();
+                var translationWindowHost = GetWindowHostOrNull();
+                bool trackTranslationDirtyBounds =
+                    translationWindowHost?.ShouldTrackLayoutDirtyBounds == true;
+                Rect translationOldDirtyBounds = trackTranslationDirtyBounds
+                    ? GetDirtyRenderBounds()
+                    : Rect.Empty;
                 Rect oldVisualBounds = translatedElement.VisualBounds;
 
                 _previousFinalRect = finalRect;
@@ -2180,11 +2204,10 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
                     oldVisualBounds.Width,
                     oldVisualBounds.Height));
 
-                Rect translationNewDirtyBounds = GetDirtyRenderBounds();
-                if (translationNewDirtyBounds != translationOldDirtyBounds)
+                if (trackTranslationDirtyBounds)
                 {
-                    var windowHost = GetWindowHostOrNull();
-                    if (windowHost != null)
+                    Rect translationNewDirtyBounds = GetDirtyRenderBounds();
+                    if (translationNewDirtyBounds != translationOldDirtyBounds)
                     {
                         bool cull = TryGetAncestorClipScreenBounds(out var clip)
                                     && Rect.Intersect(translationNewDirtyBounds, clip).IsEmpty
@@ -2192,8 +2215,8 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
                         if (!cull)
                         {
                             if (!translationOldDirtyBounds.IsEmpty)
-                                windowHost.AddDirtyRect(translationOldDirtyBounds);
-                            windowHost.AddDirtyElement(this);
+                                translationWindowHost!.AddDirtyRect(translationOldDirtyBounds);
+                            translationWindowHost!.AddDirtyElement(this);
                         }
                     }
                 }
@@ -2208,6 +2231,9 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
         // 与滚动中未动的行完全跳过下面两次 O(depth) 屏幕 bounds 走链。
         bool trackDisplacement =
             !_hasArrangedOnce || finalRect != _previousFinalRect || _desiredSize != _previousDesiredSize;
+        var displacementWindowHost = trackDisplacement ? GetWindowHostOrNull() : null;
+        bool trackDisplacementDirtyBounds =
+            displacementWindowHost?.ShouldTrackLayoutDirtyBounds == true;
         // 旧 bounds 必须在 InvalidateScreenOffsetCache 抬升全局 epoch 之前捕获（缓存
         // 命中时 O(1)）。此刻整条祖先链 _visualBounds 均为旧值——FrameworkElement.
         // ArrangeCore 先递归 ArrangeOverride、最后才写自身 _visualBounds——所以最顶层
@@ -2216,7 +2242,9 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
         // 旧位置可擦，恒用 Empty——带 Effect 的元素在 _renderSize=(0,0) 时
         // GetDirtyRenderBounds 会返回非空的 padding 矩形，且此刻祖先链未布局、位置
         // 错位，注册它只会多擦一块无关区域。
-        Rect oldDirtyBounds = trackDisplacement && _hasArrangedOnce ? GetDirtyRenderBounds() : Rect.Empty;
+        Rect oldDirtyBounds = trackDisplacementDirtyBounds && _hasArrangedOnce
+            ? GetDirtyRenderBounds()
+            : Rect.Empty;
 
         var oldRenderSize = _renderSize;
         _previousFinalRect = finalRect;
@@ -2254,7 +2282,7 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
         _hasArrangedOnce = true;
         _previousDesiredSize = _desiredSize;
 
-        if (trackDisplacement)
+        if (trackDisplacementDirtyBounds)
         {
             // RC4-b：父级驱动的位移（reflow 推动的兄弟、Canvas 偏移、邻居尺寸变化引发
             // 的 alignment 平移）只会走到这里——元素自身没有任何失效调用，窗口脏集里
@@ -2286,8 +2314,7 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
             var newDirtyBounds = GetDirtyRenderBounds();
             if (newDirtyBounds != oldDirtyBounds)
             {
-                var windowHost = GetWindowHostOrNull();
-                if (windowHost != null)
+                if (displacementWindowHost != null)
                 {
                     // new 先于 old：视口内行（多数）new∩clip≠∅ 即在第一个 Intersect 短路，
                     // 省掉一次注定被推翻的 old 交集。TryGetAncestorClipScreenBounds 返回 false
@@ -2298,8 +2325,8 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
                     if (!cull)
                     {
                         if (!oldDirtyBounds.IsEmpty)
-                            windowHost.AddDirtyRect(oldDirtyBounds);
-                        windowHost.AddDirtyElement(this);
+                            displacementWindowHost.AddDirtyRect(oldDirtyBounds);
+                        displacementWindowHost.AddDirtyElement(this);
                     }
                 }
             }
@@ -2312,7 +2339,11 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
             // 上次真实画过的位置一并提交擦除。
             // （对称性说明：此分支是内容驱动 resize、非滚动 band 来源——滚动中静止行既
             // 不改 finalRect 也不 resize——故刻意不参与上面的祖先 clip 剔除。）
-            GetWindowHostOrNull()?.AddDirtyElement(this);
+            var sizeChangeWindowHost = GetWindowHostOrNull();
+            if (sizeChangeWindowHost?.ShouldTrackLayoutDirtyBounds == true)
+            {
+                sizeChangeWindowHost.AddDirtyElement(this);
+            }
         }
 
         // If render size changed, mark this element as needing re-render
@@ -2748,6 +2779,10 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     private static void OnRenderTransformChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
         if (d is not UIElement element) return;
+
+        // Publish the effective transform before any event-driven work observes
+        // the element's new composition state.
+        element._renderTransformForBounds = e.NewValue as Transform;
 
         if (e.OldValue is Transform oldTransform)
         {
@@ -6817,6 +6852,13 @@ public struct RoutedEventHandlerInfo
 /// </summary>
 public interface IWindowHost
 {
+    /// <summary>
+    /// Gets whether layout should calculate and register per-element dirty
+    /// bounds. A host that already owns a full-frame invalidation can return
+    /// <see langword="false"/> to skip redundant ancestor walks.
+    /// </summary>
+    bool ShouldTrackLayoutDirtyBounds => true;
+
     /// <summary>
     /// Invalidates the window, causing it to repaint.
     /// </summary>

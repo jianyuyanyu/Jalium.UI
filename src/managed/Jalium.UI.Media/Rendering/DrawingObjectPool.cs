@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 
 namespace Jalium.UI.Media.Rendering;
@@ -55,9 +56,9 @@ internal static class DrawingObjectPool
 
     private static readonly object s_lock = new();
 
-    private static readonly Dictionary<uint, SolidColorBrush> s_solidBrushes = new();
-    private static readonly Dictionary<long, Pen> s_simplePens = new();
-    private static readonly Dictionary<int, FormattedText> s_formattedTexts = new();
+    private static readonly ConcurrentDictionary<uint, SolidColorBrush> s_solidBrushes = new();
+    private static readonly ConcurrentDictionary<long, Pen> s_simplePens = new();
+    private static readonly ConcurrentDictionary<int, FormattedText> s_formattedTexts = new();
 
     /// <summary>
     /// Returns a canonical instance for <paramref name="brush"/> when it is
@@ -72,6 +73,11 @@ internal static class DrawingObjectPool
         }
 
         uint key = PackArgb(scb.Color);
+        if (s_solidBrushes.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
         lock (s_lock)
         {
             if (s_solidBrushes.TryGetValue(key, out var canonical))
@@ -129,6 +135,11 @@ internal static class DrawingObjectPool
         long thicknessBits = BitConverter.DoubleToInt64Bits(pen.Thickness);
         long key = ((long)colorKey << 32) ^ thicknessBits;
 
+        if (s_simplePens.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
         lock (s_lock)
         {
             if (s_simplePens.TryGetValue(key, out var canonical))
@@ -163,6 +174,12 @@ internal static class DrawingObjectPool
     {
         var canonicalFg = CanonicalizeBrush(text.Foreground);
         int hash = HashFormattedText(text, canonicalFg);
+
+        if (s_formattedTexts.TryGetValue(hash, out var cached) &&
+            FormattedTextValueEquals(cached, text, canonicalFg))
+        {
+            return cached;
+        }
 
         lock (s_lock)
         {

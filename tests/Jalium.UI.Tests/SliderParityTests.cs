@@ -6,6 +6,7 @@ using MediaDoubleCollection = Jalium.UI.Media.DoubleCollection;
 
 namespace Jalium.UI.Tests;
 
+[Collection("Application")]
 public class SliderParityTests
 {
     [Fact]
@@ -277,6 +278,46 @@ public class SliderParityTests
     }
 
     [Fact]
+    public void MouseDrag_PreservesInitialPointerOffsetFromThumbCenter()
+    {
+        var slider = ArrangeSlider(new ProbeSlider
+        {
+            Minimum = 0,
+            Maximum = 10,
+            Value = 5,
+            TickFrequency = 1,
+            IsSnapToTickEnabled = true,
+        });
+
+        try
+        {
+            // At Value=5 the thumb spans X=50..66. Grab it near the left edge,
+            // rather than at its X=58 center.
+            slider.RaiseEvent(MouseLeftDown(new Point(51, 12)));
+            Assert.True(slider.IsMouseCaptured);
+
+            // A one-pixel move keeps the same tick. The thumb must not jump its
+            // center under the pointer or prematurely advance to the next tick.
+            slider.RaiseEvent(MouseMove(new Point(52, 12)));
+            Assert.Equal(5, slider.Value);
+
+            // The fixed seven-pixel grab offset is retained as the pointer moves.
+            slider.RaiseEvent(MouseMove(new Point(57, 12)));
+            Assert.Equal(6, slider.Value);
+
+            slider.RaiseEvent(MouseLeftUp(new Point(57, 12)));
+            Assert.False(slider.IsMouseCaptured);
+        }
+        finally
+        {
+            if (slider.IsMouseCaptured)
+            {
+                slider.ReleaseMouseCapture();
+            }
+        }
+    }
+
+    [Fact]
     public void PreviewTrackPress_PagesOrMovesToPoint_AccordingToMode()
     {
         var pagingSlider = ArrangeSlider(new ProbeSlider
@@ -339,6 +380,48 @@ public class SliderParityTests
             xButton2: MouseButtonState.Released,
             modifiers: ModifierKeys.None,
             timestamp: 0);
+
+    private static MouseButtonEventArgs MouseLeftDown(Point position) =>
+        new(
+            UIElement.MouseDownEvent,
+            position,
+            MouseButton.Left,
+            MouseButtonState.Pressed,
+            clickCount: 1,
+            leftButton: MouseButtonState.Pressed,
+            middleButton: MouseButtonState.Released,
+            rightButton: MouseButtonState.Released,
+            xButton1: MouseButtonState.Released,
+            xButton2: MouseButtonState.Released,
+            modifiers: ModifierKeys.None,
+            timestamp: 0);
+
+    private static MouseEventArgs MouseMove(Point position) =>
+        new(
+            UIElement.MouseMoveEvent,
+            position,
+            MouseButtonState.Pressed,
+            middleButton: MouseButtonState.Released,
+            rightButton: MouseButtonState.Released,
+            xButton1: MouseButtonState.Released,
+            xButton2: MouseButtonState.Released,
+            modifiers: ModifierKeys.None,
+            timestamp: 1);
+
+    private static MouseButtonEventArgs MouseLeftUp(Point position) =>
+        new(
+            UIElement.MouseUpEvent,
+            position,
+            MouseButton.Left,
+            MouseButtonState.Released,
+            clickCount: 1,
+            leftButton: MouseButtonState.Released,
+            middleButton: MouseButtonState.Released,
+            rightButton: MouseButtonState.Released,
+            xButton1: MouseButtonState.Released,
+            xButton2: MouseButtonState.Released,
+            modifiers: ModifierKeys.None,
+            timestamp: 2);
 
     private sealed class ProbeSlider : Slider
     {

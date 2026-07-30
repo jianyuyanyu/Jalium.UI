@@ -182,7 +182,7 @@ internal sealed class OverlayLayer : Canvas
     protected override Size MeasureOverride(Size constraint)
     {
         // Measure all children with infinite space (they position themselves absolutely)
-        foreach (UIElement child in Children)
+        foreach (UIElement child in Children.EnumerateStruct())
         {
             child.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
         }

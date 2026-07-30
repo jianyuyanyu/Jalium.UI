@@ -2,7 +2,7 @@ name: Linux
 
 on:
   push:
-    branches: [master, preview-26.10.7]
+    branches: [master, preview-26.10.8]
   pull_request:
   workflow_dispatch:
 

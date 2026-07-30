@@ -291,6 +291,54 @@ public class PrimitiveThemeTests
     }
 
     [Fact]
+    public void Slider_Thumb_ShouldBeBorderlessAndGrowWithAutomaticTransition()
+    {
+        ResetApplicationState();
+        var app = new Application();
+
+        try
+        {
+            var slider = new Slider { Width = 200 };
+            var host = new Grid { Width = 240, Height = 48 };
+            host.Children.Add(slider);
+
+            host.Measure(new Size(240, 48));
+            host.Arrange(new Rect(0, 0, 240, 48));
+
+            var thumbHost = Assert.IsType<Grid>(slider.FindName("PART_Thumb"));
+            var thumbVisual = Assert.IsType<Jalium.UI.Shapes.Ellipse>(
+                slider.FindName("PART_ThumbVisual"));
+
+            Assert.Equal(16, thumbHost.Width);
+            Assert.Equal(16, thumbHost.Height);
+            Assert.Null(thumbVisual.Stroke);
+            Assert.Equal(0, thumbVisual.StrokeThickness);
+            Assert.Equal(10, thumbVisual.Width);
+            Assert.Equal(10, thumbVisual.Height);
+            Assert.Contains(
+                nameof(FrameworkElement.Width),
+                (IEnumerable<string>)thumbVisual.TransitionProperty);
+            Assert.Contains(
+                nameof(FrameworkElement.Height),
+                (IEnumerable<string>)thumbVisual.TransitionProperty);
+            Assert.True(thumbVisual.TransitionDuration.HasTimeSpan);
+            Assert.Equal(TimeSpan.FromMilliseconds(140), thumbVisual.TransitionDuration.TimeSpan);
+
+            slider.SetIsMouseOver(true);
+
+            Assert.True(thumbVisual.HasAutomaticTransition(FrameworkElement.WidthProperty));
+            Assert.True(thumbVisual.HasAutomaticTransition(FrameworkElement.HeightProperty));
+            Assert.Equal(14d, thumbVisual.GetEffectiveBaseValue(FrameworkElement.WidthProperty));
+            Assert.Equal(14d, thumbVisual.GetEffectiveBaseValue(FrameworkElement.HeightProperty));
+            Assert.Null(thumbVisual.Stroke);
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    [Fact]
     public void Slider_FirstMeasureSmallerThanThumb_ShouldNotCreateNegativeTemplateSize()
     {
         ResetApplicationState();

@@ -15,16 +15,16 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
-        Console.WriteLine("[Demo] step 0: Main entered");
+        System.Diagnostics.Debug.WriteLine("[Demo] step 0: Main entered");
 
         // Auto = honour JALIUM_RENDER_BACKEND (vulkan/d3d12/software); the
         // platform default order still picks D3D12 on Windows when unset.
         var renderContext = RenderContext.GetOrCreateCurrent(RenderBackend.Auto);
         renderContext.DefaultRenderingEngine = RenderingEngine.Impeller;
-        Console.WriteLine($"[Demo] step 1: render ctx backend={renderContext.Backend} engine={renderContext.DefaultRenderingEngine}");
+        System.Diagnostics.Debug.WriteLine($"[Demo] step 1: render ctx backend={renderContext.Backend} engine={renderContext.DefaultRenderingEngine}");
 
         var builder = AppBuilder.CreateBuilder(args);
-        Console.WriteLine("[Demo] step 2: builder created");
+        System.Diagnostics.Debug.WriteLine("[Demo] step 2: builder created");
 
         builder.Logging.SetMinimumLevel(LogLevel.Information);
         builder.Services.AddSingleton<ToastNotificationHost>(_ => new ToastNotificationHost
@@ -36,25 +36,25 @@ internal static class Program
 
         builder.ConfigureApplication(app =>
         {
-            Console.WriteLine($"[Demo] step 3a: ConfigureApplication, app type={app.GetType().FullName}");
+            System.Diagnostics.Debug.WriteLine($"[Demo] step 3a: ConfigureApplication, app type={app.GetType().FullName}");
             SystemNotificationManager.Current.Initialize("Jalium.UI.DesktopDemo", "Jalium Desktop Demo");
-            Console.WriteLine("[Demo] step 3b: SystemNotificationManager initialized");
+            System.Diagnostics.Debug.WriteLine("[Demo] step 3b: SystemNotificationManager initialized");
 
             var toastHost = app.Services!.GetRequiredService<ToastNotificationHost>();
             ToastService.SetHost(toastHost);
-            Console.WriteLine("[Demo] step 3c: toast host wired");
+            System.Diagnostics.Debug.WriteLine("[Demo] step 3c: toast host wired");
 
-            Console.WriteLine("[Demo] step 3d: building EffectReproWindow...");
+            System.Diagnostics.Debug.WriteLine("[Demo] step 3d: building EffectReproWindow...");
             app.MainWindow = EffectReproWindow.Build();
-            Console.WriteLine($"[Demo] step 3e: MainWindow set, title='{app.MainWindow?.Title}'");
+            System.Diagnostics.Debug.WriteLine($"[Demo] step 3e: MainWindow set, title='{app.MainWindow?.Title}'");
         });
 
-        Console.WriteLine("[Demo] step 4: about to Build host");
+        System.Diagnostics.Debug.WriteLine("[Demo] step 4: about to Build host");
         using var host = builder.Build();
-        Console.WriteLine("[Demo] step 5: host built; about to host.Run()");
+        System.Diagnostics.Debug.WriteLine("[Demo] step 5: host built; about to host.Run()");
         host.UseDeveloperTools();
         var exit = host.Run();
-        Console.WriteLine($"[Demo] step 6: host.Run() returned exit={exit}");
+        System.Diagnostics.Debug.WriteLine($"[Demo] step 6: host.Run() returned exit={exit}");
         return exit;
     }
 

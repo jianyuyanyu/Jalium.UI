@@ -6,7 +6,7 @@ namespace Jalium.UI.Diagnostics;
 /// TEMPORARY diagnostic instrumentation for the "title-bar hover freezes rendering"
 /// investigation. Enabled with JALIUM_HOVER_TRACE=1; zero overhead otherwise
 /// (single static readonly bool branch). Dumps one line of per-second counter
-/// deltas + gauges to stderr from a dedicated background thread, so it keeps
+/// deltas + gauges to a debugger and trace file from a dedicated background thread, so it keeps
 /// reporting even when the UI thread / frame chain is stalled.
 /// REMOVE AFTER INVESTIGATION.
 /// </summary>
@@ -190,11 +190,11 @@ public static class HoverTrace
         }
     }
 
-    // Mirror to stderr (visible when launched from a console) AND append to the
-    // trace file (the reliable sink for windowed apps). Both are best-effort.
+    // Mirror to the debugger AND append to the trace file (the reliable sink for
+    // windowed apps). Both are best-effort.
     private static void WriteLine(string line)
     {
-        try { Console.Error.WriteLine(line); } catch { }
+        try { System.Diagnostics.Debug.WriteLine(line); } catch { }
         try { System.IO.File.AppendAllText(s_filePath, line + Environment.NewLine); } catch { }
     }
 }

@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+
 namespace Jalium.UI;
 
 /// <summary>
@@ -7,7 +9,13 @@ public static class EventManager
 {
     private static readonly Dictionary<(Type, string), RoutedEvent> _registeredEvents = new();
     private static readonly Dictionary<RoutedEvent, List<ClassHandlerInfo>> _classHandlers = new();
-    private static readonly Dictionary<(RoutedEvent Event, Type TargetType), ClassHandlerInfo[]> _resolvedClassHandlers = new();
+    // Routed-event dispatch is a very hot read path while class-handler
+    // registration is rare. ConcurrentDictionary lets already-resolved target
+    // types bypass the global registration lock entirely. Values are immutable
+    // arrays, so readers never observe a partially constructed handler list.
+    private static readonly ConcurrentDictionary<
+        (RoutedEvent Event, Type TargetType),
+        ClassHandlerInfo[]> _resolvedClassHandlers = new();
     private static readonly object _lock = new();
 
     /// <summary>
@@ -109,17 +117,25 @@ public static class EventManager
     /// </summary>
     internal static ClassHandlerInfo[] GetClassHandlers(RoutedEvent routedEvent, Type targetType)
     {
+        var key = (routedEvent, targetType);
+        if (_resolvedClassHandlers.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
         lock (_lock)
         {
-            var key = (routedEvent, targetType);
-            if (_resolvedClassHandlers.TryGetValue(key, out var cached))
+            // A different thread may have populated this key while we waited.
+            if (_resolvedClassHandlers.TryGetValue(key, out cached))
             {
                 return cached;
             }
 
             if (!_classHandlers.TryGetValue(routedEvent, out var handlers))
             {
-                return Array.Empty<ClassHandlerInfo>();
+                return _resolvedClassHandlers.GetOrAdd(
+                    key,
+                    static _ => Array.Empty<ClassHandlerInfo>());
             }
 
             int matchingCount = 0;
@@ -133,7 +149,9 @@ public static class EventManager
 
             if (matchingCount == 0)
             {
-                return Array.Empty<ClassHandlerInfo>();
+                return _resolvedClassHandlers.GetOrAdd(
+                    key,
+                    static _ => Array.Empty<ClassHandlerInfo>());
             }
 
             var resolved = new ClassHandlerInfo[matchingCount];
@@ -146,8 +164,7 @@ public static class EventManager
                 }
             }
 
-            _resolvedClassHandlers[key] = resolved;
-            return resolved;
+            return _resolvedClassHandlers.GetOrAdd(key, resolved);
         }
     }
 

@@ -1,4 +1,5 @@
 using System.Collections;
+using System.Collections.Specialized;
 using Jalium.UI.Media;
 
 namespace Jalium.UI.Controls.Charts;
@@ -8,6 +9,8 @@ namespace Jalium.UI.Controls.Charts;
 /// </summary>
 public abstract class ChartSeries : DependencyObject
 {
+    private Dictionary<INotifyCollectionChanged, int>? _observedCollections;
+
     #region Dependency Properties
 
     /// <summary>
@@ -143,4 +146,74 @@ public abstract class ChartSeries : DependencyObject
     }
 
     #endregion
+
+    /// <inheritdoc />
+    protected override void OnPropertyChanged(DependencyPropertyChangedEventArgs e)
+    {
+        if (e.OldValue is INotifyCollectionChanged oldCollection)
+        {
+            StopObservingCollection(oldCollection);
+        }
+
+        base.OnPropertyChanged(e);
+
+        if (e.NewValue is INotifyCollectionChanged newCollection)
+        {
+            ObserveCollection(newCollection);
+        }
+
+        if (BindingMentor is ChartBase chart)
+        {
+            chart.InvalidateVisual();
+        }
+    }
+
+    private void ObserveCollection(INotifyCollectionChanged collection)
+    {
+        _observedCollections ??= new Dictionary<INotifyCollectionChanged, int>(
+            ReferenceEqualityComparer.Instance);
+
+        if (_observedCollections.TryGetValue(collection, out var referenceCount))
+        {
+            _observedCollections[collection] = referenceCount + 1;
+            return;
+        }
+
+        _observedCollections[collection] = 1;
+        CollectionChangedEventManager.AddHandler(
+            collection,
+            OnObservedCollectionChanged);
+    }
+
+    private void StopObservingCollection(INotifyCollectionChanged collection)
+    {
+        if (_observedCollections == null ||
+            !_observedCollections.TryGetValue(collection, out var referenceCount))
+        {
+            return;
+        }
+
+        if (referenceCount > 1)
+        {
+            _observedCollections[collection] = referenceCount - 1;
+            return;
+        }
+
+        CollectionChangedEventManager.RemoveHandler(
+            collection,
+            OnObservedCollectionChanged);
+        _observedCollections.Remove(collection);
+        if (_observedCollections.Count == 0)
+        {
+            _observedCollections = null;
+        }
+    }
+
+    private void OnObservedCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (BindingMentor is ChartBase chart)
+        {
+            chart.InvalidateVisual();
+        }
+    }
 }

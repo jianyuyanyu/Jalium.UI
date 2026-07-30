@@ -52,6 +52,65 @@ DWORD GetFrameLatencyWaitTimeoutMs(HWND hwnd)
         static_cast<DWORD>(50));
 }
 
+bool IsWindowInMoveSize(HWND hwnd)
+{
+    if (!hwnd) return false;
+
+    const DWORD windowThreadId =
+        GetWindowThreadProcessId(hwnd, nullptr);
+    if (windowThreadId == 0) return false;
+
+    GUITHREADINFO threadInfo = {};
+    threadInfo.cbSize = sizeof(threadInfo);
+    return GetGUIThreadInfo(windowThreadId, &threadInfo) != FALSE &&
+           (threadInfo.flags & GUI_INMOVESIZE) != 0;
+}
+
+void GetReservedSwapChainSize(
+    HWND hwnd,
+    uint32_t requestedWidth,
+    uint32_t requestedHeight,
+    uint32_t& reservedWidth,
+    uint32_t& reservedHeight)
+{
+    reservedWidth = requestedWidth;
+    reservedHeight = requestedHeight;
+    if (!hwnd) return;
+
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!monitor) return;
+
+    MONITORINFO monitorInfo = {};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (!GetMonitorInfoW(monitor, &monitorInfo)) return;
+
+    uint32_t monitorWidth = static_cast<uint32_t>(
+        (std::max)(1L, monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left));
+    uint32_t monitorHeight = static_cast<uint32_t>(
+        (std::max)(1L, monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top));
+
+    // A full 4K reserve costs about 64 MiB for a double-buffered RGBA8 swap
+    // chain and removes ResizeBuffers from the common live-resize path.  Do not
+    // eagerly reserve an entire 8K desktop for a small window, though: scale
+    // the speculative reserve down to the same pixel budget.  A genuinely
+    // larger window still grows to its requested size below.
+    constexpr uint64_t kMaxEagerReservePixels = 3840ull * 2160ull;
+    const uint64_t monitorPixels =
+        static_cast<uint64_t>(monitorWidth) * monitorHeight;
+    if (monitorPixels > kMaxEagerReservePixels) {
+        const double scale = std::sqrt(
+            static_cast<double>(kMaxEagerReservePixels) /
+            static_cast<double>(monitorPixels));
+        monitorWidth = (std::max)(
+            1u, static_cast<uint32_t>(std::floor(monitorWidth * scale)));
+        monitorHeight = (std::max)(
+            1u, static_cast<uint32_t>(std::floor(monitorHeight * scale)));
+    }
+
+    reservedWidth = (std::max)(reservedWidth, monitorWidth);
+    reservedHeight = (std::max)(reservedHeight, monitorHeight);
+}
+
 } // namespace
 
 // ============================================================================
@@ -376,9 +435,20 @@ bool D3D12RenderTarget::CreateSwapChain() {
     }
     tearingSupported_ = (allowTearing == TRUE);
 
+    swapChainWidth_ = static_cast<uint32_t>(width_);
+    swapChainHeight_ = static_cast<uint32_t>(height_);
+    if (isComposition_) {
+        GetReservedSwapChainSize(
+            hwnd_,
+            swapChainWidth_,
+            swapChainHeight_,
+            swapChainWidth_,
+            swapChainHeight_);
+    }
+
     DXGI_SWAP_CHAIN_DESC1 desc = {};
-    desc.Width = width_;
-    desc.Height = height_;
+    desc.Width = swapChainWidth_;
+    desc.Height = swapChainHeight_;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
     desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -421,13 +491,31 @@ bool D3D12RenderTarget::CreateSwapChain() {
         if (FAILED(hr)) return false;
         hr = dcompSwapChainVisual_->SetContent(swapChain1.Get());
         if (FAILED(hr)) return false;
+        // Keep the visual large enough to cover every client size that fits in
+        // the reserved swap chain. The composition target clips this visual to
+        // the HWND, so WM_SIZE can expose pre-cleared reserve pixels immediately
+        // without waiting for a second DComp commit. Clipping to width_/height_
+        // here leaves the newly added part of the HWND uncovered during that
+        // commit gap, exposing the black base window and native caption buttons.
+        const D2D_RECT_F capacityClip = {
+            0.0f,
+            0.0f,
+            static_cast<float>(swapChainWidth_),
+            static_cast<float>(swapChainHeight_)
+        };
+        hr = dcompSwapChainVisual_->SetClip(capacityClip);
+        if (FAILED(hr)) return false;
         hr = dcompVisual_->AddVisual(dcompSwapChainVisual_.Get(), FALSE, nullptr);
         if (FAILED(hr)) return false;
         hr = dcompTarget_->SetRoot(dcompVisual_.Get());
         if (FAILED(hr)) return false;
         hr = dcompDevice_->Commit();
         if (FAILED(hr)) return false;
+        hasLastWindowRect_ = GetWindowRect(hwnd_, &lastWindowRect_) != FALSE;
     } else {
+        // A direct HWND swap chain must remain exactly client-sized. Keeping the
+        // target and buffers equal avoids DXGI/DWM rubber-sheet scaling while a
+        // conventional ResizeBuffers transition is in progress.
         desc.Scaling = DXGI_SCALING_NONE;
         // FRAME_LATENCY_WAITABLE_OBJECT lets the CPU block in lockstep with
         // swap-chain buffer availability so CPU work happens right before
@@ -452,6 +540,9 @@ bool D3D12RenderTarget::CreateSwapChain() {
             hr = factory->CreateSwapChainForHwnd(commandQueue, hwnd_, &desc, nullptr, nullptr, &swapChain1);
         }
         if (FAILED(hr) && desc.Scaling == DXGI_SCALING_NONE) {
+            // Scaling NONE is unavailable on a few older DXGI paths. STRETCH is
+            // still geometrically exact here because buffer and client sizes are
+            // always identical on this compatibility path.
             desc.Scaling = DXGI_SCALING_STRETCH;
             hr = factory->CreateSwapChainForHwnd(commandQueue, hwnd_, &desc, nullptr, nullptr, &swapChain1);
         }
@@ -508,6 +599,9 @@ bool D3D12RenderTarget::CreateSwapChain() {
     hr = swapChain1.As(&swapChain_);
     if (FAILED(hr)) return false;
 
+    swapChainWidth_ = desc.Width;
+    swapChainHeight_ = desc.Height;
+
     // If the swap chain was created with the waitable flag, take ownership
     // of the latency-control HANDLE and cap maximum frame latency to 1.
     // SetMaximumFrameLatency(1) overrides DXGI's default of 3, which is the
@@ -561,9 +655,148 @@ void D3D12RenderTarget::WaitForAllFrames() {
 // Resize
 // ============================================================================
 
+JaliumResult D3D12RenderTarget::CommitCompositionResizePlacement(
+    bool waitForCompletion)
+{
+    if (!isComposition_ || !dcompSwapChainVisual_ || !dcompDevice_) {
+        return JALIUM_ERROR_INVALID_STATE;
+    }
+
+    const float nextOffsetX = compositionAnchorRightActive_
+        ? static_cast<float>(
+            static_cast<int64_t>(width_) -
+            static_cast<int64_t>(swapChainWidth_))
+        : 0.0f;
+    const float nextOffsetY = compositionAnchorBottomActive_
+        ? static_cast<float>(
+            static_cast<int64_t>(height_) -
+            static_cast<int64_t>(swapChainHeight_))
+        : 0.0f;
+    if (nextOffsetX == dcompSwapChainOffsetX_ &&
+        nextOffsetY == dcompSwapChainOffsetY_) {
+        if (waitForCompletion) {
+            HRESULT waitHr = dcompDevice_->WaitForCommitCompletion();
+            if (FAILED(waitHr)) {
+                return JALIUM_ERROR_DEVICE_LOST;
+            }
+        }
+        return JALIUM_OK;
+    }
+
+    HRESULT hr = dcompSwapChainVisual_->SetOffsetX(nextOffsetX);
+    if (SUCCEEDED(hr)) {
+        hr = dcompSwapChainVisual_->SetOffsetY(nextOffsetY);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = dcompDevice_->Commit();
+    }
+    if (SUCCEEDED(hr) && waitForCompletion) {
+        // HWND geometry and DirectComposition visual properties are separate
+        // DWM transactions. Waiting here caps live resize at the compositor's
+        // real consumption rate and prevents a newer window width from being
+        // paired with an older visual offset for one refresh.
+        hr = dcompDevice_->WaitForCommitCompletion();
+    }
+    if (FAILED(hr)) {
+        return JALIUM_ERROR_DEVICE_LOST;
+    }
+
+    dcompSwapChainOffsetX_ = nextOffsetX;
+    dcompSwapChainOffsetY_ = nextOffsetY;
+    return JALIUM_OK;
+}
+
 JaliumResult D3D12RenderTarget::Resize(int32_t width, int32_t height) {
     if (width <= 0 || height <= 0) return JALIUM_ERROR_INVALID_ARGUMENT;
-    if (width == width_ && height == height_) return JALIUM_OK;
+
+    const bool inMoveSize = isComposition_ && IsWindowInMoveSize(hwnd_);
+    RECT currentWindowRect = {};
+    const bool hasCurrentWindowRect =
+        isComposition_ && GetWindowRect(hwnd_, &currentWindowRect) != FALSE;
+    const bool preserveRight =
+        hasCurrentWindowRect &&
+        hasLastWindowRect_ &&
+        currentWindowRect.right == lastWindowRect_.right &&
+        currentWindowRect.left != lastWindowRect_.left;
+    const bool preserveLeft =
+        hasCurrentWindowRect &&
+        hasLastWindowRect_ &&
+        currentWindowRect.left == lastWindowRect_.left &&
+        currentWindowRect.right != lastWindowRect_.right;
+    const bool preserveBottom =
+        hasCurrentWindowRect &&
+        hasLastWindowRect_ &&
+        currentWindowRect.bottom == lastWindowRect_.bottom &&
+        currentWindowRect.top != lastWindowRect_.top;
+    const bool preserveTop =
+        hasCurrentWindowRect &&
+        hasLastWindowRect_ &&
+        currentWindowRect.top == lastWindowRect_.top &&
+        currentWindowRect.bottom != lastWindowRect_.bottom;
+    bool hasCursorEdgeHint = false;
+    bool cursorIndicatesLeftEdge = false;
+    bool cursorIndicatesTopEdge = false;
+    if (inMoveSize && hasCurrentWindowRect) {
+        POINT cursor = {};
+        if (GetCursorPos(&cursor)) {
+            hasCursorEdgeHint = true;
+            cursorIndicatesLeftEdge =
+                std::abs(cursor.x - currentWindowRect.left) <=
+                std::abs(cursor.x - currentWindowRect.right);
+            cursorIndicatesTopEdge =
+                std::abs(cursor.y - currentWindowRect.top) <=
+                std::abs(cursor.y - currentWindowRect.bottom);
+        }
+    }
+    if (hasCurrentWindowRect) {
+        lastWindowRect_ = currentWindowRect;
+        hasLastWindowRect_ = true;
+    }
+
+    if (isComposition_) {
+        if (!inMoveSize) {
+            compositionAnchorRight_ = false;
+            compositionAnchorBottom_ = false;
+        } else {
+            if (width != width_) {
+                if (preserveRight) {
+                    compositionAnchorRight_ = true;
+                } else if (preserveLeft) {
+                    // A new right-edge session must actively clear a right
+                    // anchor left over from an earlier left-edge session.
+                    compositionAnchorRight_ = false;
+                } else if (hasCursorEdgeHint) {
+                    // WM_SIZING previews can arrive before the HWND rect changes,
+                    // so use the cursor's nearer edge for the first delta.
+                    compositionAnchorRight_ = cursorIndicatesLeftEdge;
+                }
+            }
+            if (height != height_) {
+                if (preserveBottom) {
+                    compositionAnchorBottom_ = true;
+                } else if (preserveTop) {
+                    compositionAnchorBottom_ = false;
+                } else if (hasCursorEdgeHint) {
+                    compositionAnchorBottom_ = cursorIndicatesTopEdge;
+                }
+            }
+        }
+    }
+    if (!compositionAnchorRight_) {
+        compositionAnchorRightActive_ = false;
+    }
+    if (!compositionAnchorBottom_) {
+        compositionAnchorBottomActive_ = false;
+    }
+    if (width == width_ && height == height_) {
+        if (isComposition_ &&
+            (dcompSwapChainOffsetX_ != 0.0f ||
+             dcompSwapChainOffsetY_ != 0.0f)) {
+            return CommitCompositionResizePlacement(
+                /*waitForCompletion=*/true);
+        }
+        return JALIUM_OK;
+    }
 
     // The command list's REAL open state (cmdListRecording_), not isDrawing_/
     // inFrame_, decides resize safety: BeginFrame opens the list before isDrawing_/
@@ -595,29 +828,91 @@ JaliumResult D3D12RenderTarget::Resize(int32_t width, int32_t height) {
         isDrawing_ = false;
     }
 
-    // Single GPU wait via DirectRenderer (it owns all submitted GPU work)
+    // DirectComposition owns the HWND target independently of the swap-chain
+    // allocation. Its visual already covers the entire pre-cleared capacity and
+    // the HWND provides the final crop, so a logical resize is metadata-only:
+    // pixels remain 1:1 and there is no per-WM_SIZE DComp commit gap.
+    if (isComposition_ &&
+        static_cast<uint32_t>(width) <= swapChainWidth_ &&
+        static_cast<uint32_t>(height) <= swapChainHeight_) {
+        width_ = width;
+        height_ = height;
+        if (compositionAnchorRightActive_ ||
+            compositionAnchorBottomActive_ ||
+            dcompSwapChainOffsetX_ != 0.0f ||
+            dcompSwapChainOffsetY_ != 0.0f) {
+            JaliumResult placementResult =
+                CommitCompositionResizePlacement(
+                    // EndDraw performs the compositor completion wait after
+                    // presenting the capacity-relative copy. Keep this metadata
+                    // update non-blocking so the UI thread does not wait twice.
+                    /*waitForCompletion=*/false);
+            if (placementResult != JALIUM_OK) {
+                return placementResult;
+            }
+        }
+        // A previously submitted frame may still be waiting in the flip queue
+        // with geometry for the old client size. WM_NCCALCSIZE preserves the
+        // currently displayed image against the stationary edge, but that
+        // queued frame would otherwise arrive afterwards and undo the
+        // preservation for one refresh. DXGI_PRESENT_RESTART is specifically
+        // intended to discard such old-size queued presentations.
+        restartPresentAfterResize_ = true;
+        frameLatencyWaitTimeoutMs_ = GetFrameLatencyWaitTimeoutMs(hwnd_);
+        if (directRenderer_) {
+            directRenderer_->OnLogicalResize(
+                static_cast<UINT>(width),
+                static_cast<UINT>(height));
+        }
+        fullInvalidation_ = true;
+        dirtyRects_.clear();
+        return JALIUM_OK;
+    }
+
+    uint32_t newSwapChainWidth = static_cast<uint32_t>(width);
+    uint32_t newSwapChainHeight = static_cast<uint32_t>(height);
+    if (isComposition_) {
+        GetReservedSwapChainSize(
+            hwnd_,
+            newSwapChainWidth,
+            newSwapChainHeight,
+            newSwapChainWidth,
+            newSwapChainHeight);
+        newSwapChainWidth = (std::max)(newSwapChainWidth, swapChainWidth_);
+        newSwapChainHeight = (std::max)(newSwapChainHeight, swapChainHeight_);
+    }
+
+    // Capacity growth / compatibility path: this is the only branch that
+    // releases RTVs and waits for all submitted GPU work.
     if (directRenderer_) {
         directRenderer_->ReleaseBackBufferReferences();
     } else {
         WaitForAllFrames();
     }
 
-    HRESULT hr = swapChain_->ResizeBuffers(swapBufferCount_, width, height,
+    HRESULT hr = swapChain_->ResizeBuffers(
+        swapBufferCount_,
+        newSwapChainWidth,
+        newSwapChainHeight,
         DXGI_FORMAT_R8G8B8A8_UNORM, swapChainCreationFlags_);
     if (FAILED(hr)) {
         auto* device = backend_ ? backend_->GetDevice() : nullptr;
         HRESULT removedReason = device ? device->GetDeviceRemovedReason() : E_FAIL;
         char buffer[256] = {};
         sprintf_s(buffer,
-            "[D3D12RenderTarget] ResizeBuffers failed hr=0x%08X removedReason=0x%08X size=%dx%d\n",
+            "[D3D12RenderTarget] ResizeBuffers failed hr=0x%08X removedReason=0x%08X logical=%dx%d capacity=%ux%u\n",
             static_cast<unsigned int>(hr),
             static_cast<unsigned int>(removedReason),
             width,
-            height);
+            height,
+            newSwapChainWidth,
+            newSwapChainHeight);
         OutputDebugStringA(buffer);
         return FAILED(removedReason) ? JALIUM_ERROR_DEVICE_LOST : JALIUM_ERROR_RESOURCE_CREATION_FAILED;
     }
 
+    swapChainWidth_ = newSwapChainWidth;
+    swapChainHeight_ = newSwapChainHeight;
     width_ = width;
     height_ = height;
     frameLatencyWaitTimeoutMs_ = GetFrameLatencyWaitTimeoutMs(hwnd_);
@@ -632,6 +927,38 @@ JaliumResult D3D12RenderTarget::Resize(int32_t width, int32_t height) {
         if (SUCCEEDED(swapChain_.As(&swapChain2)) && swapChain2) {
             swapChain2->SetMaximumFrameLatency(maxFrameLatency_);
         }
+    }
+
+    if (isComposition_) {
+        if (!dcompSwapChainVisual_ || !dcompDevice_) {
+            return JALIUM_ERROR_INVALID_STATE;
+        }
+        // ResizeBuffers changed the physical capacity, so update the persistent
+        // coverage clip once. Logical resizes inside this capacity need no
+        // DirectComposition transaction.
+        const D2D_RECT_F capacityClip = {
+            0.0f,
+            0.0f,
+            static_cast<float>(swapChainWidth_),
+            static_cast<float>(swapChainHeight_)
+        };
+        HRESULT clipHr = dcompSwapChainVisual_->SetClip(capacityClip);
+        if (SUCCEEDED(clipHr)) {
+            clipHr = dcompSwapChainVisual_->SetOffsetX(0.0f);
+        }
+        if (SUCCEEDED(clipHr)) {
+            clipHr = dcompSwapChainVisual_->SetOffsetY(0.0f);
+        }
+        if (SUCCEEDED(clipHr)) {
+            clipHr = dcompDevice_->Commit();
+        }
+        if (FAILED(clipHr)) {
+            return JALIUM_ERROR_DEVICE_LOST;
+        }
+        compositionAnchorRightActive_ = false;
+        compositionAnchorBottomActive_ = false;
+        dcompSwapChainOffsetX_ = 0.0f;
+        dcompSwapChainOffsetY_ = 0.0f;
     }
 
     if (directRenderer_) {
@@ -727,6 +1054,13 @@ JaliumResult D3D12RenderTarget::BeginDraw() {
         lastFrameWaitableWaitNs_ = accumulatingWaitableWaitNs_;
         accumulatingWaitableWaitNs_ = 0;
     }
+
+    directRenderer_->SetCompositionResizePlacement(
+        isComposition_ && compositionAnchorRight_,
+        isComposition_ && compositionAnchorBottom_,
+        swapChainWidth_,
+        swapChainHeight_,
+        fullInvalidation_ || !dirtyRects_.empty());
 
     float clearAlpha = isComposition_ ? 0.0f : clearA_;
     bool ok = directRenderer_->BeginFrame(
@@ -824,8 +1158,21 @@ JaliumResult D3D12RenderTarget::EndDraw() {
     // credit scheduling — with MFL=1 the queue is provably empty at submit.
     UINT presentFlags = (!vsyncEnabled_ && tearingSupported_ && !isComposition_)
         ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    if (isComposition_ && restartPresentAfterResize_) {
+        presentFlags |= DXGI_PRESENT_RESTART;
+    }
 
-    bool useDirty = !fullInvalidation_ && !dirtyRects_.empty();
+    const bool compositionResizePlacementRequested =
+        isComposition_ &&
+        (compositionAnchorRight_ || compositionAnchorBottom_);
+    // The duplicate lands at capacity-relative coordinates, not at the
+    // top-left logical dirty rectangles accumulated by managed rendering.
+    // Present the whole composition surface while this temporary placement is
+    // active so DXGI never carries stale pixels into the stationary edge.
+    bool useDirty =
+        !compositionResizePlacementRequested &&
+        !fullInvalidation_ &&
+        !dirtyRects_.empty();
     std::vector<D3D12_RECT> d3dDirtyRects;
     if (useDirty) {
         // Dirty rects are stored in DIPs but Present1 expects back-buffer pixel
@@ -848,10 +1195,46 @@ JaliumResult D3D12RenderTarget::EndDraw() {
     // this frame and only its unified non-OK EndDraw path returns it.
     JaliumResult endResult = directRenderer_->EndFrame(useDirty, d3dDirtyRects, syncInterval, presentFlags,
                                                        /*reportTransientPresentFailure=*/externalPresentPacing_);
+    if (endResult == JALIUM_OK) {
+        restartPresentAfterResize_ = false;
+    }
 
     if (endResult == JALIUM_OK && isComposition_ && dcompDevice_) {
-        HRESULT hr = dcompDevice_->Commit();
-        if (FAILED(hr)) { isDrawing_ = false; return JALIUM_ERROR_DEVICE_LOST; }
+        const bool placementRecorded =
+            directRenderer_->DidRecordCompositionResizePlacement();
+        compositionAnchorRightActive_ =
+            compositionAnchorRight_ && placementRecorded;
+        compositionAnchorBottomActive_ =
+            compositionAnchorBottom_ && placementRecorded;
+
+        const float expectedOffsetX = compositionAnchorRightActive_
+            ? static_cast<float>(
+                static_cast<int64_t>(width_) -
+                static_cast<int64_t>(swapChainWidth_))
+            : 0.0f;
+        const float expectedOffsetY = compositionAnchorBottomActive_
+            ? static_cast<float>(
+                static_cast<int64_t>(height_) -
+                static_cast<int64_t>(swapChainHeight_))
+            : 0.0f;
+        const bool placementNeedsCommit =
+            expectedOffsetX != dcompSwapChainOffsetX_ ||
+            expectedOffsetY != dcompSwapChainOffsetY_;
+        if (placementNeedsCommit) {
+            JaliumResult placementResult =
+                CommitCompositionResizePlacement(
+                    /*waitForCompletion=*/true);
+            if (placementResult != JALIUM_OK) {
+                isDrawing_ = false;
+                return placementResult;
+            }
+        } else {
+            HRESULT hr = dcompDevice_->Commit();
+            if (FAILED(hr)) {
+                isDrawing_ = false;
+                return JALIUM_ERROR_DEVICE_LOST;
+            }
+        }
     }
 
     dirtyRects_.clear();

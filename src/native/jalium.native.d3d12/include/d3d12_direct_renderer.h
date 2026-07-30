@@ -228,6 +228,23 @@ public:
     // recreates RTVs, and invalidates cached blur temp textures.
     bool OnResize(UINT newWidth, UINT newHeight);
 
+    // Records a logical DirectComposition clip resize that retained the physical
+    // swap-chain buffers. Shared scratch trimming is deferred to the next safe
+    // frame boundary.
+    void OnLogicalResize(UINT newWidth, UINT newHeight);
+    // During a left/top interactive resize, duplicate the logical frame against
+    // the right/bottom edge of the retained composition buffer. Every queued
+    // frame then has the same physical anchor, independent of its logical size.
+    void SetCompositionResizePlacement(
+        bool anchorRight,
+        bool anchorBottom,
+        UINT surfaceWidth,
+        UINT surfaceHeight,
+        bool logicalFrameUpdated);
+    bool DidRecordCompositionResizePlacement() const {
+        return compositionResizePlacementRecorded_;
+    }
+
     // --- Per-frame lifecycle ---
     bool BeginFrame(UINT frameIndex, UINT width, UINT height, bool clear, float clearR, float clearG, float clearB, float clearA);
     /// `reportTransientPresentFailure` selects how a transient (non
@@ -783,6 +800,7 @@ private:
     // reference it). readbackFenceEvent_ is a dedicated auto-reset event so
     // FetchBackBufferReadback never races the frame path's fenceEvent_.
     bool RecordBackBufferReadbackCopy();
+    bool RecordCompositionResizePlacementCopy();
     bool readbackPending_ = false;
     bool readbackReady_ = false;
     ComPtr<ID3D12Resource> readbackBuffer_;
@@ -1119,6 +1137,26 @@ private:
     // Frame state
     UINT viewportWidth_ = 0;
     UINT viewportHeight_ = 0;
+    UINT pendingLogicalResizeWidth_ = 0;
+    UINT pendingLogicalResizeHeight_ = 0;
+    bool logicalResizePending_ = false;
+    bool compositionAnchorRight_ = false;
+    bool compositionAnchorBottom_ = false;
+    UINT compositionSurfaceWidth_ = 0;
+    UINT compositionSurfaceHeight_ = 0;
+    bool compositionLogicalFrameUpdated_ = false;
+    bool compositionResizePlacementRecorded_ = false;
+    // One shared default-heap copy surface is safe because every use is ordered
+    // on the same D3D12 command queue. It is capacity-sized once and reused
+    // throughout the modal resize instead of reallocating on every WM_SIZE.
+    ComPtr<ID3D12Resource> compositionResizeScratch_;
+    UINT compositionResizeScratchWidth_ = 0;
+    UINT compositionResizeScratchHeight_ = 0;
+    D3D12_RESOURCE_STATES compositionResizeScratchState_ =
+        D3D12_RESOURCE_STATE_COPY_DEST;
+    UINT compositionResizeScratchContentWidth_ = 0;
+    UINT compositionResizeScratchContentHeight_ = 0;
+    bool compositionResizeScratchContentValid_ = false;
     bool inFrame_ = false;
     // [JALIUM-921 diagnostic] True while commandList_ is actually open (recording),
     // tracked independently of inFrame_. inFrame_ is set late in BeginFrame (after

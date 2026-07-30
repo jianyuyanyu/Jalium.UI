@@ -218,6 +218,10 @@ public class ScrollBar : RangeBase
     private double _overlayTrackLocalOpacity;
     private bool _overlayTrackHadLocalHitTestVisibility;
     private bool _overlayTrackLocalHitTestVisibility;
+    private bool _hasAutoHideOpacitySnapshot;
+    private bool _autoHideHadLocalOpacity;
+    private double _autoHideLocalOpacity;
+    private double _autoHideBaseOpacity = 1.0;
     private GestureRecognizer? _overlayThumbGestureRecognizer;
     private int _overlayThumbTouchId = -1;
     private bool _isOverlayThumbTouchDragUnlocked;
@@ -227,6 +231,9 @@ public class ScrollBar : RangeBase
     private double _autoHideVisualAnimFrom;
     private double _autoHideVisualAnimTo;
     private double _autoHideCollapseProgress;
+    private double _autoHideVisibilityAnimFrom = 1.0;
+    private double _autoHideVisibilityAnimTo = 1.0;
+    private double _autoHideVisibilityProgress = 1.0;
     private double _chromeOpacity = 1.0;
     private const string ScrollBarStyleKey = "ScrollBarStyle";
     private const string LineButtonStyleKey = "ScrollBarLineButtonStyle";
@@ -246,7 +253,7 @@ public class ScrollBar : RangeBase
     // out as a round dot. Keeps the dot visible/grabbable on very thin scroll bars where the
     // expanded cross-axis thickness would otherwise drop below this.
     private const double MinThumbDotDiameter = 8.0;
-    private const double AutoHideVisualTransitionDurationMs = 160.0;
+    private const double AutoHideVisualTransitionDurationMs = 280.0;
 
     #endregion
 
@@ -512,6 +519,7 @@ public class ScrollBar : RangeBase
         ApplySelfStyle();
         ApplyPartStyles();
         ApplyAutoHideVisualState(_autoHideCollapseProgress, null, suppressArrangeInvalidation: true);
+        ApplyAutoHideVisibilityState(_autoHideVisibilityProgress);
     }
 
     private void OnResourcesChangedHandler(object? sender, EventArgs e)
@@ -520,6 +528,7 @@ public class ScrollBar : RangeBase
         ApplyPartStyles();
         UpdateTrackBindings();
         ApplyAutoHideVisualState(_autoHideCollapseProgress);
+        ApplyAutoHideVisibilityState(_autoHideVisibilityProgress);
         InvalidateMeasure();
         InvalidateVisual();
     }
@@ -1400,6 +1409,7 @@ public class ScrollBar : RangeBase
             scrollBar._autoHideCollapseProgress,
             null,
             suppressArrangeInvalidation: true);
+        scrollBar.ApplyAutoHideVisibilityState(scrollBar._autoHideVisibilityProgress);
         scrollBar.InvalidateMeasure();
         scrollBar.InvalidateArrange();
         scrollBar.InvalidateVisual();
@@ -1419,32 +1429,56 @@ public class ScrollBar : RangeBase
 
     internal void StartAutoHideVisualTransition(double targetProgress)
     {
-        targetProgress = Math.Clamp(targetProgress, 0.0, 1.0);
+        var targetVisibility = _autoHideVisualTimer is { IsEnabled: true }
+            ? _autoHideVisibilityAnimTo
+            : _autoHideVisibilityProgress;
+        StartAutoHideTransition(targetProgress, targetVisibility);
+    }
 
-        if (Math.Abs(_autoHideCollapseProgress - targetProgress) <= 0.001)
+    internal void StartAutoHideVisibilityTransition(double targetProgress)
+    {
+        var targetCollapse = _autoHideVisualTimer is { IsEnabled: true }
+            ? _autoHideVisualAnimTo
+            : _autoHideCollapseProgress;
+        StartAutoHideTransition(targetCollapse, targetProgress);
+    }
+
+    private void StartAutoHideTransition(double targetCollapseProgress, double targetVisibilityProgress)
+    {
+        targetCollapseProgress = Math.Clamp(targetCollapseProgress, 0.0, 1.0);
+        targetVisibilityProgress = Math.Clamp(targetVisibilityProgress, 0.0, 1.0);
+
+        if (Math.Abs(_autoHideCollapseProgress - targetCollapseProgress) <= 0.001 &&
+            Math.Abs(_autoHideVisibilityProgress - targetVisibilityProgress) <= 0.001)
         {
-            _autoHideCollapseProgress = targetProgress;
+            _autoHideCollapseProgress = targetCollapseProgress;
+            _autoHideVisibilityProgress = targetVisibilityProgress;
             ApplyAutoHideVisualState(_autoHideCollapseProgress);
+            ApplyAutoHideVisibilityState(_autoHideVisibilityProgress);
             StopAutoHideVisualTimer();
             return;
         }
 
         // Arrange can ask for the same state on every layout pass. Do not
-        // restart an in-flight fade toward that target or a busy layout loop
-        // could keep the indicator partially visible indefinitely.
+        // restart an in-flight transition toward those targets or a busy layout
+        // loop could keep the indicator partially transitioned indefinitely.
         if (_autoHideVisualTimer is { IsEnabled: true } &&
-            Math.Abs(_autoHideVisualAnimTo - targetProgress) <= 0.001)
+            Math.Abs(_autoHideVisualAnimTo - targetCollapseProgress) <= 0.001 &&
+            Math.Abs(_autoHideVisibilityAnimTo - targetVisibilityProgress) <= 0.001)
         {
             return;
         }
 
         _autoHideVisualAnimFrom = _autoHideCollapseProgress;
-        _autoHideVisualAnimTo = targetProgress;
+        _autoHideVisualAnimTo = targetCollapseProgress;
+        _autoHideVisibilityAnimFrom = _autoHideVisibilityProgress;
+        _autoHideVisibilityAnimTo = targetVisibilityProgress;
         _autoHideVisualAnimStartTick = Environment.TickCount64;
 
         EnsureAutoHideVisualTimer();
         _autoHideVisualTimer!.Start();
         ApplyAutoHideVisualState(_autoHideCollapseProgress);
+        ApplyAutoHideVisibilityState(_autoHideVisibilityProgress);
     }
 
     private void StopAutoHideVisualTimer()
@@ -1459,12 +1493,19 @@ public class ScrollBar : RangeBase
         var eased = SmoothStep(raw);
 
         _autoHideCollapseProgress = Lerp(_autoHideVisualAnimFrom, _autoHideVisualAnimTo, eased);
+        _autoHideVisibilityProgress = Lerp(
+            _autoHideVisibilityAnimFrom,
+            _autoHideVisibilityAnimTo,
+            eased);
         ApplyAutoHideVisualState(_autoHideCollapseProgress);
+        ApplyAutoHideVisibilityState(_autoHideVisibilityProgress);
 
         if (raw >= 1.0)
         {
             _autoHideCollapseProgress = _autoHideVisualAnimTo;
+            _autoHideVisibilityProgress = _autoHideVisibilityAnimTo;
             ApplyAutoHideVisualState(_autoHideCollapseProgress);
+            ApplyAutoHideVisibilityState(_autoHideVisibilityProgress);
             StopAutoHideVisualTimer();
         }
     }
@@ -1680,6 +1721,62 @@ public class ScrollBar : RangeBase
         _hasOverlayThumbPaddingSnapshot = false;
         _overlayThumbHadLocalPadding = false;
         _overlayThumbLocalPadding = default;
+    }
+
+    private void ApplyAutoHideVisibilityState(double visibilityProgress)
+    {
+        visibilityProgress = Math.Clamp(visibilityProgress, 0.0, 1.0);
+        _autoHideVisibilityProgress = visibilityProgress;
+
+        // Do not introduce a local Opacity value while the bar is fully shown.
+        // Keeping the property untouched lets theme/style changes continue to flow.
+        if (!_hasAutoHideOpacitySnapshot)
+        {
+            if (visibilityProgress >= 0.999)
+                return;
+
+            _autoHideHadLocalOpacity = HasLocalValue(UIElement.OpacityProperty);
+            if (_autoHideHadLocalOpacity &&
+                ReadLocalValue(UIElement.OpacityProperty) is double localOpacity)
+            {
+                _autoHideLocalOpacity = localOpacity;
+            }
+
+            _autoHideBaseOpacity = double.IsFinite(Opacity)
+                ? Math.Clamp(Opacity, 0.0, 1.0)
+                : 1.0;
+            _hasAutoHideOpacitySnapshot = true;
+        }
+
+        if (visibilityProgress >= 0.999)
+        {
+            RestoreAutoHideOpacity();
+            return;
+        }
+
+        // Opacity remains hit-testable at zero, so the invisible ScrollBar can
+        // still receive MouseEnter while shape and visibility animate separately.
+        Opacity = _autoHideBaseOpacity * visibilityProgress;
+    }
+
+    private void RestoreAutoHideOpacity()
+    {
+        if (!_hasAutoHideOpacitySnapshot)
+            return;
+
+        if (_autoHideHadLocalOpacity)
+        {
+            Opacity = _autoHideLocalOpacity;
+        }
+        else
+        {
+            ClearValue(UIElement.OpacityProperty);
+        }
+
+        _hasAutoHideOpacitySnapshot = false;
+        _autoHideHadLocalOpacity = false;
+        _autoHideLocalOpacity = default;
+        _autoHideBaseOpacity = 1.0;
     }
 
     private void ApplyOverlayTrackPresentation(Track track, double opacity, bool isHitTestVisible)

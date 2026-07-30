@@ -9,6 +9,13 @@ namespace Jalium.UI.Controls;
 /// </summary>
 public class StackPanel : Panel, IScrollInfo
 {
+    // Layout callbacks may mutate Children, so retain the existing snapshot
+    // behavior without allocating through Cast().ToArray() on every pass.
+    // Reentrant layout gets its own fallback list and cannot corrupt the outer
+    // snapshot.
+    private readonly List<UIElement> _layoutChildrenSnapshot = new();
+    private int _layoutChildrenSnapshotDepth;
+
     protected internal override bool HasLogicalOrientation => true;
 
     protected internal override Orientation LogicalOrientation => Orientation;
@@ -259,54 +266,62 @@ public class StackPanel : Panel, IScrollInfo
         double maxCross = 0;
         bool sawVisible = false;
 
-        foreach (UIElement child in Children.Cast<UIElement>().ToArray())
+        var layoutChildren = CaptureLayoutChildren();
+        try
         {
-            // Skip collapsed children
-            if (child.Visibility == Visibility.Collapsed)
-                continue;
-
-            // Measure with the constrained cross-axis first so stretch/layout-driven content
-            // (for example Grid with star columns) can establish its viewport-based layout.
-            // Only if the constrained pass already overflows on the scrollable cross axis do
-            // we remeasure unconstrained to compute the true scroll extent.
-            var finiteChildAvailable = isVertical
-                ? new Size(availableSize.Width, double.PositiveInfinity)
-                : new Size(double.PositiveInfinity, availableSize.Height);
-
-            child.Measure(finiteChildAvailable);
-            var childSize = child.DesiredSize;
-
-            if (isVertical &&
-                _canHorizontallyScroll &&
-                !double.IsPositiveInfinity(availableSize.Width) &&
-                childSize.Width > availableSize.Width + 0.5)
+            foreach (var child in layoutChildren)
             {
-                child.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-                childSize = child.DesiredSize;
-            }
-            else if (!isVertical &&
-                     _canVerticallyScroll &&
-                     !double.IsPositiveInfinity(availableSize.Height) &&
-                     childSize.Height > availableSize.Height + 0.5)
-            {
-                child.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-                childSize = child.DesiredSize;
-            }
+                // Skip collapsed children
+                if (child.Visibility == Visibility.Collapsed)
+                    continue;
 
-            if (isVertical)
-            {
-                if (sawVisible) totalHeight += spacing;
-                totalHeight += childSize.Height;
-                maxCross = Math.Max(maxCross, childSize.Width);
-            }
-            else
-            {
-                if (sawVisible) totalWidth += spacing;
-                totalWidth += childSize.Width;
-                maxCross = Math.Max(maxCross, childSize.Height);
-            }
+                // Measure with the constrained cross-axis first so stretch/layout-driven content
+                // (for example Grid with star columns) can establish its viewport-based layout.
+                // Only if the constrained pass already overflows on the scrollable cross axis do
+                // we remeasure unconstrained to compute the true scroll extent.
+                var finiteChildAvailable = isVertical
+                    ? new Size(availableSize.Width, double.PositiveInfinity)
+                    : new Size(double.PositiveInfinity, availableSize.Height);
 
-            sawVisible = true;
+                child.Measure(finiteChildAvailable);
+                var childSize = child.DesiredSize;
+
+                if (isVertical &&
+                    _canHorizontallyScroll &&
+                    !double.IsPositiveInfinity(availableSize.Width) &&
+                    childSize.Width > availableSize.Width + 0.5)
+                {
+                    child.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                    childSize = child.DesiredSize;
+                }
+                else if (!isVertical &&
+                         _canVerticallyScroll &&
+                         !double.IsPositiveInfinity(availableSize.Height) &&
+                         childSize.Height > availableSize.Height + 0.5)
+                {
+                    child.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                    childSize = child.DesiredSize;
+                }
+
+                if (isVertical)
+                {
+                    if (sawVisible) totalHeight += spacing;
+                    totalHeight += childSize.Height;
+                    maxCross = Math.Max(maxCross, childSize.Width);
+                }
+                else
+                {
+                    if (sawVisible) totalWidth += spacing;
+                    totalWidth += childSize.Width;
+                    maxCross = Math.Max(maxCross, childSize.Height);
+                }
+
+                sawVisible = true;
+            }
+        }
+        finally
+        {
+            ReleaseLayoutChildren(layoutChildren);
         }
 
         var extent = isVertical
@@ -339,51 +354,59 @@ public class StackPanel : Panel, IScrollInfo
         double scrollOffsetX = ScrollOwner != null ? -_horizontalOffset : 0;
         double scrollOffsetY = ScrollOwner != null ? -_verticalOffset : 0;
 
-        foreach (UIElement child in Children.Cast<UIElement>().ToArray())
+        var layoutChildren = CaptureLayoutChildren();
+        try
         {
-            // Skip collapsed children
-            if (child.Visibility == Visibility.Collapsed)
-                continue;
-
-            if (sawVisible)
+            foreach (var child in layoutChildren)
             {
-                offset += spacing;
-            }
+                // Skip collapsed children
+                if (child.Visibility == Visibility.Collapsed)
+                    continue;
 
-            var childSize = child.DesiredSize;
-            var arrangeWidth = isVertical && _canHorizontallyScroll ? Math.Max(finalSize.Width, _extent.Width) : finalSize.Width;
-            var arrangeHeight = !isVertical && _canVerticallyScroll ? Math.Max(finalSize.Height, _extent.Height) : finalSize.Height;
+                if (sawVisible)
+                {
+                    offset += spacing;
+                }
 
-            Rect childRect;
-            if (isVertical)
-            {
-                var startY = offset + scrollOffsetY;
-                var endY = startY + childSize.Height;
-                var snappedY = SnapLayoutValue(startY);
-                var snappedBottom = SnapLayoutValue(endY);
-                childRect = new Rect(
-                    SnapLayoutValue(scrollOffsetX),
-                    snappedY,
-                    SnapLayoutValue(arrangeWidth),
-                    Math.Max(0, snappedBottom - snappedY));
-                offset += childSize.Height;
-            }
-            else
-            {
-                var startX = offset + scrollOffsetX;
-                var endX = startX + childSize.Width;
-                var snappedX = SnapLayoutValue(startX);
-                var snappedRight = SnapLayoutValue(endX);
-                childRect = new Rect(
-                    snappedX,
-                    SnapLayoutValue(scrollOffsetY),
-                    Math.Max(0, snappedRight - snappedX),
-                    SnapLayoutValue(arrangeHeight));
-                offset += childSize.Width;
-            }
+                var childSize = child.DesiredSize;
+                var arrangeWidth = isVertical && _canHorizontallyScroll ? Math.Max(finalSize.Width, _extent.Width) : finalSize.Width;
+                var arrangeHeight = !isVertical && _canVerticallyScroll ? Math.Max(finalSize.Height, _extent.Height) : finalSize.Height;
 
-            child.Arrange(childRect);
-            sawVisible = true;
+                Rect childRect;
+                if (isVertical)
+                {
+                    var startY = offset + scrollOffsetY;
+                    var endY = startY + childSize.Height;
+                    var snappedY = SnapLayoutValue(startY);
+                    var snappedBottom = SnapLayoutValue(endY);
+                    childRect = new Rect(
+                        SnapLayoutValue(scrollOffsetX),
+                        snappedY,
+                        SnapLayoutValue(arrangeWidth),
+                        Math.Max(0, snappedBottom - snappedY));
+                    offset += childSize.Height;
+                }
+                else
+                {
+                    var startX = offset + scrollOffsetX;
+                    var endX = startX + childSize.Width;
+                    var snappedX = SnapLayoutValue(startX);
+                    var snappedRight = SnapLayoutValue(endX);
+                    childRect = new Rect(
+                        snappedX,
+                        SnapLayoutValue(scrollOffsetY),
+                        Math.Max(0, snappedRight - snappedX),
+                        SnapLayoutValue(arrangeHeight));
+                    offset += childSize.Width;
+                }
+
+                child.Arrange(childRect);
+                sawVisible = true;
+            }
+        }
+        finally
+        {
+            ReleaseLayoutChildren(layoutChildren);
         }
 
         // Update viewport if scrolling
@@ -393,6 +416,37 @@ public class StackPanel : Panel, IScrollInfo
         }
 
         return finalSize;
+    }
+
+    private List<UIElement> CaptureLayoutChildren()
+    {
+        List<UIElement> snapshot;
+        if (_layoutChildrenSnapshotDepth++ == 0)
+        {
+            snapshot = _layoutChildrenSnapshot;
+            snapshot.Clear();
+        }
+        else
+        {
+            snapshot = new List<UIElement>(Children.Count);
+        }
+
+        for (int index = 0; index < Children.Count; index++)
+        {
+            snapshot.Add(Children[index]);
+        }
+
+        return snapshot;
+    }
+
+    private void ReleaseLayoutChildren(List<UIElement> snapshot)
+    {
+        if (ReferenceEquals(snapshot, _layoutChildrenSnapshot))
+        {
+            snapshot.Clear();
+        }
+
+        _layoutChildrenSnapshotDepth--;
     }
 
     #endregion

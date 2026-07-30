@@ -34,7 +34,6 @@ public abstract class JaliumActivity : Activity, ISurfaceHolderCallback, IAndroi
     private static readonly object s_appThreadGate = new();
     private static Thread? s_jaliumThread;
     private static WeakReference<JaliumActivity>? s_pendingActivity;
-    private static int s_consoleRedirectInstalled;
 
     /// <summary>
     /// Builds the <see cref="JaliumApp"/> that drives this activity. Typically this
@@ -48,16 +47,6 @@ public abstract class JaliumActivity : Activity, ISurfaceHolderCallback, IAndroi
     protected override void OnCreate(Bundle? savedInstanceState)
     {
         base.OnCreate(savedInstanceState);
-
-        // Route Console.Out/Error into logcat before any framework code runs.
-        // Android drops managed stdout/stderr, and the rendering/lifecycle
-        // layers report their black-screen root causes exclusively through
-        // Console — without this redirect that evidence never leaves the device.
-        if (Interlocked.Exchange(ref s_consoleRedirectInstalled, 1) == 0)
-        {
-            Console.SetError(new AndroidLogTextWriter(Android.Util.LogPriority.Error));
-            Console.SetOut(new AndroidLogTextWriter(Android.Util.LogPriority.Info));
-        }
 
         _activityGeneration = AndroidActivityBridge.RegisterActivity();
 

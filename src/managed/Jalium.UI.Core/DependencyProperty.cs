@@ -44,6 +44,14 @@ public sealed class DependencyProperty
     /// </summary>
     private readonly object _metadataSync = new();
 
+    // Most dependency properties never override metadata after registration.
+    // In that overwhelmingly common case every target type uses
+    // DefaultMetadata, so consulting the per-property ConcurrentDictionary on
+    // every GetValue is pure overhead. The flag is published before the first
+    // override is applied; readers then fall back to the synchronized cache
+    // path until that override either commits or rolls back.
+    private int _hasTypeMetadata;
+
     // Lazily-synthesized boxed default(T) for a non-nullable value-type property whose registered
     // metadata default is null (see GetEffectiveDefaultValue). A synthesized value-type default is never
     // null, so a non-null box is its own publication signal — no separate "computed" flag (which would
@@ -461,8 +469,13 @@ public sealed class DependencyProperty
                 ValidateDefaultValue(typeMetadata, PropertyType, forType, Name, ValidateValueCallback);
 
             typeMetadata.InvokeMerge(baseMetadata, this);
-            _typeMetadata[forType] = typeMetadata;
+
+            // Empty the old inherited answers before publishing the slow-path
+            // flag. Once readers observe the flag they can no longer return a
+            // stale cache entry while OnApply is still running.
             _metadataCache.Clear();
+            Volatile.Write(ref _hasTypeMetadata, 1);
+            _typeMetadata[forType] = typeMetadata;
 
             try
             {
@@ -472,6 +485,8 @@ public sealed class DependencyProperty
             {
                 _typeMetadata.Remove(forType);
                 _metadataCache.Clear();
+                if (_typeMetadata.Count == 0)
+                    Volatile.Write(ref _hasTypeMetadata, 0);
                 throw;
             }
         }
@@ -486,6 +501,9 @@ public sealed class DependencyProperty
     public PropertyMetadata GetMetadata(Type forType)
     {
         ArgumentNullException.ThrowIfNull(forType);
+
+        if (Volatile.Read(ref _hasTypeMetadata) == 0)
+            return DefaultMetadata;
 
         // Metadata is immutable once published and overrides are exceptionally
         // rare compared with GetValue. Keep the steady-state cache hit outside

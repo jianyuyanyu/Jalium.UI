@@ -537,13 +537,25 @@ public partial class Popup : FrameworkElement
         _parentWindow = GetParentWindow();
         if (_parentWindow == null) return;
 
-        // Prepare full popup subtree before measuring.
-        // Popup children are measured before attachment, so style/template/bindings must be ready now.
+        // Attach the child to its PopupRoot before preparing or measuring it.  The root
+        // is the inheritance bridge for the detached popup tree (most importantly for
+        // DataContext).  Measuring the raw child first used to size data-bound popup
+        // content as though its Text values were still empty; the bindings activated
+        // only after PopupRoot was created, leaving the now-taller content clipped by
+        // the stale host height.
+        if (child.VisualParent != null)
+        {
+            child.DetachFromVisualParent();
+        }
+
+        _popupRoot = new PopupRoot(this, child, isLightDismiss: !StaysOpen);
+
+        // Prepare the fully inherited popup subtree before measuring.
         PreparePopupSubtree(child);
 
         // Force fresh layout when re-opening: child may have been detached
         // from a previous PopupRoot and its IsMeasureValid is stale
-        InvalidateSubtree(child);
+        InvalidateSubtree(_popupRoot);
 
         // Measure child to determine popup size
         var popupSize = MeasurePopupChild(child);
@@ -559,16 +571,6 @@ public partial class Popup : FrameworkElement
         var skipWindowAutoFlip = PreferExternalWindow && !ShouldConstrainToRootBounds && supportsExternalPopup;
         var adjustedPos = skipWindowAutoFlip ? windowLocalPos : ApplyAutoFlip(windowLocalPos, popupSize, windowSize);
 
-        // Detach child from any existing visual parent before wrapping in PopupRoot.
-        // This handles cases where the child was previously attached to another tree
-        // (e.g., ToolTip reuse, or implicit style application adding to a container).
-        if (child.VisualParent != null)
-        {
-            child.DetachFromVisualParent();
-        }
-
-        // Create PopupRoot wrapper
-        _popupRoot = new PopupRoot(this, child, isLightDismiss: !StaysOpen);
         _popupRoot.Width = popupSize.Width;
         _popupRoot.Height = popupSize.Height;
 

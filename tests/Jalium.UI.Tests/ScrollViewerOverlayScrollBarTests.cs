@@ -512,7 +512,7 @@ public class ScrollViewerOverlayScrollBarTests
         scrollBar.Arrange(new Rect(0, 0, 40, 220));
 
         scrollBar.StartAutoHideVisualTransition(1.0);
-        SetPrivateField(scrollBar, "_autoHideVisualAnimStartTick", Environment.TickCount64 - 200);
+        SetPrivateField(scrollBar, "_autoHideVisualAnimStartTick", Environment.TickCount64 - 1000);
 
         // Mirrors ScrollViewer arranging again while the same fade is active.
         scrollBar.StartAutoHideVisualTransition(1.0);

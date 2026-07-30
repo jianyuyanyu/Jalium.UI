@@ -1031,44 +1031,91 @@ public abstract class Visual : DependencyObject
             return true;
         }
 
-        // CurrentClipBounds is expressed in the final drawing surface space. Use the
-        // child's render-space AABB as well: testing the static layout box here culls a
-        // translated/rotated/scaled child as soon as an animation moves it away from its
-        // original slot. The dirty region then gets cleared but the Path subtree is never
-        // submitted, which makes vector content blink between swap-chain buffers.
-        Rect childBounds;
+        // CurrentClipBounds is expressed in the drawing context's CURRENT managed
+        // coordinate space. RenderTargetDrawingContext keeps clips in surface space
+        // internally, but maps them back through the inverse native transform while a
+        // Viewbox/RenderTransform is active. Therefore the child bounds compared here
+        // must use childOffset plus only the CHILD'S transform. GetRenderBounds() is in
+        // final surface space and includes every ancestor transform; comparing it with
+        // the inverse-mapped clip culls visible descendants in the lower/right part of
+        // an upscaled Viewbox.
+        Rect localBounds;
         if (child.Effect is IEffect effect && effect.HasEffect)
         {
             var padding = effect.EffectPadding;
             var size = child.RenderSize;
-            childBounds = child.MapLocalRectToScreen(new Rect(
+            localBounds = new Rect(
                 -padding.Left,
                 -padding.Top,
                 size.Width + padding.Left + padding.Right,
-                size.Height + padding.Top + padding.Bottom));
+                size.Height + padding.Top + padding.Bottom);
         }
         else
         {
-            childBounds = child.GetRenderBounds();
+            var size = child.RenderSize;
+            localBounds = new Rect(0, 0, size.Width, size.Height);
         }
 
-        // Render() is also used by detached/offscreen callers that seed a non-zero
-        // DrawingContext.Offset. GetRenderBounds is rooted in the visual tree, so retain
-        // the caller's ambient offset by translating from the tree-space layout origin to
-        // the live childOffset. In the normal Window path this delta is exactly zero.
-        var treeSpaceOrigin = child.GetScreenBounds();
-        double offsetDeltaX = childOffset.X - treeSpaceOrigin.X;
-        double offsetDeltaY = childOffset.Y - treeSpaceOrigin.Y;
-        if (offsetDeltaX != 0 || offsetDeltaY != 0)
-        {
-            childBounds = new Rect(
-                childBounds.X + offsetDeltaX,
-                childBounds.Y + offsetDeltaY,
-                childBounds.Width,
-                childBounds.Height);
-        }
+        Rect childBounds = MapChildBoundsToCurrentDrawingSpace(
+            child,
+            childOffset,
+            localBounds);
 
         return clipBounds.IntersectsWith(childBounds);
+    }
+
+    /// <summary>
+    /// Maps a child's local ink bounds into the managed coordinate space currently
+    /// exposed by the drawing context. Ancestor transforms are already accounted for
+    /// by <see cref="IClipBoundsDrawingContext.CurrentClipBounds"/>; applying them here
+    /// again would mix current-drawing and final-surface coordinates.
+    /// </summary>
+    private static Rect MapChildBoundsToCurrentDrawingSpace(
+        UIElement child,
+        Point childOffset,
+        Rect localBounds)
+    {
+        var transform = child.RenderTransform;
+        if (transform == null)
+        {
+            return new Rect(
+                childOffset.X + localBounds.X,
+                childOffset.Y + localBounds.Y,
+                localBounds.Width,
+                localBounds.Height);
+        }
+
+        var size = child.RenderSize;
+        var origin = child.RenderTransformOrigin;
+        double originX = origin.X * size.Width;
+        double originY = origin.Y * size.Height;
+        var matrix = transform.Value;
+
+        Point MapPoint(double x, double y)
+        {
+            double localX = x - originX;
+            double localY = y - originY;
+            return new Point(
+                localX * matrix.M11 + localY * matrix.M21 + matrix.OffsetX
+                    + originX + childOffset.X,
+                localX * matrix.M12 + localY * matrix.M22 + matrix.OffsetY
+                    + originY + childOffset.Y);
+        }
+
+        double left = localBounds.X;
+        double top = localBounds.Y;
+        double right = localBounds.X + localBounds.Width;
+        double bottom = localBounds.Y + localBounds.Height;
+        var p0 = MapPoint(left, top);
+        var p1 = MapPoint(right, top);
+        var p2 = MapPoint(left, bottom);
+        var p3 = MapPoint(right, bottom);
+
+        double minX = Math.Min(Math.Min(p0.X, p1.X), Math.Min(p2.X, p3.X));
+        double minY = Math.Min(Math.Min(p0.Y, p1.Y), Math.Min(p2.Y, p3.Y));
+        double maxX = Math.Max(Math.Max(p0.X, p1.X), Math.Max(p2.X, p3.X));
+        double maxY = Math.Max(Math.Max(p0.Y, p1.Y), Math.Max(p2.Y, p3.Y));
+        return new Rect(minX, minY, maxX - minX, maxY - minY);
     }
 
     /// <summary>

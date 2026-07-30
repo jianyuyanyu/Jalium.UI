@@ -295,6 +295,7 @@ private:
 
     bool CreateSwapChain();
     void WaitForAllFrames();
+    JaliumResult CommitCompositionResizePlacement(bool waitForCompletion);
 
     // Flush pending Vello paths before non-Vello draws to maintain correct Z-order.
     // Also commits any deferred clip / transform pushes so the upcoming draw
@@ -393,6 +394,13 @@ private:
     // Swap chain
     ComPtr<IDXGISwapChain3> swapChain_;
     uint32_t frameIndex_ = 0;
+    // A DirectComposition target may retain a monitor-sized physical allocation.
+    // Its visual covers that full capacity at 1:1 pixels while the HWND supplies
+    // the final crop, so newly exposed client area never reveals the base window.
+    // A direct HWND target keeps these dimensions equal to the client and uses
+    // the conventional ResizeBuffers path.
+    uint32_t swapChainWidth_ = 0;
+    uint32_t swapChainHeight_ = 0;
 
     // Synchronization (used only for Resize/Shutdown — per-frame sync is in DirectRenderer)
     ComPtr<ID3D12Fence> fence_;
@@ -421,6 +429,11 @@ private:
     bool tearingSupported_ = false;
     bool isComposition_ = false;
     bool vsyncEnabled_ = false;
+    // A metadata-only DirectComposition resize can happen after an old-size
+    // frame was submitted but before DWM consumes it. The next Present uses
+    // DXGI_PRESENT_RESTART so that stale queued frame cannot reappear at the
+    // new HWND origin and make the fixed edge visibly jump.
+    bool restartPresentAfterResize_ = false;
     // External present pacing (managed scheduler owns the frame-latency
     // waitable): BeginDraw skips the waitable wait and Present uses sync
     // interval 0 so the UI thread never blocks on the compositor. See
@@ -468,6 +481,17 @@ private:
     ComPtr<IDCompositionTarget> dcompTarget_;
     ComPtr<IDCompositionVisual> dcompVisual_;
     ComPtr<IDCompositionVisual> dcompSwapChainVisual_;
+    // Interactive left/top resizing keeps the opposite HWND edge stationary.
+    // DirectRenderer duplicates each frame against that edge while the
+    // DirectComposition child visual selects the matching capacity-relative copy.
+    RECT lastWindowRect_ = {};
+    bool hasLastWindowRect_ = false;
+    bool compositionAnchorRight_ = false;
+    bool compositionAnchorBottom_ = false;
+    bool compositionAnchorRightActive_ = false;
+    bool compositionAnchorBottomActive_ = false;
+    float dcompSwapChainOffsetX_ = 0.0f;
+    float dcompSwapChainOffsetY_ = 0.0f;
 
     struct WebViewVisualEntry {
         ComPtr<IDCompositionVisual> containerVisual;

@@ -11,25 +11,28 @@
         <Setter Property="ProgressBrush" Value="{ThemeResource AccentBrush}" />
         <Setter Property="BorderBrush" Value="{ThemeResource ControlBorder}" />
         <Setter Property="BorderThickness" Value="0" />
-        <Setter Property="CornerRadius" Value="3" />
+        <Setter Property="CornerRadius" Value="999" />
         <Setter Property="MinHeight" Value="4" />
         <Setter Property="Height" Value="6" />
         <Setter Property="Template">
             <ControlTemplate TargetType="ProgressBar">
                 <Grid>
                     <!-- Track Background -->
-                    <Grid Name="PART_Track"
-                          Background="{TemplateBinding Background}" />
+                    <Rectangle Name="PART_Track"
+                               Fill="{TemplateBinding Background}"
+                               RadiusX="999"
+                               RadiusY="999" />
 
                     <!-- Progress Indicator -->
                     <Border Name="PART_Indicator"
                             Background="{TemplateBinding ProgressBrush}"
                             CornerRadius="{TemplateBinding CornerRadius}"
+                            Shape="RoundedRectangle"
                             HorizontalAlignment="Left" />
                 </Grid>
                 <ControlTemplate.Triggers>
                     <Trigger Property="IsEnabled" Value="False">
-                        <Setter TargetName="PART_Track" Property="Background" Value="{ThemeResource ControlBackgroundDisabled}" />
+                        <Setter TargetName="PART_Track" Property="Fill" Value="{ThemeResource ControlBackgroundDisabled}" />
                         <Setter TargetName="PART_Indicator" Property="Background" Value="{ThemeResource AccentBrushDisabled}" />
                     </Trigger>
                 </ControlTemplate.Triggers>
@@ -43,7 +46,6 @@
     <Style TargetType="Slider">
         <Setter Property="Background" Value="{ThemeResource SliderTrack}" />
         <Setter Property="Foreground" Value="{ThemeResource AccentBrush}" />
-        <Setter Property="BorderBrush" Value="{ThemeResource WindowBackground}" />
         <Setter Property="MinHeight" Value="32" />
         <Setter Property="Height" Value="32" />
         <Setter Property="Template">
@@ -69,35 +71,45 @@
                                Margin="8,0,8,0" />
 
                     <!-- Thumb -->
-                    <Ellipse Name="PART_Thumb"
-                             TransitionProperty="Stroke"
-                             TransitionDuration="0:0:0.12"
-                             TransitionTimingFunction="Recommended"
-                             Width="18"
-                             Height="18"
-                             Fill="{TemplateBinding Foreground}"
-                             Stroke="{TemplateBinding BorderBrush}"
-                             StrokeThickness="2"
-                             HorizontalAlignment="Left"
-                             VerticalAlignment="Center" />
+                    <Grid Name="PART_Thumb"
+                          Width="16"
+                          Height="16"
+                          Background="Transparent"
+                          HorizontalAlignment="Left"
+                          VerticalAlignment="Center">
+                        <Ellipse Name="PART_ThumbVisual"
+                                 TransitionProperty="Width,Height"
+                                 TransitionDuration="0:0:0.14"
+                                 TransitionTimingFunction="Recommended"
+                                 Width="10"
+                                 Height="10"
+                                 Fill="{TemplateBinding Foreground}"
+                                 StrokeThickness="0"
+                                 HorizontalAlignment="Center"
+                                 VerticalAlignment="Center" />
+                    </Grid>
                 </Grid>
                 <ControlTemplate.Triggers>
                     <Trigger Property="IsMouseOver" Value="True">
                         <Setter TargetName="PART_SelectionRange" Property="Fill" Value="{ThemeResource AccentBrushHover}" />
-                        <Setter TargetName="PART_Thumb" Property="Fill" Value="{ThemeResource AccentBrushHover}" />
+                        <Setter TargetName="PART_ThumbVisual" Property="Fill" Value="{ThemeResource AccentBrushHover}" />
+                        <Setter TargetName="PART_ThumbVisual" Property="Width" Value="14" />
+                        <Setter TargetName="PART_ThumbVisual" Property="Height" Value="14" />
                     </Trigger>
                     <Trigger Property="IsKeyboardFocused" Value="True">
-                        <Setter TargetName="PART_Thumb" Property="Stroke" Value="{ThemeResource ControlBorderFocused}" />
+                        <Setter TargetName="PART_ThumbVisual" Property="Width" Value="14" />
+                        <Setter TargetName="PART_ThumbVisual" Property="Height" Value="14" />
                     </Trigger>
                     <Trigger Property="IsMouseCaptured" Value="True">
                         <Setter TargetName="PART_SelectionRange" Property="Fill" Value="{ThemeResource AccentBrushPressed}" />
-                        <Setter TargetName="PART_Thumb" Property="Fill" Value="{ThemeResource AccentBrushPressed}" />
+                        <Setter TargetName="PART_ThumbVisual" Property="Fill" Value="{ThemeResource AccentBrushPressed}" />
+                        <Setter TargetName="PART_ThumbVisual" Property="Width" Value="16" />
+                        <Setter TargetName="PART_ThumbVisual" Property="Height" Value="16" />
                     </Trigger>
                     <Trigger Property="IsEnabled" Value="False">
                         <Setter TargetName="PART_Track" Property="Fill" Value="{ThemeResource ControlBackgroundDisabled}" />
                         <Setter TargetName="PART_SelectionRange" Property="Fill" Value="{ThemeResource AccentBrushDisabled}" />
-                        <Setter TargetName="PART_Thumb" Property="Fill" Value="{ThemeResource AccentBrushDisabled}" />
-                        <Setter TargetName="PART_Thumb" Property="Stroke" Value="{ThemeResource ControlBorderDisabled}" />
+                        <Setter TargetName="PART_ThumbVisual" Property="Fill" Value="{ThemeResource AccentBrushDisabled}" />
                     </Trigger>
                 </ControlTemplate.Triggers>
             </ControlTemplate>

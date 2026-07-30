@@ -27,7 +27,7 @@ public class BarChart : AxisChartBase
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Content)]
     public static readonly DependencyProperty SeriesProperty =
         DependencyProperty.Register(nameof(Series), typeof(ObservableCollection<BarSeries>), typeof(BarChart),
-            new PropertyMetadata(null, OnVisualPropertyChanged));
+            new PropertyMetadata(null, OnSeriesCollectionPropertyChanged));
 
     /// <summary>
     /// Identifies the Orientation dependency property.

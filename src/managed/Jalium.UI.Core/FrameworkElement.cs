@@ -383,6 +383,17 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
     /// <param name="sizeInfo">Details of the size change.</param>
     protected virtual void OnSizeChanged(SizeChangedInfo sizeInfo)
     {
+        // Size changes are extremely common during layout, while listeners are
+        // uncommon. Keep the observable paths intact, but do not allocate an
+        // event-args object or enter routed-event dispatch when nobody can see it.
+        if (SizeChanged is null
+            && !HasRoutedEventHandler(SizeChangedEvent)
+            && EventManager.GetClassHandlers(SizeChangedEvent, GetType()).Length == 0
+            && !Diagnostics.RoutedEventDiagnostics.IsRecording)
+        {
+            return;
+        }
+
         var args = new SizeChangedEventArgs(sizeInfo)
         {
             RoutedEvent = SizeChangedEvent,
@@ -561,22 +572,12 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
     public override object? GetValue(DependencyProperty dp)
     {
         ArgumentNullException.ThrowIfNull(dp);
-
-        var localSource = base.GetValueSourceInternal(dp);
-        if (localSource.BaseValueSource != BaseValueSource.Default || localSource.IsAnimated)
-        {
-            return base.GetValue(dp);
-        }
-
-        // For inheriting properties, check parent chain
-        if (dp.GetMetadata(GetType()).Inherits && FrameworkParent is FrameworkElement parent)
-        {
-            if (TryGetInheritedBaseValue(parent, dp, out var inheritedValue))
-            {
-                return TrackMutableRenderBrushValue(dp, inheritedValue);
-            }
-        }
-
+        // DependencyObject.GetValue resolves through the virtual
+        // GetUncoercedBaseValueInternal method below, so inheritance and mutable
+        // brush ownership are already handled in a single pass. The former
+        // preflight called GetValueSourceInternal first and then resolved the
+        // same property again, doubling dictionary lookups and coercion callbacks
+        // for every FrameworkElement property read.
         return base.GetValue(dp);
     }
 
@@ -2908,8 +2909,13 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
     {
         ArgumentNullException.ThrowIfNull(sizeInfo);
         _previousRenderSize = sizeInfo.NewSize;
-        SetValue(ActualWidthPropertyKey, sizeInfo.NewSize.Width);
-        SetValue(ActualHeightPropertyKey, sizeInfo.NewSize.Height);
+        // A horizontal live resize changes the width of most elements while
+        // leaving their height untouched (and vice versa). Avoid running a full
+        // read-only dependency-property mutation for the unchanged dimension.
+        if (sizeInfo.WidthChanged)
+            SetValue(ActualWidthPropertyKey, sizeInfo.NewSize.Width);
+        if (sizeInfo.HeightChanged)
+            SetValue(ActualHeightPropertyKey, sizeInfo.NewSize.Height);
         OnSizeChanged(sizeInfo);
     }
 
