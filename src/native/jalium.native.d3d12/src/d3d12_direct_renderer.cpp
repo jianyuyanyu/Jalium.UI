@@ -621,7 +621,7 @@ bool D3D12DirectRenderer::CreateFrameResources()
         // Per-frame constants ring buffer — each FlushGraphicsForCompute gets its own
         // 256-byte aligned slot, so offscreen and main-RT draws see correct constants.
         auto cbHeapProps = MakeHeapProps(D3D12_HEAP_TYPE_UPLOAD);
-        auto cbBufDesc = MakeBufferDesc(kConstantsRingSize);
+        auto cbBufDesc = MakeBufferDesc(kConstantsRingInitialSize);
         if (FAILED(device_->CreateCommittedResource(
                 &cbHeapProps, D3D12_HEAP_FLAG_NONE, &cbBufDesc,
                 D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
@@ -629,6 +629,8 @@ bool D3D12DirectRenderer::CreateFrameResources()
             return false;
         fr.constantsBuffer->SetName(L"JaliumFrameConstantsRing");  // [JALIUM-921 diag]
         fr.constantsBuffer->Map(0, nullptr, &fr.constantsMappedPtr);
+        fr.constantsCapacity = fr.constantsMappedPtr ? kConstantsRingInitialSize : 0;
+        fr.constantsRingOffset = 0;
     }
 
     // Partition SRV heap into per-frame regions to prevent cross-frame descriptor races.
@@ -700,6 +702,89 @@ bool D3D12DirectRenderer::EnsureFrameInstanceCapacity(FrameResources& fr, size_t
     return true;
 }
 
+// Reserve the next 256-byte constants slot for this frame, growing the ring when
+// it is exhausted.
+//
+// Why growth and not the old `if (offset + 256 > size) offset = 0;` wrap:
+// the command list is NOT submitted until EndFrame, so every draw recorded
+// earlier in the frame still holds a root-CBV pointing into its own slot. Wrapping
+// to 0 overwrote those still-live slots with a LATER flush's constants. And since
+// an offscreen effect capture binds the CAPTURE viewport into
+// screenWidth/Height/invScreen*, the clobbered main-RT draws were then transformed
+// with capture-space constants and landed outside the back buffer — they did not
+// error, they silently vanished.
+//
+// Repro that motivated this: each element-level effect (DropShadow / Glow / Blur)
+// burns >= 2 slots (BeginEffectCapture's FlushGraphicsForCompute, plus the flush
+// that restores the main RT). A page carrying ~15 of them crossed the 64-slot ring
+// and everything recorded before the wrap point disappeared — for the Jalium One
+// welcome page that was the whole right sidebar and the status bar, while the
+// left column (recorded after the wrap, so with intact constants) still drew. The
+// old 8-effect version of the same page fit under 64 slots and looked fine, which
+// is what made this read as a mysterious "too many shadows" threshold.
+//
+// Growing mid-frame is safe for exactly the reason instance-buffer growth is: the
+// old resource is parked on fr.retiredInstanceBuffers, which keeps its refcount —
+// and therefore the GPU virtual addresses already baked into recorded draws —
+// alive until BeginFrame's fence wait for this slot clears the list. The new
+// buffer starts at offset 0 of a DISJOINT address range, so no live slot can be
+// aliased. Capacity persists across frames, so a heavy page reallocs at most once
+// per frame-resource slot per doubling and then always fits.
+UINT D3D12DirectRenderer::AcquireConstantsSlot(FrameResources& fr)
+{
+    const UINT offset = fr.constantsRingOffset;
+    if (fr.constantsMappedPtr && offset + kConstantsSlotSize <= fr.constantsCapacity) {
+        fr.constantsRingOffset = offset + kConstantsSlotSize;
+        return offset;
+    }
+
+    UINT newCap = (fr.constantsCapacity >= kConstantsRingInitialSize)
+        ? fr.constantsCapacity * 2
+        : kConstantsRingInitialSize;
+
+    if (newCap <= kConstantsRingMaxSize && device_) {
+        ComPtr<ID3D12Resource> grown;
+        auto heapProps = MakeHeapProps(D3D12_HEAP_TYPE_UPLOAD);
+        auto bufDesc = MakeBufferDesc(newCap);
+        if (SUCCEEDED(device_->CreateCommittedResource(
+                &heapProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&grown)))) {
+            void* mapped = nullptr;
+            grown->Map(0, nullptr, &mapped);
+            if (mapped) {
+                grown->SetName(L"JaliumFrameConstantsRing");  // [JALIUM-921 diag]
+                if (fr.constantsBuffer) {
+                    if (fr.constantsMappedPtr) {
+                        fr.constantsBuffer->Unmap(0, nullptr);
+                        fr.constantsMappedPtr = nullptr;
+                    }
+                    // Same fence-gated parking lot the instance buffer uses; the
+                    // list is cleared in BeginFrame once this slot's fence retires.
+                    fr.retiredInstanceBuffers.push_back(std::move(fr.constantsBuffer));
+                }
+                fr.constantsBuffer = std::move(grown);
+                fr.constantsMappedPtr = mapped;
+                fr.constantsCapacity = newCap;
+                fr.constantsRingOffset = kConstantsSlotSize;
+                return 0;
+            }
+        }
+    }
+
+    // Growth unavailable: 2 MB backstop reached, allocation failed, or the device
+    // was removed. With a live mapping, fall back to the legacy wrap — aliased
+    // constants are wrong but bounded, and strictly better than writing past the
+    // mapped range. With no mapping there is nothing safe to hand back.
+    if (!fr.constantsMappedPtr || fr.constantsCapacity < kConstantsSlotSize) {
+        return kInvalidConstantsSlot;
+    }
+    UINT wrapped = offset;
+    if (wrapped + kConstantsSlotSize > fr.constantsCapacity) wrapped = 0;
+    fr.constantsRingOffset = wrapped + kConstantsSlotSize;
+    return wrapped;
+}
+
 bool D3D12DirectRenderer::CreateRootSignature()
 {
     // Root signature layout (version 1.0 for compatibility):
@@ -715,7 +800,7 @@ bool D3D12DirectRenderer::CreateRootSignature()
     srvRange.RegisterSpace = 0;
     srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER params[4] = {};
+    D3D12_ROOT_PARAMETER params[5] = {};
     // [0] Root CBV for frame constants (b0)
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
@@ -753,6 +838,12 @@ bool D3D12DirectRenderer::CreateRootSignature()
     params[3].Constants.Num32BitValues = 12;
     params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+    // [4] Root SRV for the raw per-frame gradient stop table (t2).
+    params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[4].Descriptor.ShaderRegister = 2;
+    params[4].Descriptor.RegisterSpace = 0;
+    params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
     // Static samplers
     // s0 — bilinear clamp (Linear / LowQuality bitmap path; general texture sampling)
     // s1 — point clamp (NearestNeighbor bitmap path AND pixel-exact ClearType text)
@@ -784,7 +875,7 @@ bool D3D12DirectRenderer::CreateRootSignature()
     samplers[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-    rootSigDesc.NumParameters = 4;
+    rootSigDesc.NumParameters = 5;
     rootSigDesc.pParameters = params;
     rootSigDesc.NumStaticSamplers = 3;
     rootSigDesc.pStaticSamplers = samplers;
@@ -1114,6 +1205,7 @@ bool D3D12DirectRenderer::BeginFrame(UINT frameIndex, UINT width, UINT height,
     if (backend_) {
         backend_->ReclaimRetiredGpuResources(fence_->GetCompletedValue());
     }
+    ReclaimRetiredPipelineStates(fence_->GetCompletedValue());
 
     // Reset allocator + command list. Both fail on a removed device (and the
     // gate above can race a removal happening right now); recording into a
@@ -1188,6 +1280,7 @@ bool D3D12DirectRenderer::BeginFrame(UINT frameIndex, UINT width, UINT height,
 
     // Clear instance collections
     rectInstances_.clear();
+    gradientStops_.clear();
     textInstances_.clear();
     bitmapInstances_.clear();
     triangleVertices_.clear();
@@ -1220,7 +1313,10 @@ bool D3D12DirectRenderer::BeginFrame(UINT frameIndex, UINT width, UINT height,
     // rebuild. ApplyPendingPathMsaaSampleCount also zeroes pathMsaaWidth_/Height_
     // so the scratch resources recreate at the new sample count on this frame's
     // first path batch.
-    if (pendingPathMsaaSampleCount_ != pathMsaaSampleCount_) {
+    // Compare against the REQUEST behind the current effective count, not the
+    // effective count itself: a 16× request that the device resolves to 8×
+    // would otherwise look "still pending" forever and rebuild every frame.
+    if (pendingPathMsaaSampleCount_ != pathMsaaSampleCountRequest_) {
         ApplyPendingPathMsaaSampleCount();
     }
 
@@ -1229,6 +1325,7 @@ bool D3D12DirectRenderer::BeginFrame(UINT frameIndex, UINT width, UINT height,
     roundedClipStack_.clear();
     savedScissorStack_ = {};
     savedRetainedRoundedClipStack_.clear();
+    savedOffscreenRoundedClipStack_.clear();
 
     // Reset pre-glass snapshot flag for fused panels
     preGlassSnapshotCaptured_ = false;
@@ -1250,6 +1347,12 @@ bool D3D12DirectRenderer::BeginFrame(UINT frameIndex, UINT width, UINT height,
     captureViewportH_ = 0;
     glyphAtlasUsedThisFrame_ = false;
     glyphAtlasUploadRecordedThisFrame_ = false;
+
+    // The abandoned list will never execute. Earlier submitted frames may
+    // still reference these PSOs, so gate them on the newest signal already
+    // issued to this ordered queue.
+    RetirePendingPipelineStates(
+        nextFenceValue_ > 1 ? nextFenceValue_ - 1 : 0);
     fr.constantsRingOffset = 0;  // reset ring buffer for this frame
 
     // Keep the in-place blur temps sized to the (monotonically ratcheted)
@@ -1361,6 +1464,7 @@ void D3D12DirectRenderer::AbortFrame()
 
     // Clear instance collections so they don't leak into the next frame
     rectInstances_.clear();
+    gradientStops_.clear();
     textInstances_.clear();
     bitmapInstances_.clear();
     triangleVertices_.clear();
@@ -1386,6 +1490,7 @@ void D3D12DirectRenderer::AbortFrame()
     roundedClipStack_.clear();
     savedScissorStack_ = {};
     savedRetainedRoundedClipStack_.clear();
+    savedOffscreenRoundedClipStack_.clear();
     glyphAtlasUsedThisFrame_ = false;
     glyphAtlasUploadRecordedThisFrame_ = false;
 
@@ -1607,6 +1712,7 @@ JaliumResult D3D12DirectRenderer::EndFrame(bool useDirtyRects, const std::vector
     // resources retired *after* this call are tagged with the new value
     // and will be reclaimed when this frame's Signal completes.
     backend_->NoteSubmittedFenceValue(frames_[currentFrame_].fenceValue);
+    RetirePendingPipelineStates(frames_[currentFrame_].fenceValue);
 
     if (SUCCEEDED(hr) || hr == DXGI_STATUS_OCCLUDED) {
         return JALIUM_OK;
@@ -2131,9 +2237,41 @@ static inline bool BatchStateCompatibleForMerge(const DrawBatch& prev, const Dra
     return true;
 }
 
+bool D3D12DirectRenderer::AppendSdfGradientStops(
+    const SdfGradientStop* stops,
+    uint32_t count,
+    uint32_t& startOffset)
+{
+    startOffset = 0;
+    if (count == 0) return true;
+    if (!stops) return false;
+
+    constexpr size_t kMaxAddressableStops =
+        static_cast<size_t>((std::numeric_limits<uint32_t>::max)());
+    if (gradientStops_.size() > kMaxAddressableStops - count) {
+        return false;
+    }
+
+    startOffset = static_cast<uint32_t>(gradientStops_.size());
+    gradientStops_.insert(gradientStops_.end(), stops, stops + count);
+    return true;
+}
+
 void D3D12DirectRenderer::AddSdfRect(const SdfRectInstance& inst)
 {
+    std::vector<SdfGradientStop> pendingStops;
     if (rectInstances_.size() >= kMaxInstancesPerFrame) {
+        if (inst.stopCount > 0) {
+            const size_t begin = inst.stopOffset;
+            const size_t count = inst.stopCount;
+            if (begin > gradientStops_.size() ||
+                count > gradientStops_.size() - begin) {
+                return;
+            }
+            pendingStops.assign(
+                gradientStops_.begin() + begin,
+                gradientStops_.begin() + begin + count);
+        }
         // Auto-flush: upload and record the current batch, then continue
         // instead of dropping the draw call.
         if (!FlushGraphicsForCompute()) return;  // device lost — frame will abort
@@ -2143,6 +2281,22 @@ void D3D12DirectRenderer::AddSdfRect(const SdfRectInstance& inst)
     // baked into SdfRectInstance per-vertex, so they do NOT affect batch
     // coalescing — only scissor + rounded clip + batch type do.
     SdfRectInstance adjusted = inst;
+    if (!pendingStops.empty()) {
+        if (!AppendSdfGradientStops(
+                pendingStops.data(),
+                static_cast<uint32_t>(pendingStops.size()),
+                adjusted.stopOffset)) {
+            return;
+        }
+    } else if (adjusted.stopCount > 0) {
+        const size_t begin = adjusted.stopOffset;
+        const size_t count = adjusted.stopCount;
+        if (begin > gradientStops_.size() ||
+            count > gradientStops_.size() - begin) {
+            return;
+        }
+    }
+
     adjusted.fillR *= adjusted.fillA;
     adjusted.fillG *= adjusted.fillA;
     adjusted.fillB *= adjusted.fillA;
@@ -2201,7 +2355,8 @@ void D3D12DirectRenderer::AddText(IDWriteTextLayout* layout, float x, float y,
                                    float r, float g, float b, float a,
                                    uint64_t layoutKey,
                                    int32_t aaMode,
-                                   int32_t hintingMode)
+                                   int32_t hintingMode,
+                                   const EngineBrushData* gradientBrush)
 {
     if (!glyphAtlas_ || !layout) return;
 
@@ -2296,6 +2451,45 @@ void D3D12DirectRenderer::AddText(IDWriteTextLayout* layout, float x, float y,
             if (crispAxisAligned) {
                 g.posX = std::round(g.posX * dpi) * invDpi;
                 g.posY = std::round(g.posY * dpi) * invDpi;
+            }
+        }
+    }
+
+    // ── Gradient foreground: recolour each glyph quad from the brush ──────────
+    //
+    // Runs AFTER the loop above so every quad's position/size is final; sampling
+    // before the scale + pixel snap would read the gradient at the wrong place.
+    //
+    // The brush's coordinates live in the caller's PRE-transform space (that is the
+    // space the managed layer computed the gradient's start/end in, from the text's
+    // layout rect), while the quads are now in post-transform screen DIPs. Map each
+    // quad centre back with the origin and the per-axis scale — exact for the
+    // axis-aligned transforms text actually renders under, and a close approximation
+    // under rotation, where the per-glyph quantisation dominates the error anyway.
+    if (count > 0 && gradientBrush && gradientBrush->stops && gradientBrush->stopCount > 0) {
+        std::vector<float> stopData;
+        FlattenGradientStops(*gradientBrush, stopData);
+        if (!stopData.empty()) {
+            const float invSx = (scaled && std::abs(scaleX) > 1e-6f) ? 1.0f / scaleX : 1.0f;
+            const float invSy = (scaled && std::abs(scaleY) > 1e-6f) ? 1.0f / scaleY : 1.0f;
+
+            for (uint32_t i = startIdx; i < startIdx + count; i++) {
+                auto& q = textInstances_[i];
+
+                // Colour-emoji glyphs carry their own palette baked into the atlas and
+                // flag it with a negative-R sentinel. Tinting them is wrong for a solid
+                // foreground and equally wrong for a gradient — leave them alone.
+                if (q.colorR < 0.0f) continue;
+
+                const float cx = x + ((q.posX + q.sizeX * 0.5f) - tx) * invSx;
+                const float cy = y + ((q.posY + q.sizeY * 0.5f) - ty) * invSy;
+
+                GradientColor gc = SampleBrushGradient(*gradientBrush, stopData.data(), cx, cy);
+                const float ga = gc.a * currentOpacity_;
+                q.colorR = gc.r * ga;
+                q.colorG = gc.g * ga;
+                q.colorB = gc.b * ga;
+                q.colorA = ga;
             }
         }
     }
@@ -2899,6 +3093,10 @@ void D3D12DirectRenderer::UploadInstances()
         if (!rectInstances_.empty()) {
             probe += rectInstances_.size() * sizeof(SdfRectInstance);
         }
+        probe = ((probe + 3) / 4) * 4;
+        if (!gradientStops_.empty()) {
+            probe += gradientStops_.size() * sizeof(SdfGradientStop);
+        }
         const size_t textAlignProbe = sizeof(GlyphQuadInstance);
         probe = ((probe + textAlignProbe - 1) / textAlignProbe) * textAlignProbe;
         if (!textInstances_.empty()) {
@@ -2934,6 +3132,7 @@ void D3D12DirectRenderer::UploadInstances()
                 frameDeviceLost_ = true;
             }
             rectInstances_.clear();
+            gradientStops_.clear();
             textInstances_.clear();
             bitmapInstances_.clear();
             triangleVertices_.clear();
@@ -2963,7 +3162,27 @@ void D3D12DirectRenderer::UploadInstances()
         }
     }
 
-    // Upload text instances (after rects, aligned to GlyphQuadInstance stride)
+    // Upload the complete gradient stop table after rects. SdfRectInstance
+    // stores an offset/count pair into this raw 20-byte-stride array, so no
+    // renderer-side color-stop limit or truncation is involved.
+    size_t gradientStopBufferOffset = ((offset + 3) / 4) * 4;
+    gradientStopBufferByteOffset_ = gradientStopBufferOffset;
+    if (!gradientStops_.empty()) {
+        size_t gradientStopDataSize =
+            gradientStops_.size() * sizeof(SdfGradientStop);
+        if (gradientStopBufferOffset + gradientStopDataSize <= cap) {
+            memcpy(
+                dst + gradientStopBufferOffset,
+                gradientStops_.data(),
+                gradientStopDataSize);
+            offset = gradientStopBufferOffset + gradientStopDataSize;
+        } else {
+            OutputDebugStringA(
+                "[D3D12DirectRenderer] WARNING: Gradient stop buffer overflow — data dropped\n");
+        }
+    }
+
+    // Upload text instances (after gradient stops, aligned to GlyphQuadInstance stride)
     // NOTE: GlyphQuadInstance is 48 bytes (not power-of-2), use division for alignment
     size_t textAlign = sizeof(GlyphQuadInstance);
     size_t textBufferOffset = ((offset + textAlign - 1) / textAlign) * textAlign;
@@ -3073,8 +3292,24 @@ void D3D12DirectRenderer::UploadInstances()
         // executed), causing the GPU to read invalid data → device lost.
         // Truncate: drop the draws that don't fit.  This may cause visual glitches
         // for the remainder of this frame, but avoids device removal.
+        //
+        // "Visual glitches" undersells it: EVERY remaining draw of the frame is
+        // discarded, so whole panels recorded after this point vanish with no
+        // error anywhere the app can see.  OutputDebugString alone made that
+        // effectively invisible outside a native debugger, which is how this was
+        // once mistaken for a mysterious "too many element shadows" threshold.
+        // Mirror it to stderr (once per process) so it is diagnosable from a
+        // normal run; if this ever fires again, kMaxSrvDescriptors is the knob.
         OutputDebugStringA("[D3D12DirectRenderer] SRV descriptor ring overflow — truncating draws for this frame\n");
+        static bool overflowReported = false;
+        if (!overflowReported) {
+            overflowReported = true;
+            fputs("[Jalium.D3D12] SRV descriptor ring overflow: the rest of this frame was dropped. "
+                  "Raise kMaxSrvDescriptors (d3d12_direct_renderer.h).\n", stderr);
+            fflush(stderr);
+        }
         rectInstances_.clear();
+        gradientStops_.clear();
         textInstances_.clear();
         bitmapInstances_.clear();
         triangleVertices_.clear();
@@ -3173,18 +3408,28 @@ void D3D12DirectRenderer::RecordDrawCommands()
     // Each flush gets its own slot so offscreen and main-RT draws see correct constants
     // (avoids the race where a single CBV upload buffer gets overwritten mid-frame).
     auto& fr = frames_[currentFrame_];
-    UINT cbOffset = fr.constantsRingOffset;
-    if (cbOffset + 256 > kConstantsRingSize) cbOffset = 0;  // wrap
-    memcpy((uint8_t*)fr.constantsMappedPtr + cbOffset, &currentFrameConstants_, sizeof(DirectFrameConstants));
-    commandList_->SetGraphicsRootConstantBufferView(0,
-        fr.constantsBuffer->GetGPUVirtualAddress() + cbOffset);
-    fr.constantsRingOffset = cbOffset + 256;
+    const UINT cbOffset = AcquireConstantsSlot(fr);
+    // Resolve the address ONCE: AcquireConstantsSlot may have swapped in a grown
+    // buffer, and the path-blit restore tail below re-binds the same slot. Caching
+    // the VA keeps that re-bind pinned to the resource this slot actually lives in.
+    D3D12_GPU_VIRTUAL_ADDRESS cbAddr = 0;
+    if (cbOffset != kInvalidConstantsSlot) {
+        memcpy((uint8_t*)fr.constantsMappedPtr + cbOffset, &currentFrameConstants_, sizeof(DirectFrameConstants));
+        cbAddr = fr.constantsBuffer->GetGPUVirtualAddress() + cbOffset;
+        commandList_->SetGraphicsRootConstantBufferView(0, cbAddr);
+    }
 
     // Bind instance SRV (descriptor table) — use current flush's descriptor region
     UINT descBase = lastFlushSrvBase_;
     auto srvGpuBase = srvHeap_->GetGPUDescriptorHandleForHeapStart();
     srvGpuBase.ptr += descBase * srvDescriptorSize_;
     commandList_->SetGraphicsRootDescriptorTable(1, srvGpuBase);
+    const D3D12_GPU_VIRTUAL_ADDRESS gradientStopGpuAddress =
+        fr.instanceUploadBuffer->GetGPUVirtualAddress() +
+        gradientStopBufferByteOffset_;
+    commandList_->SetGraphicsRootShaderResourceView(
+        4,
+        gradientStopGpuAddress);
 
     // Bitmap/snapshot batches each get their own unique descriptor pair starting at slot 8+
     UINT nextBitmapDescSlot = descBase + 8;  // first bitmap-specific slot
@@ -3601,9 +3846,13 @@ void D3D12DirectRenderer::RecordDrawCommands()
         // are correct in capture mode too: cbOffset/srvGpuBase reference the capture
         // flush's own sub-region constants and instances.
         commandList_->SetGraphicsRootSignature(rootSignature_.Get());
-        commandList_->SetGraphicsRootConstantBufferView(0,
-            fr.constantsBuffer->GetGPUVirtualAddress() + cbOffset);
+        if (cbAddr) {
+            commandList_->SetGraphicsRootConstantBufferView(0, cbAddr);
+        }
         commandList_->SetGraphicsRootDescriptorTable(1, srvGpuBase);
+        commandList_->SetGraphicsRootShaderResourceView(
+            4,
+            gradientStopGpuAddress);
 
         // Re-bind the render target + viewport for the subsequent non-path batches.
         // The batch loop re-sets scissor per batch but inherits RT + viewport, so
@@ -4307,6 +4556,7 @@ bool D3D12DirectRenderer::FlushGraphicsForCompute()
     // this flush (barriers, dispatches, SRV creation — same AV class).
     if (!CheckFrameDeviceAlive()) {
         rectInstances_.clear();
+        gradientStops_.clear();
         textInstances_.clear();
         bitmapInstances_.clear();
         triangleVertices_.clear();
@@ -4322,6 +4572,7 @@ bool D3D12DirectRenderer::FlushGraphicsForCompute()
 
     // Clear the batch/instance lists so EndFrame won't re-record them
     rectInstances_.clear();
+    gradientStops_.clear();
     textInstances_.clear();
     bitmapInstances_.clear();
     triangleVertices_.clear();
@@ -5109,9 +5360,17 @@ void D3D12DirectRenderer::EmitSoftGlowDot(
 
     // Straight-alpha stops (the pixel shader premultiplies). A solid core, a
     // fast shoulder, then a transparent rim → a soft, glow-like falloff.
-    dot.stop0Pos = 0.0f; dot.stop0R = r; dot.stop0G = g; dot.stop0B = b; dot.stop0A = peakAlpha;
-    dot.stop1Pos = 0.5f; dot.stop1R = r; dot.stop1G = g; dot.stop1B = b; dot.stop1A = peakAlpha * 0.32f;
-    dot.stop2Pos = 1.0f; dot.stop2R = r; dot.stop2G = g; dot.stop2B = b; dot.stop2A = 0.0f;
+    const SdfGradientStop stops[] = {
+        { 0.0f, r, g, b, peakAlpha },
+        { 0.5f, r, g, b, peakAlpha * 0.32f },
+        { 1.0f, r, g, b, 0.0f },
+    };
+    if (!AppendSdfGradientStops(
+            stops,
+            dot.stopCount,
+            dot.stopOffset)) {
+        return;
+    }
 
     dot.opacity = 1.0f;
     AddSdfRect(dot);
@@ -5469,6 +5728,14 @@ bool D3D12DirectRenderer::BeginOffscreenCapture(int slot, float x, float y, floa
     savedScissorStack_ = std::move(scissorStack_);
     scissorStack_ = {};
 
+    // Same story for the rounded-clip channel, which the hardware scissor does
+    // NOT cover: an ancestor's RoundedClipState resolves to screen-space physical
+    // pixels and the SDF mask tests it against SV_Position, which is capture-local
+    // in here — so the whole capture would be masked away and the effect would
+    // composite an empty texture. Restored by EndOffscreenCapture.
+    savedOffscreenRoundedClipStack_ = std::move(roundedClipStack_);
+    roundedClipStack_.clear();
+
     // Push a transform to shift from screen coords to offscreen-local coords
     PushTransform(1, 0, 0, 1, -x, -y);
 
@@ -5509,6 +5776,8 @@ void D3D12DirectRenderer::EndOffscreenCapture(int slot)
         captureViewportH_ = 0;
         scissorStack_ = std::move(savedScissorStack_);
         savedScissorStack_ = {};
+        roundedClipStack_ = std::move(savedOffscreenRoundedClipStack_);
+        savedOffscreenRoundedClipStack_.clear();
         float dipWl = (float)viewportWidth_ / dpiScale_;
         float dipHl = (float)viewportHeight_ / dpiScale_;
         currentFrameConstants_.screenWidth = dipWl;
@@ -5553,6 +5822,12 @@ void D3D12DirectRenderer::EndOffscreenCapture(int slot)
     // Restore the scissor stack saved during BeginOffscreenCapture
     scissorStack_ = std::move(savedScissorStack_);
     savedScissorStack_ = {};
+
+    // ...and the rounded-clip channel, so the composite draw is masked by the
+    // ancestor clip in screen space (where it is meaningful) instead of the
+    // captured pixels being masked in capture-local space (where it is not).
+    roundedClipStack_ = std::move(savedOffscreenRoundedClipStack_);
+    savedOffscreenRoundedClipStack_.clear();
 
     offscreenCaptureValid_[slot] = true;
 }
@@ -5883,6 +6158,85 @@ void D3D12DirectRenderer::DrawOffscreenBitmapCropped(int slot,
 // BlurOffscreenSlot — blur an offscreen capture texture in-place
 // ============================================================================
 
+void D3D12DirectRenderer::RetirePendingPipelineStates(uint64_t submissionFenceValue)
+{
+    if (pendingPipelineStates_.empty()) return;
+
+    if (submissionFenceValue == 0 || !fence_) {
+        pendingPipelineStates_.clear();
+        return;
+    }
+
+    retiredPipelineStates_.reserve(
+        retiredPipelineStates_.size() + pendingPipelineStates_.size());
+    for (auto& pso : pendingPipelineStates_) {
+        if (pso) {
+            retiredPipelineStates_.push_back(
+                { std::move(pso), submissionFenceValue });
+        }
+    }
+    pendingPipelineStates_.clear();
+}
+
+void D3D12DirectRenderer::ReclaimRetiredPipelineStates(uint64_t completedFenceValue)
+{
+    if (retiredPipelineStates_.empty()) return;
+
+    auto newEnd = std::remove_if(
+        retiredPipelineStates_.begin(),
+        retiredPipelineStates_.end(),
+        [completedFenceValue](const RetiredPipelineState& retired) {
+            return retired.fenceValue <= completedFenceValue;
+        });
+    retiredPipelineStates_.erase(newEnd, retiredPipelineStates_.end());
+}
+
+void D3D12DirectRenderer::ClearCustomShaderCache()
+{
+    if (customShaderCache_.empty()) {
+        if (fence_) ReclaimRetiredPipelineStates(fence_->GetCompletedValue());
+        return;
+    }
+
+    // Once the list has been submitted, nextFenceValue_ - 1 is the newest
+    // signal on this renderer's ordered queue and therefore covers every
+    // earlier frame that could reference a cached PSO. For an open list there
+    // is no safe numerical value yet: an auxiliary Signal may run before that
+    // list. Keep those PSOs pending until EndFrame supplies its actual fence.
+    const bool listOpen =
+        cmdListRecording_.load(std::memory_order_acquire) || inFrame_;
+    const uint64_t retirementFence =
+        nextFenceValue_ > 1 ? nextFenceValue_ - 1 : 0;
+
+    if (!listOpen && (retirementFence == 0 || !fence_)) {
+        customShaderCache_.clear();
+        return;
+    }
+
+    if (listOpen) {
+        pendingPipelineStates_.reserve(
+            pendingPipelineStates_.size() + customShaderCache_.size());
+    } else {
+        retiredPipelineStates_.reserve(
+            retiredPipelineStates_.size() + customShaderCache_.size());
+    }
+    for (auto& entry : customShaderCache_) {
+        if (entry.pso) {
+            if (listOpen) {
+                pendingPipelineStates_.push_back(std::move(entry.pso));
+            } else {
+                retiredPipelineStates_.push_back(
+                    { std::move(entry.pso), retirementFence });
+            }
+        }
+    }
+    customShaderCache_.clear();
+
+    // Usually no-op for a live frame, but releases immediately when the queue
+    // was already idle at the time the cache eviction request arrived.
+    ReclaimRetiredPipelineStates(fence_->GetCompletedValue());
+}
+
 ID3D12PipelineState* D3D12DirectRenderer::GetOrCreateCustomShaderPSO(const uint8_t* shaderBytecode, uint32_t shaderBytecodeSize)
 {
     if (!device_ || !rootSignature_ || !customEffectVS_ || !shaderBytecode || shaderBytecodeSize == 0) {
@@ -5929,6 +6283,7 @@ ID3D12PipelineState* D3D12DirectRenderer::GetOrCreateCustomShaderPSO(const uint8
         LogDeviceRemovedReason("CreateCustomShaderPSO", device_, hr);
         return nullptr;
     }
+    pso->SetName(L"JaliumCustomShaderPSO");
 
     CustomShaderCacheEntry entry;
     entry.hash = hash;
@@ -7159,12 +7514,16 @@ void D3D12DirectRenderer::DrawLiquidGlass(
     currentFrameConstants_.screenHeight = (float)viewportHeight_ / dpiScale_;
     currentFrameConstants_.invScreenWidth = dpiScale_ / (float)viewportWidth_;
     currentFrameConstants_.invScreenHeight = dpiScale_ / (float)viewportHeight_;
-    UINT lgFcOffset = fr.constantsRingOffset;
-    if (lgFcOffset + 256 > kConstantsRingSize) lgFcOffset = 0;
-    memcpy((uint8_t*)fr.constantsMappedPtr + lgFcOffset, &currentFrameConstants_, sizeof(DirectFrameConstants));
-    fr.constantsRingOffset = lgFcOffset + 256;
-    D3D12_GPU_VIRTUAL_ADDRESS lgFcAddr = fr.constantsBuffer->GetGPUVirtualAddress() + lgFcOffset;
-    cl->SetGraphicsRootConstantBufferView(0, lgFcAddr);
+    // Held past this block: the restore tail at the end of this function re-binds
+    // the same slot, and AcquireConstantsSlot may have swapped constantsBuffer, so
+    // the VA must be the one resolved at acquisition time.
+    D3D12_GPU_VIRTUAL_ADDRESS lgFcAddr = 0;
+    const UINT lgFcOffset = AcquireConstantsSlot(fr);
+    if (lgFcOffset != kInvalidConstantsSlot) {
+        memcpy((uint8_t*)fr.constantsMappedPtr + lgFcOffset, &currentFrameConstants_, sizeof(DirectFrameConstants));
+        lgFcAddr = fr.constantsBuffer->GetGPUVirtualAddress() + lgFcOffset;
+        cl->SetGraphicsRootConstantBufferView(0, lgFcAddr);
+    }
 
     // Bind liquid glass params (b1) — unique per call
     cl->SetGraphicsRootConstantBufferView(1, cbGpuAddr);
@@ -7220,7 +7579,9 @@ void D3D12DirectRenderer::DrawLiquidGlass(
     // --- Restore previous pipeline state ---
     cl->SetGraphicsRootSignature(rootSignature_.Get());
     cl->SetDescriptorHeaps(1, heaps);
-    cl->SetGraphicsRootConstantBufferView(0, lgFcAddr);
+    if (lgFcAddr) {
+        cl->SetGraphicsRootConstantBufferView(0, lgFcAddr);
+    }
     cl->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
     cl->RSSetViewports(1, &vp);
     cl->RSSetScissorRects(1, &scissor);

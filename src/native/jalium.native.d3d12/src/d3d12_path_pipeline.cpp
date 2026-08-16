@@ -49,6 +49,21 @@
 
 namespace jalium {
 
+// MSAA scratch formats. One definition, used by the PSOs, by the resources,
+// and by the multisample-capability query — a sample count that is not
+// supported for BOTH of these is not usable, and querying a different format
+// than the one the resources use would resolve to a count that then fails
+// CreateCommittedResource.
+//   • R16G16B16A16_FLOAT keeps premultiplied intermediate values without
+//     clamping; sRGB conversion happens at the resolve blit.
+//   • D24_UNORM_S8_UINT — only the stencil half is used, depth is permanently
+//     disabled.
+static constexpr DXGI_FORMAT kPathMsaaColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+static constexpr DXGI_FORMAT kPathMsaaDsFormat    = DXGI_FORMAT_D24_UNORM_S8_UINT;
+
+// Sample counts we are willing to run the path scratch at, highest first.
+static constexpr UINT kPathMsaaLadder[] = { 16u, 8u, 4u, 2u, 1u };
+
 namespace {
 inline D3D12_RESOURCE_BARRIER MakeBarrier(ID3D12Resource* r,
     D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
@@ -152,7 +167,8 @@ bool D3D12DirectRenderer::CreateStencilPathResources()
     if (!device_) return false;
 
     // Optional startup override of the path MSAA quality, e.g.
-    // JALIUM_PATH_MSAA=4 to halve path GPU cost on low-end adapters.
+    // JALIUM_PATH_MSAA=4 to halve path GPU cost on low-end adapters, or =16 for
+    // maximum smoothness where the adapter offers it.
     // Runtime changes go through SetPathMsaaSampleCount; this only seeds the
     // initial value so the first PSO/RT build uses it.
     // _dupenv_s is the CRT-safe form (plain getenv trips C4996-as-error here).
@@ -162,10 +178,15 @@ bool D3D12DirectRenderer::CreateStencilPathResources()
         if (_dupenv_s(&env, &envLen, "JALIUM_PATH_MSAA") == 0 && env) {
             int requested = std::atoi(env);
             SetPathMsaaSampleCount(requested > 0 ? (uint32_t)requested : 8u);
-            pathMsaaSampleCount_ = pendingPathMsaaSampleCount_;  // seed active too
+            pathMsaaSampleCountRequest_ = pendingPathMsaaSampleCount_;
             free(env);
         }
     }
+
+    // Resolve the request (default or env-seeded) against what this device
+    // actually supports, so the first PSO/RT build already uses a valid count.
+    pathMsaaSampleCount_ =
+        ResolveSupportedPathMsaaSampleCount(pathMsaaSampleCountRequest_);
 
     if (!stencilPathCache_) {
         stencilPathCache_ = std::make_unique<StencilPathCache>(kStencilPathCacheCapacity);
@@ -353,12 +374,6 @@ bool D3D12DirectRenderer::RebuildStencilCoverPSOs()
         return false;
     }
 
-    // RT format = MSAA scratch color (R16G16B16A16_FLOAT keeps premult
-    // intermediate values without clamping; sRGB conversion happens at the
-    // resolve blit since the back buffer is sRGB-aware).
-    constexpr DXGI_FORMAT kMsaaColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    constexpr DXGI_FORMAT kMsaaDsFormat    = DXGI_FORMAT_D24_UNORM_S8_UINT;
-
     D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
@@ -372,9 +387,9 @@ bool D3D12DirectRenderer::RebuildStencilCoverPSOs()
     psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     psoDesc.SampleMask = UINT_MAX;
     psoDesc.NumRenderTargets = 1;
-    psoDesc.RTVFormats[0] = kMsaaColorFormat;
+    psoDesc.RTVFormats[0] = kPathMsaaColorFormat;
     psoDesc.SampleDesc.Count = pathMsaaSampleCount_;
-    psoDesc.DSVFormat = kMsaaDsFormat;
+    psoDesc.DSVFormat = kPathMsaaDsFormat;
 
     psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -454,17 +469,57 @@ bool D3D12DirectRenderer::RebuildStencilCoverPSOs()
     return true;
 }
 
+UINT D3D12DirectRenderer::ResolveSupportedPathMsaaSampleCount(UINT requested) const
+{
+    if (!device_ || requested <= 1u) return 1u;
+
+    // D3D12 guarantees nothing above 1× for a given format: 16× in particular
+    // is common on desktop NVIDIA but absent on plenty of integrated parts, and
+    // an unsupported count does not fail loudly — CreateGraphicsPipelineState
+    // and CreateCommittedResource just return E_INVALIDARG and the whole
+    // stencil path silently disables itself. So ask, and walk down.
+    for (UINT candidate : kPathMsaaLadder) {
+        if (candidate > requested) continue;
+        if (candidate == 1u) return 1u;
+
+        bool ok = true;
+        for (DXGI_FORMAT fmt : { kPathMsaaColorFormat, kPathMsaaDsFormat }) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q = {};
+            q.Format = fmt;
+            q.SampleCount = candidate;
+            q.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
+            if (FAILED(device_->CheckFeatureSupport(
+                    D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q, sizeof(q)))
+                || q.NumQualityLevels == 0) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return candidate;
+    }
+    return 1u;
+}
+
 void D3D12DirectRenderer::ApplyPendingPathMsaaSampleCount()
 {
-    if (pendingPathMsaaSampleCount_ == pathMsaaSampleCount_) return;
+    if (pendingPathMsaaSampleCount_ == pathMsaaSampleCountRequest_) return;
+
+    const UINT resolved =
+        ResolveSupportedPathMsaaSampleCount(pendingPathMsaaSampleCount_);
+    // Record the request FIRST and unconditionally: it is what makes this
+    // change "applied", including when the device resolves two different
+    // requests (16 and 8 on 8×-only hardware) to the same effective count.
+    pathMsaaSampleCountRequest_ = pendingPathMsaaSampleCount_;
+
     if (!stencilPathReady_) {
         // Pipeline not initialised yet — just latch the value so the first
         // CreateStencilPathResources picks it up.
-        pathMsaaSampleCount_ = pendingPathMsaaSampleCount_;
+        pathMsaaSampleCount_ = resolved;
         return;
     }
+    if (resolved == pathMsaaSampleCount_) return;   // nothing to rebuild
 
-    pathMsaaSampleCount_ = pendingPathMsaaSampleCount_;
+    pathMsaaSampleCount_ = resolved;
 
     // Caller (BeginFrame) has already waited the per-frame fence, so the old
     // MSAA PSOs and scratch RT are guaranteed idle on the GPU.
@@ -491,12 +546,17 @@ void D3D12DirectRenderer::SetPathMsaaSampleCount(uint32_t sampleCount)
     pathAnalyticOnly_ = (sampleCount == 0);
     if (pathAnalyticOnly_) return;
 
-    // Clamp to the MSAA counts D3D12 hardware universally supports for this use.
-    uint32_t clamped = (sampleCount >= 8) ? 8u
-                     : (sampleCount >= 4) ? 4u
-                     : (sampleCount >= 2) ? 2u
-                                          : 1u;
-    pendingPathMsaaSampleCount_ = clamped;
+    // Normalize to a power of two we build PSOs for. The device may not support
+    // the normalized value — that is resolved (downward) against real caps in
+    // ApplyPendingPathMsaaSampleCount, which owns the frame boundary where the
+    // MSAA resources can safely be rebuilt. Normalizing here and resolving
+    // there keeps this setter callable from any thread at any time.
+    uint32_t normalized = (sampleCount >= 16) ? 16u
+                        : (sampleCount >= 8)  ?  8u
+                        : (sampleCount >= 4)  ?  4u
+                        : (sampleCount >= 2)  ?  2u
+                                              :  1u;
+    pendingPathMsaaSampleCount_ = normalized;
 }
 
 bool D3D12DirectRenderer::EnsureStencilDepthBuffer(UINT width, UINT height)
@@ -554,8 +614,9 @@ bool D3D12DirectRenderer::EnsureStencilDepthBuffer(UINT width, UINT height)
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
 
-    constexpr DXGI_FORMAT kColorFmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    constexpr DXGI_FORMAT kDsFmt    = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    // Same two formats the PSOs and the multisample-capability query use.
+    constexpr DXGI_FORMAT kColorFmt = kPathMsaaColorFormat;
+    constexpr DXGI_FORMAT kDsFmt    = kPathMsaaDsFormat;
 
     // MSAA color (sample count is runtime-configurable).
     {

@@ -233,6 +233,14 @@ internal static class DrawingReplayer
                     target.SetShapeType((int)c.V0, (float)c.V1);
                     break;
 
+                case DrawCommandKind.DrawRecordedDrawing:
+                    // Whole-frame scene graph: current Offset / clip / opacity /
+                    // transform state was emitted immediately before this node.
+                    // The nested drawing is immutable and can be replayed directly
+                    // without rebuilding or copying its command list on the UI thread.
+                    Replay((RecordedDrawing)c.A!, target);
+                    break;
+
             }
         }
     }

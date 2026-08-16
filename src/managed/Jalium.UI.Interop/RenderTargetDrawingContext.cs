@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using Jalium.UI;
+using Jalium.UI.Diagnostics;
 using Jalium.UI.Media;
 using Jalium.UI.Media.Imaging;
 using Jalium.UI.Rendering;
@@ -63,6 +64,8 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
     private readonly Stack<Rect?> _clipBoundsStack = new();
     private readonly Stack<PushedEffect> _effectStack = new();
+    private readonly HashSet<IEffect> _effectApplicationPath =
+        new(ReferenceEqualityComparer.Instance);
 
     // Depth of non-translate (scale/rotate/skew/matrix) transforms currently active
     // on the transform stack. Translate transforms go through the managed Offset
@@ -150,25 +153,32 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
     private sealed class BitmapCacheEntry
     {
-        public BitmapCacheEntry(NativeBitmap bitmap, long estimatedBytes, long lastAccessSequence, uint contentRevision = 0)
+        public BitmapCacheEntry(NativeBitmap bitmap, long estimatedBytes, long lastAccessSequence, long contentGeneration = 0)
         {
             Bitmap = bitmap;
             EstimatedBytes = estimatedBytes;
             LastAccessSequence = lastAccessSequence;
-            ContentRevision = contentRevision;
+            ContentGeneration = contentGeneration;
         }
 
         public NativeBitmap Bitmap { get; }
         public long EstimatedBytes { get; }
         public long LastAccessSequence { get; set; }
         /// <summary>
-        /// For mutable sources (<see cref="WriteableBitmap"/>) this holds the
-        /// <c>ContentRevision</c> value at upload time. A mismatch on lookup
-        /// means the back-buffer has been rewritten — the cache entry will then
-        /// either update pixels in-place (D3D12 / Vulkan) and bump this counter,
-        /// or re-upload via destroy+recreate.
+        /// <see cref="ImageSource.ContentGeneration"/> of the pixels this entry actually uploaded.
+        /// A mismatch on lookup means the source replaced its raster under a reference-equal
+        /// identity, so the cached texture holds the wrong bytes: the entry either updates pixels
+        /// in-place (D3D12 / Vulkan, <see cref="WriteableBitmap"/> only) and re-stamps this, or is
+        /// dropped and re-uploaded.
         /// </summary>
-        public uint ContentRevision { get; set; }
+        /// <remarks>
+        /// This deliberately covers every source kind rather than just <see cref="WriteableBitmap"/>.
+        /// The old test was <c>imageSource is WriteableBitmap &amp;&amp; revision differs</c>, which
+        /// made a <see cref="BitmapImage"/> that upgraded its display bucket permanently
+        /// un-detectable: the cache kept serving the small first decode, so the upgrade paid a
+        /// full native decode and changed nothing on screen — no crash, no log line.
+        /// </remarks>
+        public long ContentGeneration { get; set; }
 
         /// <summary>
         /// Per-frame id at which this entry was last drawn. When it equals the current
@@ -237,6 +247,72 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         public BitmapImage? RasterizedBitmap;
         public int PixelWidth;
         public int PixelHeight;
+
+        /// <summary>
+        /// The inner <see cref="ImageSource"/>s the rasterization read pixels from, each with the
+        /// <see cref="ImageSource.ContentGeneration"/> that was baked into this raster.
+        /// </summary>
+        /// <remarks>
+        /// <para>The entry is keyed on the OUTER vector source, but a <see cref="DrawingImage"/>
+        /// wrapping an <see cref="ImageDrawing"/> — or a shape filled with an
+        /// <see cref="ImageBrush"/> — bakes an inner bitmap's pixels into this raster. The first
+        /// rasterization of a URI-backed inner source necessarily runs before its deferred decode
+        /// has published anything, and produces a valid, entirely blank buffer. Without this list
+        /// the publish raises <c>RasterChanged</c> for the INNER source, the eviction looks that
+        /// inner source up under the outer key, misses, and the blank raster is served for the life
+        /// of the window (the context outlives every frame) unless the draw rect happens to change
+        /// size.</para>
+        /// <para>Generations as well as identities, for the same division of labour the GPU bitmap
+        /// cache uses: the compare is what guarantees CORRECTNESS on the next draw, and the event
+        /// is what makes the release PROMPT. The compare is the half that still holds when no
+        /// eviction is delivered at all — a host with no dispatcher pumping the decode notifier, a
+        /// context whose drain has not run yet — and the event is the half that covers a publish
+        /// landing DURING the rasterization, whose generation this list would otherwise record as
+        /// already included.</para>
+        /// </remarks>
+        public List<(ImageSource Source, long Generation)>? TouchedSources;
+
+        /// <summary>
+        /// Whether every source this raster was built from still carries the pixels it was built
+        /// from.
+        /// </summary>
+        public bool MatchesTouchedSourceGenerations()
+        {
+            if (TouchedSources is null)
+            {
+                return true;
+            }
+
+            for (var i = 0; i < TouchedSources.Count; i++)
+            {
+                var (source, generation) = TouchedSources[i];
+                if (source.ContentGeneration != generation)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>Whether this raster was built from <paramref name="source"/>'s pixels.</summary>
+        public bool DependsOn(ImageSource source)
+        {
+            if (TouchedSources is null)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < TouchedSources.Count; i++)
+            {
+                if (ReferenceEquals(TouchedSources[i].Source, source))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
     }
     private readonly Dictionary<ImageSource, VectorDrawingCacheEntry> _vectorDrawingCache = new();
 
@@ -560,13 +636,27 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
     }
 
     /// <summary>
-    /// Destroys retained layers queued by <see cref="Visual"/> (idle-eviction /
-    /// detach happen without a render context). Called once per frame by the
-    /// window so the GPU textures are released promptly through the fence-gated
-    /// native graveyard.
+    /// The owning thread's frame prologue. Destroys retained layers queued by
+    /// <see cref="Visual"/> (idle-eviction / detach happen without a render
+    /// context) so the GPU textures are released promptly through the
+    /// fence-gated native graveyard, applies the bitmap-cache evictions other
+    /// threads queued, and re-arms the per-frame effect-capture self-heal.
     /// </summary>
+    /// <remarks>
+    /// Every host that owns a context calls this once per frame BEFORE it draws
+    /// (<c>Window</c> on both the inline and render-thread paths,
+    /// <c>PopupWindow</c>, <c>DockIndicatorWindow</c>), which is what makes it
+    /// the one place where "this must happen on the thread that owns the caches,
+    /// before anything reads them" can be honoured for all of them at once.
+    /// </remarks>
     internal void DrainPendingRetainedLayers()
     {
+        // First, because it is the only step here that must precede every cache READ this frame,
+        // and because it is the only one that does not need a live render target: a context whose
+        // RT handle is momentarily zero still has to retire the uploads other threads asked it to
+        // drop, or the request is silently lost until the next raise.
+        DrainPendingCacheEvictions();
+
         // Per-frame self-heal for the effect-capture cull override: if a render
         // exception unwound past an open BeginEffectCapture (Visual.RenderDirect
         // has no try/finally and the window's catch-all keeps the process alive),
@@ -577,6 +667,7 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         // native side has the symmetric guard in ResetGpuReplay).
         _effectCaptureCullSuspendDepth = 0;
         _effectCaptureCullOverrideStack.Clear();
+        _suppressedEffectCaptureDepth = 0;
         if (_renderTarget == null || _renderTarget.Handle == nint.Zero) return;
         while (Visual.TryDequeuePendingLayerDestroy(out nint h))
         {
@@ -593,6 +684,25 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
     /// based (not snapshot based) and are unaffected — they keep rendering fully.
     /// </summary>
     internal bool SimplifyBackdropEffects { get; set; }
+
+    /// <summary>
+    /// Draw element content directly instead of redirecting every shadow, glow,
+    /// blur, or custom effect through the renderer-wide offscreen surface. Live
+    /// window resize enables this policy because those shared surfaces otherwise
+    /// serialize effect-heavy frames behind the previous GPU fence. The window
+    /// schedules a normal full frame when resizing ends, so the visual downgrade
+    /// exists only while the pointer is moving.
+    /// </summary>
+    internal bool SimplifyElementEffects { get; set; }
+
+    bool IEffectDrawingContext.IsElementEffectCaptureEnabled =>
+        !SimplifyElementEffects;
+
+    // DrawingRecorder replay can contain explicit Begin/End effect commands
+    // even when Visual itself observes the policy above. Track those suppressed
+    // scopes so their content stays on the main target and the replay remains
+    // balanced without entering the native capture pipeline.
+    private int _suppressedEffectCaptureDepth;
 
     /// <summary>
     /// Begins batching ellipse draw calls. While batching is active, DrawEllipse calls
@@ -650,14 +760,142 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         // when the owning element has been off-screen long enough.
         _gpuEvictionHandler = OnGpuCacheEvictionRequested;
         ImageSource.GpuCacheEvictionRequested += _gpuEvictionHandler;
+
+        // And to raster replacement, which is a different statement: eviction says "release this
+        // memory, the bytes are still correct", RasterChanged says "these bytes are WRONG".
+        // A deferred bitmap publishing a bigger bucket keeps its reference identity, and this
+        // cache is keyed on exactly that identity, so without this leg the upgrade decode runs in
+        // full and the screen never changes.
+        //
+        // Neither handler touches the caches inline — both only QUEUE the source. See
+        // _pendingCacheEvictions for the ownership argument.
+        _rasterChangedHandler = OnImageRasterChanged;
+        ImageSource.RasterChanged += _rasterChangedHandler;
     }
 
     private readonly Action<ImageSource> _gpuEvictionHandler;
+    private readonly Action<ImageSource> _rasterChangedHandler;
 
-    private void OnGpuCacheEvictionRequested(ImageSource source)
+    // Sources whose cached upload is to be dropped: enqueued by whichever thread RAISED the
+    // eviction, applied by the thread that OWNS this context.
+    //
+    // Both events are bare synchronous invokes on the raising thread, and their raisers are the
+    // decode publish, the animated-substitute swap and every source assignment — delivered on the
+    // main dispatcher. But the main dispatcher does not own this context: whenever the render
+    // thread is running (the default on Windows/D3D12) it exclusively owns creation, drawing and
+    // the cache trim, and it is inside GetNativeBitmap — TryGetValue, in-place entry mutation,
+    // indexer insert, a non-atomic _bitmapCacheBytes read-modify-write and an ENUMERATING trim
+    // loop — over these very dictionaries at exactly the moment a publish lands. Evicting inline
+    // from the raising thread is therefore a second writer to a plain Dictionary plus a Dispose of
+    // a native texture the render thread is about to sample: the "native brush use-after-free +
+    // Dictionary corruption" pair that Window's render-thread ownership rule exists to prevent.
+    // Neither leg is observable when it happens — the notifier catches per item and the render
+    // loop discards the frame — so it presents as an image that is wrong on some machines with
+    // nothing logged, which is the whole failure class this pipeline work exists to remove.
+    //
+    // Deferring by one frame is sound because the event is not the correctness mechanism: the
+    // ContentGeneration compare in GetNativeBitmap already re-uploads a replaced raster on the very
+    // next draw with no event at all. What the event buys is PROMPT release of the superseded
+    // texture, and prompt is not weakened here — the same notifier drain that raises it also raises
+    // ContentChangedBatchCompleted, which is what schedules the frame that applies it. Only the
+    // idle reclaimer, which asks for no repaint of its own, now waits for whatever frame comes
+    // next; it is asking to give memory back, so a late release costs nothing.
+    private readonly object _pendingCacheEvictionLock = new();
+    // A set, not a list: the bucket ladder publishes several times per image, and each publish
+    // raises once. Collapsing them keeps the drain proportional to distinct sources.
+    private readonly HashSet<ImageSource> _pendingCacheEvictions = new();
+    // Fast-path flag so an idle frame does not take the lock. Only ever written under the lock;
+    // a read that races a raise costs one frame of delay and can never lose an eviction, because
+    // the flag stays set until a drain clears it under that same lock.
+    private volatile bool _hasPendingCacheEvictions;
+
+    /// <summary>
+    /// Queues the reclaimer's request to release this context's upload of <paramref name="source"/>.
+    /// </summary>
+    private void OnGpuCacheEvictionRequested(ImageSource source) => QueueCacheEviction(source);
+
+    /// <summary>
+    /// Queues the drop of this context's upload of a source whose pixels were replaced under a
+    /// reference-equal identity, so the next draw re-uploads from the new raster instead of
+    /// re-serving the superseded one.
+    /// </summary>
+    /// <remarks>
+    /// Belt and braces with the generation compare in <see cref="GetNativeBitmap"/>: that compare
+    /// is what guarantees CORRECTNESS on the very next draw even if this event is never delivered,
+    /// while this handler is what releases the superseded GPU texture promptly rather than leaving
+    /// it resident until the trim pass notices. That is precisely why it is safe to defer the drop
+    /// to the owning thread's next frame instead of doing it here, on the raiser's thread.
+    /// </remarks>
+    private void OnImageRasterChanged(ImageSource source) => QueueCacheEviction(source);
+
+    /// <summary>
+    /// Records that <paramref name="source"/>'s cached upload must be dropped. Callable from ANY
+    /// thread; touches nothing but the pending set.
+    /// </summary>
+    private void QueueCacheEviction(ImageSource source)
     {
-        if (_closed) return;
+        if (source is null) return;
 
+        lock (_pendingCacheEvictionLock)
+        {
+            // Racy read of _closed, deliberately: losing the race merely leaves one reference in a
+            // set that Close() has already abandoned, and the drain that would act on it no longer
+            // runs. Reading it inside the lock keeps it ordered against Close()'s own Clear.
+            if (_closed) return;
+
+            _pendingCacheEvictions.Add(source);
+            _hasPendingCacheEvictions = true;
+        }
+    }
+
+    /// <summary>
+    /// Applies the evictions queued by other threads. Must run on the thread that owns this
+    /// context, and does so as the first step of that thread's frame — see
+    /// <see cref="DrainPendingRetainedLayers"/>.
+    /// </summary>
+    private void DrainPendingCacheEvictions()
+    {
+        if (!_hasPendingCacheEvictions) return;
+
+        ImageSource[] evictions;
+        lock (_pendingCacheEvictionLock)
+        {
+            var count = _pendingCacheEvictions.Count;
+            _hasPendingCacheEvictions = false;
+            if (count == 0) return;
+
+            evictions = new ImageSource[count];
+            _pendingCacheEvictions.CopyTo(evictions);
+            _pendingCacheEvictions.Clear();
+        }
+
+        foreach (var source in evictions)
+        {
+            try
+            {
+                DropCachedUploadOf(source);
+            }
+            catch (Exception ex)
+            {
+                // One bad source must not cost the others their eviction, and must NOT escape into
+                // the frame: this runs at the top of Replay, where a throw is swallowed by the
+                // render loop's catch-all and would discard every frame for as long as the entry
+                // kept failing — a permanently black window from a texture-release fault. Reported
+                // through the Release-live channel rather than swallowed; the entry is already out
+                // of the dictionary by the time Dispose can throw, so the cache stays coherent and
+                // only the native handle leaks.
+                ImageDiagnostics.DecodeFailed(
+                    DescribeImageSource(source), "gpu cache eviction", ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Drops this context's upload of <paramref name="source"/> and any vector raster derived from
+    /// it. Owning thread only — reached solely from <see cref="DrainPendingCacheEvictions"/>.
+    /// </summary>
+    private void DropCachedUploadOf(ImageSource source)
+    {
         // The bitmap cache is keyed by ImageSource reference identity, so a
         // direct lookup is enough — no scan needed. RemoveBitmapCacheEntry
         // disposes the NativeBitmap (which calls jalium_bitmap_destroy on the
@@ -671,13 +909,52 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         // it was uploaded as a NativeBitmap via the same pipeline.
         if (_vectorDrawingCache.TryGetValue(source, out var vector))
         {
-            if (vector.RasterizedBitmap != null &&
-                _bitmapCache.TryGetValue(vector.RasterizedBitmap, out var vectorEntry))
-            {
-                RemoveBitmapCacheEntry(vector.RasterizedBitmap, vectorEntry);
-            }
-            _vectorDrawingCache.Remove(source);
+            DropVectorRaster(source, vector);
         }
+
+        // ...and every slot whose raster was rasterized FROM this source. A DrawingImage keeps its
+        // own identity while the bitmap inside it publishes under a different one, so the key
+        // lookup above cannot see that relationship; the dependency set recorded at rasterization
+        // time is what does. A linear scan is right here: the dictionary holds one entry per vector
+        // source drawn into this window (single digits), a drop runs once per publish rather than
+        // per frame, and a reverse index would have to be unwound on every eviction path to avoid
+        // rooting dead sources.
+        if (_vectorDrawingCache.Count != 0)
+        {
+            List<ImageSource>? dependents = null;
+            foreach (var kvp in _vectorDrawingCache)
+            {
+                if (kvp.Value.DependsOn(source))
+                {
+                    (dependents ??= []).Add(kvp.Key);
+                }
+            }
+
+            if (dependents is not null)
+            {
+                foreach (var key in dependents)
+                {
+                    if (_vectorDrawingCache.TryGetValue(key, out var dependent))
+                    {
+                        DropVectorRaster(key, dependent);
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Removes one vector-raster slot and the GPU upload of the bitmap it produced.
+    /// </summary>
+    private void DropVectorRaster(ImageSource key, VectorDrawingCacheEntry entry)
+    {
+        if (entry.RasterizedBitmap != null &&
+            _bitmapCache.TryGetValue(entry.RasterizedBitmap, out var rasterEntry))
+        {
+            RemoveBitmapCacheEntry(entry.RasterizedBitmap, rasterEntry);
+        }
+
+        _vectorDrawingCache.Remove(key);
     }
 
     private static (float RadiusX, float RadiusY) NormalizeRoundedRectRadii(float width, float height, double radiusX, double radiusY)
@@ -1109,11 +1386,32 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         if (_closed || formattedText == null || string.IsNullOrEmpty(formattedText.Text)) return;
         Jalium.UI.Diagnostics.HoverTrace.Bump(Jalium.UI.Diagnostics.HoverTrace.DRAW_TEXT2);
 
-        var brush = formattedText.Foreground != null ? GetNativeBrush(formattedText.Foreground) : null;
-        if (brush == null) return;
-
         var mx = origin.X + Offset.X;
         var my = origin.Y + Offset.Y;
+
+        // Gradient foregrounds are mapped onto the text's own box. The old call passed
+        // no bounds at all (GetNativeBrush(brush) ⇒ a 0×0 rect), which degenerates a
+        // RelativeToBoundingBox gradient — every stop collapses onto the same point, so
+        // even a backend that CAN render gradient text has nothing meaningful to sample.
+        // Measured extents, not MaxTextWidth/Height: those are the layout CONSTRAINT and
+        // are routinely unbounded (the 10000 fallback below), which would stretch the
+        // gradient across a box the text occupies a sliver of.
+        var brushW = (float)formattedText.Width;
+        var brushH = (float)formattedText.Height;
+        if (brushW <= 0 || float.IsInfinity(brushW) || float.IsNaN(brushW)) brushW = 0;
+        if (brushH <= 0 || float.IsInfinity(brushH) || float.IsNaN(brushH)) brushH = 0;
+
+        // The brush is created per branch below, NOT here: the two call paths hand
+        // native DIFFERENT coordinate spaces, and a RelativeToBoundingBox gradient is
+        // resolved to absolute coordinates at creation time against the bounds given
+        // here. Binding it once up front pins the gradient to the pre-transform box
+        // while the scale-compensated branch reports glyph positions in screen space —
+        // every glyph then samples the gradient at the wrong place (on a 150% display
+        // the sampling coordinate is 1.5× the mapped one, so most glyphs clamp to the
+        // last stop and the gradient looks frozen and truncated).
+        // Solid brushes ignore the bounds entirely, so this costs the common path nothing.
+        if (formattedText.Foreground == null) return;
+
         var width = (float)formattedText.MaxTextWidth;
         var height = (float)formattedText.MaxTextHeight;
         if (width <= 0 || float.IsInfinity(width) || float.IsNaN(width)) width = 10000;
@@ -1197,7 +1495,11 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
             var x = (float)mx;
             var y = (float)my; // pixel snapping disabled: the line-box top Y passes through unrounded
-            _renderTarget.DrawText(formattedText.Text, format, x, y, width, height, brush);
+            // Native receives the untransformed origin here, so the gradient maps onto
+            // the text box in that same space.
+            var identityBrush = GetNativeBrush(formattedText.Foreground, x, y, brushW, brushH);
+            if (identityBrush == null) return;
+            _renderTarget.DrawText(formattedText.Text, format, x, y, width, height, identityBrush);
             return;
         }
 
@@ -1249,9 +1551,18 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             (float)invA21, (float)invA22,
             (float)invDx,  (float)invDy
         };
+        // Glyph positions below are SCREEN space (the inverse push cancels native's
+        // transform), and the box is scaled by the effective em size — so the gradient
+        // must be mapped onto that same screen-space box, not the pre-transform one.
+        var screenBrush = GetNativeBrush(
+            formattedText.Foreground,
+            screenX, screenY,
+            (float)(brushW * effectiveScale), (float)(brushH * effectiveScale));
+        if (screenBrush == null) return;
+
         _renderTarget.DrawTextWithInverseTransform(
             formattedText.Text, scaledFormat,
-            screenX, screenY, scaledWidth, scaledHeight, brush,
+            screenX, screenY, scaledWidth, scaledHeight, screenBrush,
             inverse);
     }
 
@@ -2561,9 +2872,14 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             if (targetH > MaxSvgRasterEdge) targetH = MaxSvgRasterEdge;
 
             // ── Check cache: reuse rasterized BitmapImage if size matches ──
+            // ...and if every bitmap baked into it still holds the pixels that were baked in. The
+            // size compare alone served a DrawingImage's PRE-DECODE rasterization — an entirely
+            // transparent buffer — for as long as the element kept its size, which for an icon in a
+            // fixed cell is forever.
             if (_vectorDrawingCache.TryGetValue(imageSource, out var cached) &&
                 cached.RasterizedBitmap != null &&
-                cached.PixelWidth == targetW && cached.PixelHeight == targetH)
+                cached.PixelWidth == targetW && cached.PixelHeight == targetH &&
+                cached.MatchesTouchedSourceGenerations())
             {
                 // Cache hit — draw via the standard bitmap pipeline (< 0.1ms)
                 var cachedNative = GetNativeBitmap(cached.RasterizedBitmap);
@@ -2595,8 +2911,15 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             _svgNativeCallTicks = 0;
             _svgBoundsCalcTicks = 0;
 
-            // Rasterize via CPU software renderer into a BGRA pixel buffer
-            var pixels = SoftwareVectorRasterizer.Rasterize(drawing, targetW, targetH, vectorViewport);
+            // Rasterize via CPU software renderer into a BGRA pixel buffer.
+            //
+            // The rasterizer records which inner bitmaps it sampled. That set is the entry's
+            // staleness signal: this raster is a flat snapshot of sources that publish
+            // asynchronously, and the very first rasterization of a URI-backed inner bitmap
+            // necessarily happens before its decode has produced anything.
+            var touchedSources = new HashSet<ImageSource>();
+            var pixels = SoftwareVectorRasterizer.Rasterize(
+                drawing, targetW, targetH, vectorViewport, touchedSources);
             BitmapImage? rasterized = null;
             if (pixels != null)
             {
@@ -2605,13 +2928,24 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
             if (rasterized != null)
             {
+                List<(ImageSource Source, long Generation)>? dependencies = null;
+                if (touchedSources.Count > 0)
+                {
+                    dependencies = new List<(ImageSource, long)>(touchedSources.Count);
+                    foreach (var touched in touchedSources)
+                    {
+                        dependencies.Add((touched, touched.ContentGeneration));
+                    }
+                }
+
                 // Cache the BitmapImage — D3D12 resource lifecycle is managed by
                 // the existing GetNativeBitmap / _bitmapCache pipeline.
                 _vectorDrawingCache[imageSource] = new VectorDrawingCacheEntry
                 {
                     RasterizedBitmap = rasterized,
                     PixelWidth = targetW,
-                    PixelHeight = targetH
+                    PixelHeight = targetH,
+                    TouchedSources = dependencies,
                 };
 
                 // Draw via standard bitmap pipeline
@@ -2665,32 +2999,34 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         // "display-size by default, full-res on demand" behaviour. WriteableBitmap
         // (video), AnimatedBitmap and vector sources are excluded by the is-check and
         // the earlier branches, so their fast paths are untouched.
+        // Transform-space size, in the same units the downscale cache has always used: an
+        // ancestor scale/rotate transform is mirrored in _currentNativeMatrix, so fold its
+        // effective scale in. With no in-tree transform sx=sy=1 and this is identical to a bare
+        // ceil(); a genuine minify (sx<1) is honoured as-is to avoid over-large buckets.
+        GetTransformScale(out var sx, out var sy);
+        int bucketTargetW = (int)Math.Ceiling(rectangle.Width * sx);
+        int bucketTargetH = (int)Math.Ceiling(rectangle.Height * sy);
+
         ImageSource drawSource = imageSource;
-        if (imageSource is BitmapImage downscaleCandidate && downscaleCandidate.RawPixelData != null)
+        if (imageSource is BitmapImage downscaleCandidate &&
+            downscaleCandidate.TryGetPixelSnapshot(out var candidateSnapshot) &&
+            candidateSnapshot is not null)
         {
-            // Target size must approximate device pixels. rectangle.Width/Height is in
-            // this context's drawing space; an ancestor scale/rotate transform is
-            // mirrored in _currentNativeMatrix (m11,m12,m21,m22,dx,dy), so fold its
-            // effective scale in. With no in-tree transform sx=sy=1 and this is
-            // identical to a bare ceil(); a genuine minify (sx<1) is honoured as-is to
-            // avoid over-large buckets.
-            double sx = Math.Sqrt(_currentNativeMatrix[0] * _currentNativeMatrix[0]
-                                + _currentNativeMatrix[1] * _currentNativeMatrix[1]);
-            double sy = Math.Sqrt(_currentNativeMatrix[2] * _currentNativeMatrix[2]
-                                + _currentNativeMatrix[3] * _currentNativeMatrix[3]);
-            if (sx <= 0) sx = 1;
-            if (sy <= 0) sy = 1;
-            int targetW = (int)Math.Ceiling(rectangle.Width * sx);
-            int targetH = (int)Math.Ceiling(rectangle.Height * sy);
-            if (targetW > 0 && targetH > 0 &&
+            if (bucketTargetW > 0 && bucketTargetH > 0 &&
                 Jalium.UI.Media.Imaging.BitmapDownscaleCache.TryGetOrCreate(
-                    downscaleCandidate, targetW, targetH, out var thumb))
+                    downscaleCandidate, candidateSnapshot, bucketTargetW, bucketTargetH, out var thumb))
             {
                 drawSource = thumb;
             }
         }
 
-        var bitmap = GetNativeBitmap(drawSource);
+        // The decode hint is the TRUE device rect, so it additionally folds in this render
+        // target's own DPI — which _currentNativeMatrix does not carry, because the native side
+        // applies the DPI scale itself. Per render target rather than per process, so a window on
+        // a 200% secondary monitor asks for 200% pixels while one on the 100% primary does not.
+        var (deviceW, deviceH) = ToDeviceHint(bucketTargetW, bucketTargetH);
+
+        var bitmap = GetNativeBitmap(drawSource, deviceW, deviceH);
         if (bitmap == null) return;
 
         // Pixel snapping disabled: pass the origin through so animated images move
@@ -3063,20 +3399,39 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
                 GetBoundsClipLimit());
         }
 
-        // Snap clip edges to pixel grid by expanding outward (Floor start, Ceiling end).
-        // Drawing operations (DrawRoundedRectangle etc.) pixel-snap their origin via Math.Round,
-        // so the drawn stroke can land up to 0.5px outside the mathematical clip region.
-        // Expanding to full-pixel boundaries ensures the clip always contains the entire
-        // pixel-snapped content, preventing asymmetric border thickness artifacts.
         var exactLeft = offsetBounds.Left;
         var exactTop = offsetBounds.Top;
         var exactRight = offsetBounds.Right;
         var exactBottom = offsetBounds.Bottom;
 
+        // Aliased (scissor-only) clips are snapped to the pixel grid by expanding
+        // OUTWARD (Floor start, Ceiling end). Drawing operations pixel-snap their
+        // origin via Math.Round, so a snapped stroke can land up to 0.5px outside
+        // the mathematical clip region; a tight integer scissor would shave it off
+        // and produce asymmetric border thickness.
         var x = (float)Math.Floor(exactLeft);
         var y = (float)Math.Floor(exactTop);
         var w = (float)Math.Ceiling(exactRight) - x;
         var h = (float)Math.Ceiling(exactBottom) - y;
+
+        // Rounded clips get the EXACT rect instead. Their backend counterpart is an
+        // antialiased SDF coverage mask evaluated per fragment (rounded_clip.hlsli,
+        // sampled by every batched pixel shader), and that mask must sit on the true
+        // geometric boundary. Handing it the outward-expanded rect — which this
+        // method used to do for both paths — made the antialiased clip up to 1px
+        // LOOSER than the real one, so clipped content survived a row past where it
+        // should have stopped, at full coverage.
+        //
+        // That produced a bright 1px seam wherever a ClipToBounds Border held an
+        // Image under a gradient scrim: the scrim is an ordinary fill and stopped on
+        // its own exact AA edge, while the Image rode the loosened mask one row
+        // further and showed through unscrimmed. The backend still expands the
+        // scissor itself (D3D12RenderTarget::EmitRoundedClipPair), so the hard cull
+        // stays conservative while the mask stays exact.
+        var ex = (float)exactLeft;
+        var ey = (float)exactTop;
+        var ew = (float)Math.Max(0, exactRight - exactLeft);
+        var eh = (float)Math.Max(0, exactBottom - exactTop);
 
         var clipRect = new Rect(exactLeft, exactTop, Math.Max(0, exactRight - exactLeft), Math.Max(0, exactBottom - exactTop));
         PushClipBounds(clipRect);
@@ -3085,17 +3440,17 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         {
             if (rectGeom.HasPerCornerRadii)
             {
-                var (tl, tr, br, bl) = NormalizePerCornerRadii(w, h,
+                var (tl, tr, br, bl) = NormalizePerCornerRadii(ew, eh,
                     rectGeom.CornerRadius.TopLeft,
                     rectGeom.CornerRadius.TopRight,
                     rectGeom.CornerRadius.BottomRight,
                     rectGeom.CornerRadius.BottomLeft);
-                _renderTarget.PushPerCornerRoundedRectClip(x, y, w, h, tl, tr, br, bl);
+                _renderTarget.PushPerCornerRoundedRectClip(ex, ey, ew, eh, tl, tr, br, bl);
             }
             else if (rectGeom.RadiusX > 0 || rectGeom.RadiusY > 0)
             {
-                var (rx, ry) = NormalizeRoundedRectRadii(w, h, rectGeom.RadiusX, rectGeom.RadiusY);
-                _renderTarget.PushRoundedRectClip(x, y, w, h, rx, ry);
+                var (rx, ry) = NormalizeRoundedRectRadii(ew, eh, rectGeom.RadiusX, rectGeom.RadiusY);
+                _renderTarget.PushRoundedRectClip(ex, ey, ew, eh, rx, ry);
             }
             else
             {
@@ -3321,7 +3676,7 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
     /// <inheritdoc />
     public override void PushEffect(IEffect effect, Rect captureBounds)
     {
-        if (_closed || effect == null || !effect.HasEffect) return;
+        if (_closed || effect == null || !effect.HasEffect || SimplifyElementEffects) return;
 
         var padding = effect.EffectPadding;
 
@@ -3379,6 +3734,11 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
     public void BeginEffectCapture(float x, float y, float w, float h)
     {
         if (_closed) return;
+        if (SimplifyElementEffects)
+        {
+            _suppressedEffectCaptureDepth++;
+            return;
+        }
         // Swap the cull source from the dirty-region/viewport clip to the
         // capture rect for the capture's duration — see CurrentClipBounds.
         // Stored in SURFACE space (the exact PushClipBounds mapping) so it
@@ -3407,6 +3767,11 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
     public void EndEffectCapture()
     {
         if (_closed) return;
+        if (_suppressedEffectCaptureDepth > 0)
+        {
+            _suppressedEffectCaptureDepth--;
+            return;
+        }
         if (_effectCaptureCullSuspendDepth > 0)
             _effectCaptureCullSuspendDepth--;
         if (_effectCaptureCullOverrideStack.Count > 0)
@@ -3422,7 +3787,11 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         float captureOriginX = 0, float captureOriginY = 0,
         float cornerTL = 0, float cornerTR = 0, float cornerBR = 0, float cornerBL = 0)
     {
-        if (_closed || effect == null) return;
+        if (_closed || effect == null || SimplifyElementEffects) return;
+        if (!_effectApplicationPath.Add(effect)) return;
+
+        try
+        {
 
         // UV offset: difference between element position and capture origin.
         // The offscreen texture starts at captureOrigin; the element content sits
@@ -3432,7 +3801,7 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
         if (effect is Media.Effects.BlurEffect blur)
         {
-            if (blur.Radius > 0.5)
+            if (blur.Radius > 0)
             {
                 // Blur content should be clipped to element's rounded corners.
                 // x,y already contain the element's screen position (= Offset).
@@ -3451,7 +3820,7 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         }
         else if (effect is Media.Effects.ElementBlurEffect elementBlur)
         {
-            if (elementBlur.Radius > 0.5)
+            if (elementBlur.Radius > 0)
                 _renderTarget.DrawBlurEffect(x, y, w, h, (float)elementBlur.Radius, uvOffX, uvOffY);
         }
         else if (effect is Media.Effects.DropShadowEffect shadow)
@@ -3470,22 +3839,24 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         else if (effect is Media.Effects.OuterGlowEffect glow)
         {
             var color = glow.GlowColor;
+            var effectiveAlpha = (color.A / 255f) * (float)glow.Opacity;
             _renderTarget.DrawOuterGlowEffect(x, y, w, h,
                 (float)glow.EffectiveBlurRadius,
                 color.R / 255f, color.G / 255f, color.B / 255f,
-                (float)glow.Opacity, (float)glow.Intensity,
+                effectiveAlpha, (float)glow.Intensity,
                 uvOffX, uvOffY,
                 cornerTL, cornerTR, cornerBR, cornerBL);
         }
         else if (effect is Media.Effects.InnerShadowEffect innerShadow)
         {
             var color = innerShadow.Color;
+            var effectiveAlpha = (color.A / 255f) * (float)innerShadow.Opacity;
             _renderTarget.DrawInnerShadowEffect(x, y, w, h,
                 (float)innerShadow.BlurRadius,
                 (float)innerShadow.OffsetX,
                 (float)innerShadow.OffsetY,
                 color.R / 255f, color.G / 255f, color.B / 255f,
-                (float)innerShadow.Opacity,
+                effectiveAlpha,
                 uvOffX, uvOffY,
                 cornerTL, cornerTR, cornerBR, cornerBL);
         }
@@ -3537,12 +3908,31 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         }
         else if (effect is Media.Effects.EffectGroup group)
         {
-            // Apply the first active child effect
+            // A group must never silently discard all but its first child. Each
+            // supported child reads the same isolated capture and is dispatched in
+            // declaration order. Preserve the original capture origin and corner
+            // radii; resetting them to zero shifts sampling for padded effects and
+            // was enough to make grouped shadows/glows disappear.
             var activeEffects = group.ActiveEffects;
-            if (activeEffects.Count > 0)
+            for (int i = 0; i < activeEffects.Count; i++)
             {
-                ApplyElementEffect(activeEffects[0], x, y, w, h);
+                var child = activeEffects[i];
+                ApplyElementEffect(child, x, y, w, h,
+                    captureOriginX, captureOriginY,
+                    cornerTL, cornerTR, cornerBR, cornerBL);
             }
+        }
+        else
+        {
+            // Unknown/custom Effect subclasses must degrade to an unmodified
+            // composite. The element has already been redirected offscreen; doing
+            // nothing here would make otherwise valid custom effects erase it.
+            _renderTarget.DrawBlurEffect(x, y, w, h, 0f, uvOffX, uvOffY);
+        }
+        }
+        finally
+        {
+            _effectApplicationPath.Remove(effect);
         }
     }
 
@@ -3552,8 +3942,33 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         if (_closed) return;
         _closed = true;
         ImageSource.GpuCacheEvictionRequested -= _gpuEvictionHandler;
+        ImageSource.RasterChanged -= _rasterChangedHandler;
+
+        // Nothing will drain the queue once this context stops getting frames, and every entry in
+        // it is a strong reference to an application bitmap, so release them here. A raise that was
+        // already in flight when the delegates came off can still add one afterwards; harmless, and
+        // it is why QueueCacheEviction re-checks _closed under the same lock.
+        lock (_pendingCacheEvictionLock)
+        {
+            _pendingCacheEvictions.Clear();
+            _hasPendingCacheEvictions = false;
+        }
         // Note: Don't dispose cached resources here - they may be reused
     }
+
+    /// <summary>
+    /// Number of GPU textures this context currently holds. Test seam for the eviction-threading
+    /// contract: whether a queued eviction has been applied yet is not otherwise observable from
+    /// outside, and that timing is the whole property under test.
+    /// </summary>
+    internal int CachedBitmapCount => _bitmapCache.Count;
+
+    /// <summary>
+    /// Vector rasterizations this context currently holds. Test seam for the same reason
+    /// <see cref="CachedBitmapCount"/> is one: whether a cache-clearing call reached this
+    /// dictionary is not observable from outside, and it did not for either of them.
+    /// </summary>
+    internal int CachedVectorDrawingCount => _vectorDrawingCache.Count;
 
     /// <summary>
     /// Clears all cached resources.
@@ -3578,6 +3993,7 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         }
         _bitmapCache.Clear();
         _bitmapCacheBytes = 0;
+        ClearVectorDrawingCache();
     }
 
     /// <summary>
@@ -3593,7 +4009,23 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
         _bitmapCache.Clear();
         _bitmapCacheBytes = 0;
+        ClearVectorDrawingCache();
     }
+
+    /// <summary>
+    /// Drops every cached vector rasterization.
+    /// </summary>
+    /// <remarks>
+    /// Belongs with the bitmap cache in both callers above and was missing from both. Each entry
+    /// holds a full-size <see cref="BitmapImage"/> raster — the thing a teardown or a low-memory
+    /// purge is trying to release — and, once the uploads it depended on have been disposed, an
+    /// entry that survives is a strong reference to pixels nothing is drawing. Correctness rests on
+    /// the same argument as the eviction path: the raster is reproducible, so dropping it can only
+    /// cost one re-rasterization on the next frame that needs it. Neither caller runs per frame
+    /// (window/popup teardown, render-thread handover, and the low-memory notification), so that
+    /// cost is not on any hot path.
+    /// </remarks>
+    private void ClearVectorDrawingCache() => _vectorDrawingCache.Clear();
 
     /// <summary>
     /// Trims caches if they exceed their maximum size.
@@ -3642,11 +4074,13 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         if (brush is SolidColorBrush solidBrush)
         {
             var color = solidBrush.Color;
+            double opacity = Math.Clamp(solidBrush.Opacity, 0.0, 1.0);
             // Cache based on (brush reference, current color) to invalidate
-            // when the same brush object has its Color property changed
+            // when the same brush object's color or opacity changes.
             if (_brushCache.TryGetValue(brush, out var cached))
             {
-                if (cached.CachedColor == color)
+                if (cached.CachedColor == color &&
+                    cached.CachedOpacity == opacity)
                 {
                     cached.LastAccessSequence = ++_brushCacheSequence;
                     return cached;
@@ -3658,8 +4092,13 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
             // Pass sRGB values to native: D2D expects sRGB, and the direct D3D12
             // path converts to linear internally (SRGB RTV handles gamma).
-            var nb = _context.CreateSolidBrush(color.R / 255f, color.G / 255f, color.B / 255f, color.A / 255f);
+            var nb = _context.CreateSolidBrush(
+                color.R / 255f,
+                color.G / 255f,
+                color.B / 255f,
+                EffectiveBrushAlpha(color.A, opacity));
             nb.CachedColor = color;
+            nb.CachedOpacity = opacity;
             nb.LastAccessSequence = ++_brushCacheSequence;
             _brushCache[brush] = nb;
             return nb;
@@ -3667,10 +4106,14 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
         if (brush is LinearGradientBrush linear)
         {
-            // Cache gradient brushes when bounding box is (0,0,0,0) — i.e. Absolute mapping
-            // or when called without bounds. For RelativeToBoundingBox, bounds change per call.
-            if (linear.MappingMode != BrushMappingMode.RelativeToBoundingBox &&
-                _brushCache.TryGetValue(brush, out var cachedLinear))
+            long contentHash = linear.ComputeContentHash();
+            long boundsKey =
+                linear.MappingMode == BrushMappingMode.RelativeToBoundingBox
+                    ? ComputeGradientBoundsKey(bx, by, bw, bh)
+                    : 0;
+            if (_brushCache.TryGetValue(brush, out var cachedLinear) &&
+                cachedLinear.CachedGradientContentHash == contentHash &&
+                cachedLinear.CachedBoundsKey == boundsKey)
             {
                 cachedLinear.LastAccessSequence = ++_brushCacheSequence;
                 return cachedLinear;
@@ -3680,8 +4123,14 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
         if (brush is RadialGradientBrush radial)
         {
-            if (radial.MappingMode != BrushMappingMode.RelativeToBoundingBox &&
-                _brushCache.TryGetValue(brush, out var cachedRadial))
+            long contentHash = radial.ComputeContentHash();
+            long boundsKey =
+                radial.MappingMode == BrushMappingMode.RelativeToBoundingBox
+                    ? ComputeGradientBoundsKey(bx, by, bw, bh)
+                    : 0;
+            if (_brushCache.TryGetValue(brush, out var cachedRadial) &&
+                cachedRadial.CachedGradientContentHash == contentHash &&
+                cachedRadial.CachedBoundsKey == boundsKey)
             {
                 cachedRadial.LastAccessSequence = ++_brushCacheSequence;
                 return cachedRadial;
@@ -3748,8 +4197,15 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
     private static Color? SampleAverageColor(ImageSource? source)
     {
-        if (source is BitmapImage bitmap && bitmap.RawPixelData is { Length: >= 4 } pixels)
+        // Through the snapshot so the buffer cannot be replaced by a decode worker between the
+        // length check and the sampling loop. No decode is requested: this is the stroke-fallback
+        // colour for a brush whose source has already been resolved elsewhere.
+        if (source is BitmapImage bitmap &&
+            bitmap.TryGetPixelSnapshot(out var snapshot) &&
+            snapshot is { Pixels.Length: >= 4 })
         {
+            var pixels = snapshot.Pixels;
+
             // Pixels are BGRA8 stored as Pbgra32. Sample on a coarse grid to
             // keep this O(1) — full-image averaging on a 4K texture is wasted
             // work for a fallback color.
@@ -3899,7 +4355,21 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         float clipRx, float clipRy)
     {
         if (imageBrush.ImageSource is null) return;
-        var nativeBitmap = GetNativeBitmap(imageBrush.ImageSource);
+
+        // shapeBounds is already in this context's drawing space (callers add Offset before
+        // handing it over), so it converts to device pixels exactly like a DrawImage rect. Cover
+        // mode matters to the bucket resolver: UniformToFill has to satisfy the LARGER axis ratio,
+        // and asking for a contain-sized bucket there produces a visibly soft fill.
+        GetTransformScale(out var sx, out var sy);
+        var (hintW, hintH) = ToDeviceHint(
+            (int)Math.Ceiling(shapeBounds.Width * sx),
+            (int)Math.Ceiling(shapeBounds.Height * sy));
+
+        var nativeBitmap = GetNativeBitmap(
+            imageBrush.ImageSource,
+            hintW,
+            hintH,
+            hintCover: imageBrush.Stretch == Stretch.UniformToFill);
         if (nativeBitmap is null) return;
 
         var imgW = (double)nativeBitmap.Width;
@@ -4017,7 +4487,14 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
                Math.Abs(a.Height - b.Height) < Eps;
     }
 
-    private static float[] MarshalGradientStops(IList<GradientStop> stops)
+    internal static float EffectiveBrushAlpha(byte alpha, double opacity)
+    {
+        return alpha / 255f * (float)Math.Clamp(opacity, 0.0, 1.0);
+    }
+
+    internal static float[] MarshalGradientStops(
+        IList<GradientStop> stops,
+        double opacity)
     {
         var arr = new float[stops.Count * 5];
         for (int i = 0; i < stops.Count; i++)
@@ -4030,9 +4507,32 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             arr[off + 1] = s.Color.R / 255f;
             arr[off + 2] = s.Color.G / 255f;
             arr[off + 3] = s.Color.B / 255f;
-            arr[off + 4] = s.Color.A / 255f;
+            arr[off + 4] = EffectiveBrushAlpha(s.Color.A, opacity);
         }
         return arr;
+    }
+
+    private static long ComputeGradientBoundsKey(
+        float bx,
+        float by,
+        float bw,
+        float bh)
+    {
+        const long FnvOffsetBasis =
+            unchecked((long)0xcbf29ce484222325UL);
+        const long FnvPrime =
+            unchecked((long)0x100000001b3UL);
+
+        long hash = FnvOffsetBasis;
+        hash = unchecked(
+            (hash ^ BitConverter.SingleToInt32Bits(bx)) * FnvPrime);
+        hash = unchecked(
+            (hash ^ BitConverter.SingleToInt32Bits(by)) * FnvPrime);
+        hash = unchecked(
+            (hash ^ BitConverter.SingleToInt32Bits(bw)) * FnvPrime);
+        hash = unchecked(
+            (hash ^ BitConverter.SingleToInt32Bits(bh)) * FnvPrime);
+        return hash == 0 ? 1 : hash;
     }
 
     private NativeBrush? CreateNativeLinearGradient(LinearGradientBrush brush,
@@ -4061,7 +4561,9 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         if (sx == ex && sy == ey)
             return null;
 
-        var stops = MarshalGradientStops(brush.GradientStops);
+        var stops = MarshalGradientStops(
+            brush.GradientStops,
+            brush.Opacity);
         var nb = _context.CreateLinearGradientBrush(sx, sy, ex, ey, stops, (uint)brush.GradientStops.Count, (uint)brush.SpreadMethod);
         if (!nb.IsValid)
         {
@@ -4070,6 +4572,11 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         }
 
         nb.LastAccessSequence = ++_brushCacheSequence;
+        nb.CachedGradientContentHash = brush.ComputeContentHash();
+        nb.CachedBoundsKey =
+            brush.MappingMode == BrushMappingMode.RelativeToBoundingBox
+                ? ComputeGradientBoundsKey(bx, by, bw, bh)
+                : 0;
 
         // Replace previous cached entry if any
         if (_brushCache.TryGetValue(brush, out var old))
@@ -4104,7 +4611,9 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             oy = (float)brush.GradientOrigin.Y;
         }
 
-        var stops = MarshalGradientStops(brush.GradientStops);
+        var stops = MarshalGradientStops(
+            brush.GradientStops,
+            brush.Opacity);
         var nb = _context.CreateRadialGradientBrush(cx, cy, rx, ry, ox, oy, stops, (uint)brush.GradientStops.Count, (uint)brush.SpreadMethod);
         if (!nb.IsValid)
         {
@@ -4113,6 +4622,11 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         }
 
         nb.LastAccessSequence = ++_brushCacheSequence;
+        nb.CachedGradientContentHash = brush.ComputeContentHash();
+        nb.CachedBoundsKey =
+            brush.MappingMode == BrushMappingMode.RelativeToBoundingBox
+                ? ComputeGradientBoundsKey(bx, by, bw, bh)
+                : 0;
 
         // Replace previous cached entry if any
         if (_brushCache.TryGetValue(brush, out var old))
@@ -4161,7 +4675,13 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             return cached;
         }
 
-        var format = _context.CreateTextFormat(fontFamily, (float)fontSize, fontWeight, fontStyle);
+        // Resolve the family STACK the same way measurement does. Both paths must land on the
+        // same typeface or the layout is computed for one font and the glyphs drawn in another:
+        // DirectWrite does not reject an unknown family here, it quietly substitutes a default,
+        // so the mismatch is silent and shows up only as text overflowing its own measured box
+        // (a trailing glyph clipped by any container sized to that box).
+        var format = TextMeasurement.CreateTextFormatFromFamilyList(
+            _context, fontFamily, (float)fontSize, fontWeight, fontStyle);
         if (format != null)
         {
             // Push the resolved TextOptions modes into the freshly created
@@ -4180,7 +4700,99 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         return format;
     }
 
-    private NativeBitmap? GetNativeBitmap(ImageSource imageSource)
+    /// <summary>
+    /// Effective per-axis scale of the transform currently pushed on this context.
+    /// </summary>
+    /// <remarks>
+    /// <c>_currentNativeMatrix</c> is [m11, m12, m21, m22, dx, dy] and mirrors exactly the
+    /// in-tree PushTransform stack — RenderTransform, LayoutTransform, ScrollViewer zoom. It does
+    /// NOT include the render target's DPI scale, which the native side applies on its own; see
+    /// <see cref="ToDeviceHint"/> for the conversion that does.
+    /// </remarks>
+    private void GetTransformScale(out double scaleX, out double scaleY)
+    {
+        scaleX = Math.Sqrt(_currentNativeMatrix[0] * _currentNativeMatrix[0]
+                         + _currentNativeMatrix[1] * _currentNativeMatrix[1]);
+        scaleY = Math.Sqrt(_currentNativeMatrix[2] * _currentNativeMatrix[2]
+                         + _currentNativeMatrix[3] * _currentNativeMatrix[3]);
+        if (!(scaleX > 0) || !double.IsFinite(scaleX)) scaleX = 1;
+        if (!(scaleY > 0) || !double.IsFinite(scaleY)) scaleY = 1;
+    }
+
+    /// <summary>
+    /// Converts a transform-space size into the device-pixel decode hint <see cref="GetNativeBitmap"/>
+    /// takes, by folding in this render target's DPI scale.
+    /// </summary>
+    /// <remarks>
+    /// This is the whole reason the hint does not come from <c>FrameworkElement.LayoutDpiScale</c>:
+    /// that is a process-global static assigned by whichever window last handled a DPI change, so
+    /// on a mixed-DPI multi-monitor desktop every window but one asks for the wrong number of
+    /// pixels. The render target owns the DPI of the monitor it is actually presenting to.
+    /// </remarks>
+    private (int Width, int Height) ToDeviceHint(int transformSpaceWidth, int transformSpaceHeight)
+    {
+        if (transformSpaceWidth <= 0 || transformSpaceHeight <= 0)
+        {
+            return (0, 0);
+        }
+
+        var dpiX = _renderTarget.DpiScaleX;
+        var dpiY = _renderTarget.DpiScaleY;
+        if (!(dpiX > 0) || !double.IsFinite(dpiX)) dpiX = 1;
+        if (!(dpiY > 0) || !double.IsFinite(dpiY)) dpiY = 1;
+
+        // Clamped to the same ceiling RequestDecode clamps to, so an absurd transform cannot ask
+        // the decoder for a buffer nothing could allocate.
+        return (
+            (int)Math.Clamp(Math.Ceiling(transformSpaceWidth * dpiX), 1d, 16384d),
+            (int)Math.Clamp(Math.Ceiling(transformSpaceHeight * dpiY), 1d, 16384d));
+    }
+
+    /// <summary>
+    /// Stable identity for an image source in diagnostics records, without forcing every source
+    /// type to grow a diagnostics API.
+    /// </summary>
+    private static string DescribeImageSource(ImageSource imageSource) =>
+        imageSource switch
+        {
+            BitmapImage bitmap => bitmap.DiagnosticSourceName,
+            _ => imageSource.GetType().Name,
+        };
+
+    /// <summary>
+    /// Resolves the GPU texture for an image source — and, for a deferred source that has not
+    /// decoded yet, REQUESTS that decode on the way through.
+    /// </summary>
+    /// <param name="imageSource">The source to realize.</param>
+    /// <param name="hintPixelWidth">
+    /// Device-pixel width the caller is about to draw into, or 0 when unknown. Advisory: it feeds
+    /// the display-bucket ladder, which only ever grows, so an under-estimate costs sharpness on
+    /// one frame and an over-estimate costs resident bytes.
+    /// </param>
+    /// <param name="hintPixelHeight">Device-pixel height, same contract as
+    /// <paramref name="hintPixelWidth"/>.</param>
+    /// <param name="hintCover">
+    /// True when the caller will scale the image to COVER its rect (<c>Stretch.UniformToFill</c>),
+    /// so the bucket must satisfy the larger axis ratio rather than the smaller one.
+    /// </param>
+    /// <remarks>
+    /// <para>This method is the single choke point every bitmap consumer funnels through —
+    /// <c>DrawImage</c>, the <c>ImageBrush</c> tile filler, the vector raster cache, animated
+    /// frames — which is exactly why the decode request belongs here and nowhere else. It used to
+    /// live in <c>Image.OnRender</c>, so an <c>ImageBrush</c>, an <c>ImageDrawing</c> or a
+    /// <c>Shape.Fill</c> backed by a URI bitmap had NOTHING in the process that would ever ask for
+    /// its pixels: this method saw a pending deferred source, returned null, and did so again on
+    /// every subsequent frame forever. Permanently blank, with no error anywhere.</para>
+    /// <para>The size hints come from the caller's true device rect (its draw rect folded through
+    /// the live transform stack and the render target's own DPI), never from a process-global DPI
+    /// scale. A process-global is wrong under a RenderTransform, wrong under ScrollViewer zoom,
+    /// and wrong for every window that is not on the primary monitor.</para>
+    /// </remarks>
+    private NativeBitmap? GetNativeBitmap(
+        ImageSource imageSource,
+        int hintPixelWidth = 0,
+        int hintPixelHeight = 0,
+        bool hintCover = false)
     {
         if (imageSource == null) return null;
 
@@ -4193,19 +4805,35 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         if (imageSource is Jalium.UI.Media.AnimatedBitmap animated)
         {
             var current = animated.CurrentFrame;
-            return current != null ? GetNativeBitmap(current) : null;
+            return current != null
+                ? GetNativeBitmap(current, hintPixelWidth, hintPixelHeight, hintCover)
+                : null;
         }
 
-        // For mutable sources we need to validate the cached upload against the
-        // current content revision — a rewritten WriteableBitmap shares the
-        // same instance, so reference identity alone isn't enough.
-        uint currentRevision = imageSource is WriteableBitmap wb
-            ? wb.ContentRevision : 0u;
+        // A deferred BitmapImage whose encoded bytes turned out to hold several frames carries an
+        // internal AnimatedBitmap substitute, discovered by the metadata probe. Forwarding to it
+        // here — through the same path a top-level AnimatedBitmap takes — is what makes
+        // <Image Source="cat.gif"/> animate for EVERY consumer, without the framework ever writing
+        // to the application's Source property. ImageSourceLoader could only make that swap when
+        // the encoded bytes were already materialised, which a deferred source's never are, so the
+        // XAML type converter's own path always produced a static first frame.
+        //
+        // No recursion risk: the substitute's frames are eager BitmapImages built from decoded
+        // pixels, so they carry no substitute of their own.
+        if (imageSource is BitmapImage { AnimatedSubstitute: { } animatedSubstitute })
+        {
+            return GetNativeBitmap(animatedSubstitute, hintPixelWidth, hintPixelHeight, hintCover);
+        }
+
+        // Reference identity is not enough for ANY source whose pixels can be replaced in place:
+        // a rewritten WriteableBitmap and a BitmapImage that upgraded its display bucket both keep
+        // the same instance. ContentGeneration is the one stamp that covers both (and reads 0 for
+        // genuinely immutable sources, which compares equal forever exactly as before).
+        var currentGeneration = imageSource.ContentGeneration;
 
         if (_bitmapCache.TryGetValue(imageSource, out var cached))
         {
-            bool stale = imageSource is WriteableBitmap &&
-                         cached.ContentRevision != currentRevision;
+            bool stale = cached.ContentGeneration != currentGeneration;
 
             if (!stale && cached.Bitmap.IsValid)
             {
@@ -4229,7 +4857,7 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
                     writeableUpdate.PixelHeight,
                     writeableUpdate.BackBufferStride))
             {
-                cached.ContentRevision = currentRevision;
+                cached.ContentGeneration = currentGeneration;
                 cached.LastAccessSequence = ++_bitmapCacheSequence;
                 cached.LastFrameUsed = _currentFrameId;
                 return cached.Bitmap;
@@ -4240,46 +4868,95 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
         NativeBitmap? nativeBitmap = null;
 
+        // Stamp the entry with the generation of the pixels ACTUALLY uploaded, not with the value
+        // read at method entry. A publish that lands between the two makes the two differ, and
+        // stamping the newer one would mark the older texture current — a permanently stale
+        // upload. Stamping the older one costs one extra frame, and the compare above corrects it.
+        var uploadedGeneration = currentGeneration;
+
         if (imageSource is BitmapImage bitmapImage)
         {
+            BitmapPixelSnapshot? snapshot = null;
             try
             {
-                // An image whose pixels the idle reclaimer dropped still has its
-                // encoded bytes: restore the decoded buffer once rather than
-                // letting every GPU cache miss re-run a full native decode on
-                // this thread (and bypass the downscale cache, which requires
-                // RawPixelData). Cheap no-op when the pixels are still present.
-                if (bitmapImage.RawPixelData == null)
+                // THE decode driver. Every bitmap consumer in the framework reaches this line, so
+                // this is where "somebody wants these pixels, at about this size" is recorded —
+                // not in Image.OnRender, which only exists for one of those consumers.
+                //
+                // Idempotent and cheap: a non-deferred source returns immediately, and a deferred
+                // one only enqueues work when the request can reach a strictly larger display
+                // bucket than the one already published. Calling it once per draw is therefore a
+                // lock acquisition, not a decode.
+                //
+                // Gated on a known axis, and that gate is load-bearing. An all-zero request is not
+                // "no request" to the deferred decoder — it means "the caller does not know the
+                // size, so it may need every pixel", and it resolves to the source's NATURAL size.
+                // Since a display bucket may only ever grow, forwarding a degenerate frame's (0,0)
+                // once would pin the full-resolution raster resident for the life of the source. A
+                // renderer always knows its own rect, so (0,0) here is never an honest request for
+                // full resolution; the only caller entitled to make that request is layout, which
+                // does so explicitly through Image.RequestBitmapDecode.
+                if (hintPixelWidth > 0 || hintPixelHeight > 0)
                 {
-                    bitmapImage.TryRestorePixelData();
+                    bitmapImage.RequestDecode(hintPixelWidth, hintPixelHeight, hintCover);
                 }
 
-                if (bitmapImage.RawPixelData != null &&
-                    bitmapImage.PixelWidth > 0 &&
-                    bitmapImage.PixelHeight > 0)
+                if (!bitmapImage.TryGetPixelSnapshot(out snapshot) || snapshot is null)
                 {
-                    // BitmapImage.RawPixelData is straight (non-premultiplied) alpha: WIC
-                    // decodes to 32bppBGRA and IconHelper's GetDIBits is straight too. The
-                    // bitmap-upload ABI takes straight alpha regardless of backend — each
-                    // native backend premultiplies internally as its blend requires (D3D12
-                    // premultiplies on upload in CreateBitmapFromPixels; Vulkan premultiplies
-                    // while packing its replay staging buffer; software blends straight).
-                    // The managed layer stays backend-agnostic and hands the raw pixels over
-                    // as-is.
-                    nativeBitmap = _context.CreateBitmapFromPixels(
-                        bitmapImage.RawPixelData,
-                        bitmapImage.PixelWidth,
-                        bitmapImage.PixelHeight,
-                        bitmapImage.PixelStride);
+                    // No pixels yet. For a deferred source that is simply "the decode is still in
+                    // flight" and the request above is what finishes it. For a NON-deferred source
+                    // whose buffer the idle reclaimer dropped, this rebuilds it from the encoded
+                    // bytes rather than letting every GPU cache miss pay a full native decode.
+                    // Both states look identical from here, which is why the restore must be tried
+                    // for both rather than being gated behind a pending check — gating it is what
+                    // made a reclaimed deferred source unreachable to the restore path entirely.
+                    bitmapImage.TryRestorePixelData();
+                    bitmapImage.TryGetPixelSnapshot(out snapshot);
                 }
-                else if (bitmapImage.ImageData != null)
+
+                if (snapshot is not null)
                 {
-                    nativeBitmap = _context.CreateBitmap(bitmapImage.ImageData);
+                    // One consistent tuple: buffer, dimensions, stride and channel order were
+                    // produced together and published with a single reference write. Reading them
+                    // as four independent properties is what let the render thread pair a 64x64
+                    // buffer with 512x512 dimensions mid-publish and hand an out-of-range upload
+                    // to the backend — a black rectangle, or worse.
+                    uploadedGeneration = snapshot.Generation;
+                    nativeBitmap = UploadSnapshot(snapshot);
+                }
+                else if (!bitmapImage.IsDeferredDecodePending &&
+                         bitmapImage.ImageData is { Length: > 0 } encodedBytes)
+                {
+                    // Encoded-bytes fallback for a source that has no pixel buffer and no deferred
+                    // decoder behind it. Deliberately NOT taken for a pending deferred source:
+                    // that would run a full synchronous native decode on the render thread, which
+                    // is precisely what the deferred scheduler exists to avoid.
+                    nativeBitmap = _context.CreateBitmap(encodedBytes);
                 }
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"[RenderTargetDrawingContext] Failed to create bitmap: {ex.Message}");
+                // NOT Debug.WriteLine. That is [Conditional("DEBUG")] and therefore absent from
+                // the builds users run, which is the entire reason a GPU upload failure — VRAM
+                // exhaustion, a dimension over the adapter's D3D12_REQ_TEXTURE2D limit on a
+                // FL9_3/FL10_x WARP or RDP adapter, a device-removed frame — presented as a black
+                // rectangle with no evidence anywhere. ImageDiagnostics is live in Release.
+                ImageDiagnostics.UploadFailed(
+                    DescribeImageSource(imageSource),
+                    "BitmapImage upload",
+                    snapshot?.Width ?? bitmapImage.PixelWidth,
+                    snapshot?.Height ?? bitmapImage.PixelHeight,
+                    ex);
+
+                // Diagnostics alone is a support channel, not an application one: an app that
+                // handles Image.ImageFailed to swap in a fallback got nothing at all, because
+                // nothing routed an upload failure into the source's LoadFailed chain. Posted
+                // rather than raised, because this method runs on the render thread whenever
+                // JALIUM_RENDER_THREAD is on (the default on Windows) and that chain reaches a
+                // routed-event raise and a dependency-property write. The notifier deduplicates
+                // against the source's latched failure, so a retry-every-frame upload path costs
+                // one ImageFailed per failure episode rather than one per frame.
+                BitmapDecodeNotifier.PostSourceFailure(imageSource, ex);
             }
         }
         else if (imageSource is WriteableBitmap writeable &&
@@ -4304,18 +4981,36 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"[RenderTargetDrawingContext] WriteableBitmap upload failed: {ex.Message}");
+                ImageDiagnostics.UploadFailed(
+                    DescribeImageSource(imageSource),
+                    "WriteableBitmap upload",
+                    writeable.PixelWidth,
+                    writeable.PixelHeight,
+                    ex);
+
+                // Same contract as the BitmapImage path above: the application learns about the
+                // failure through Image.ImageFailed, on the UI thread, once per failure episode.
+                BitmapDecodeNotifier.PostSourceFailure(imageSource, ex);
             }
         }
 
         if (nativeBitmap != null)
         {
+            // The device took these pixels, so whatever refused them earlier has cleared. Releasing
+            // the latch here is the other half of the "an upload failure never stops the draw"
+            // contract: the render gate ignores an upload-class failure so the retry can happen at
+            // all, and this is what makes the retry's success visible — the once-per-episode
+            // ImageFailed report re-arms, and ImageSource.LoadFailure stops describing a failure
+            // that no longer exists. A decode-class failure is deliberately left alone; see
+            // ImageSource.ClearUploadFailure.
+            imageSource.ClearUploadFailure();
+
             var estimatedBytes = EstimateBitmapBytes(nativeBitmap);
             _bitmapCache[imageSource] = new BitmapCacheEntry(
                 nativeBitmap,
                 estimatedBytes,
                 ++_bitmapCacheSequence,
-                currentRevision)
+                uploadedGeneration)
             {
                 LastFrameUsed = _currentFrameId,
             };
@@ -4323,6 +5018,61 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         }
 
         return nativeBitmap;
+    }
+
+    /// <summary>
+    /// Uploads one immutable pixel publication to the GPU, normalizing its channel order first
+    /// when the decoder produced something other than BGRA8.
+    /// </summary>
+    /// <remarks>
+    /// <para>The pixels are straight (non-premultiplied) alpha: WIC decodes to 32bppBGRA and
+    /// IconHelper's GetDIBits is straight too. The bitmap-upload ABI takes straight alpha
+    /// regardless of backend — each native backend premultiplies internally as its blend requires
+    /// (D3D12 premultiplies on upload in CreateBitmapFromPixels; Vulkan premultiplies while packing
+    /// its replay staging buffer; software blends straight). The managed layer stays
+    /// backend-agnostic and hands the raw pixels over as-is.</para>
+    /// <para>What it does NOT do is assume the channel order. <c>DecodedImage.Format</c> used to be
+    /// discarded at publish time, so an Android/Mali decoder returning RGBA8 was uploaded as if it
+    /// were BGRA8 — every image rendered with red and blue swapped, with nothing anywhere saying
+    /// so. The format now travels with the pixels and is honoured here.</para>
+    /// </remarks>
+    private NativeBitmap UploadSnapshot(BitmapPixelSnapshot snapshot)
+    {
+        if (s_uploadFaultInjector?.Invoke(snapshot) is { } injected)
+        {
+            throw injected;
+        }
+
+        return _context.CreateBitmapFromPixels(
+            snapshot.Pixels,
+            snapshot.Width,
+            snapshot.Height,
+            snapshot.Stride,
+            snapshot.Format);
+    }
+
+    private static Func<BitmapPixelSnapshot, Exception?>? s_uploadFaultInjector;
+
+    /// <summary>
+    /// Test seam: makes the native upload of a publication fail, the way a real adapter does.
+    /// </summary>
+    /// <remarks>
+    /// <para>The upload catch is where a black image finally became REPORTABLE — it is the site
+    /// that used to be a compiled-out <c>Debug.WriteLine</c> — and it was also the one site nothing
+    /// could reach from a test: the fault it handles is VRAM exhaustion, a device-removed frame or
+    /// an over-limit texture dimension on a WARP/RDP adapter, none of which a test can provoke on
+    /// demand. Reverting both reporting calls in that catch to <c>Debug.WriteLine</c> therefore left
+    /// the whole suite green, i.e. the fix's headline site was unpinned. This seam is what a test
+    /// stands in for the adapter with.</para>
+    /// <para>Deliberately a nullable static consulted only inside <see cref="UploadSnapshot"/>: one
+    /// null read per texture upload (not per draw — a cache hit never reaches here), no allocation,
+    /// and no way for it to change behaviour unless a test has explicitly installed a fault. It is
+    /// never set by framework code.</para>
+    /// </remarks>
+    internal static Func<BitmapPixelSnapshot, Exception?>? UploadFaultInjector
+    {
+        get => Volatile.Read(ref s_uploadFaultInjector);
+        set => Volatile.Write(ref s_uploadFaultInjector, value);
     }
 
     private void TrimBitmapCacheIfNeeded()

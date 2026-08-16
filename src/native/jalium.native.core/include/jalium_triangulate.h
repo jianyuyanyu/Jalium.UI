@@ -1280,6 +1280,47 @@ inline std::vector<Contour> FlattenPathToContours(float startX, float startY,
 /// Returns premultiplied linear-space RGBA.
 struct GradientColor { float r, g, b, a; };
 
+/// Samples an ordered, interleaved [position, r, g, b, a] stop table.
+/// The binary search keeps CPU-tessellated gradients practical at the full
+/// ABI stop count instead of doing a linear scan for every emitted vertex.
+inline GradientColor SampleGradientStops(float t,
+                                         const float* stops,
+                                         uint32_t stopCount) {
+    if (!stops || stopCount == 0) return { 0, 0, 0, 0 };
+    if (stopCount == 1 || t <= stops[0]) {
+        return { stops[1], stops[2], stops[3], stops[4] };
+    }
+
+    uint32_t lower = 1;
+    uint32_t upper = stopCount - 1;
+    while (lower < upper) {
+        const uint32_t middle = lower + (upper - lower) / 2;
+        if (t <= stops[middle * 5]) {
+            upper = middle;
+        } else {
+            lower = middle + 1;
+        }
+    }
+
+    const uint32_t i = lower;
+    const float previousPosition = stops[(i - 1) * 5];
+    const float position = stops[i * 5];
+    const float span = position - previousPosition;
+    float fraction =
+        span > 1e-6f ? (t - previousPosition) / span : 0.0f;
+    fraction = (std::max)(0.0f, (std::min)(1.0f, fraction));
+    return {
+        stops[(i - 1) * 5 + 1] +
+            fraction * (stops[i * 5 + 1] - stops[(i - 1) * 5 + 1]),
+        stops[(i - 1) * 5 + 2] +
+            fraction * (stops[i * 5 + 2] - stops[(i - 1) * 5 + 2]),
+        stops[(i - 1) * 5 + 3] +
+            fraction * (stops[i * 5 + 3] - stops[(i - 1) * 5 + 3]),
+        stops[(i - 1) * 5 + 4] +
+            fraction * (stops[i * 5 + 4] - stops[(i - 1) * 5 + 4])
+    };
+}
+
 inline GradientColor SampleLinearGradient(float px, float py,
                                            float startX, float startY, float endX, float endY,
                                            const float* stops, uint32_t stopCount) {
@@ -1292,29 +1333,7 @@ inline GradientColor SampleLinearGradient(float px, float py,
     }
     t = (std::max)(0.0f, (std::min)(1.0f, t));
 
-    // Find the two surrounding stops and interpolate
-    // stops layout: [pos0, r0, g0, b0, a0, pos1, r1, g1, b1, a1, ...]
-    if (stopCount == 0) return { 0, 0, 0, 0 };
-    if (stopCount == 1 || t <= stops[0]) {
-        return { stops[1], stops[2], stops[3], stops[4] };
-    }
-    for (uint32_t i = 1; i < stopCount; ++i) {
-        float pos = stops[i * 5];
-        if (t <= pos || i == stopCount - 1) {
-            float prevPos = stops[(i - 1) * 5];
-            float span = pos - prevPos;
-            float frac = (span > 1e-6f) ? (t - prevPos) / span : 0.0f;
-            frac = (std::max)(0.0f, (std::min)(1.0f, frac));
-            return {
-                stops[(i-1)*5+1] + frac * (stops[i*5+1] - stops[(i-1)*5+1]),
-                stops[(i-1)*5+2] + frac * (stops[i*5+2] - stops[(i-1)*5+2]),
-                stops[(i-1)*5+3] + frac * (stops[i*5+3] - stops[(i-1)*5+3]),
-                stops[(i-1)*5+4] + frac * (stops[i*5+4] - stops[(i-1)*5+4])
-            };
-        }
-    }
-    uint32_t last = stopCount - 1;
-    return { stops[last*5+1], stops[last*5+2], stops[last*5+3], stops[last*5+4] };
+    return SampleGradientStops(t, stops, stopCount);
 }
 
 inline GradientColor SampleRadialGradient(float px, float py,
@@ -1326,28 +1345,7 @@ inline GradientColor SampleRadialGradient(float px, float py,
     float t = std::sqrt(dx * dx + dy * dy);
     t = (std::max)(0.0f, (std::min)(1.0f, t));
 
-    // Reuse linear gradient stop lookup with the computed t
-    if (stopCount == 0) return { 0, 0, 0, 0 };
-    if (stopCount == 1 || t <= stops[0]) {
-        return { stops[1], stops[2], stops[3], stops[4] };
-    }
-    for (uint32_t i = 1; i < stopCount; ++i) {
-        float pos = stops[i * 5];
-        if (t <= pos || i == stopCount - 1) {
-            float prevPos = stops[(i - 1) * 5];
-            float span = pos - prevPos;
-            float frac = (span > 1e-6f) ? (t - prevPos) / span : 0.0f;
-            frac = (std::max)(0.0f, (std::min)(1.0f, frac));
-            return {
-                stops[(i-1)*5+1] + frac * (stops[i*5+1] - stops[(i-1)*5+1]),
-                stops[(i-1)*5+2] + frac * (stops[i*5+2] - stops[(i-1)*5+2]),
-                stops[(i-1)*5+3] + frac * (stops[i*5+3] - stops[(i-1)*5+3]),
-                stops[(i-1)*5+4] + frac * (stops[i*5+4] - stops[(i-1)*5+4])
-            };
-        }
-    }
-    uint32_t last = stopCount - 1;
-    return { stops[last*5+1], stops[last*5+2], stops[last*5+3], stops[last*5+4] };
+    return SampleGradientStops(t, stops, stopCount);
 }
 
 } // namespace jalium

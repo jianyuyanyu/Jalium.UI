@@ -295,6 +295,7 @@ using System.Runtime.CompilerServices;
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.Media.Effects.DropShadowEffect))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.Media.Effects.EdgeProfile))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.Media.Effects.EffectGroup))]
+[assembly: TypeForwardedTo(typeof(global::Jalium.UI.Media.Effects.EffectCollection))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.Media.Effects.ElementBlurEffect))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.Media.Effects.EmbossBitmapEffect))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.Media.Effects.EmbossEffect))]

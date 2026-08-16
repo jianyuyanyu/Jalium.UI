@@ -1,43 +1,157 @@
-using System.Collections.ObjectModel;
-using System.Collections.Specialized;
 using Jalium.UI;
+using Jalium.UI.Markup;
 
 namespace Jalium.UI.Media.Effects;
 
 /// <summary>
-/// Composes multiple <see cref="Effect"/> instances into a single effect that applies them
-/// sequentially. Each effect in the group is applied in order, with the output of one
-/// feeding into the input of the next.
-/// This is the modern replacement for the deprecated BitmapEffectGroup.
+/// A Freezable collection of element effects.
 /// </summary>
-public sealed class EffectGroup : Effect
+public sealed class EffectCollection : FreezableCollection<Effect>
 {
-    private readonly ObservableCollection<Effect> _children = new();
+    private HashSet<EffectGroup>? _owners;
 
-    /// <summary>
-    /// Initializes a new instance of the <see cref="EffectGroup"/> class.
-    /// </summary>
-    public EffectGroup()
+    /// <summary>Creates a modifiable deep clone of this collection.</summary>
+    public new EffectCollection Clone() => (EffectCollection)base.Clone();
+
+    /// <summary>Creates a modifiable deep clone using current values.</summary>
+    public new EffectCollection CloneCurrentValue() => (EffectCollection)base.CloneCurrentValue();
+
+    internal void ValidateOwner(EffectGroup owner)
     {
-        _children.CollectionChanged += OnChildrenChanged;
+        ArgumentNullException.ThrowIfNull(owner);
+
+        for (int i = 0; i < Count; i++)
+        {
+            ValidateAcyclicOwner(ChildrenGroupOrNull(this[i]), owner);
+        }
     }
 
-    /// <summary>
-    /// Gets the collection of child effects. Effects are applied in order.
-    /// </summary>
-    public ObservableCollection<Effect> Children => _children;
+    internal void AttachOwner(EffectGroup owner)
+    {
+        ValidateOwner(owner);
+        (_owners ??= new HashSet<EffectGroup>()).Add(owner);
+    }
+
+    internal void DetachOwner(EffectGroup owner)
+    {
+        if (_owners is null)
+            return;
+
+        _owners.Remove(owner);
+        if (_owners.Count == 0)
+            _owners = null;
+    }
+
+    protected override void ValidateItem(Effect item)
+    {
+        base.ValidateItem(item);
+
+        if (_owners is null)
+            return;
+
+        var childGroup = ChildrenGroupOrNull(item);
+        foreach (var owner in _owners)
+        {
+            ValidateAcyclicOwner(childGroup, owner);
+        }
+    }
+
+    private static EffectGroup? ChildrenGroupOrNull(Effect effect) => effect as EffectGroup;
+
+    private static void ValidateAcyclicOwner(EffectGroup? candidate, EffectGroup owner)
+    {
+        if (candidate is null)
+            return;
+
+        var pending = new Stack<EffectGroup>();
+        var visited = new HashSet<EffectGroup>();
+        pending.Push(candidate);
+
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            if (!visited.Add(current))
+                continue;
+
+            if (ReferenceEquals(current, owner))
+            {
+                throw new InvalidOperationException(
+                    "An EffectGroup cannot contain itself, directly or indirectly.");
+            }
+
+            var children = current.Children;
+            for (int i = 0; i < children.Count; i++)
+            {
+                if (children[i] is EffectGroup childGroup)
+                    pending.Push(childGroup);
+            }
+        }
+    }
+
+    protected override Freezable CreateInstanceCore() => new EffectCollection();
+}
+
+/// <summary>
+/// Composes multiple <see cref="Effect"/> instances into one element effect.
+/// Children are dispatched in declaration order.
+/// </summary>
+[ContentProperty(nameof(Children))]
+public sealed class EffectGroup : Effect
+{
+    [ThreadStatic]
+    private static HashSet<EffectGroup>? s_evaluationPath;
+
+    /// <summary>Identifies the <see cref="Children"/> dependency property.</summary>
+    public static readonly DependencyProperty ChildrenProperty =
+        DependencyProperty.Register(
+            nameof(Children),
+            typeof(EffectCollection),
+            typeof(EffectGroup),
+            new PropertyMetadata(null));
+
+    /// <summary>Initializes an empty effect group.</summary>
+    public EffectGroup()
+    {
+        Children = new EffectCollection();
+    }
+
+    /// <summary>Gets or sets the child effects in declaration order.</summary>
+    public EffectCollection Children
+    {
+        get => (EffectCollection?)GetValue(ChildrenProperty) ?? new EffectCollection();
+        set
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            value.ValidateOwner(this);
+            SetValue(ChildrenProperty, value);
+        }
+    }
 
     /// <inheritdoc />
     public override bool HasEffect
     {
         get
         {
-            for (int i = 0; i < _children.Count; i++)
+            var path = s_evaluationPath ??= new HashSet<EffectGroup>();
+            if (!path.Add(this))
+                return false;
+
+            try
             {
-                if (_children[i].HasEffect)
-                    return true;
+                var children = Children;
+                for (int i = 0; i < children.Count; i++)
+                {
+                    if (children[i].HasEffect)
+                        return true;
+                }
+                return false;
             }
-            return false;
+            finally
+            {
+                path.Remove(this);
+                if (path.Count == 0)
+                    s_evaluationPath = null;
+            }
         }
     }
 
@@ -49,62 +163,93 @@ public sealed class EffectGroup : Effect
     {
         get
         {
-            // Accumulate padding from all child effects
-            double left = 0, top = 0, right = 0, bottom = 0;
-            for (int i = 0; i < _children.Count; i++)
+            var path = s_evaluationPath ??= new HashSet<EffectGroup>();
+            if (!path.Add(this))
+                return Thickness.Zero;
+
+            // Every child reads the same captured source today, so the capture must
+            // cover the largest extent requested by any child.
+            try
             {
-                var p = _children[i].EffectPadding;
-                left = Math.Max(left, p.Left);
-                top = Math.Max(top, p.Top);
-                right = Math.Max(right, p.Right);
-                bottom = Math.Max(bottom, p.Bottom);
+                double left = 0, top = 0, right = 0, bottom = 0;
+                var children = Children;
+                for (int i = 0; i < children.Count; i++)
+                {
+                    var p = children[i].EffectPadding;
+                    left = Math.Max(left, p.Left);
+                    top = Math.Max(top, p.Top);
+                    right = Math.Max(right, p.Right);
+                    bottom = Math.Max(bottom, p.Bottom);
+                }
+                return new Thickness(left, top, right, bottom);
             }
-            return new Thickness(left, top, right, bottom);
+            finally
+            {
+                path.Remove(this);
+                if (path.Count == 0)
+                    s_evaluationPath = null;
+            }
         }
     }
 
-    /// <summary>
-    /// Gets the active effects (those with HasEffect == true).
-    /// </summary>
+    /// <summary>Gets the active effects (those with <see cref="Effect.HasEffect"/>).</summary>
     internal IReadOnlyList<Effect> ActiveEffects
     {
         get
         {
             var result = new List<Effect>();
-            for (int i = 0; i < _children.Count; i++)
+            var path = s_evaluationPath ??= new HashSet<EffectGroup>();
+            if (!path.Add(this))
+                return result;
+
+            try
             {
-                if (_children[i].HasEffect)
-                    result.Add(_children[i]);
+                var children = Children;
+                for (int i = 0; i < children.Count; i++)
+                {
+                    if (children[i].HasEffect)
+                        result.Add(children[i]);
+                }
+                return result;
             }
-            return result;
+            finally
+            {
+                path.Remove(this);
+                if (path.Count == 0)
+                    s_evaluationPath = null;
+            }
         }
     }
 
-    private void OnChildrenChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    /// <summary>Creates a modifiable deep clone of this group.</summary>
+    public new EffectGroup Clone() => (EffectGroup)base.Clone();
+
+    /// <summary>Creates a modifiable deep clone using current values.</summary>
+    public new EffectGroup CloneCurrentValue() => (EffectGroup)base.CloneCurrentValue();
+
+    protected override Freezable CreateInstanceCore() => new EffectGroup();
+
+    protected override void OnPropertyChanged(DependencyPropertyChangedEventArgs e)
     {
-        // Unsubscribe from old items
-        if (e.OldItems != null)
+        base.OnPropertyChanged(e);
+        if (ReferenceEquals(e.Property, ChildrenProperty))
         {
-            foreach (Effect effect in e.OldItems)
+            if (e.OldValue is EffectCollection oldChildren &&
+                !ReferenceEquals(oldChildren, e.NewValue))
             {
-                effect.EffectChanged -= OnChildEffectChanged;
+                oldChildren.DetachOwner(this);
             }
-        }
 
-        // Subscribe to new items
-        if (e.NewItems != null)
-        {
-            foreach (Effect effect in e.NewItems)
+            if (e.NewValue is EffectCollection newChildren)
             {
-                effect.EffectChanged += OnChildEffectChanged;
+                newChildren.AttachOwner(this);
             }
+
+            OnFreezablePropertyChanged(
+                e.OldValue as DependencyObject,
+                e.NewValue as DependencyObject,
+                ChildrenProperty);
+            OnEffectChanged();
         }
-
-        OnEffectChanged();
-    }
-
-    private void OnChildEffectChanged(object? sender, EventArgs e)
-    {
-        OnEffectChanged();
     }
 }

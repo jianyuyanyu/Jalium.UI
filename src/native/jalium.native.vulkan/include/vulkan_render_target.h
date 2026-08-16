@@ -958,6 +958,11 @@ private:
         float tl, float tr, float br, float bl, Brush* brush);
     bool TryRecordGpuPerCornerRoundedRectStrokeCommand(float x, float y, float w, float h,
         float tl, float tr, float br, float bl, float strokeWidth, Brush* brush);
+    // Gradient strokes cannot use the replay SDF recorders because those
+    // intentionally carry only one representative colour. Route them through
+    // the stop-aware path engine before any solid-colour recorder is attempted.
+    bool TryStrokeGradientRoundedOutline(float x, float y, float w, float h,
+        float tl, float tr, float br, float bl, Brush* brush, float strokeWidth);
     bool TryRecordGpuEllipseFillCommand(float cx, float cy, float rx, float ry, Brush* brush);
     bool TryRecordGpuEllipseStrokeCommand(float cx, float cy, float rx, float ry, float strokeWidth, Brush* brush);
     bool TryRecordGpuLineCommand(float x1, float y1, float x2, float y2, float strokeWidth, Brush* brush);
@@ -1258,8 +1263,8 @@ private:
 
     // E4 — Path MSAA knob (SetPathMsaaSampleCount). Now carries D3D12's real
     // semantics: 0 = analytic-only (route solid fills to the scanline analytic-AA
-    // rasterizer, see pathAnalyticOnly_); 1/2/4/8 = the desired stencil-then-cover
-    // MSAA sample count, intersected with device caps in EnsureStencilCover
+    // rasterizer, see pathAnalyticOnly_); 1/2/4/8/16 = the desired stencil-then-
+    // cover MSAA sample count, intersected with device caps in EnsureStencilCover
     // Resources (a changed value rebuilds the stencil FB/PSOs at the frame
     // boundary via the size+sample key). Default 8 mirrors D3D12
     // (d3d12_direct_renderer.h pathMsaaSampleCount_ = 8) and is re-seeded from the

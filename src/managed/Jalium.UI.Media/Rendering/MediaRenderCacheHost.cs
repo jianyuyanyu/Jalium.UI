@@ -15,7 +15,7 @@ namespace Jalium.UI.Media.Rendering;
 /// <para>
 /// Recorders are pooled process-wide under a single lock. Even on the
 /// render-thread path (JALIUM_RENDER_THREAD) the pool stays single-producer:
-/// <see cref="CreateFrameRecorder"/> + <see cref="FinishRecord"/> both run on the
+/// <see cref="CreateFrameRecorder()"/> + <see cref="FinishRecord"/> both run on the
 /// UI thread inside <c>Window.PublishFrameToRenderThread</c>; the render thread
 /// only calls <see cref="Replay"/>, which is read-only over the published
 /// <see cref="RecordedDrawing"/> and never touches the pool. So the single lock suffices —
@@ -54,13 +54,16 @@ internal sealed class MediaRenderCacheHost : IRenderCacheHost
     /// recorder; replayed via <see cref="Replay"/>.
     /// </summary>
     public DrawingContext CreateFrameRecorder()
+        => CreateFrameRecorder(simplifyElementEffects: false);
+
+    public DrawingContext CreateFrameRecorder(bool simplifyElementEffects)
     {
         DrawingRecorder recorder;
         lock (_poolLock)
         {
             recorder = _pool.Count > 0 ? _pool.Pop() : new DrawingRecorder();
         }
-        recorder.BindWholeFrame();
+        recorder.BindWholeFrame(simplifyElementEffects);
         return recorder;
     }
 
@@ -77,7 +80,14 @@ internal sealed class MediaRenderCacheHost : IRenderCacheHost
 
     public void Replay(object drawing, DrawingContext targetDrawingContext)
     {
-        DrawingReplayer.Replay((RecordedDrawing)drawing, targetDrawingContext);
+        var recordedDrawing = (RecordedDrawing)drawing;
+        if (targetDrawingContext is DrawingRecorder recorder &&
+            recorder.TryAppendRecordedDrawing(recordedDrawing))
+        {
+            return;
+        }
+
+        DrawingReplayer.Replay(recordedDrawing, targetDrawingContext);
     }
 
     /// <summary>

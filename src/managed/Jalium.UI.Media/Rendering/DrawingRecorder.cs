@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Jalium.UI.Rendering;
 
 namespace Jalium.UI.Media.Rendering;
 
@@ -38,7 +39,8 @@ namespace Jalium.UI.Media.Rendering;
 /// </remarks>
 internal sealed class DrawingRecorder : DrawingContextAdapter,
     IOffsetDrawingContext, IClipBoundsDrawingContext,
-    IClipDrawingContext, IOpacityDrawingContext, ITransformDrawingContext, IEffectDrawingContext
+    IClipDrawingContext, IOpacityDrawingContext, ITransformDrawingContext,
+    IEffectDrawingContext, ICacheableDrawingContext
 {
     private readonly List<DrawCommand> _commands = new(32);
     private readonly BoundsAccumulator _bounds = new();
@@ -51,6 +53,8 @@ internal sealed class DrawingRecorder : DrawingContextAdapter,
     // are captured) instead of proxied, and bounds/clip culling is disabled.
     // Used by the render-thread path (record on UI thread, replay on render thread).
     private bool _wholeFrame;
+    private bool _snapshotInputs;
+    private bool _simplifyElementEffects;
     private Point _recordedOffset;
     private (bool recording, bool unrecordable) _wholeFrameSavedScope;
 
@@ -66,6 +70,15 @@ internal sealed class DrawingRecorder : DrawingContextAdapter,
         _bounds.Reset();
         _offsetProxy = target as IOffsetDrawingContext;
         _wholeFrame = false;
+        // A per-visual cache can be created by the pre-show inline frame and
+        // reused later by the default D3D12 render worker. Make every retained
+        // drawing publication-safe at creation time; otherwise an old mutable
+        // PathGeometry remains dispatcher-owned and fails only when a later
+        // whole-frame scene graph replays it on the worker. Snapshotting still
+        // happens only when this visual is dirty, while clean frames reuse the
+        // immutable drawing by reference.
+        _snapshotInputs = true;
+        _simplifyElementEffects = false;
     }
 
     /// <summary>
@@ -75,12 +88,14 @@ internal sealed class DrawingRecorder : DrawingContextAdapter,
     /// bounds/clip culling is disabled (the recorded bounds would be meaningless
     /// once per-child offsets vary across the frame). Consumed via <see cref="Commit"/>.
     /// </summary>
-    public void BindWholeFrame()
+    public void BindWholeFrame(bool simplifyElementEffects = false)
     {
         _commands.Clear();
         _bounds.Reset();
         _offsetProxy = null;
         _wholeFrame = true;
+        _snapshotInputs = true;
+        _simplifyElementEffects = simplifyElementEffects;
         _recordedOffset = default;
         // Enter the whole-frame recordability scope so call sites that hit
         // un-representable content (via a failed `is RenderTargetDrawingContext`
@@ -105,6 +120,8 @@ internal sealed class DrawingRecorder : DrawingContextAdapter,
             _offsetProxy = null;
             _bounds.Reset();
             _wholeFrame = false;
+            _snapshotInputs = false;
+            _simplifyElementEffects = false;
             // An empty-but-unrecordable capture must still force a fallback, so
             // don't return the shared (fully-recordable) Empty in that case.
             return fullyRecordable
@@ -122,6 +139,8 @@ internal sealed class DrawingRecorder : DrawingContextAdapter,
         _bounds.Reset();
         _offsetProxy = null;
         _wholeFrame = false;
+        _snapshotInputs = false;
+        _simplifyElementEffects = false;
 
         return new RecordedDrawing(arr, arr.Length, drawingBounds, fullyRecordable);
     }
@@ -138,6 +157,8 @@ internal sealed class DrawingRecorder : DrawingContextAdapter,
         _bounds.Reset();
         _offsetProxy = null;
         _wholeFrame = false;
+        _snapshotInputs = false;
+        _simplifyElementEffects = false;
     }
 
     // ── Ambient-state proxies ────────────────────────────────────────────
@@ -174,6 +195,30 @@ internal sealed class DrawingRecorder : DrawingContextAdapter,
     // whole-frame path already relied on this; the per-visual path needs it too.
     Rect? IClipBoundsDrawingContext.CurrentClipBounds => null;
 
+    /// <summary>
+    /// Appends an immutable per-visual drawing as one scene-graph node instead
+    /// of flattening all of its commands into the whole-frame list. Returns
+    /// false for ordinary per-visual recorders, whose callers should use normal
+    /// command replay.
+    /// </summary>
+    internal bool TryAppendRecordedDrawing(RecordedDrawing drawing)
+    {
+        if (!_wholeFrame)
+        {
+            return false;
+        }
+
+        if (!drawing.IsFullyRecordable)
+        {
+            DrawingContext.MarkCurrentFrameUnrecordable();
+        }
+        if (drawing.Count != 0)
+        {
+            _commands.Add(DrawCommand.RecordedDrawingCmd(drawing));
+        }
+        return true;
+    }
+
     // ── Whole-frame freeze-clone (increment 3) ──────────────────────────
     // On the whole-frame (render-thread) path, mutable live payloads (gradient/
     // image brushes, transforms, video bitmaps) are snapshotted at record time
@@ -181,10 +226,11 @@ internal sealed class DrawingRecorder : DrawingContextAdapter,
     // render thread. Immutable / pooled inputs (SolidColorBrush, simple Pen,
     // FormattedText) are already value-snapshotted by DrawingObjectPool and pass
     // through untouched. No-op on the default per-visual path (zero added cost).
-    private Brush? SnapBrush(Brush? b) => _wholeFrame ? DrawInputSnapshotter.SnapshotBrush(b) : b;
-    private Pen? SnapPen(Pen? p) => _wholeFrame ? DrawInputSnapshotter.SnapshotPen(p) : p;
-    private Transform SnapTransform(Transform t) => _wholeFrame ? DrawInputSnapshotter.SnapshotTransform(t) : t;
-    private ImageSource SnapImage(ImageSource i) => _wholeFrame ? DrawInputSnapshotter.SnapshotImage(i) : i;
+    private Brush? SnapBrush(Brush? b) => _snapshotInputs ? DrawInputSnapshotter.SnapshotBrush(b) : b;
+    private Pen? SnapPen(Pen? p) => _snapshotInputs ? DrawInputSnapshotter.SnapshotPen(p) : p;
+    private Transform SnapTransform(Transform t) => _snapshotInputs ? DrawInputSnapshotter.SnapshotTransform(t) : t;
+    private Geometry SnapGeometry(Geometry g) => _snapshotInputs ? DrawInputSnapshotter.SnapshotGeometry(g) : g;
+    private ImageSource SnapImage(ImageSource i) => _snapshotInputs ? DrawInputSnapshotter.SnapshotImage(i) : i;
 
     // ── Draw calls ──────────────────────────────────────────────────────
     //
@@ -315,7 +361,7 @@ internal sealed class DrawingRecorder : DrawingContextAdapter,
         // mutation would race the render-thread replay. Rare enough (most text is
         // solid-colored) to fall back to direct render rather than snapshot the
         // whole FormattedText.
-        if (_wholeFrame && canonical.Foreground is not (null or SolidColorBrush))
+        if (_snapshotInputs && canonical.Foreground is not (null or SolidColorBrush))
             DrawingContext.MarkCurrentFrameUnrecordable();
         _commands.Add(DrawCommand.Text(canonical, origin));
 
@@ -342,8 +388,9 @@ internal sealed class DrawingRecorder : DrawingContextAdapter,
     {
         var canonicalBrush = SnapBrush(DrawingObjectPool.CanonicalizeBrush(brush));
         var canonicalPen = SnapPen(DrawingObjectPool.CanonicalizePen(pen));
-        _commands.Add(DrawCommand.GeometryCmd(canonicalBrush, canonicalPen, geometry));
-        _bounds.AccumulateRect(geometry.Bounds, StrokeSlop(canonicalPen));
+        var capturedGeometry = SnapGeometry(geometry);
+        _commands.Add(DrawCommand.GeometryCmd(canonicalBrush, canonicalPen, capturedGeometry));
+        _bounds.AccumulateRect(capturedGeometry.Bounds, StrokeSlop(canonicalPen));
     }
 
     public override void SetShapeType(int type, float exponent)
@@ -423,8 +470,9 @@ internal sealed class DrawingRecorder : DrawingContextAdapter,
 
     public override void PushClip(Geometry clipGeometry)
     {
-        _commands.Add(DrawCommand.PushClipCmd(clipGeometry));
-        _bounds.PushClip(clipGeometry);
+        var capturedGeometry = SnapGeometry(clipGeometry);
+        _commands.Add(DrawCommand.PushClipCmd(capturedGeometry));
+        _bounds.PushClip(capturedGeometry);
     }
 
     public override void PushOpacity(double opacity)
@@ -466,6 +514,9 @@ internal sealed class DrawingRecorder : DrawingContextAdapter,
     // would silently DROP those operations. PushOpacity(double) / PushClip(Geometry)
     // / Pop() are already provided by the base DrawingContext overrides above;
     // only the members below are new. Harmless in per-visual mode (never called).
+
+    bool IEffectDrawingContext.IsElementEffectCaptureEnabled =>
+        !_simplifyElementEffects;
 
     void IOpacityDrawingContext.PopOpacity() => Pop();
 

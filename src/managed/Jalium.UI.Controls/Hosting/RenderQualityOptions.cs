@@ -2,16 +2,31 @@ namespace Jalium.UI.Hosting;
 
 /// <summary>
 /// Anti-aliasing quality for filled vector paths. Selected via
-/// <c>app.UsePathAntiAliasing(...)</c>. Higher MSAA is smoother but multiplies the
-/// per-path GPU cost (measured ~6–7 ms per 8× path on a weak iGPU); the analytic
-/// mode matches how WPF and Chromium/Skia actually anti-alias 2D vector content.
+/// <c>app.UsePathAntiAliasing(...)</c>.
 /// </summary>
+/// <remarks>
+/// <para>
+/// This setting governs <b>large</b> filled paths only. Icon- and control-scale
+/// fills — everything under roughly 512×512 device pixels, which is very nearly
+/// every <c>Path</c>/<c>Shape</c> in a real UI — always take the analytic
+/// coverage rasterizer regardless of the tier chosen here, because MSAA's
+/// handful of coverage levels is a visible staircase at that size while
+/// analytic coverage is exact. The tiers below therefore trade quality against
+/// GPU cost for full-page vector artwork, where a constant per-path GPU cost
+/// beats an area-proportional CPU one.
+/// </para>
+/// <para>
+/// Higher MSAA multiplies both the per-path GPU cost (measured ~6–7 ms per 8×
+/// path on a weak iGPU) and the size of the viewport-sized MSAA scratch target.
+/// </para>
+/// </remarks>
 public enum PathAntiAliasing
 {
     /// <summary>
-    /// CPU analytic coverage anti-aliasing (no GPU MSAA) — the cheapest option and
-    /// the approach WPF and Chromium/Skia use for 2D vector fills. Best for weak
-    /// integrated GPUs.
+    /// CPU analytic coverage anti-aliasing (no GPU MSAA) — the approach WPF and
+    /// Chromium/Skia use for 2D vector fills, and the highest-quality option at
+    /// small sizes. Choosing it means large paths use it too, so no MSAA
+    /// scratch target is ever allocated. Best for weak integrated GPUs.
     /// </summary>
     Analytic = 0,
 
@@ -21,7 +36,16 @@ public enum PathAntiAliasing
     /// <summary>8× MSAA — the framework's historical default. Smooth but the heaviest common tier.</summary>
     Msaa8x = 8,
 
-    /// <summary>16× MSAA — maximum smoothness; only on GPUs that support it, otherwise clamped down.</summary>
+    /// <summary>
+    /// 16× MSAA — maximum smoothness. The backend queries the device
+    /// (D3D12 <c>CheckFeatureSupport(MULTISAMPLE_QUALITY_LEVELS)</c>, Vulkan
+    /// <c>framebuffer*SampleCounts</c>) for both the scratch colour and
+    /// depth-stencil formats and steps down to the highest supported count when
+    /// 16× is unavailable, so requesting it is always safe. Note the cost: the
+    /// scratch is viewport-sized, so 16× roughly doubles 8×'s footprint
+    /// (~700 MB at 2560×1440) — and it is only allocated at all once a path too
+    /// large for the analytic rasterizer is drawn.
+    /// </summary>
     Msaa16x = 16,
 }
 
@@ -35,8 +59,9 @@ public enum PathAntiAliasing
 /// The chosen mode is applied to every window's render target via
 /// <c>RenderTarget.SetPathMsaaSampleCount</c> at creation (and re-applied on
 /// device-lost recovery). Lowering the path MSAA level is the single biggest lever
-/// for the per-present GPU cost on weak GPUs, where filled paths (8× stencil-then-
-/// cover) dominate the frame.
+/// for the per-present GPU cost on weak GPUs when a scene is dominated by large
+/// filled paths; small paths are unaffected because they never reach the MSAA
+/// stencil-then-cover pipeline (see <see cref="PathAntiAliasing"/>).
 /// </remarks>
 public sealed class RenderQualityOptions
 {
@@ -70,8 +95,9 @@ public sealed class RenderQualityOptions
     /// current <see cref="PathAntiAliasing"/>. MSAA tiers map to their sample count;
     /// <see cref="PathAntiAliasing.Analytic"/> maps to <c>0</c>, the sentinel that
     /// tells the native side to route solid fills to the analytic-coverage
-    /// rasterizer instead of the MSAA stencil path. The native side clamps MSAA
-    /// counts down to what the GPU actually supports.
+    /// rasterizer instead of the MSAA stencil path. The native side resolves MSAA
+    /// counts down to what the GPU actually supports for the scratch target's
+    /// formats, so an unsupported tier degrades rather than failing.
     /// </summary>
     public uint ResolvePathMsaaSampleCount() => PathAntiAliasing switch
     {

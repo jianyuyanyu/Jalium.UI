@@ -13,14 +13,13 @@ struct PsInput
     nointerpolation uint  gradientType : TEXCOORD4;
     nointerpolation uint  stopCount    : TEXCOORD5;
     nointerpolation float4 gradGeom    : TEXCOORD6;
-    nointerpolation float4 stop01PosR  : TEXCOORD7;
-    nointerpolation float4 stop01AG    : TEXCOORD8;
-    nointerpolation float4 stop12BA    : TEXCOORD9;
-    nointerpolation float4 stop23GB    : TEXCOORD10;
-    nointerpolation float4 stop3Color  : TEXCOORD11;
-    nointerpolation float4 shapeParams : TEXCOORD12; // x=shapeType, y=shapeN, z=shadowMode, w=paintMode
-    nointerpolation float  shadowSigma : TEXCOORD13; // gaussian sigma (screen px), used when shadowMode>0.5
+    nointerpolation uint   stopOffset   : TEXCOORD7;
+    nointerpolation float4 shapeParams : TEXCOORD8;  // x=shapeType, y=shapeN, z=shadowMode, w=paintMode
+    nointerpolation float  shadowSigma : TEXCOORD9;  // gaussian sigma (screen px), used when shadowMode>0.5
+    nointerpolation float  gradientOpacity : TEXCOORD10;
 };
+
+ByteAddressBuffer gradientStopData : register(t2);
 
 float sdRoundedBox(float2 p, float2 b, float4 r)
 {
@@ -43,38 +42,61 @@ float erf_approx(float x)
     return s * y;
 }
 
+float LoadGradientStopPosition(uint index)
+{
+    const uint byteOffset = index * 20;
+    return asfloat(gradientStopData.Load(byteOffset));
+}
+
+float4 LoadGradientStopColor(uint index)
+{
+    const uint byteOffset = index * 20;
+    return asfloat(gradientStopData.Load4(byteOffset + 4));
+}
+
 float4 SampleGradient(PsInput input, float t)
 {
     t = saturate(t);
-    uint count = input.stopCount;
+    const uint count = input.stopCount;
     if (count == 0) return float4(0, 0, 0, 0);
 
-    float  pos[4];
-    float4 col[4];
+    const uint firstIndex = input.stopOffset;
+    const float firstPosition = LoadGradientStopPosition(firstIndex);
+    const float4 firstColor = LoadGradientStopColor(firstIndex);
+    if (count == 1 || t <= firstPosition) return firstColor;
 
-    pos[0] = input.stop01PosR.x;
-    col[0] = float4(input.stop01PosR.yzw, input.stop01AG.x);
-    pos[1] = input.stop01AG.y;
-    col[1] = float4(input.stop01AG.zw, input.stop12BA.xy);
-    pos[2] = input.stop12BA.z;
-    col[2] = float4(input.stop12BA.w, input.stop23GB.xyz);
-    pos[3] = input.stop23GB.w;
-    col[3] = input.stop3Color;
+    const uint lastRelativeIndex = count - 1;
+    const uint lastIndex = firstIndex + lastRelativeIndex;
+    const float lastPosition = LoadGradientStopPosition(lastIndex);
+    const float4 lastColor = LoadGradientStopColor(lastIndex);
+    if (t >= lastPosition) return lastColor;
 
-    if (t <= pos[0] || count == 1) return col[0];
-    if (t >= pos[count - 1]) return col[count - 1];
-
-    [unroll]
-    for (uint i = 0; i < 3; i++)
+    uint low = 0;
+    uint high = lastRelativeIndex;
+    [loop]
+    while (high - low > 1)
     {
-        if (i + 1 < count && t >= pos[i] && t <= pos[i + 1])
-        {
-            float range = pos[i + 1] - pos[i];
-            float local = (range > 0.0) ? (t - pos[i]) / range : 0.0;
-            return lerp(col[i], col[i + 1], local);
-        }
+        const uint middle = low + (high - low) / 2;
+        const float middlePosition =
+            LoadGradientStopPosition(firstIndex + middle);
+        if (t < middlePosition)
+            high = middle;
+        else
+            low = middle;
     }
-    return col[count - 1];
+
+    const uint lowIndex = firstIndex + low;
+    const uint highIndex = firstIndex + high;
+    const float lowPosition = LoadGradientStopPosition(lowIndex);
+    const float4 lowColor = LoadGradientStopColor(lowIndex);
+    const float highPosition = LoadGradientStopPosition(highIndex);
+    const float4 highColor = LoadGradientStopColor(highIndex);
+
+    const float range = highPosition - lowPosition;
+    const float local = (range > 0.0)
+        ? saturate((t - lowPosition) / range)
+        : 0.0;
+    return lerp(lowColor, highColor, local);
 }
 
 float4 main(PsInput input) : SV_Target
@@ -140,6 +162,7 @@ float4 main(PsInput input) : SV_Target
         float t = (lenSq > 0.0) ? dot(input.localPos - start, dir) / lenSq : 0.0;
         fill = SampleGradient(input, t);
         fill.rgb *= fill.a;
+        fill *= input.gradientOpacity;
     }
     else if (input.gradientType == 2)
     {
@@ -149,6 +172,7 @@ float4 main(PsInput input) : SV_Target
         float t = length(d);
         fill = SampleGradient(input, t);
         fill.rgb *= fill.a;
+        fill *= input.gradientOpacity;
     }
     else
     {

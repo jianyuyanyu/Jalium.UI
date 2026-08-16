@@ -57,28 +57,7 @@ inline GradientColor SampleSweepGradient(float px, float py,
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
 
-    // Standard stop lookup: project t into the stop range and interpolate.
-    if (stopCount == 1 || t <= stops[0]) {
-        return { stops[1], stops[2], stops[3], stops[4] };
-    }
-    for (uint32_t i = 1; i < stopCount; ++i) {
-        float pos = stops[i * 5];
-        if (t <= pos || i == stopCount - 1) {
-            float prevPos = stops[(i - 1) * 5];
-            float span = pos - prevPos;
-            float frac = (span > 1e-6f) ? (t - prevPos) / span : 0.0f;
-            if (frac < 0.0f) frac = 0.0f;
-            if (frac > 1.0f) frac = 1.0f;
-            return {
-                stops[(i-1)*5+1] + frac * (stops[i*5+1] - stops[(i-1)*5+1]),
-                stops[(i-1)*5+2] + frac * (stops[i*5+2] - stops[(i-1)*5+2]),
-                stops[(i-1)*5+3] + frac * (stops[i*5+3] - stops[(i-1)*5+3]),
-                stops[(i-1)*5+4] + frac * (stops[i*5+4] - stops[(i-1)*5+4])
-            };
-        }
-    }
-    uint32_t last = stopCount - 1;
-    return { stops[last*5+1], stops[last*5+2], stops[last*5+3], stops[last*5+4] };
+    return SampleGradientStops(t, stops, stopCount);
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +78,75 @@ inline void FlattenGradientStops(const EngineBrushData& brush,
         out.push_back(brush.stops[i].b);
         out.push_back(brush.stops[i].a);
     }
+}
+
+// Returns only positions where the piecewise-linear RGBA function changes
+// slope. Every real colour/alpha transition is retained; mathematically
+// redundant stops do not produce thousands of sub-pixel triangles.
+inline void BuildGradientRampBreakpoints(
+    const EngineBrushData& brush,
+    std::vector<float>& out) {
+    out.clear();
+    if (!brush.stops || brush.stopCount == 0) return;
+
+    out.reserve(brush.stopCount);
+    for (uint32_t i = 0; i < brush.stopCount; ++i) {
+        bool changesRamp = i == 0 || i + 1 == brush.stopCount;
+        if (!changesRamp) {
+            const auto& previousStop = brush.stops[i - 1];
+            const auto& stop = brush.stops[i];
+            const auto& nextStop = brush.stops[i + 1];
+            const double previousPosition =
+                std::clamp(static_cast<double>(previousStop.position),
+                           0.0, 1.0);
+            const double position =
+                std::clamp(static_cast<double>(stop.position),
+                           0.0, 1.0);
+            const double nextPosition =
+                std::clamp(static_cast<double>(nextStop.position),
+                           0.0, 1.0);
+            const double span = nextPosition - previousPosition;
+            if (span <= 1e-12 ||
+                position <= previousPosition ||
+                position >= nextPosition) {
+                // Equal/reversed positions can encode a hard transition.
+                changesRamp = true;
+            } else {
+                const double fraction =
+                    (position - previousPosition) / span;
+                constexpr double kCollinearTolerance = 1e-6;
+                const double previousChannels[] = {
+                    previousStop.r, previousStop.g,
+                    previousStop.b, previousStop.a
+                };
+                const double channels[] = {
+                    stop.r, stop.g, stop.b, stop.a
+                };
+                const double nextChannels[] = {
+                    nextStop.r, nextStop.g,
+                    nextStop.b, nextStop.a
+                };
+                for (uint32_t channel = 0; channel < 4; ++channel) {
+                    const double expected =
+                        previousChannels[channel] +
+                        (nextChannels[channel] -
+                         previousChannels[channel]) * fraction;
+                    if (std::fabs(channels[channel] - expected) >
+                        kCollinearTolerance) {
+                        changesRamp = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (changesRamp) {
+            out.push_back(
+                std::clamp(brush.stops[i].position, 0.0f, 1.0f));
+        }
+    }
+
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
 }
 
 // ---------------------------------------------------------------------------

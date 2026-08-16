@@ -33,6 +33,7 @@ internal enum DrawCommandKind : byte
     EndEffectCapture,
     ApplyElementEffect,
     SetShapeType,                // SuperEllipse shape-type state (V0=type, V1=exponent)
+    DrawRecordedDrawing,         // whole-frame scene graph: immutable per-visual command list
 }
 
 /// <summary>
@@ -185,6 +186,15 @@ internal readonly struct DrawCommand
     public static DrawCommand SetOffsetCmd(Point offset) =>
         new(DrawCommandKind.SetOffset, null, null, null,
             offset.X, offset.Y, 0, 0, 0, 0, 0, 0);
+
+    /// <summary>
+    /// Whole-frame scene-graph node. <c>A</c> carries an immutable per-visual
+    /// drawing whose local commands are replayed under the offset/state already
+    /// emitted by the parent whole-frame recorder.
+    /// </summary>
+    public static DrawCommand RecordedDrawingCmd(RecordedDrawing drawing) =>
+        new(DrawCommandKind.DrawRecordedDrawing, drawing, null, null,
+            0, 0, 0, 0, 0, 0, 0, 0);
 
     // ── IEffectDrawingContext (element effects: BlurEffect / DropShadowEffect) ──
     // Captured by the whole-frame recorder so the offscreen-capture + apply

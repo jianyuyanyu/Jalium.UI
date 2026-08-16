@@ -323,10 +323,13 @@ private:
         const EngineTransform& transform,
         int32_t edgeMode);
 
-    /// Legacy per-call pixel-space scanline polygon fill. EncodeFillPolygon
-    /// delegates here for gradient brushes and polygons its local-space
-    /// triangulator rejects.
-    bool EncodeFillPolygonScanline(
+    /// Re-expresses a polygon as LineTo/ClosePath commands and hands it to
+    /// EncodeFillPathScanline, so polygons and paths share ONE analytic-AA
+    /// rasterizer (and one PixelRect cache) instead of two near-identical
+    /// implementations. EncodeFillPolygon delegates here whenever the analytic
+    /// route is chosen — icon-sized fills, gradients, and any polygon its
+    /// local-space triangulator rejects.
+    bool EncodeFillPolygonAsPath(
         const float* points, uint32_t pointCount,
         const EngineBrushData& brush,
         FillRule fillRule,
@@ -348,18 +351,41 @@ private:
 
     /// Per-frame constant-width edge-AA feather ring built from the cached
     /// local-space boundary contours (our solid-fill target has no MSAA).
+    ///
+    /// This is the APPROXIMATE anti-aliasing route, used only for fills too
+    /// large for the analytic rasterizer (see PreferAnalyticFill in the .cpp).
+    /// Pass gradientBrush + gradientStops to colour the ring's inner edge from
+    /// a gradient instead of the flat r/g/b/a — the sample is taken in PATH
+    /// space, the same space and sampler the interior mesh uses, so the ring
+    /// and the interior agree in colour and no seam appears where they meet.
     void EmitContourFeather(
         const std::vector<Contour>& contours,
         const EngineTransform& transform,
-        float r, float g, float b, float a);
+        float r, float g, float b, float a,
+        const EngineBrushData* gradientBrush = nullptr,
+        const float* gradientStops = nullptr);
 
     // --- Gradient Fill ---
 
-    /// Encode a gradient-filled path (linear or radial).
+    /// Paints an analytic-coverage PixelRect list with a gradient brush: every
+    /// emitted quad corner is sampled from the gradient in PATH space (the
+    /// space the brush geometry is authored in) and scaled by the rect's exact
+    /// coverage alpha. This is what gives gradient-filled paths the same edge
+    /// quality solid fills get from the scanline rasterizer.
+    void EmitGradientCoverageRects(
+        const std::vector<PixelRect>& rects,
+        const EngineBrushData& brush,
+        const float* stopData,
+        const EngineTransform& transform);
+
+    /// Encode a gradient-filled path (linear or radial). Contours are in PATH
+    /// space; the gradient is sampled there and the result transformed to
+    /// pixels.
     bool EncodeGradientFillPath(
         const std::vector<Contour>& contours,
         const EngineBrushData& brush,
-        const EngineTransform& transform);
+        const EngineTransform& transform,
+        FillRule fillRule);
 
     // --- Legacy helpers ---
 
@@ -598,7 +624,14 @@ private:
 
     std::list<FillRectsNode> fillCacheList_;
     std::unordered_map<uint64_t, std::list<FillRectsNode>::iterator> fillCacheMap_;
-    static constexpr size_t kFillCacheCapacity = 512;
+    // Raised from 512 when polygon fills started sharing this cache (they used
+    // to run an uncached rasterizer of their own) AND when icon-scale path
+    // fills moved off the MSAA stencil route onto the analytic rasterizer. A
+    // dense IDE screen can hold well over a thousand distinct filled figures;
+    // an evicted entry costs a full re-rasterization on the next frame, which
+    // is exactly the per-frame cost this cache exists to remove. Entries are
+    // small — an icon's rect list is a few hundred bytes.
+    static constexpr size_t kFillCacheCapacity = 2048;
 
     static uint64_t HashFillInputs(
         float startX, float startY,

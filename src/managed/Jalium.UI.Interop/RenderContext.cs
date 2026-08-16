@@ -458,15 +458,95 @@ public sealed class RenderContext : IDisposable
     }
 
     /// <summary>
-    /// Creates a bitmap from raw BGRA8 pixel data in STRAIGHT (non-premultiplied)
+    /// Creates a bitmap from raw 32-bpp pixel data in STRAIGHT (non-premultiplied)
     /// alpha. The caller stays backend-agnostic: each native backend premultiplies
     /// internally where its blend requires it, so the same straight pixels are
     /// correct on D3D12, Vulkan and the software rasterizer alike.
     /// </summary>
-    public NativeBitmap CreateBitmapFromPixels(byte[] pixelData, int width, int height, int stride = 0)
+    /// <param name="pixelData">The source buffer. Never written to.</param>
+    /// <param name="width">Pixel width.</param>
+    /// <param name="height">Pixel height.</param>
+    /// <param name="stride">Bytes per row, or 0 to infer <c>width * 4</c>.</param>
+    /// <param name="format">
+    /// Channel order of <paramref name="pixelData"/>. The bitmap-upload ABI
+    /// (<c>jalium_bitmap_create_from_pixels</c>) takes BGRA8 only, so any other order is
+    /// normalized here rather than being assumed away by the caller — an Android/Mali decoder
+    /// legitimately hands back <see cref="Jalium.UI.Media.Imaging.NativePixelFormat.Rgba8"/>, and uploading that as BGRA8
+    /// swaps red and blue in every image with nothing reporting it.
+    /// </param>
+    public NativeBitmap CreateBitmapFromPixels(
+        byte[] pixelData,
+        int width,
+        int height,
+        int stride = 0,
+        Jalium.UI.Media.Imaging.NativePixelFormat format = Jalium.UI.Media.Imaging.NativePixelFormat.Bgra8)
     {
         ThrowIfDisposed();
+
+        if (format != Jalium.UI.Media.Imaging.NativePixelFormat.Bgra8)
+        {
+            pixelData = ConvertToBgra8(pixelData, width, height, stride, format);
+        }
+
         return new NativeBitmap(this, pixelData, width, height, stride);
+    }
+
+    /// <summary>
+    /// Rewrites a non-BGRA8 32-bpp buffer into a freshly allocated BGRA8 one.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately allocates instead of swizzling in place. The buffer handed in belongs to an
+    /// immutable <c>BitmapPixelSnapshot</c> that the owning source, the downscale cache and every
+    /// other render target share by reference; swizzling it in place would corrupt all of them and
+    /// would double-swap on the second upload. The copy is paid once per GPU cache miss, not per
+    /// frame.
+    /// </remarks>
+    private static byte[] ConvertToBgra8(
+        byte[] pixelData,
+        int width,
+        int height,
+        int stride,
+        Jalium.UI.Media.Imaging.NativePixelFormat format)
+    {
+        if (format != Jalium.UI.Media.Imaging.NativePixelFormat.Rgba8)
+        {
+            // An order this method does not know how to rewrite. Uploading it unconverted is the
+            // pre-existing behaviour and is visibly wrong rather than silently wrong, so let the
+            // pixels through instead of throwing away the image entirely.
+            return pixelData;
+        }
+
+        if (width <= 0 || height <= 0)
+        {
+            return pixelData;
+        }
+
+        var rowBytes = width * 4;
+        if (stride <= 0) stride = rowBytes;
+        if ((long)stride * height > pixelData.Length)
+        {
+            // Geometry the caller could not honour; leave the bytes alone rather than reading out
+            // of range. BitmapPixelSnapshot.Create rejects this shape, so only a legacy caller can
+            // reach it.
+            return pixelData;
+        }
+
+        var converted = new byte[pixelData.Length];
+        Array.Copy(pixelData, converted, pixelData.Length);
+
+        for (var y = 0; y < height; y++)
+        {
+            var rowStart = y * stride;
+            for (var x = 0; x < rowBytes; x += 4)
+            {
+                var offset = rowStart + x;
+                // RGBA -> BGRA: swap channels 0 and 2, leave green and alpha in place.
+                converted[offset] = pixelData[offset + 2];
+                converted[offset + 2] = pixelData[offset];
+            }
+        }
+
+        return converted;
     }
 
     /// <summary>

@@ -32,10 +32,9 @@ namespace Jalium.UI.Media.Rendering;
 /// Per-frame-mutating GPU resources (a <see cref="WriteableBitmap"/> used as an
 /// image or image-brush source — e.g. video) cannot be cheaply value-copied, so
 /// they trip <see cref="DrawingContext.MarkCurrentFrameUnrecordable"/> and the
-/// frame falls back to a direct render. Unfrozen <see cref="Geometry"/> is left
-/// as-is (the common case is a per-OnRender temporary that never escapes the
-/// walk); callers that animate a long-lived Geometry should <c>Freeze()</c> it,
-/// matching the WPF convention.
+/// frame falls back to a direct render. Mutable <see cref="Geometry"/> instances
+/// are cloned at their current value and frozen before publication so collection
+/// reads on the render worker never cross a dispatcher boundary.
 /// </para>
 /// </remarks>
 internal static class DrawInputSnapshotter
@@ -169,6 +168,31 @@ internal static class DrawInputSnapshotter
     /// </summary>
     public static Transform SnapshotTransform(Transform transform)
         => new MatrixTransform(transform.Value);
+
+    /// <summary>
+    /// Returns a render-thread-readable geometry. Frozen geometries are already
+    /// immutable and can be shared; mutable or dispatcher-owned geometries are
+    /// deep-cloned at their current value and frozen on the recording thread.
+    /// If a custom geometry cannot be frozen, mark the frame unrecordable so the
+    /// window safely falls back instead of publishing a cross-thread object.
+    /// </summary>
+    public static Geometry SnapshotGeometry(Geometry geometry)
+    {
+        if (geometry.IsFrozen)
+        {
+            return geometry;
+        }
+
+        var snapshot = geometry.CloneCurrentValue();
+        if (!snapshot.CanFreeze)
+        {
+            DrawingContext.MarkCurrentFrameUnrecordable();
+            return geometry;
+        }
+
+        snapshot.Freeze();
+        return snapshot;
+    }
 
     /// <summary>
     /// Returns <paramref name="image"/> unchanged, but trips a frame fallback for

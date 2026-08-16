@@ -314,6 +314,7 @@ public sealed class OuterGlowBitmapEffect : BitmapEffect
 }
 
 [Obsolete("Use Effect-derived classes instead.")]
+[Jalium.UI.Markup.ContentProperty(nameof(Children))]
 public sealed class BitmapEffectGroup : BitmapEffect
 {
     public static readonly DependencyProperty ChildrenProperty =

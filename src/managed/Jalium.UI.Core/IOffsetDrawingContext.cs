@@ -156,6 +156,16 @@ public interface ILayerCompositingDrawingContext
 public interface IEffectDrawingContext
 {
     /// <summary>
+    /// Gets whether element content should be redirected through an offscreen
+    /// effect capture. Drawing contexts may temporarily return <c>false</c> for
+    /// latency-sensitive presentation modes such as interactive window resize;
+    /// callers must then render the element content directly and skip applying
+    /// the effect. The default preserves the existing behavior for custom and
+    /// recording drawing contexts.
+    /// </summary>
+    bool IsElementEffectCaptureEnabled => true;
+
+    /// <summary>
     /// Begins capturing element content into an offscreen bitmap for effect processing.
     /// </summary>
     void BeginEffectCapture(float x, float y, float w, float h);

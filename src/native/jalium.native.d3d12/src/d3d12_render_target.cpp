@@ -5,6 +5,7 @@
 #include "d3d12_vello.h"
 #include "d3d12_shader_bytecode.h"  // kcolor_matrix_ps / kemboss_ps (D6 effects)
 #include "jalium_text_stats.h"
+#include "jalium_flatten.h"  // PreferAnalyticFill / PathCommandExtent / TransformedExtent
 #include <d3dcompiler.h>   // D3DCompile — runtime HLSL→DXBC for DrawShaderEffectFromSource
 #pragma comment(lib, "d3dcompiler.lib")
 #include <cstring>
@@ -322,20 +323,17 @@ JaliumResult D3D12RenderTarget::ReclaimIdleResources() {
     // safe boundary. Lazily rebuilt as text re-renders.
     //
     // Other D3D12 caches (bitmap-batch textures, instance buffers, blur
-    // temps, snapshot RTs) either reset every frame (cleared in BeginFrame
-    // around line 792) or are ComPtr-managed scratch resources that don't
-    // benefit from explicit eviction. The custom-shader PSO cache is
-    // negligibly sized for typical apps and not worth touching here.
+    // temps, snapshot RTs) either reset every frame or are ComPtr-managed
+    // scratch resources that don't benefit from explicit eviction.
     if (directRenderer_) {
         if (auto* atlas = directRenderer_->GetGlyphAtlas()) {
             atlas->RequestResetAtFrameBoundary();
         }
 
-        // Custom-shader PSO cache: tiny by entry count but each entry holds
-        // an ID3D12PipelineState (driver-side pipeline + bytecode). ComPtrs
-        // auto-release on clear(); any in-flight draw using these PSOs
-        // keeps its own implicit ref through the open command list until
-        // the next fence completes — frame-safe.
+        // A command list does not retain the application's PSO COM reference.
+        // ClearCustomShaderCache therefore moves entries to DirectRenderer's
+        // fence-gated retired list; releasing them inline here would trigger
+        // D3D12 #921 while an Effect/Backdrop draw is open or in flight.
         directRenderer_->ClearCustomShaderCache();
     }
     return JALIUM_OK;
@@ -1094,6 +1092,12 @@ JaliumResult D3D12RenderTarget::BeginDraw() {
     isDrawing_ = true;
     preGlassSnapshotCaptured_ = false;
 
+    // A render exception can abandon a managed Begin/End effect pair while the
+    // window keeps this render target alive. DirectRenderer::BeginFrame resets
+    // its capture state; reset the matching wrapper state at the same boundary.
+    effectCaptureScopeStack_.clear();
+    lastEffectCaptureOk_ = false;
+
     // Defensive: any deferred Push* recorded across a failed frame would
     // otherwise leak into this one. BeginDraw always starts with a clean
     // pending list, matching the documented contract that callers issue
@@ -1251,12 +1255,47 @@ JaliumResult D3D12RenderTarget::EndDraw() {
 
 bool D3D12RenderTarget::FillBrushToInstance(Brush* brush, SdfRectInstance& inst) {
     if (!brush) return false;
+
+    auto appendStops = [&](const std::vector<GradStop>& source) {
+        inst.stopOffset = 0;
+        inst.stopCount = 0;
+        if (source.empty()) return true;
+        if (!directRenderer_ ||
+            source.size() >
+                static_cast<size_t>((std::numeric_limits<uint32_t>::max)())) {
+            return false;
+        }
+
+        std::vector<SdfGradientStop> stops;
+        stops.reserve(source.size());
+        for (const auto& sourceStop : source) {
+            stops.push_back({
+                sourceStop.position,
+                sourceStop.color.r,
+                sourceStop.color.g,
+                sourceStop.color.b,
+                sourceStop.color.a,
+            });
+        }
+
+        if (!directRenderer_->AppendSdfGradientStops(
+                stops.data(),
+                static_cast<uint32_t>(stops.size()),
+                inst.stopOffset)) {
+            return false;
+        }
+        inst.stopCount = static_cast<uint32_t>(stops.size());
+        return true;
+    };
+
     auto type = brush->GetType();
     if (type == JALIUM_BRUSH_SOLID) {
         auto* sb = static_cast<D3D12SolidBrush*>(brush);
         inst.fillR = sb->r_; inst.fillG = sb->g_;
         inst.fillB = sb->b_; inst.fillA = sb->a_;
         inst.gradientType = 0;
+        inst.stopOffset = 0;
+        inst.stopCount = 0;
         return true;
     }
     if (type == JALIUM_BRUSH_LINEAR_GRADIENT) {
@@ -1266,16 +1305,7 @@ bool D3D12RenderTarget::FillBrushToInstance(Brush* brush, SdfRectInstance& inst)
         inst.gradGeom1 = lb->startY_;
         inst.gradGeom2 = lb->endX_;
         inst.gradGeom3 = lb->endY_;
-        inst.stopCount = (uint32_t)std::min<size_t>(lb->stops_.size(), 4);
-        for (uint32_t i = 0; i < inst.stopCount; i++) {
-            float* s = &inst.stop0Pos + i * 5;
-            s[0] = lb->stops_[i].position;
-            s[1] = lb->stops_[i].color.r;
-            s[2] = lb->stops_[i].color.g;
-            s[3] = lb->stops_[i].color.b;
-            s[4] = lb->stops_[i].color.a;
-        }
-        return true;
+        return appendStops(lb->stops_);
     }
     if (type == JALIUM_BRUSH_RADIAL_GRADIENT) {
         auto* rb = static_cast<D3D12RadialGradientBrush*>(brush);
@@ -1284,26 +1314,16 @@ bool D3D12RenderTarget::FillBrushToInstance(Brush* brush, SdfRectInstance& inst)
         inst.gradGeom1 = rb->centerY_;
         inst.gradGeom2 = rb->radiusX_;
         inst.gradGeom3 = rb->radiusY_;
-        inst.stopCount = (uint32_t)std::min<size_t>(rb->stops_.size(), 4);
-        for (uint32_t i = 0; i < inst.stopCount; i++) {
-            float* s = &inst.stop0Pos + i * 5;
-            s[0] = rb->stops_[i].position;
-            s[1] = rb->stops_[i].color.r;
-            s[2] = rb->stops_[i].color.g;
-            s[3] = rb->stops_[i].color.b;
-            s[4] = rb->stops_[i].color.a;
-        }
-        return true;
+        return appendStops(rb->stops_);
     }
     return false;
 }
 
-bool D3D12RenderTarget::TryDrawContinuousGradientStroke(
+bool D3D12RenderTarget::TryDrawGradientStroke(
     float x, float y, float w, float h,
     float tl, float tr, float br, float bl,
     Brush* brush, float strokeWidth) {
-    if (!brush || !directRenderer_ || strokeWidth <= 0.0f ||
-        directRenderer_->GetShapeType() < 0.5f) {
+    if (!brush || !directRenderer_ || strokeWidth <= 0.0f) {
         return false;
     }
 
@@ -1374,8 +1394,8 @@ bool D3D12RenderTarget::BrushToEngineBrush(Brush* brush, float opacity,
         bd.stops = stopStore.data();
         bd.stopCount = (uint32_t)stopStore.size();
         // Flat fallback (first stop) for the engine routes with no gradient
-        // sampler — strokes (EncodeStrokePathPixelCached) and polygon fills
-        // (EncodeFillPolygonScanline) paint a solid of bd.r/g/b/a.
+        // sampler — e.g. strokes taking EncodeStrokePathPixelCached paint a
+        // solid of bd.r/g/b/a. Path and polygon FILLS all sample properly now.
         bd.r = stopStore[0].r; bd.g = stopStore[0].g; bd.b = stopStore[0].b; bd.a = stopStore[0].a;
         return true;
     }
@@ -1585,23 +1605,16 @@ void D3D12RenderTarget::FlushImpellerBatches() {
     // first non-path draw of a path-heavy frame.
     thread_local std::vector<TriangleVertex> s_flushExpand;
 
-    // In a retained / offscreen capture the layer render target is layer-local
-    // (origin 0,0) and the Impeller vertices were baked into layer-local space by
-    // the capture's (-x,-y) transform — but each batch's SNAPSHOTTED scissor is
-    // still in WINDOW space (managed pre-added the child world offset to the clip
-    // rect, and unlike the vertices the rect never goes through the capture
-    // transform). Replaying that window-space rect against the small layer RT
-    // clips every triangle away — the bug where filled / stroked straight-line
-    // geometry vanished inside a Viewbox (only stencil-FillPath and SDF survived).
-    // Shift the scissor by the same capture offset so it lands in layer-local space
-    // and matches the vertices. Outside any capture this is a no-op (offset 0).
-    LONG capSox = 0, capSoy = 0;
-    if (directRenderer_->IsInRetainedCapture() || directRenderer_->IsInOffscreenCapture()) {
-        auto capT = directRenderer_->GetCurrentTransform();
-        float dpiS = directRenderer_->GetDpiScale();
-        capSox = (LONG)(capT.dx * dpiS);
-        capSoy = (LONG)(capT.dy * dpiS);
-    }
+    // Every Impeller batch snapshots DirectRenderer's already-transformed
+    // scissor. Begin*Capture clears the parent/window-space stack and the
+    // D3D12RenderTarget wrapper immediately mirrors that empty state into
+    // Impeller; clips pushed afterwards pass through PushScissor's active
+    // (-captureOrigin) transform and are therefore capture-local already.
+    //
+    // Do NOT apply the capture translation again here. The former double shift
+    // narrowed an outer panel's local clip by captureX/captureY: at common IDE
+    // dimensions it removed exactly the fourth WrapPanel column (and the final
+    // visible row) of stroked Path icons while SDF/text content remained.
 
     for (auto& batch : impellerEngine_->GetBatches()) {
         if (batch.indices.empty() || batch.vertices.empty()) continue;
@@ -1622,10 +1635,10 @@ void D3D12RenderTarget::FlushImpellerBatches() {
             // Push raw pixel-space scissor rect directly
             // (DirectRenderer stores pixel-space rects in its scissor stack)
             D3D12_RECT sr;
-            sr.left = (LONG)batch.scissorL + capSox;
-            sr.top = (LONG)batch.scissorT + capSoy;
-            sr.right = (LONG)batch.scissorR + capSox;
-            sr.bottom = (LONG)batch.scissorB + capSoy;
+            sr.left = (LONG)batch.scissorL;
+            sr.top = (LONG)batch.scissorT;
+            sr.right = (LONG)batch.scissorR;
+            sr.bottom = (LONG)batch.scissorB;
             directRenderer_->PushScissorRaw(sr);
         } else {
             // No recorded clip → draw unclipped (full viewport), exactly like a
@@ -1695,7 +1708,7 @@ void D3D12RenderTarget::FillRectangle(float x, float y, float w, float h, Brush*
 void D3D12RenderTarget::DrawRectangle(float x, float y, float w, float h, Brush* brush, float strokeWidth) {
     if (!isDrawing_ || !brush || !directRenderer_) return;
     FlushVelloIfNeeded();
-    if (TryDrawContinuousGradientStroke(
+    if (TryDrawGradientStroke(
             x, y, w, h, 0.0f, 0.0f, 0.0f, 0.0f, brush, strokeWidth)) return;
     // Gradient outline → TRUE per-pixel gradient stroke via the engine (the SDF
     // border below paints a solid color). Solids fall straight through.
@@ -1747,7 +1760,7 @@ void D3D12RenderTarget::FillRoundedRectangle(float x, float y, float w, float h,
 void D3D12RenderTarget::DrawRoundedRectangle(float x, float y, float w, float h, float rx, float ry, Brush* brush, float strokeWidth) {
     if (!isDrawing_ || !brush || !directRenderer_) return;
     FlushVelloIfNeeded();
-    if (TryDrawContinuousGradientStroke(
+    if (TryDrawGradientStroke(
             x, y, w, h, rx, rx, rx, rx, brush, strokeWidth)) return;
 
     // Gradient outline → TRUE per-pixel gradient stroke via the engine.
@@ -1811,7 +1824,7 @@ void D3D12RenderTarget::DrawPerCornerRoundedRectangle(float x, float y, float w,
     float tl, float tr, float br, float bl, Brush* brush, float strokeWidth) {
     if (!isDrawing_ || !brush || !directRenderer_) return;
     FlushVelloIfNeeded();
-    if (TryDrawContinuousGradientStroke(
+    if (TryDrawGradientStroke(
             x, y, w, h, tl, tr, br, bl, brush, strokeWidth)) return;
 
     // Gradient outline → TRUE per-pixel gradient stroke via the engine.
@@ -2082,60 +2095,15 @@ void D3D12RenderTarget::FillPolygon(const float* points, uint32_t pointCount, Br
     // deferred Push* here too.
     CommitDeferredState();
 
-    // ── Thin-fill stencil-then-cover fast path (solid color brushes only).
-    //
-    // The Impeller / fan-triangulation paths below rasterize through the
-    // single-sampled triangle pipeline (trianglePSO is SampleDesc.Count = 1, no
-    // MSAA). A thin axis-aligned fill — e.g. the 1px-tall title-bar *minimize*
-    // glyph — then loses coverage on sub-pixel rows and renders blank or faint,
-    // while the *maximize* glyph (authored as a nested compound path, so it
-    // reaches FillPath) renders crisply via the 8x MSAA stencil-then-cover path.
-    //
-    // Give thin solid fills that same robust MSAA coverage WITHOUT disturbing the
-    // well-tuned, coalesced Impeller route for normal-sized polygons: route ONLY
-    // near-degenerate thin polygons (device-space minor extent of a few pixels)
-    // through stencil-then-cover. Normal shapes are untouched, so there is no
-    // coverage/perf regression for them.
-    //
-    // GUARD: stencil-path batches honor only the rectangular scissor — the cover
-    // PS has no rounded-clip SDF (the Impeller triangle path snapshots the
-    // rounded clip per batch instead). So skip this fast path whenever a rounded
-    // clip is active, otherwise a thin polygon inside a rounded-clipped region
-    // would escape the rounding.
-    if (!directRenderer_->HasRoundedClip() && brush->GetType() == JALIUM_BRUSH_SOLID) {
-        float minX = points[0], minY = points[1], maxX = points[0], maxY = points[1];
-        for (uint32_t i = 1; i < pointCount; i++) {
-            float x = points[i * 2], y = points[i * 2 + 1];
-            if (x < minX) minX = x; else if (x > maxX) maxX = x;
-            if (y < minY) minY = y; else if (y > maxY) maxY = y;
-        }
-        auto t = directRenderer_->GetCurrentTransform();
-        float sx = std::sqrt(t.m11 * t.m11 + t.m12 * t.m12);
-        float sy = std::sqrt(t.m21 * t.m21 + t.m22 * t.m22);
-        float scale = std::max(sx, sy) * directRenderer_->GetDpiScale();
-        float devMinExtent = std::min(maxX - minX, maxY - minY) * scale;
-
-        if (devMinExtent < 4.0f) {
-            float r, g, b, a;
-            if (ExtractBrushColor(brush, r, g, b, a)) {
-                // points → path commands: implicit MoveTo(start) + LineTo(rest) +
-                // ClosePath. Tags match jalium_triangulate.h (LineTo = 0, Close = 5).
-                std::vector<float> cmds;
-                cmds.reserve(static_cast<size_t>(pointCount) * 3 + 1);
-                for (uint32_t i = 1; i < pointCount; i++) {
-                    cmds.push_back(0.0f);                 // LineTo
-                    cmds.push_back(points[i * 2]);
-                    cmds.push_back(points[i * 2 + 1]);
-                }
-                cmds.push_back(5.0f);                      // ClosePath
-                auto geom = directRenderer_->GetOrBuildStencilPathGeometry(
-                    points[0], points[1], cmds.data(), (uint32_t)cmds.size());
-                if (directRenderer_->AddStencilPath(geom, r, g, b, a, fillRule)) {
-                    return;
-                }
-            }
-        }
-    }
+    // NOTE: a thin-polygon detour through the 8× MSAA stencil-then-cover
+    // pipeline used to sit here. It existed because the Impeller polygon route
+    // triangulated and relied on binary pixel-centre coverage, so a sub-pixel
+    // fill (the 1px-tall title-bar *minimize* glyph) rendered blank or faint.
+    // ImpellerD3D12Engine::EncodeFillPolygon now routes every icon-scale
+    // polygon — thin ones very much included — through the analytic-coverage
+    // rasterizer, which gives a 0.4px-tall shape an exact alpha-0.4 row. The
+    // detour therefore only added a second code path, its own scissor/rounded-
+    // clip caveat, and a full-screen MSAA resolve per path-mode exit.
 
     // Impeller engine path
     if (IsImpellerActive() && EnsureImpellerEngine()) {
@@ -2391,22 +2359,46 @@ void D3D12RenderTarget::FillPath(float startX, float startY, const float* comman
     // happens at fragment time and needs barycentric vertex colors), so they
     // fall through to the Impeller path below — which is unchanged.
     //
-    // Analytic-only mode (app.UsePathAntiAliasing(Analytic)) skips this MSAA fast
-    // path so solid fills use the engine's analytic-coverage rasterizer below —
-    // the same path gradient fills already take — for WPF/Skia-style AA at a
-    // fraction of the 8× stencil-then-cover GPU cost.
+    // SIZE GATE (PreferAnalyticFill, jalium_flatten.h): MSAA resolves coverage
+    // into 8 samples, while the engine's analytic rasterizer computes it
+    // exactly. At icon scale that difference is the whole ballgame — 8× MSAA is
+    // a visible staircase on a 15px star — so small paths deliberately fall
+    // through to the analytic route below, which also lets a typical UI avoid
+    // allocating the viewport-sized 8× MSAA scratch and its per-path-run
+    // full-screen resolve entirely. Large artwork keeps stencil-then-cover,
+    // where a constant GPU cost beats an area-proportional CPU one.
+    //
+    // Analytic-only mode (app.UsePathAntiAliasing(Analytic)) forces every solid
+    // fill down the analytic route regardless of size.
     if (!directRenderer_->IsPathAnalyticOnly())
     {
-        float r, g, b, a;
-        if (ExtractBrushColor(brush, r, g, b, a)) {
-            auto geom = directRenderer_->GetOrBuildStencilPathGeometry(
-                startX, startY, commands, commandLength);
-            if (directRenderer_->AddStencilPath(geom, r, g, b, a, fillRule)) {
-                return;
+        bool smallEnoughForAnalytic = false;
+        {
+            float lminX, lminY, lmaxX, lmaxY;
+            if (PathCommandExtent(startX, startY, commands, commandLength,
+                                  lminX, lminY, lmaxX, lmaxY)) {
+                auto t = directRenderer_->GetCurrentTransform();
+                const float s = directRenderer_->GetDpiScale();
+                float devW, devH;
+                TransformedExtent(lminX, lminY, lmaxX, lmaxY,
+                                  t.m11 * s, t.m12 * s, t.m21 * s, t.m22 * s,
+                                  t.dx * s, t.dy * s, devW, devH);
+                smallEnoughForAnalytic = PreferAnalyticFill(devW, devH);
             }
         }
-        // Brush wasn't a solid color, or the renderer wasn't ready: drop through
-        // to the engine routing below.
+
+        if (!smallEnoughForAnalytic) {
+            float r, g, b, a;
+            if (ExtractBrushColor(brush, r, g, b, a)) {
+                auto geom = directRenderer_->GetOrBuildStencilPathGeometry(
+                    startX, startY, commands, commandLength);
+                if (directRenderer_->AddStencilPath(geom, r, g, b, a, fillRule)) {
+                    return;
+                }
+            }
+        }
+        // Small path, brush wasn't a solid color, or the renderer wasn't ready:
+        // drop through to the engine routing below.
     }
 
     // Route based on active rendering engine
@@ -2604,14 +2596,29 @@ void D3D12RenderTarget::RenderText(
 
     auto* tf = static_cast<D3D12TextFormat*>(format);
     float r = 1, g = 1, b = 1, a = 1;
-    // Gradient foregrounds: the glyph pipeline is single-colour, so degrade a
-    // gradient brush to the equal-weight average of ALL its stops — the SAME
-    // representative colour the Vulkan backend renders (its RenderText calls
-    // TryGetApproximateBrushColor too), instead of the previous unchecked
-    // ExtractBrushColor call that silently left the white default in place and
-    // made gradient-foreground text come out pure white (parity gap A5).
-    // Null / image / unsupported brushes keep the historical white fallback.
+    // Fallback colour for every sink that can't take a gradient (and for image /
+    // unsupported / null brushes, which keep the historical white): the
+    // equal-weight average of ALL stops — the same representative colour the
+    // Vulkan backend renders, since its RenderText calls
+    // TryGetApproximateBrushColor too.
     TryGetApproximateBrushColor(brush, r, g, b, a);
+
+    // A linear / radial gradient foreground is now rendered AS a gradient rather
+    // than collapsed to that average: AddText evaluates the brush once per glyph
+    // quad, so the colour varies across the run and a highlight can travel
+    // through the text. Previously this degraded to one flat colour, which made
+    // "sweep a light across a label" impossible to express at all.
+    //
+    // Opacity is deliberately NOT folded in here (1.0f): AddText applies the
+    // renderer's current opacity to the run, exactly as it does for solid
+    // foregrounds. Passing it twice would square it.
+    EngineBrushData gradientBrush;
+    std::vector<EngineBrushData::GradientStop> gradientStops;
+    const EngineBrushData* textGradient = nullptr;
+    if (BrushToEngineBrush(brush, 1.0f, gradientBrush, gradientStops) &&
+        (gradientBrush.type == 1 || gradientBrush.type == 2)) {
+        textGradient = &gradientBrush;
+    }
 
     ComPtr<IDWriteTextLayout> layout;
     uint64_t layoutKey = 0;
@@ -2622,7 +2629,8 @@ void D3D12RenderTarget::RenderText(
     // ClearType and Grayscale runs cache independently within the same frame.
     const int32_t aaMode = tf->ResolveEffectiveTextRenderingMode();
     const int32_t hintingMode = tf->GetTextHintingMode();
-    directRenderer_->AddText(layout.Get(), x, y, r, g, b, a, layoutKey, aaMode, hintingMode);
+    directRenderer_->AddText(layout.Get(), x, y, r, g, b, a, layoutKey, aaMode, hintingMode,
+                             textGradient);
 }
 
 // ============================================================================
@@ -2768,6 +2776,90 @@ bool D3D12RenderTarget::IdentityMatrixSkip(const float* m)
            std::abs(m[5])        < kEpsilon;
 }
 
+// Pushes the scissor + antialiased SDF mask for one rounded clip.
+//
+// These two must NOT receive the same rectangle, and that is the whole point of
+// this helper:
+//
+//   · The scissor is a hard integer cull (D3D12_RECT is LONG). It has to be
+//     expanded OUTWARD to whole pixels, because drawing ops pixel-snap their
+//     origin and a snapped stroke can land up to 0.5px outside the mathematical
+//     clip; a tight scissor would shave it off (asymmetric border thickness).
+//
+//   · The SDF mask is a continuous, sub-pixel-accurate coverage function
+//     evaluated per fragment. It must use the EXACT geometry, because that is
+//     the real clip boundary.
+//
+// Feeding the outward-expanded rect to BOTH — which is what the managed
+// PushClip used to do — makes the antialiased clip up to 1px LOOSER than the
+// true boundary. Symptom seen in the field: a Border with ClipToBounds holding
+// an Image plus a gradient scrim. The scrim is an ordinary fill, so its own AA
+// edge stopped at the exact bottom (118.x); the Image was clipped by the
+// loosened mask, so it survived at FULL coverage one row further down. That row
+// rendered as raw, unscrimmed image — a bright 1px line across the card
+// (measured RGB 235,238,250 against 55,55,58 above and 44,44,46 below), and it
+// blinked whenever the element animated through sub-pixel positions.
+//
+// The pair below keeps the scissor conservative and the mask exact, so every
+// primitive inside a rounded clip — fills, bitmaps, text, triangles, all of
+// which sample RoundedClipCoverage — stops on the same sub-pixel boundary.
+void D3D12RenderTarget::EmitRoundedClipPair(float x, float y, float w, float h,
+                                            float tl, float tr, float br, float bl,
+                                            bool perCorner)
+{
+    // Straight clip edges are SNAPPED to the pixel grid; only the corner arcs stay
+    // antialiased. Both the scissor and the SDF mask get the same snapped rect.
+    //
+    // Why straight edges must not produce fractional coverage:
+    //
+    // The mask multiplies each primitive's alpha independently. At a clip edge with
+    // partial coverage c, a stack that composites correctly in the interior no
+    // longer does at the edge, because every layer's alpha gets scaled by the same c
+    // — including the ones whose job is to COVER the layers beneath them.
+    //
+    // Measured case (template card: Image under a gradient scrim, both inside a
+    // ClipToBounds Border, card animating through sub-pixel positions on hover):
+    //   interior row (c=1):   scrim 0.92 over image -> 0.92*44 + 0.08*235 = 59
+    //   edge row    (c=0.5):  image lands at 0.5*235 + 0.5*44 = 139,
+    //                         scrim can only apply 0.92*0.5 = 0.46 on top
+    //                         -> 0.46*44 + 0.54*139 = 96
+    // i.e. the edge row comes out BRIGHTER than the row above it — a 1px line that
+    // pulses as the fraction sweeps 0->1 during the animation. No amount of
+    // authoring (wider scrim, different gradient, negative margins) fixes it: the
+    // scrim's own opacity is being scaled by the clip too.
+    //
+    // Snapping removes the failure mode at the source: coverage on a straight edge
+    // is only ever 0 or 1, so the edge row composites exactly like an interior row.
+    // The clip boundary then steps by whole pixels during motion instead of fading —
+    // which is precisely how a hard clip (CSS overflow:hidden, scissor) behaves, and
+    // is imperceptible next to the pulsing line it replaces.
+    //
+    // Round-to-NEAREST, not floor/ceil: outward expansion is what let content leak a
+    // full pixel past the mask (the original hard white seam), and inward would shave
+    // pixel-snapped strokes. Nearest agrees with the Math.Round origin snapping the
+    // drawing ops already use, so clip and content land on the same grid.
+    //
+    // Corners are unaffected: the arcs are inset from the edges by their radius, so
+    // they still evaluate the smooth SDF and keep their antialiasing.
+    const float cx0 = std::round(x);
+    const float cy0 = std::round(y);
+    const float cx1 = std::round(x + w);
+    const float cy1 = std::round(y + h);
+    const float cw = std::max(0.0f, cx1 - cx0);
+    const float ch = std::max(0.0f, cy1 - cy0);
+
+    directRenderer_->PushScissor(cx0, cy0, cw, ch);
+
+    if (perCorner) {
+        directRenderer_->PushPerCornerRoundedClip(cx0, cy0, cw, ch, tl, tr, br, bl);
+    } else {
+        // Symmetric variant: tl/tr carry (rx, ry).
+        directRenderer_->PushRoundedClip(cx0, cy0, cw, ch, tl, tr);
+    }
+    clipFrameIsRounded_.push_back(true);
+    SyncScissorToImpeller();
+}
+
 void D3D12RenderTarget::EmitDeferredOp(const DeferredStateOp& op)
 {
     if (!directRenderer_) return;
@@ -2788,19 +2880,18 @@ void D3D12RenderTarget::EmitDeferredOp(const DeferredStateOp& op)
             // pending batches keep their draw-time clip even after the live stack
             // moves on. This is what lets path batches coalesce across rounded-clip
             // pushes instead of forcing a GPU flush at every Border/titlebar.
-            directRenderer_->PushScissor(op.data[0], op.data[1], op.data[2], op.data[3]);
-            directRenderer_->PushRoundedClip(op.data[0], op.data[1], op.data[2], op.data[3],
-                                              op.data[4], op.data[5]);
-            clipFrameIsRounded_.push_back(true);
-            SyncScissorToImpeller();
+            //
+            // The scissor and the SDF mask deliberately get DIFFERENT rects — see
+            // ExpandScissorForClip for why feeding both the same rect leaks 1px.
+            EmitRoundedClipPair(op.data[0], op.data[1], op.data[2], op.data[3],
+                                op.data[4], op.data[5], op.data[4], op.data[5],
+                                /*perCorner=*/false);
             break;
         case DeferredOpKind::ClipPerCornerRounded:
             // See ClipRoundedRect: per-batch rounded-clip snapshot, no flush.
-            directRenderer_->PushScissor(op.data[0], op.data[1], op.data[2], op.data[3]);
-            directRenderer_->PushPerCornerRoundedClip(op.data[0], op.data[1], op.data[2], op.data[3],
-                                                       op.data[4], op.data[5], op.data[6], op.data[7]);
-            clipFrameIsRounded_.push_back(true);
-            SyncScissorToImpeller();
+            EmitRoundedClipPair(op.data[0], op.data[1], op.data[2], op.data[3],
+                                op.data[4], op.data[5], op.data[6], op.data[7],
+                                /*perCorner=*/true);
             break;
         case DeferredOpKind::Opacity:
             opacityStack_.push(directRenderer_->GetOpacity());
@@ -2938,12 +3029,12 @@ void D3D12RenderTarget::SetExternalPresentPacing(bool enabled) {
     // Only meaningful when the swap chain actually has a frame-latency
     // waitable for the caller to consume; without one BeginDraw never waited
     // in the first place, so external pacing would silently remove the only
-    // back-pressure (DXGI's own Present blocking). Composition (DComp) swap
-    // chains ALSO carry a waitable, but their Present + dcomp Commit cadence
-    // must stay internally paced — reject them too. Callers check
-    // GetFrameLatencyWaitable() != 0 and non-composition before enabling;
-    // this is defence in depth for direct C-ABI hosts.
-    externalPresentPacing_ = enabled && frameLatencyWaitable_ != nullptr && !isComposition_;
+    // back-pressure (DXGI's own Present blocking). DirectComposition swap
+    // chains expose the same DXGI frame-latency waitable and obey the same
+    // MaxFrameLatency contract. Let the managed scheduler consume that signal
+    // as the sole pacing owner too; Present(0) is followed by the normal DComp
+    // Commit below, so composition cadence and resize placement stay intact.
+    externalPresentPacing_ = enabled && frameLatencyWaitable_ != nullptr;
     if (externalPresentPacing_) {
         // BeginDraw stops writing the waitable-wait stats in this mode; clear
         // them so a stale value from before the switch (e.g. the render
@@ -3441,18 +3532,25 @@ void D3D12RenderTarget::DrawDesktopBackdrop(
 
 void D3D12RenderTarget::BeginTransitionCapture(int slot, float x, float y, float w, float h) {
     if (!isDrawing_ || !directRenderer_ || slot < 0 || slot > 1) return;
-    CommitDeferredState();
-    // Drain pending Impeller batches to the back buffer before redirecting the
-    // render target to the offscreen slot (see BeginEffectCapture for the full
-    // rationale — otherwise pre-capture strokes leak into the captured texture).
-    FlushImpellerBatches();
-    directRenderer_->BeginOffscreenCapture(slot, x, y, w, h);
+    // Drain either engine before redirecting the render target. This preserves
+    // painter order and ensures no pre-capture path batch crosses the coordinate-
+    // space boundary.
+    FlushVelloIfNeeded();
+    if (directRenderer_->BeginOffscreenCapture(slot, x, y, w, h)) {
+        // BeginOffscreenCapture isolated the native parent clip stack. Mirror
+        // that state so newly recorded Impeller batches cannot retain a stale
+        // window-space clip while their vertices are capture-local.
+        SyncScissorToImpeller();
+    }
 }
 
 void D3D12RenderTarget::EndTransitionCapture(int slot) {
     if (!isDrawing_ || !directRenderer_ || slot < 0 || slot > 1) return;
-    CommitDeferredState();
+    // Flush every path while the offscreen target and its local clip space are
+    // still active; otherwise a lazy final path escapes onto the main target.
+    FlushVelloIfNeeded();
     directRenderer_->EndOffscreenCapture(slot);
+    SyncScissorToImpeller();
 }
 
 void D3D12RenderTarget::DrawTransitionShader(float x, float y, float w, float h, float progress, int mode,
@@ -3490,32 +3588,51 @@ void D3D12RenderTarget::DrawCapturedTransition(int slot, float x, float y, float
 // ============================================================================
 
 void D3D12RenderTarget::BeginEffectCapture(float x, float y, float w, float h) {
-    if (!isDrawing_ || !directRenderer_) { lastEffectCaptureOk_ = false; return; }
-    CommitDeferredState();
-    // Drain any pending Impeller stroke/fill batches to the DirectRenderer's
-    // triangle list BEFORE we redirect the render target to the offscreen
-    // capture. Without this, an element rendered just before an effect element
-    // (e.g. a card's arrow glyph immediately preceding the NEXT card's drop
-    // shadow) is still queued in the Impeller engine; it would otherwise be
-    // drained mid-capture and drawn into the effect's offscreen texture instead
-    // of the back buffer, so every such element except the last (which has no
-    // following capture) silently vanished. FlushGraphicsForCompute then paints
-    // the now-materialised triangles to the current (back-buffer) target.
-    FlushImpellerBatches();
+    if (!isDrawing_ || !directRenderer_) {
+        effectCaptureScopeStack_.push_back(false);
+        return;
+    }
+    // Drain either path engine BEFORE redirecting the render target. Without
+    // this, geometry emitted just before an effected element crosses into the
+    // capture and violates both painter order and the clip coordinate space.
+    FlushVelloIfNeeded();
     if (!directRenderer_->FlushGraphicsForCompute()) {
         // Device lost — frame will abort; EndEffectCapture sees the flag and
         // skips its EndOffscreenCapture.
-        lastEffectCaptureOk_ = false;
+        effectCaptureScopeStack_.push_back(false);
         return;
     }
-    lastEffectCaptureOk_ = directRenderer_->BeginOffscreenCapture(0, x, y, w, h);
+    const bool captureOk =
+        directRenderer_->BeginOffscreenCapture(0, x, y, w, h);
+    effectCaptureScopeStack_.push_back(captureOk);
+    if (captureOk) {
+        // BeginOffscreenCapture cleared the DirectRenderer parent clip stack.
+        // Keep Impeller's sticky clip mirror in the same empty, capture-local
+        // coordinate space; clips pushed by descendants are transformed once
+        // by DirectRenderer::PushScissor and then snapshotted as-is.
+        SyncScissorToImpeller();
+    }
 }
 
 void D3D12RenderTarget::EndEffectCapture() {
+    if (effectCaptureScopeStack_.empty()) {
+        lastEffectCaptureOk_ = false;
+        return;
+    }
+
+    const bool captureOk = effectCaptureScopeStack_.back();
+    effectCaptureScopeStack_.pop_back();
+    lastEffectCaptureOk_ = captureOk;
+
     if (!isDrawing_ || !directRenderer_) return;
-    CommitDeferredState();
-    if (lastEffectCaptureOk_) {
+    if (captureOk) {
+        // Lazy path batches must be materialised before restoring the main RT;
+        // this is the end-side half of the capture coordinate-space boundary.
+        FlushVelloIfNeeded();
         directRenderer_->EndOffscreenCapture(0);
+        // EndOffscreenCapture restored the parent clip stack. Mirror it before
+        // any following Impeller path is recorded in window space.
+        SyncScissorToImpeller();
     }
 }
 
@@ -3931,8 +4048,14 @@ void D3D12RenderTarget::DrawOuterGlowEffect(float x, float y, float w, float h,
 void D3D12RenderTarget::DrawColorMatrixEffect(float x, float y, float w, float h, const float* matrix) {
     if (!isDrawing_ || !directRenderer_) return;
     CommitDeferredState();
-    if (!matrix || !lastEffectCaptureOk_) {
-        // No matrix / capture failed — legacy fallback: composite unmodified.
+    if (!lastEffectCaptureOk_) {
+        // A nested capture can legitimately degrade to pass-through because D3D12
+        // owns one element-effect surface. Slot 0 then belongs to the still-open
+        // ancestor capture; sampling it here would alias the active render target.
+        return;
+    }
+    if (!matrix) {
+        // A successful capture with no matrix degrades to an unmodified composite.
         directRenderer_->DrawOffscreenBitmap(0, x, y, w, h, 1.0f);
         return;
     }
@@ -3975,7 +4098,8 @@ void D3D12RenderTarget::DrawEmbossEffect(float x, float y, float w, float h,
     if (!isDrawing_ || !directRenderer_) return;
     CommitDeferredState();
     if (!lastEffectCaptureOk_) {
-        directRenderer_->DrawOffscreenBitmap(0, x, y, w, h, 1.0f);
+        // The nested pass-through case has no child capture to composite. Slot 0
+        // is the ancestor's active render target and must not be sampled here.
         return;
     }
 

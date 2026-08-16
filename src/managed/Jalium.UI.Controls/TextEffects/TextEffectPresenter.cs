@@ -202,6 +202,8 @@ public partial class TextEffectPresenter : FrameworkElement
     private bool _isAttached;
     private double _elapsedMs;
     private long _lastTickUtc;
+    /// <summary>订阅之后还没收到过帧回调。首帧只用来对表，不推进动画。</summary>
+    private bool _awaitingFirstTick;
 
 
 
@@ -795,6 +797,7 @@ public partial class TextEffectPresenter : FrameworkElement
         }
 
         _lastTickUtc = Environment.TickCount64;
+        _awaitingFirstTick = true;
         CompositionTarget.Rendering += OnRenderingTick;
         CompositionTarget.Subscribe();
         _renderingSubscribed = true;
@@ -815,11 +818,45 @@ public partial class TextEffectPresenter : FrameworkElement
     private void OnRenderingTick(object? sender, EventArgs e)
     {
         var now = Environment.TickCount64;
-        var delta = now - _lastTickUtc;
+        var raw = now - _lastTickUtc;
         _lastTickUtc = now;
+
+        var delta = ResolveFrameDelta(raw, _awaitingFirstTick);
+        _awaitingFirstTick = false;
 
         AdvanceFrame(delta);
         InvalidateVisual();
+    }
+
+    /// <summary>Longest step a single frame may advance the animation clock by.</summary>
+    internal const double MaxFrameDeltaMs = 100;
+
+    /// <summary>
+    /// Turns a wall-clock gap into an animation step.
+    ///
+    /// <para>
+    /// The raw gap cannot be used directly. <see cref="_lastTickUtc"/> is stamped when the
+    /// presenter SUBSCRIBES, but the first <see cref="CompositionTarget.Rendering"/> callback
+    /// only arrives once the window is actually on screen — the framework pre-renders while the
+    /// native surface is still hidden, and the frame loop parks when nothing is animating.
+    /// That gap is routinely hundreds of milliseconds, which is longer than a whole enter
+    /// animation: fed in verbatim it drives every cell straight to Settled on the first frame,
+    /// and the text simply appears with no effect at all. Same story for any mid-animation
+    /// stall (a long layout pass, a blocking call, a dropped frame burst).
+    /// </para>
+    ///
+    /// <para>
+    /// So: the first tick after subscribing only establishes the time base (step 0), and every
+    /// later step is capped. Capping makes a stalled animation run slightly slow rather than
+    /// skip ahead — for a sub-second entrance, being late is invisible while skipping is fatal.
+    /// The cap sits well above a normal frame (100ms ≈ 10fps), so healthy frames pass through
+    /// untouched.
+    /// </para>
+    /// </summary>
+    internal static double ResolveFrameDelta(double rawDeltaMs, bool isFirstTick)
+    {
+        if (isFirstTick || rawDeltaMs <= 0) return 0;
+        return rawDeltaMs > MaxFrameDeltaMs ? MaxFrameDeltaMs : rawDeltaMs;
     }
 
 
@@ -1287,7 +1324,14 @@ public partial class TextEffectPresenter : FrameworkElement
         double width;
         if (TextMeasurement.MeasureText(formatted) && formatted.IsMeasured)
         {
-            width = formatted.Width;
+            // Every cell is measured in isolation, so a whitespace grapheme is
+            // ALL trailing whitespace — and DirectWrite excludes that from
+            // Width by design, reporting 0. Taking Width verbatim collapsed
+            // every space in the run ("Type a lyric..." laid out as
+            // "Typealyric..."). WidthIncludingTrailingWhitespace is the metric
+            // that carries the advance; for a non-whitespace cell the two are
+            // equal, so the max is a no-op there.
+            width = Math.Max(formatted.Width, formatted.WidthIncludingTrailingWhitespace);
         }
         else
         {

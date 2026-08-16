@@ -408,6 +408,9 @@ public:
     void DrawShaderEffect(float x, float y, float w, float h,
         const uint8_t* shaderBytecode, uint32_t shaderBytecodeSize,
         const float* constants, uint32_t constantFloatCount) override;
+    void DrawShaderEffectFromSource(float x, float y, float w, float h,
+        const char* hlslSource, const float* constants,
+        uint32_t constantFloatCount) override;
 
     // Liquid glass approximation
     void DrawLiquidGlass(
@@ -521,12 +524,22 @@ private:
     int32_t dirtyRight_ = 0;
     int32_t dirtyBottom_ = 0;
 
-    // Effect capture state
+    // Effect capture state. Captures can nest when an effected element is
+    // rendered inside another effected element, so each open scope owns its
+    // framebuffer snapshot and capture bounds.
+    struct EffectCaptureState {
+        SoftwareFramebuffer savedFramebuffer;
+        float x = 0;
+        float y = 0;
+        float width = 0;
+        float height = 0;
+    };
+
     SoftwareFramebuffer effectCaptureFb_;
-    SoftwareFramebuffer savedFb_;
-    float effectCaptureX_ = 0, effectCaptureY_ = 0;
-    float effectCaptureW_ = 0, effectCaptureH_ = 0;
-    bool effectCaptureActive_ = false;
+    std::vector<EffectCaptureState> effectCaptureStack_;
+    float lastEffectCaptureX_ = 0, lastEffectCaptureY_ = 0;
+    float lastEffectCaptureW_ = 0, lastEffectCaptureH_ = 0;
+    bool effectCaptureReady_ = false;
 
     // Transition capture state
     SoftwareFramebuffer transitionCaptureFb_[2];

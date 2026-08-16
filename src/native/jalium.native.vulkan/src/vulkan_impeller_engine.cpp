@@ -272,6 +272,87 @@ inline void TransformCommandsToPixelSpace(
     }
 }
 
+// A vertex-colour stroke can only reproduce a piecewise-linear gradient when
+// the centreline mesh has a vertex at every real ramp breakpoint. Insert the
+// intersections of each linear-gradient iso-line with every source-space
+// contour segment before ExpandStrokePath builds the stroke mesh.
+inline void SubdivideContoursAtLinearGradientBreakpoints(
+    std::vector<Contour>& contours,
+    const EngineBrushData& brush,
+    bool closed)
+{
+    if (brush.type != 1 || !brush.stops || brush.stopCount < 2) return;
+
+    const float dx = brush.endX - brush.startX;
+    const float dy = brush.endY - brush.startY;
+    const float lengthSquared = dx * dx + dy * dy;
+    if (lengthSquared <= 1e-6f) return;
+
+    std::vector<float> breakpoints;
+    BuildGradientRampBreakpoints(brush, breakpoints);
+    if (breakpoints.empty()) return;
+
+    auto gradientT = [&](float x, float y) {
+        return ((x - brush.startX) * dx +
+                (y - brush.startY) * dy) / lengthSquared;
+    };
+
+    constexpr float kEndpointTolerance = 1e-6f;
+    for (auto& contour : contours) {
+        const uint32_t count = contour.VertexCount();
+        if (count < 2) continue;
+
+        const uint32_t segmentCount = closed ? count : count - 1;
+        std::vector<float> refined;
+        refined.reserve(contour.points.size());
+        for (uint32_t i = 0; i < segmentCount; ++i) {
+            const uint32_t j = (i + 1) % count;
+            const float ax = contour.X(i);
+            const float ay = contour.Y(i);
+            const float bx = contour.X(j);
+            const float by = contour.Y(j);
+            refined.push_back(ax);
+            refined.push_back(ay);
+
+            const float ta = gradientT(ax, ay);
+            const float tb = gradientT(bx, by);
+            if (std::fabs(tb - ta) <= kEndpointTolerance) continue;
+
+            const float minimum = std::min(ta, tb);
+            const float maximum = std::max(ta, tb);
+            auto first = std::upper_bound(
+                breakpoints.begin(),
+                breakpoints.end(),
+                minimum + kEndpointTolerance);
+            auto last = std::lower_bound(
+                breakpoints.begin(),
+                breakpoints.end(),
+                maximum - kEndpointTolerance);
+
+            auto appendIntersection = [&](float stopPosition) {
+                const float u = (stopPosition - ta) / (tb - ta);
+                refined.push_back(ax + (bx - ax) * u);
+                refined.push_back(ay + (by - ay) * u);
+            };
+            if (tb > ta) {
+                for (auto it = first; it != last; ++it) {
+                    appendIntersection(*it);
+                }
+            } else {
+                for (auto it = last; it != first;) {
+                    --it;
+                    appendIntersection(*it);
+                }
+            }
+        }
+        if (!closed) {
+            refined.push_back(contour.X(count - 1));
+            refined.push_back(contour.Y(count - 1));
+        }
+        contour.points.swap(refined);
+    }
+}
+
 inline void EmitRectsAsBatch(
     const std::vector<PixelRect>& rects,
     float r, float g, float b, float a,
@@ -688,14 +769,14 @@ bool ImpellerVulkanEngine::EncodeStrokePath(
     // the feathered triangle mesh keyed on geometry + stroke params +
     // scaleBucket (transform EXCLUDED), then each frame only transform the
     // cached vertices (O(N)) and recolor. Emits pipelineType=0 — bypassing BOTH
-    // the CPU scanline AND the GPU stencil-then-cover, exactly like the gradient
-    // branch below already does, just memoized. Solid AND linear/radial/sweep
-    // gradient strokes take this path; dashed / explicit-analytic / no-command /
-    // zero-width defer to the proven legacy body.
+    // the CPU scanline AND the GPU stencil-then-cover. Gradient strokes skip
+    // this brush-independent cache because their mesh must be subdivided at
+    // moving ramp breakpoints; dashed / explicit-analytic / no-command /
+    // zero-width also defer to the proven legacy body.
     const bool gradientStroke =
         (brush.type == 1 || brush.type == 2 || brush.type == 3) &&
         brush.stops && brush.stopCount > 0;
-    if (StrokeCacheEnabled() && !analytic &&
+    if (StrokeCacheEnabled() && !analytic && !gradientStroke &&
         (!dashPattern || dashCount == 0) &&
         commands && commandLength > 0 && strokeWidth > 0.0f) {
 
@@ -851,6 +932,8 @@ bool ImpellerVulkanEngine::EncodeStrokePath(
         std::vector<Contour> srcContours =
             FlattenPathToContours(startX, startY, commands, commandLength, gTol);
         if (!srcContours.empty()) {
+            SubdivideContoursAtLinearGradientBreakpoints(
+                srcContours, brush, closed);
             auto gJoin = static_cast<ImpellerJoin>(lineJoin);
             auto gCap  = static_cast<ImpellerCap>(lineCap);
             std::vector<VkImpellerVertex> meshVerts;
