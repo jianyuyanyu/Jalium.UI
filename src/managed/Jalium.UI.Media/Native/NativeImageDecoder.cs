@@ -165,12 +165,15 @@ public sealed class NativeImageDecoder : INativeImageDecoder
                     Buffer.MemoryCopy((void*)native.Pixels, dst, size, size);
                 }
             }
+            // buffer 是刚 new 出来的专属托管数组、恰好 size 长度，原生侧内存在 finally
+            // 里立即释放——消费方可以直接接管，不必再拷一份全尺寸副本。
             return new DecodedImage(
                 buffer,
                 width,
                 height,
                 stride,
-                NativeMediaInterop.FromNative(native.Format));
+                NativeMediaInterop.FromNative(native.Format),
+                bufferIsExclusive: true);
         }
         finally
         {

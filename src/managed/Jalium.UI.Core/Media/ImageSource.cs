@@ -3,11 +3,63 @@ using System.Diagnostics.CodeAnalysis;
 namespace Jalium.UI.Media;
 
 /// <summary>
+/// The class of failure behind <see cref="ImageSource.LoadFailure"/>.
+/// </summary>
+/// <remarks>
+/// <para>The distinction decides one thing: whether an element is entitled to stop painting the
+/// source. It is not cosmetic. A <see cref="Load"/> failure means there are no pixels and no later
+/// frame can invent any, so skipping the draw costs nothing and avoids painting a broken thing. An
+/// <see cref="Upload"/> failure means the pixels are perfectly good and the DEVICE refused them —
+/// VRAM pressure, a device-removed frame, a texture dimension over the adapter's limit on a
+/// WARP/RDP adapter — and the only thing that ever clears one is RETRYING the upload on the next
+/// frame.</para>
+/// <para>Gating the draw on an upload failure therefore removes the very retry that would clear it,
+/// so one bad frame on one machine becomes a permanently blank element for the life of the window:
+/// the exact reported symptom this whole pipeline exists to eliminate, reintroduced through the
+/// failure path. Anything deciding whether to paint must therefore take the failure and its class
+/// together, from <see cref="ImageSource.TryGetLoadFailure"/>, rather than reading
+/// <see cref="ImageSource.LoadFailure"/> on its own.</para>
+/// </remarks>
+internal enum ImageSourceFailureKind
+{
+    /// <summary>The source could not produce pixels: a missing file, a codec fault, a bad decode.</summary>
+    Load,
+
+    /// <summary>The pixels exist and the GPU refused them. Usually transient; always retryable.</summary>
+    Upload,
+}
+
+/// <summary>
 /// Represents the source of an image.
 /// </summary>
 public abstract class ImageSource : Animation.Animatable, IFormattable
 {
-    private Exception? _loadFailure;
+    /// <summary>
+    /// A latched failure together with its class, published as ONE object.
+    /// </summary>
+    /// <remarks>
+    /// One reference rather than two fields is what makes the pair atomic. The render backend
+    /// latches an upload failure from the render thread while an element reads the class of it on
+    /// the UI thread, and two independent fields let that reader pair a live exception with the
+    /// previous failure's class — i.e. suppress the draw for an upload failure, which is the
+    /// permanently blank element this classification exists to prevent. A single reference also
+    /// makes "claim the report" and "release it once the retry succeeded" plain compare-exchanges
+    /// with no lock on any path.
+    /// </remarks>
+    private sealed class LoadFailureRecord
+    {
+        internal LoadFailureRecord(Exception error, ImageSourceFailureKind kind)
+        {
+            Error = error;
+            Kind = kind;
+        }
+
+        internal Exception Error { get; }
+
+        internal ImageSourceFailureKind Kind { get; }
+    }
+
+    private LoadFailureRecord? _loadFailure;
 
     /// <summary>
     /// Gets the width of the image in pixels.
@@ -65,18 +117,189 @@ public abstract class ImageSource : Animation.Animatable, IFormattable
     internal event Action<ImageSource, Exception>? LoadFailed;
 
     /// <summary>Gets the most recent unresolved load failure.</summary>
-    internal Exception? LoadFailure => _loadFailure;
+    internal Exception? LoadFailure => Volatile.Read(ref _loadFailure)?.Error;
+
+    /// <summary>
+    /// Reads the latched failure and its class in ONE go.
+    /// </summary>
+    /// <remarks>
+    /// There is deliberately no standalone <c>LoadFailureKind</c> to pair with
+    /// <see cref="LoadFailure"/>. Reading them as two properties is two reads of a field a
+    /// successful retry clears from the render thread, so a caller can observe a live failure and
+    /// then the default class for the failure that is no longer there — and act as if a cleared
+    /// upload fault were a load fault, which is a blank frame produced by the reader rather than by
+    /// the pipeline. One read cannot disagree with itself.
+    /// </remarks>
+    internal bool TryGetLoadFailure(
+        [NotNullWhen(true)] out Exception? error,
+        out ImageSourceFailureKind kind)
+    {
+        var latched = Volatile.Read(ref _loadFailure);
+        if (latched is null)
+        {
+            error = null;
+            kind = ImageSourceFailureKind.Load;
+            return false;
+        }
+
+        error = latched.Error;
+        kind = latched.Kind;
+        return true;
+    }
 
     /// <summary>Reports a source loading or decoding failure.</summary>
+    /// <remarks>
+    /// <para>Latches the failure, puts it on the <b>Release-live</b> diagnostics channel, and
+    /// announces it to <see cref="LoadFailed"/> — in that order, so a subscriber that throws cannot
+    /// cost the failure its record.</para>
+    /// <para>The diagnostics leg is not optional and not the caller's job to remember. Before it,
+    /// the single most common real-world image bug — an asset that was not copied to the output
+    /// directory — produced <c>Image.ImageFailed</c> and nothing else, so an application drawing
+    /// that asset through an <see cref="ImageBrush"/>, a <c>DrawingImage</c> or a
+    /// <c>Shape.Fill</c> (none of which is an <c>Image</c> element, and none of which raises that
+    /// routed event) got a blank rectangle with no counter, no EventSource record and no line in a
+    /// trace capture. Reporting from the choke point rather than from each call site is what makes
+    /// that structural: a new failure path cannot be silent by omission.</para>
+    /// <para>A site whose own record is RICHER — a decode worker that knows the stage and the
+    /// attempt number, an SVG loader that knows the path it could not read — reports first and
+    /// latches through <see cref="ReportDiagnosedLoadFailure"/> instead, so one failure produces
+    /// one record rather than two.</para>
+    /// </remarks>
     protected void ReportLoadFailure(Exception exception)
     {
         ArgumentNullException.ThrowIfNull(exception);
-        _loadFailure = exception;
+        LatchLoadFailure(exception);
+        Jalium.UI.Diagnostics.ImageDiagnostics.DecodeFailed(
+            DiagnosticIdentity, "source load", exception);
         LoadFailed?.Invoke(this, exception);
     }
 
+    /// <summary>
+    /// Latches and announces a load failure whose diagnostics record the discovering site has
+    /// ALREADY written.
+    /// </summary>
+    /// <remarks>
+    /// For the two places that report a strictly better record than
+    /// <see cref="ReportLoadFailure"/> could: the deferred decode worker, which reports the stage
+    /// and attempt on the thread that failed and only reaches the application chain later on the
+    /// main dispatcher, and the SVG loader, which names the file path rather than the source's
+    /// URI. Routing those through <see cref="ReportLoadFailure"/> would double-count
+    /// <c>DecodesFailed</c> and make one failure read as two in a support capture.
+    /// </remarks>
+    private protected void ReportDiagnosedLoadFailure(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+        LatchLoadFailure(exception);
+        LoadFailed?.Invoke(this, exception);
+    }
+
+    private void LatchLoadFailure(Exception exception) =>
+        Volatile.Write(
+            ref _loadFailure, new LoadFailureRecord(exception, ImageSourceFailureKind.Load));
+
+    /// <summary>
+    /// Stable identity for this source in diagnostics records. Overridden by sources that know
+    /// their URI; the type name is the fallback for one that does not.
+    /// </summary>
+    /// <remarks>
+    /// Read from failure paths that may run on a decode worker, so an override must not touch
+    /// dependency properties.
+    /// </remarks>
+    private protected virtual string DiagnosticIdentity => GetType().Name;
+
+    /// <summary>
+    /// Latches a GPU upload failure discovered by the render backend, and reports whether THIS
+    /// caller is the one that owes the announcement.
+    /// </summary>
+    /// <returns>
+    /// <see langword="true"/> when the failure was latched by this call, i.e. it opened a new
+    /// failure episode; <see langword="false"/> when one was already outstanding.
+    /// </returns>
+    /// <remarks>
+    /// <para><see cref="ReportLoadFailure"/> is <see langword="protected"/>, so the render backend —
+    /// the layer that discovers a GPU upload failure — cannot reach it. This seam exists so an
+    /// upload failure reaches the same <see cref="LoadFailed"/> -&gt;
+    /// <c>Image.OnSourceLoadFailed</c> -&gt; <c>ImageFailed</c> chain a decode failure already uses,
+    /// instead of being reported only to <c>ImageDiagnostics</c>.</para>
+    /// <para>It latches WITHOUT raising, and it is deliberately separate from
+    /// <see cref="ReportLoadFailure"/> for two reasons. The claim has to happen on the discovering
+    /// thread — the upload is retried every frame, so dozens of identical reports can pile up
+    /// before the UI thread next runs, and a compare-exchange here makes the deduplication exact
+    /// rather than merely collapsing it at delivery. And the raise must NOT happen here, because
+    /// this runs on the render thread whenever one is active (the default on Windows) while the
+    /// chain reaches a routed-event raise; <c>BitmapDecodeNotifier</c> carries that half to the UI
+    /// thread.</para>
+    /// </remarks>
+    internal bool TryLatchUploadFailure(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+
+        // Unsynchronised pre-check before the allocation. This is called from the catch of an
+        // upload that is retried every frame, so the overwhelmingly common case while a failure is
+        // outstanding is "already latched"; allocating a record to lose the exchange with it would
+        // put a per-frame allocation on a path that runs precisely when the machine is already
+        // under pressure. The exchange below is still the decision.
+        if (Volatile.Read(ref _loadFailure) is not null)
+        {
+            return false;
+        }
+
+        return Interlocked.CompareExchange(
+            ref _loadFailure,
+            new LoadFailureRecord(exception, ImageSourceFailureKind.Upload),
+            null) is null;
+    }
+
+    /// <summary>
+    /// Announces a failure that <see cref="TryLatchUploadFailure"/> already latched, on a thread
+    /// that may run application handlers.
+    /// </summary>
+    /// <remarks>
+    /// Announces it only while it is still the source's live failure. A retry that succeeded before
+    /// the UI thread got here has already cleared the latch, and reporting a failure the pipeline
+    /// recovered from would hand the application a fallback image for a frame that painted
+    /// correctly. The record itself is never re-latched from here, so a clear can never be undone
+    /// by a stale queued announcement.
+    /// </remarks>
+    internal void RaiseLatchedLoadFailure(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+
+        if (Volatile.Read(ref _loadFailure) is { } latched &&
+            ReferenceEquals(latched.Error, exception))
+        {
+            LoadFailed?.Invoke(this, exception);
+        }
+    }
+
+    /// <summary>
+    /// Drops a latched UPLOAD failure because a later upload of the same source succeeded.
+    /// </summary>
+    /// <remarks>
+    /// <para>Called from the successful branch of the render backend's upload, so a transient
+    /// device condition leaves no residue: the once-per-episode <c>ImageFailed</c> report re-arms,
+    /// and <see cref="LoadFailure"/> stops describing a failure the GPU has demonstrably recovered
+    /// from. Without it the latch is permanent, which silently downgrades the application channel
+    /// to one report per source for the life of the process.</para>
+    /// <para>A <see cref="ImageSourceFailureKind.Load"/> failure is deliberately untouched: a
+    /// successful upload of an older resident raster says nothing about the decode that failed, so
+    /// clearing it would un-suppress an element whose source really is broken. The unsynchronised
+    /// pre-read keeps the common case — every successful upload in the process — at one volatile
+    /// read.</para>
+    /// </remarks>
+    internal void ClearUploadFailure()
+    {
+        var latched = Volatile.Read(ref _loadFailure);
+        if (latched is null || latched.Kind != ImageSourceFailureKind.Upload)
+        {
+            return;
+        }
+
+        Interlocked.CompareExchange(ref _loadFailure, null, latched);
+    }
+
     /// <summary>Clears a previously reported failure after a successful load.</summary>
-    protected void ClearLoadFailure() => _loadFailure = null;
+    protected void ClearLoadFailure() => Volatile.Write(ref _loadFailure, null);
 
     /// <summary>
     /// Raised when an image source wants every GPU-side bitmap cache (one per
@@ -88,11 +311,17 @@ public abstract class ImageSource : Animation.Animatable, IFormattable
     /// the next render.
     /// </summary>
     /// <remarks>
-    /// Each <c>RenderTargetDrawingContext</c> subscribes in its constructor and
+    /// <para>Each <c>RenderTargetDrawingContext</c> subscribes in its constructor and
     /// unsubscribes when the context closes. Handlers run synchronously on the
     /// thread that raised the event — typically the UI thread — and must be
-    /// allocation-free; the source is the <see cref="ImageSource"/> whose GPU
-    /// upload should be dropped.
+    /// cheap; the source is the <see cref="ImageSource"/> whose GPU upload should
+    /// be dropped.</para>
+    /// <para>The raising thread is NOT the owner of the caches being asked to drop
+    /// anything: a GPU bitmap cache belongs to the render thread for as long as one
+    /// is running. A handler must therefore record the request and let its owner
+    /// apply it, never mutate cache state or destroy a native texture inline — that
+    /// races the render thread's own reads of the same dictionary and frees a
+    /// texture it is about to sample.</para>
     /// </remarks>
     internal static event Action<ImageSource>? GpuCacheEvictionRequested;
 
@@ -108,4 +337,75 @@ public abstract class ImageSource : Animation.Animatable, IFormattable
             handler(source);
         }
     }
+
+    /// <summary>
+    /// Raised when an image source has replaced the pixels behind an identity that every cache
+    /// keys on by reference — a deferred decode publishing a larger bucket, a reclaimed source
+    /// being restored — so every cached upload and every derived thumbnail of that source is now
+    /// stale even though the instance is unchanged.
+    /// </summary>
+    /// <remarks>
+    /// <para>Distinct from <see cref="GpuCacheEvictionRequested"/>, which asks caches to release
+    /// GPU memory for an image that is still correct. This one says the cached bytes are
+    /// <i>wrong</i>: a cache that ignores it keeps serving the superseded raster forever, with no
+    /// crash and no log line — the failure mode that makes a bucket upgrade look like it silently
+    /// did nothing.</para>
+    /// <para>Handlers run synchronously on the thread that raised the event and must be cheap.
+    /// Because the repaint leg hangs off this event rather than off a dispatcher post, no
+    /// dispatcher priority can starve it.</para>
+    /// <para>Same ownership rule as <see cref="GpuCacheEvictionRequested"/>: a handler may only
+    /// RECORD that a cached upload is now wrong. Dropping it inline would mutate a dictionary the
+    /// render thread is concurrently inserting into and dispose a texture it is about to draw
+    /// with. Deferring the drop is free here — a cache that compares
+    /// <see cref="ContentGeneration"/> re-uploads the replaced raster on its next draw whether or
+    /// not this event was ever delivered, so the event buys prompt release of the superseded
+    /// texture, not correctness.</para>
+    /// </remarks>
+    internal static event Action<ImageSource>? RasterChanged;
+
+    /// <summary>
+    /// Announces that <paramref name="source"/>'s pixels were replaced. No-op when nothing is
+    /// subscribed, which is the normal state in headless and unit-test hosts.
+    /// </summary>
+    internal static void RaiseRasterChanged(ImageSource source)
+    {
+        var handler = RasterChanged;
+        if (handler != null)
+        {
+            handler(source);
+        }
+    }
+
+    /// <summary>
+    /// Monotonically-increasing stamp of the pixel content currently behind this source. A cache
+    /// that recorded the value at upload time can detect that the source's raster was replaced
+    /// under a reference-equal instance by comparing against it.
+    /// </summary>
+    /// <remarks>
+    /// <para>Zero for sources whose content never changes under a stable reference, which is the
+    /// safe default: a cache comparing 0 against 0 behaves exactly as it did before this member
+    /// existed.</para>
+    /// <para>Deliberately <see cref="long"/> rather than the <see cref="uint"/>
+    /// <c>WriteableBitmap.ContentRevision</c> it generalises, so that an implementation stamping a
+    /// process-wide generation counter can hand back the identical value it published rather than a
+    /// truncation of it — a cache comparing a truncated stamp against an untruncated one never
+    /// matches and re-uploads the texture every single frame.</para>
+    /// </remarks>
+    internal virtual long ContentGeneration => 0L;
+
+    /// <summary>
+    /// Raised once after a batch of image-content notifications has been delivered, so hosts can
+    /// coalesce the repaint they owe into a single invalidation instead of one per image.
+    /// </summary>
+    /// <remarks>
+    /// Handlers run synchronously on the thread that raised the event — the main dispatcher for
+    /// decode completions — and must be allocation-free.
+    /// </remarks>
+    internal static event Action? ContentChangedBatchCompleted;
+
+    /// <summary>
+    /// Signals the end of a batch of image-content notifications. No-op when nothing is
+    /// subscribed, which is the normal state in headless and unit-test hosts.
+    /// </summary>
+    internal static void RaiseContentChangedBatchCompleted() => ContentChangedBatchCompleted?.Invoke();
 }

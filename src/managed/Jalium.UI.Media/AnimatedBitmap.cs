@@ -139,7 +139,42 @@ public sealed class AnimatedBitmap : ImageSource, IDisposable
         return anim;
     }
 
-    private void LoadFromBytes(byte[] data)
+    /// <summary>
+    /// Decodes every frame of <paramref name="data"/> WITHOUT touching a dispatcher, returning
+    /// <see langword="null"/> when the payload turns out to hold a single frame after all. The
+    /// caller must call <see cref="Play"/> on the UI thread to start playback.
+    /// </summary>
+    /// <remarks>
+    /// This is the entry point <c>BitmapImage</c>'s deferred metadata job uses to build its
+    /// internal animated substitute on a decode worker. <see cref="FromBytes"/> cannot be used
+    /// there: it auto-plays, and <see cref="Play"/> creates a <see cref="DispatcherTimer"/> bound
+    /// to <c>Dispatcher.CurrentDispatcher</c> — on a pooled worker that is a dispatcher nothing
+    /// will ever pump, and it can claim the process's main-dispatcher slot outright if it is the
+    /// first thread to touch one, which silently kills image notifications process-wide. Frame
+    /// decoding is the expensive half and stays on the worker; only the timer is deferred.
+    /// </remarks>
+    internal static AnimatedBitmap? TryCreateDetached(byte[] data)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        if (data.Length == 0)
+        {
+            return null;
+        }
+
+        var anim = new AnimatedBitmap();
+        anim.LoadFromBytes(data, autoPlay: false);
+        if (anim.FrameCount <= 1)
+        {
+            anim.Dispose();
+            return null;
+        }
+
+        return anim;
+    }
+
+    private void LoadFromBytes(byte[] data) => LoadFromBytes(data, autoPlay: true);
+
+    private void LoadFromBytes(byte[] data, bool autoPlay)
     {
         var decoder = GetDecoder();
         int frameCount = decoder.ReadFrameCount(data);
@@ -164,7 +199,7 @@ public sealed class AnimatedBitmap : ImageSource, IDisposable
 
         LoadCompleted?.Invoke(this, EventArgs.Empty);
 
-        if (_frames.Length > 1)
+        if (autoPlay && _frames.Length > 1)
         {
             Play();
         }

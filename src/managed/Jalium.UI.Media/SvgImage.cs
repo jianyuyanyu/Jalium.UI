@@ -136,18 +136,28 @@ public sealed class SvgImage : ImageSource, IDisposable
                 }
             }
 
+            ClearLoadFailure();
             OnSvgLoaded?.Invoke(this, EventArgs.Empty);
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[SvgImage] Failed to parse SVG: {ex.Message}");
+            ReportSvgFailure(DiagnosticSourceName, "SVG parse", ex);
         }
     }
 
     private void LoadFromFile(string filePath)
     {
         if (!System.IO.File.Exists(filePath))
+        {
+            // A path that does not exist used to return in silence, which made a typo in a Source
+            // URI indistinguishable from a working image that happens to draw nothing — the exact
+            // "renders blank, reports nothing" shape this channel exists to eliminate.
+            ReportSvgFailure(
+                filePath,
+                "SVG file missing",
+                new FileNotFoundException($"SVG file '{filePath}' was not found.", filePath));
             return;
+        }
 
         try
         {
@@ -156,12 +166,111 @@ public sealed class SvgImage : ImageSource, IDisposable
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[SvgImage] Failed to load SVG file: {ex.Message}");
+            ReportSvgFailure(filePath, "SVG file read", ex);
         }
+    }
+
+    /// <summary>Stable identity for this source in diagnostics records.</summary>
+    private string DiagnosticSourceName => _uriSource?.ToString() ?? "<svg>";
+
+    /// <inheritdoc />
+    private protected override string DiagnosticIdentity => DiagnosticSourceName;
+
+    /// <summary>
+    /// Records an SVG load or parse failure on the Release-live diagnostics channel and routes it
+    /// into <see cref="ImageSource.LoadFailed"/>, and through that into <c>Image.ImageFailed</c>.
+    /// </summary>
+    /// <remarks>
+    /// Every call site used to be a bare <c>Debug.WriteLine</c>, which is
+    /// <c>[Conditional("DEBUG")]</c> and therefore absent from the builds users actually run: a
+    /// malformed, missing or unreachable SVG rendered as nothing at all, with no evidence anywhere
+    /// in the process and no event the application could handle. Do not put a
+    /// <c>Debug.WriteLine</c> back here.
+    /// </remarks>
+    private void ReportSvgFailure(string source, string stage, Exception exception)
+    {
+        // Reported here rather than through ReportLoadFailure's own bridge because this names the
+        // FILE PATH and the stage, which a bare source identity ("<svg>" for a path-loaded image)
+        // cannot. ReportDiagnosedLoadFailure latches and announces without adding a second record.
+        Jalium.UI.Diagnostics.ImageDiagnostics.DecodeFailed(source, stage, exception);
+        ReportDiagnosedLoadFailure(exception);
+    }
+
+    /// <summary>
+    /// Resolves a relative URI the same way <see cref="Imaging.BitmapImage"/> does: assembly
+    /// manifest resources first (covering <c>&lt;Resource Include="..."/&gt;</c> items embedded by
+    /// Jalium.UI.Build), then a disk-relative probe against <see cref="AppContext.BaseDirectory"/>
+    /// for projects that ship the file as <c>&lt;Content CopyToOutputDirectory="..."/&gt;</c>.
+    /// </summary>
+    private void LoadFromRelativeUri(string relativePath)
+    {
+        var dotted = relativePath.Replace('/', '.').Replace('\\', '.').TrimStart('.');
+        var lastSep = relativePath.LastIndexOfAny(new[] { '/', '\\' });
+        var fileName = lastSep >= 0 ? relativePath[(lastSep + 1)..] : relativePath;
+
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            if (assembly.IsDynamic) continue;
+
+            string[] names;
+            try { names = assembly.GetManifestResourceNames(); }
+            catch { continue; }
+            if (names.Length == 0) continue;
+
+            var assemblyName = assembly.GetName().Name ?? string.Empty;
+            var match = Array.Find(names, n =>
+                string.Equals(n, dotted, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(n, assemblyName + "." + dotted, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(n, fileName, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(n, assemblyName + "." + fileName, StringComparison.OrdinalIgnoreCase));
+            if (match is null) continue;
+
+            try
+            {
+                using var stream = assembly.GetManifestResourceStream(match);
+                if (stream is null) continue;
+                using var reader = new System.IO.StreamReader(stream, System.Text.Encoding.UTF8);
+                LoadFromString(reader.ReadToEnd());
+                return;
+            }
+            catch (Exception ex)
+            {
+                ReportSvgFailure(match, "SVG manifest resource", ex);
+                return;
+            }
+        }
+
+        var basePath = AppContext.BaseDirectory;
+        if (!string.IsNullOrEmpty(basePath))
+        {
+            var candidate = System.IO.Path.Combine(basePath, relativePath);
+            if (System.IO.File.Exists(candidate))
+            {
+                LoadFromFile(candidate);
+                return;
+            }
+        }
+
+        ReportSvgFailure(
+            relativePath,
+            "SVG relative URI",
+            new FileNotFoundException(
+                $"The SVG resource '{relativePath}' could not be found in any loaded assembly's " +
+                "manifest resources or relative to the application's base directory.",
+                relativePath));
     }
 
     private void LoadFromUri(Uri uri)
     {
+        // Relative URIs must be handled BEFORE any scheme inspection: Uri.IsFile and Uri.Scheme
+        // both throw InvalidOperationException on a relative URI, so an
+        // <Image Source="Assets/icon.svg"/> used to take down the XAML build rather than render.
+        if (!uri.IsAbsoluteUri)
+        {
+            LoadFromRelativeUri(uri.OriginalString);
+            return;
+        }
+
         if (uri.IsFile || uri.Scheme == "file")
         {
             LoadFromFile(uri.LocalPath);
@@ -172,13 +281,32 @@ public sealed class SvgImage : ImageSource, IDisposable
             _httpCts = cts;
             _ = LoadFromHttpAsync(uri, cts.Token);
         }
+        else
+        {
+            // Every other scheme used to fall out of this method in silence: no drawing, no
+            // failure, no record — an <Image Source="pack://application:,,,/logo.svg"/> that
+            // renders nothing and reports nothing, which is indistinguishable from a working
+            // source whose content happens to be empty. Reported and latched like any other load
+            // failure, so it reaches ImageFailed and the trace file.
+            ReportSvgFailure(
+                uri.ToString(),
+                "SVG URI scheme",
+                new NotSupportedException(
+                    $"The SVG URI scheme '{uri.Scheme}' is not supported; use a file path, a " +
+                    "file:// URI, http(s), or assign the markup through SvgImage.FromSvgString."));
+        }
     }
 
     private async Task LoadFromHttpAsync(Uri uri, CancellationToken cancellationToken)
     {
+        // Resolved before the first await, i.e. still on the thread that assigned UriSource. Hoisted
+        // out of the try because the failure leg needs it too: the continuation below resumes on a
+        // pool thread (ConfigureAwait(false)) and BOTH legs end in application code — a Drawing swap
+        // plus OnSvgLoaded, or the LoadFailed chain and through it a routed-event raise.
+        var dispatcher = Jalium.UI.Threading.Dispatcher.CurrentDispatcher;
+
         try
         {
-            var dispatcher = Jalium.UI.Threading.Dispatcher.CurrentDispatcher;
             using var httpClient = new System.Net.Http.HttpClient();
             var svgContent = await httpClient.GetStringAsync(uri, cancellationToken).ConfigureAwait(false);
 
@@ -197,11 +325,25 @@ public sealed class SvgImage : ImageSource, IDisposable
         }
         catch (OperationCanceledException)
         {
-            // Load was cancelled
+            // Load was cancelled — UriSource was replaced or cleared. Not a failure, so it is
+            // deliberately not reported: an application that swaps sources quickly would otherwise
+            // see ImageFailed for every superseded load.
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[SvgImage] Failed to load SVG from HTTP: {ex.Message}");
+            // Counters and trace records are thread-safe, so they are taken here. The LoadFailed
+            // chain is not: it reaches a routed-event raise and a dependency-property read on the
+            // element that owns this source, and this continuation is on a pool thread. Marshal
+            // exactly that half back to the dispatcher that owned the assignment.
+            Jalium.UI.Diagnostics.ImageDiagnostics.DecodeFailed(uri.ToString(), "SVG HTTP load", ex);
+            if (dispatcher != null)
+            {
+                _ = dispatcher.BeginInvoke(() => ReportLoadFailure(ex));
+            }
+            else
+            {
+                ReportLoadFailure(ex);
+            }
         }
     }
 
