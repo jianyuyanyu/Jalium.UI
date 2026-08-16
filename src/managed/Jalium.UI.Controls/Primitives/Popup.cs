@@ -87,12 +87,38 @@ public partial class Popup : FrameworkElement
         return new Jalium.UI.Automation.Peers.PopupAutomationPeer(this);
     }
 
+    /// <summary>
+    /// The declaration-site element is only an anchor for placement and state.
+    /// Popup content receives input through <see cref="PopupRoot"/> (or the
+    /// external popup window) after opening, so this placeholder must never
+    /// cover siblings that render underneath it.
+    /// </summary>
+    protected override HitTestResult? HitTestCore(Point point) => null;
+
     private PopupRoot? _popupRoot;
     private OverlayLayer? _overlayLayer;
     private PopupWindow? _popupWindow;
     private Window? _parentWindow;
     private bool _isUsingExternalWindow;
     private DispatcherTimer? _openAnimationTimer;
+    private PopupRoot? _pendingContentSizeRoot;
+
+    /// <summary>
+    /// Gap kept between the cursor hot spot and a popup flipped above it (DIPs).
+    /// </summary>
+    private const double CursorFlipGap = 2.0;
+
+    /// <summary>
+    /// Cursor-anchored placements derive their position from the pointer, so their
+    /// overflow handling has to protect the hot spot instead of the placement target.
+    /// </summary>
+    private bool IsCursorAnchoredPlacement =>
+        Placement is PlacementMode.Mouse or PlacementMode.MousePoint;
+
+    /// <summary>
+    /// Gets whether the hosted popup subtree owns an active pointer capture.
+    /// </summary>
+    internal bool HasPointerCaptureWithin => _popupRoot?.HasPointerCaptureWithin == true;
 
     #region Dependency Properties
 
@@ -527,6 +553,23 @@ public partial class Popup : FrameworkElement
 
     #region Open / Close
 
+    /// <summary>
+    /// Ensures an already-logically-open popup has acquired a visual host.
+    /// </summary>
+    /// <remarks>
+    /// Template bindings may set <see cref="IsOpen"/> while their expanded template is
+    /// still detached. The property change is valid, but <see cref="OpenPopup"/> cannot
+    /// resolve a parent window at that point. Owners call this once template attachment
+    /// is complete so the missed first attempt does not leave a logically open popup blank.
+    /// </remarks>
+    internal void EnsureOpen()
+    {
+        if (IsOpen && _popupRoot == null)
+        {
+            OpenPopup();
+        }
+    }
+
     private void OpenPopup()
     {
         if (_popupRoot != null) return;
@@ -564,58 +607,23 @@ public partial class Popup : FrameworkElement
         var windowLocalPos = CalculateWindowLocalPosition(popupSize);
         var windowSize = new Size(_parentWindow.ActualWidth, _parentWindow.ActualHeight);
 
-        // 窗口级 AutoFlip 把 popup 夹回父窗口内（line 658-669 generic X clamp）；对 PreferExternalWindow
-        // 的 context-menu 类 popup，这会破坏"贴鼠标 / 飞出窗口"的目标，所以跳过 —— 屏幕级 flip 由
-        // OpenAsExternalWindow → ApplyScreenAutoFlip 兜底，保证不会跑到屏幕外或被任务栏遮住。
         bool supportsExternalPopup = Platform.PlatformFactory.IsWindows || Platform.PlatformFactory.IsLinux;
-        var skipWindowAutoFlip = PreferExternalWindow && !ShouldConstrainToRootBounds && supportsExternalPopup;
-        var adjustedPos = skipWindowAutoFlip ? windowLocalPos : ApplyAutoFlip(windowLocalPos, popupSize, windowSize);
+        bool useExternalWindow = ResolveHostPlacement(
+            windowLocalPos, popupSize, windowSize, supportsExternalPopup, out var adjustedPos);
 
         _popupRoot.Width = popupSize.Width;
         _popupRoot.Height = popupSize.Height;
 
-        // Decide: overlay or external window?
-        //   ShouldConstrainToRootBounds=true  → 永远 overlay（强约束）
-        //   PreferExternalWindow=true         → 直接外飞（context menu 语义；前提是 Windows）
-        //   否则                              → 看是否溢出父窗口/屏幕工作区，溢出才升级到外飞
-        if (ShouldConstrainToRootBounds)
+        // Constrained popups always remain overlays. Other popups promote only
+        // when explicitly preferred or when the resolved placement really lands
+        // outside the owner client area.
+        if (useExternalWindow)
         {
-            OpenAsOverlay(adjustedPos, popupSize, windowSize);
-        }
-        else if (PreferExternalWindow && supportsExternalPopup)
-        {
-            OpenAsExternalWindow(adjustedPos, popupSize);
+            OpenAsExternalWindow(windowLocalPos, popupSize);
         }
         else
         {
-            // Check if popup would overflow the window bounds
-            bool overflowsWindow = WouldOverflowWindow(adjustedPos, popupSize, windowSize);
-
-            // Even if within window bounds, check if popup would be outside
-            // the screen working area (behind taskbar, etc.)
-            bool overflowsScreen = false;
-            if (!overflowsWindow)
-            {
-                var screenPos = WindowLocalToScreen(adjustedPos);
-                var workArea = GetWorkingArea();
-                // screenPos and workArea are physical pixels; convert popupSize to physical
-                var dpiScale = _parentWindow!.DpiScale;
-                var physPopupW = popupSize.Width * dpiScale;
-                var physPopupH = popupSize.Height * dpiScale;
-                overflowsScreen = screenPos.Y + physPopupH > workArea.Bottom
-                    || screenPos.Y < workArea.Top
-                    || screenPos.X + physPopupW > workArea.Right
-                    || screenPos.X < workArea.Left;
-            }
-
-            if ((overflowsWindow || overflowsScreen) && supportsExternalPopup)
-            {
-                OpenAsExternalWindow(adjustedPos, popupSize);
-            }
-            else
-            {
-                OpenAsOverlay(adjustedPos, popupSize, windowSize);
-            }
+            OpenAsOverlay(adjustedPos, popupSize, windowSize);
         }
 
         // Subscribe to parent window moves for repositioning
@@ -676,8 +684,8 @@ public partial class Popup : FrameworkElement
         _popupWindow = new PopupWindow(_parentWindow!, _popupRoot!);
         var dpiScale = _parentWindow!.DpiScale;
         _popupWindow.Show(
-            (int)screenPos.X, (int)screenPos.Y,
-            (int)(popupSize.Width * dpiScale), (int)(popupSize.Height * dpiScale));
+            ToNativeHostOffset(screenPos.X), ToNativeHostOffset(screenPos.Y),
+            ToNativeHostSize(popupSize.Width, dpiScale), ToNativeHostSize(popupSize.Height, dpiScale));
 
         // Register with parent window for light dismiss
         if (!_parentWindow!.ActiveExternalPopups.Contains(this))
@@ -691,6 +699,7 @@ public partial class Popup : FrameworkElement
         if (_popupRoot == null) return;
 
         StopOpenAnimation(resetVisualState: true);
+        _pendingContentSizeRoot = null;
 
         if (_isUsingExternalWindow)
         {
@@ -720,6 +729,62 @@ public partial class Popup : FrameworkElement
         SetIsMouseOver(false);
 
         OnClosed(EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// Queues a content-driven host resize after the current popup layout pass.
+    /// </summary>
+    /// <remarks>
+    /// Popup content commonly arrives after opening (for example, async search
+    /// results). The initial host size must not remain frozen at the empty-state
+    /// measurement. Deferring avoids resizing a native popup window re-entrantly
+    /// from inside its measure pass while still coalescing a burst of child changes.
+    /// </remarks>
+    internal void QueueContentSizeUpdate(PopupRoot root)
+    {
+        if (!IsOpen || !ReferenceEquals(_popupRoot, root) ||
+            ReferenceEquals(_pendingContentSizeRoot, root))
+        {
+            return;
+        }
+
+        _pendingContentSizeRoot = root;
+        Dispatcher.CurrentDispatcher.BeginInvoke(() =>
+        {
+            if (!ReferenceEquals(_pendingContentSizeRoot, root))
+            {
+                return;
+            }
+
+            _pendingContentSizeRoot = null;
+            if (!IsOpen || !ReferenceEquals(_popupRoot, root))
+            {
+                return;
+            }
+
+            UpdateContentSize();
+        });
+    }
+
+    private void UpdateContentSize()
+    {
+        var child = Child;
+        var root = _popupRoot;
+        if (child == null || root == null || _parentWindow == null)
+        {
+            return;
+        }
+
+        var contentSize = MeasurePopupChild(child);
+        if (Math.Abs(root.Width - contentSize.Width) < 0.01 &&
+            Math.Abs(root.Height - contentSize.Height) < 0.01)
+        {
+            return;
+        }
+
+        root.Width = contentSize.Width;
+        root.Height = contentSize.Height;
+        UpdatePosition();
     }
 
     /// <summary>
@@ -848,14 +913,13 @@ public partial class Popup : FrameworkElement
         var popupSize = new Size(_popupRoot.Width, _popupRoot.Height);
         var windowLocalPos = CalculateWindowLocalPosition(popupSize);
         var windowSize = new Size(_parentWindow.ActualWidth, _parentWindow.ActualHeight);
-        // 与 OpenPopup 保持一致：外飞窗口的 popup 不做窗口级 AutoFlip，避免被夹回父窗口内。
         var supportsExternalPopup = Platform.PlatformFactory.IsWindows || Platform.PlatformFactory.IsLinux;
-        var skipWindowAutoFlip = PreferExternalWindow && !ShouldConstrainToRootBounds && supportsExternalPopup;
-        var adjustedPos = skipWindowAutoFlip ? windowLocalPos : ApplyAutoFlip(windowLocalPos, popupSize, windowSize);
+        var shouldPromote = ResolveHostPlacement(
+            windowLocalPos, popupSize, windowSize, supportsExternalPopup, out var overlayPos);
 
         if (_isUsingExternalWindow && _popupWindow != null)
         {
-            var screenPos = WindowLocalToScreen(adjustedPos);
+            var screenPos = WindowLocalToScreen(windowLocalPos);
             // Keep this symmetric with OpenAsExternalWindow: Linux popup
             // coordinates are owner-relative (and Wayland compositor
             // constrained), while Win32 receives global screen coordinates.
@@ -863,14 +927,21 @@ public partial class Popup : FrameworkElement
                 screenPos = ApplyScreenAutoFlip(screenPos, popupSize);
             var dpiScale = _parentWindow!.DpiScale;
             _popupWindow.MoveTo(
-                (int)screenPos.X, (int)screenPos.Y,
-                (int)(popupSize.Width * dpiScale), (int)(popupSize.Height * dpiScale));
+                ToNativeHostOffset(screenPos.X), ToNativeHostOffset(screenPos.Y),
+                ToNativeHostSize(popupSize.Width, dpiScale), ToNativeHostSize(popupSize.Height, dpiScale));
+        }
+        else if (shouldPromote)
+        {
+            // Content can grow after opening. Promote an existing overlay as soon
+            // as its requested bounds cross the owner instead of clamping it back.
+            _overlayLayer?.RemovePopupRoot(_popupRoot);
+            _overlayLayer = null;
+            OpenAsExternalWindow(windowLocalPos, popupSize);
         }
         else if (_overlayLayer != null)
         {
-            adjustedPos = ClampToWindow(adjustedPos, popupSize, windowSize);
-            Canvas.SetLeft(_popupRoot, adjustedPos.X);
-            Canvas.SetTop(_popupRoot, adjustedPos.Y);
+            Canvas.SetLeft(_popupRoot, overlayPos.X);
+            Canvas.SetTop(_popupRoot, overlayPos.Y);
             _overlayLayer.InvalidateVisual();
             RequestHostRender();
         }
@@ -994,6 +1065,18 @@ public partial class Popup : FrameworkElement
         var target = PlacementTarget ?? this;
         var targetBounds = GetPlacementBounds(target);
 
+        // Cursor-anchored placements must never end up underneath the pointer.
+        // Clamping them back into view would put popup pixels on the hot spot, so
+        // the element that owns the tooltip loses hover, hides the tooltip, gets
+        // MouseEnter again and the popup flickers open/closed forever. Flip above
+        // the cursor instead, matching WPF.
+        if (IsCursorAnchoredPlacement && position.Y + popupSize.Height > windowSize.Height)
+        {
+            double flippedY = position.Y - VerticalOffset - popupSize.Height - CursorFlipGap;
+            if (flippedY >= 0)
+                position = new Point(position.X, flippedY);
+        }
+
         // Vertical flip: Bottom -> Top
         if (position.Y + popupSize.Height > windowSize.Height && Placement == PlacementMode.Bottom)
         {
@@ -1047,12 +1130,134 @@ public partial class Popup : FrameworkElement
         return position;
     }
 
-    private static bool WouldOverflowWindow(Point position, Size popupSize, Size windowSize)
+    /// <summary>
+    /// Reports whether the popup rectangle at <paramref name="position"/> lies entirely
+    /// inside the owner client area.
+    /// </summary>
+    /// <remarks>
+    /// A maximized window's client area ends exactly at the work-area edge, so a popup
+    /// clamped against the taskbar lands flush with the owner bottom and the verdict is
+    /// decided by rounding noise alone: the screen round trip truncates to physical pixels
+    /// on the way out and rounds on the way back, worth up to half a physical pixel. The
+    /// tolerance covers that with margin and deliberately biases the answer towards staying
+    /// in the overlay — a popup one pixel short of the edge costs nothing, while a needless
+    /// promotion brings back the flicker this policy exists to prevent.
+    /// </remarks>
+    private static bool FitsInsideWindow(Point position, Size popupSize, Size windowSize)
     {
-        return position.X < 0
-            || position.Y < 0
-            || position.X + popupSize.Width > windowSize.Width
-            || position.Y + popupSize.Height > windowSize.Height;
+        const double tolerance = 1.0;
+        return position.X >= -tolerance
+            && position.Y >= -tolerance
+            && position.X + popupSize.Width <= windowSize.Width + tolerance
+            && position.Y + popupSize.Height <= windowSize.Height + tolerance;
+    }
+
+    /// <summary>
+    /// Pure host policy: a native popup window is required only when the resolved
+    /// placement really leaves the owner client area.
+    /// </summary>
+    /// <param name="resolvedPosition">
+    /// Owner-local position after every flip/clamp the platform can resolve up front.
+    /// Hosts without screen-level resolution (Linux, headless) pass the requested
+    /// position, which degrades this to a plain owner-bounds check.
+    /// </param>
+    internal static bool ShouldPromoteToExternalWindow(
+        bool supportsExternalPopup,
+        bool constrainToRootBounds,
+        bool preferExternalWindow,
+        Point resolvedPosition,
+        Size popupSize,
+        Size windowSize)
+    {
+        if (!supportsExternalPopup || constrainToRootBounds)
+        {
+            return false;
+        }
+
+        if (preferExternalWindow)
+        {
+            return true;
+        }
+
+        return !FitsInsideWindow(resolvedPosition, popupSize, windowSize);
+    }
+
+    /// <summary>
+    /// Determines whether owner-relative bounds require a native popup host, applying this
+    /// popup's own constrain/prefer policy on top of the shared rule.
+    /// </summary>
+    internal bool ShouldUseExternalWindowForBounds(
+        Point position,
+        Size popupSize,
+        Size windowSize,
+        bool supportsExternalPopup)
+    {
+        return ShouldPromoteToExternalWindow(
+            supportsExternalPopup,
+            ShouldConstrainToRootBounds,
+            PreferExternalWindow,
+            position,
+            popupSize,
+            windowSize);
+    }
+
+    /// <summary>
+    /// Picks the popup host and returns the owner-local position the overlay path uses.
+    /// </summary>
+    /// <remarks>
+    /// The invariant: a native popup window only pays off when the popup genuinely has to
+    /// paint outside the owner client area. Near the taskbar or a screen edge the
+    /// screen-level resolution (flip + work-area clamp) pushes the popup back inside the
+    /// owner, and a separate HWND becomes actively harmful there — it is topmost and hit
+    /// testable, so the moment it covers the cursor the owner receives WM_MOUSELEAVE, the
+    /// tooltip hides, the cursor lands back on the owning element and it reopens: an endless
+    /// flicker. Resolving the screen constraints *before* choosing the host removes that
+    /// whole class of promotion, instead of judging overflow from an unclamped request.
+    /// </remarks>
+    private bool ResolveHostPlacement(
+        Point requestedPosition,
+        Size popupSize,
+        Size windowSize,
+        bool supportsExternalPopup,
+        out Point overlayPosition)
+    {
+        // Constrained popups never leave the owner, so their placement keeps using the
+        // window-level flip exclusively — screen resolution would only add noise there.
+        var resolvedPosition = !supportsExternalPopup || ShouldConstrainToRootBounds
+            ? requestedPosition
+            : ResolveScreenConstrainedPosition(requestedPosition, popupSize);
+
+        if (ShouldUseExternalWindowForBounds(
+                resolvedPosition, popupSize, windowSize, supportsExternalPopup))
+        {
+            overlayPosition = requestedPosition;
+            return true;
+        }
+
+        // Window-level flip stays in charge of the overlay. It is an identity transform
+        // whenever the screen resolution already moved the popup back inside the owner.
+        overlayPosition = ClampToWindow(
+            ApplyAutoFlip(resolvedPosition, popupSize, windowSize),
+            popupSize,
+            windowSize);
+        return false;
+    }
+
+    /// <summary>
+    /// Resolves the requested position against the monitor work area (flip + clamp) and
+    /// converts it back to owner-local DIPs. Returns the input unchanged when no real HWND
+    /// is available or the platform has no global screen coordinates, which degrades the
+    /// caller's policy to an owner-bounds check.
+    /// </summary>
+    private Point ResolveScreenConstrainedPosition(Point requestedPosition, Size popupSize)
+    {
+        if (!OperatingSystem.IsWindows() || _parentWindow is null || _parentWindow.Handle == nint.Zero)
+        {
+            return requestedPosition;
+        }
+
+        var resolvedScreen = ApplyScreenAutoFlip(WindowLocalToScreen(requestedPosition), popupSize);
+        return ScreenToWindowLocal(resolvedScreen);
     }
 
     private static Point ClampToWindow(Point position, Size popupSize, Size windowSize)
@@ -1077,6 +1282,17 @@ public partial class Popup : FrameworkElement
         var targetScreenTopLeft = WindowLocalToScreen(new Point(targetWindowBounds.X, targetWindowBounds.Y));
         var physTargetW = targetWindowBounds.Width * dpiScale;
         var physTargetH = targetWindowBounds.Height * dpiScale;
+
+        // Cursor-anchored placements flip above the pointer rather than being clamped onto
+        // it — see the note in ApplyAutoFlip: a popup sitting on the hot spot costs the
+        // owning element its hover state and makes tooltips flicker.
+        if (IsCursorAnchoredPlacement && screenPos.Y + physPopupH > workArea.Bottom)
+        {
+            double cursorScreenY = screenPos.Y - (VerticalOffset * dpiScale);
+            double flippedY = cursorScreenY - physPopupH - (CursorFlipGap * dpiScale);
+            if (flippedY >= workArea.Top)
+                screenPos = new Point(screenPos.X, flippedY);
+        }
 
         // Vertical flip: Bottom -> Top of target
         if (screenPos.Y + physPopupH > workArea.Bottom &&
@@ -1181,6 +1397,76 @@ public partial class Popup : FrameworkElement
 
         ClientToScreen(_parentWindow!.Handle, ref pt);
         return new Point(pt.X, pt.Y);
+    }
+
+    /// <summary>
+    /// Inverse of <see cref="WindowLocalToScreen"/>: physical screen pixels back to
+    /// owner-local DIPs.
+    /// </summary>
+    private Point ScreenToWindowLocal(Point screenPhysical)
+    {
+        var dpiScale = _parentWindow!.DpiScale;
+        if (double.IsNaN(dpiScale) || double.IsInfinity(dpiScale) || dpiScale <= 0)
+            dpiScale = 1.0;
+
+        var pt = new POINT
+        {
+            X = (int)Math.Round(screenPhysical.X),
+            Y = (int)Math.Round(screenPhysical.Y)
+        };
+
+        if (OperatingSystem.IsWindows())
+        {
+            ScreenToClient(_parentWindow.Handle, ref pt);
+        }
+
+        return new Point(pt.X / dpiScale, pt.Y / dpiScale);
+    }
+
+    /// <summary>
+    /// Converts a DIP extent to the native popup host's physical pixel size, rounding up.
+    /// </summary>
+    /// <remarks>
+    /// The host derives its layout slot back from <c>physical / dpi</c> and arranges the popup
+    /// into it, so truncating leaves the slot a fraction of a pixel shorter than the content and
+    /// the layout clip eats the last column and row — exactly the missing right and bottom
+    /// border of an external popup. The overlay path stays in floating point end to end, which
+    /// is why the same popup keeps its border when it renders inside the window. The extra pixel
+    /// this rounding can add falls on the transparent margin and costs nothing.
+    /// </remarks>
+    internal static int ToNativeHostSize(double dipLength, double dpiScale)
+    {
+        if (double.IsNaN(dpiScale) || double.IsInfinity(dpiScale) || dpiScale <= 0)
+        {
+            dpiScale = 1.0;
+        }
+
+        var physical = dipLength * dpiScale;
+        if (double.IsNaN(physical) || double.IsInfinity(physical) || physical <= 1)
+        {
+            return 1;
+        }
+
+        return (int)Math.Ceiling(physical);
+    }
+
+    /// <summary>
+    /// Converts a physical screen coordinate to the native window origin, rounding down.
+    /// </summary>
+    /// <remarks>
+    /// Paired with the size rounding above: truncation rounds towards zero, so on a monitor left
+    /// of the primary one it would shift the origin right/down while the size grew, pushing
+    /// content past the clamped work-area edge. Floor keeps "the origin never moves inwards" true
+    /// for both signs.
+    /// </remarks>
+    internal static int ToNativeHostOffset(double screenPhysical)
+    {
+        if (double.IsNaN(screenPhysical) || double.IsInfinity(screenPhysical))
+        {
+            return 0;
+        }
+
+        return (int)Math.Floor(screenPhysical);
     }
 
     private double GetAutomaticPopupMaxHeight()

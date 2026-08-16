@@ -201,6 +201,54 @@ public class ContentDialogTests
     }
 
     [Fact]
+    public void PopupModalOverlay_ShouldTrackHostWindowResize_InBothDirections()
+    {
+        ResetApplicationState();
+        ResetInputState();
+        var app = new Application();
+
+        try
+        {
+            var window = CreateWindow(new Grid());
+            app.MainWindow = window;
+
+            var dialog = new ContentDialog
+            {
+                Title = "Dialog",
+                CloseButtonText = "Close"
+            };
+
+            _ = dialog.ShowAsync();
+            MeasureWindow(window);
+            ProcessUiQueue();
+
+            var host = GetPrivateField<ContentDialogOverlayHost>(dialog, "_popupHost");
+            var card = Assert.IsType<Border>(dialog.FindName("PART_DialogCard"));
+
+            AssertOverlayCoversViewport(dialog, host, card, 800, 600);
+
+            // Maximize. WM_SIZE writes Window.Width/Height and raises SizeChanged before the
+            // next layout pass writes ActualWidth/ActualHeight, so a modal overlay that copies
+            // ActualWidth in the handler stays one resize behind: the smoke layer keeps the
+            // restored size and the centred card shifts with it.
+            ResizeWindow(window, 1600, 900);
+            AssertOverlayCoversViewport(dialog, host, card, 1600, 900);
+
+            // Restore — the same lag in the opposite direction leaves an oversized overlay.
+            ResizeWindow(window, 800, 600);
+            AssertOverlayCoversViewport(dialog, host, card, 800, 600);
+
+            dialog.Hide();
+            ProcessUiQueue();
+        }
+        finally
+        {
+            ResetApplicationState();
+            ResetInputState();
+        }
+    }
+
+    [Fact]
     public void ExplicitSizeConstraints_ShouldOnlyResizeDialogCard()
     {
         ResetApplicationState();
@@ -730,6 +778,59 @@ public class ContentDialogTests
     {
         window.Measure(new Size(800, 600));
         window.Arrange(new Rect(0, 0, 800, 600));
+    }
+
+    /// <summary>
+    /// Reproduces the WM_SIZE ordering: the client size lands on Window.Width/Height and
+    /// SizeChanged fires first, and only afterwards does a layout pass refresh
+    /// ActualWidth/ActualHeight. Handlers therefore observe the *previous* arranged size.
+    /// </summary>
+    private static void ResizeWindow(Window window, double width, double height)
+    {
+        var previousSize = new Size(window.Width, window.Height);
+        window.Width = width;
+        window.Height = height;
+
+        RaiseWindowSizeChanged(window, previousSize);
+
+        window.Measure(new Size(width, height));
+        window.Arrange(new Rect(0, 0, width, height));
+    }
+
+    private static void RaiseWindowSizeChanged(Window window, Size previousSize)
+    {
+        var method = typeof(Window).GetMethod(
+            "OnSizeChanged",
+            BindingFlags.Instance | BindingFlags.NonPublic,
+            binder: null,
+            types: new[] { typeof(SizeChangedEventArgs) },
+            modifiers: null);
+        Assert.NotNull(method);
+
+        var args = new SizeChangedEventArgs(
+            new SizeChangedInfo(window, previousSize, widthChanged: true, heightChanged: true));
+        method!.Invoke(window, new object[] { args });
+    }
+
+    private static void AssertOverlayCoversViewport(
+        ContentDialog dialog,
+        ContentDialogOverlayHost host,
+        Border card,
+        double width,
+        double height)
+    {
+        Assert.Equal(width, host.ActualWidth);
+        Assert.Equal(height, host.ActualHeight);
+        Assert.Equal(width, host.VisualBounds.Width);
+        Assert.Equal(height, host.VisualBounds.Height);
+        Assert.Equal(0, host.VisualBounds.X);
+        Assert.Equal(0, host.VisualBounds.Y);
+
+        Assert.Equal(width, dialog.ActualWidth);
+        Assert.Equal(height, dialog.ActualHeight);
+
+        Assert.Equal((width - card.ActualWidth) / 2, card.VisualBounds.X, 3);
+        Assert.Equal((height - card.ActualHeight) / 2, card.VisualBounds.Y, 3);
     }
 
     private static void ProcessUiQueue()

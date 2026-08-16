@@ -95,6 +95,81 @@ public sealed class PopupContentSizingTests
     }
 
     [Fact]
+    public void OpenPopup_ResizesWhenVisibleContentChangesDesiredSize()
+    {
+        var dispatcher = Jalium.UI.Threading.Dispatcher.CurrentDispatcher;
+        dispatcher.ProcessQueue();
+
+        var content = new StackPanel();
+        content.Children.Add(new Border
+        {
+            Width = 240,
+            Height = 24,
+        });
+
+        var card = new Border
+        {
+            MinWidth = 240,
+            Child = content,
+        };
+        var host = new Grid
+        {
+            Width = 800,
+            Height = 600,
+        };
+        var popup = new Popup
+        {
+            Child = card,
+            PlacementTarget = host,
+            ShouldConstrainToRootBounds = true,
+            StaysOpen = true,
+        };
+        host.Children.Add(popup);
+
+        var window = new Window
+        {
+            Width = 800,
+            Height = 600,
+            Content = host,
+        };
+
+        try
+        {
+            popup.IsOpen = true;
+            window.Measure(new Size(800, 600));
+            window.Arrange(new Rect(0, 0, 800, 600));
+            dispatcher.ProcessQueue();
+
+            var popupRoot = GetPopupRoot(popup);
+            var initialHeight = popupRoot.Height;
+
+            content.Children.Add(new Border
+            {
+                Width = 240,
+                Height = 72,
+            });
+
+            window.Measure(new Size(800, 600));
+            window.Arrange(new Rect(0, 0, 800, 600));
+            dispatcher.ProcessQueue();
+            window.Measure(new Size(800, 600));
+            window.Arrange(new Rect(0, 0, 800, 600));
+
+            Assert.True(
+                popupRoot.Height >= initialHeight + 72 - 0.01,
+                $"Popup height stayed at {initialHeight} after content grew to {card.DesiredSize.Height}.");
+            Assert.True(
+                popupRoot.Height + 0.01 >= card.DesiredSize.Height,
+                $"Popup host height {popupRoot.Height} did not follow content height {card.DesiredSize.Height}.");
+        }
+        finally
+        {
+            popup.IsOpen = false;
+            dispatcher.ProcessQueue();
+        }
+    }
+
+    [Fact]
     public void ItemTemplatePopup_OpenedAfterLayout_KeepsTemplatedActionsInsideCard()
     {
         var model = new BindablePopupViewModel(

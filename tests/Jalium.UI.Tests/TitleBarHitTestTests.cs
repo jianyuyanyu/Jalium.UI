@@ -474,37 +474,31 @@ public class TitleBarHitTestTests
         Assert.Equal(workArea, maximized);
     }
 
-    [Theory]
-    [InlineData(-300, 0, 1200, 900)]       // left edge
-    [InlineData(0, 0, 1500, 900)]          // right edge
-    [InlineData(0, -200, 1200, 900)]       // top edge
-    [InlineData(0, 0, 1200, 1100)]         // bottom edge
-    [InlineData(-300, -200, 1200, 900)]    // top-left
-    public void NCCalcSize_InteractiveResize_RedrawsInsteadOfCopyingOldFrame(
-        int left,
-        int top,
-        int right,
-        int bottom)
+    [Fact]
+    public void NCCalcSize_WithParams_AlwaysRedrawsInsteadOfCopyingOldClientImage()
     {
-        var oldRect = (left: 0, top: 0, right: 1200, bottom: 900);
-        int actual = Window.ComputeNcCalcSizeResizeFlags(
-            (left, top, right, bottom),
-            oldRect);
-
-        Assert.Equal(0x0300, actual);
+        Assert.Equal(0x0300, Window.ComputeNcCalcSizeResult(hasNcCalcSizeParams: true));
     }
 
     [Fact]
-    public void NCCalcSize_MoveDoesNotRequestResizeRedraw()
+    public void NCCalcSize_WithoutParams_ReturnsZero()
     {
-        var oldRect = (left: 0, top: 0, right: 1200, bottom: 900);
+        Assert.Equal(0, Window.ComputeNcCalcSizeResult(hasNcCalcSizeParams: false));
+    }
 
-        Assert.Equal(0, Window.ComputeNcCalcSizeResizeFlags(
-            (left: 100, top: 50, right: 1300, bottom: 950),
-            oldRect));
-        Assert.Equal(0x0300, Window.ComputeNcCalcSizeResizeFlags(
-            (left: -100, top: 0, right: 1300, bottom: 900),
-            oldRect));
+    [Theory]
+    [InlineData(false, 0)]
+    [InlineData(true, 0x0300)]
+    public void NCCalcSize_BorderlessWndProc_UsesRedrawContract(
+        bool hasNcCalcSizeParams,
+        int expected)
+    {
+        var window = new NcCalcSizeProbeWindow
+        {
+            WindowStyle = WindowStyle.None
+        };
+
+        Assert.Equal((nint)expected, window.DispatchNcCalcSize(hasNcCalcSizeParams));
     }
 
     [Fact]
@@ -611,5 +605,18 @@ public class TitleBarHitTestTests
         Assert.NotNull(field);
 
         field!.SetValue(instance, value);
+    }
+
+    private sealed class NcCalcSizeProbeWindow : Window
+    {
+        public nint DispatchNcCalcSize(bool hasNcCalcSizeParams)
+        {
+            const uint WM_NCCALCSIZE = 0x0083;
+            return WndProc(
+                nint.Zero,
+                WM_NCCALCSIZE,
+                hasNcCalcSizeParams ? (nint)1 : nint.Zero,
+                nint.Zero);
+        }
     }
 }
