@@ -39,7 +39,11 @@ public abstract class Selector : ItemsControl
     [DevToolsPropertyCategory(DevToolsPropertyCategory.State)]
     public static readonly DependencyProperty SelectedIndexProperty =
         DependencyProperty.Register(nameof(SelectedIndex), typeof(int), typeof(Selector),
-            new PropertyMetadata(-1, OnSelectedIndexChanged));
+            new FrameworkPropertyMetadata(
+                -1,
+                FrameworkPropertyMetadataOptions.BindsTwoWayByDefault |
+                FrameworkPropertyMetadataOptions.Journal,
+                OnSelectedIndexChanged));
 
     /// <summary>
     /// Identifies the SelectedItem dependency property.
@@ -47,7 +51,10 @@ public abstract class Selector : ItemsControl
     [DevToolsPropertyCategory(DevToolsPropertyCategory.State)]
     public static readonly DependencyProperty SelectedItemProperty =
         DependencyProperty.Register(nameof(SelectedItem), typeof(object), typeof(Selector),
-            new PropertyMetadata(null, OnSelectedItemChanged));
+            new FrameworkPropertyMetadata(
+                null,
+                FrameworkPropertyMetadataOptions.BindsTwoWayByDefault,
+                OnSelectedItemChanged));
 
     /// <summary>
     /// Identifies the SelectedValue dependency property.
@@ -55,7 +62,10 @@ public abstract class Selector : ItemsControl
     [DevToolsPropertyCategory(DevToolsPropertyCategory.State)]
     public static readonly DependencyProperty SelectedValueProperty =
         DependencyProperty.Register(nameof(SelectedValue), typeof(object), typeof(Selector),
-            new PropertyMetadata(null, OnSelectedValueChanged));
+            new FrameworkPropertyMetadata(
+                null,
+                FrameworkPropertyMetadataOptions.BindsTwoWayByDefault,
+                OnSelectedValueChanged));
 
     /// <summary>
     /// Identifies the SelectedValuePath dependency property.

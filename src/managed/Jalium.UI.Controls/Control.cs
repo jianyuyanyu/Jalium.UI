@@ -541,44 +541,20 @@ public class Control : FrameworkElement
             {
                 _templateApplied = true;
 
-                // Set the templated parent for template bindings
-                SetTemplatedParentRecursive(_templateRoot, this);
-
-                // Mark the template root so Visual.RenderDirect paints it as a
-                // background layer (before this control's OnRender) instead of
-                // as a normal child (after OnRender). Without this flag, a
-                // template with an opaque Background would obscure the output
-                // of a self-drawing control's OnRender — that's the BarChart
-                // (and every other ChartBase-derived control) "blank box" bug.
-                _templateRoot.IsTemplatedRoot = true;
-
-                // Add to visual tree
-                AddVisualChild(_templateRoot);
-
-                // Template-authored literal values must participate as template values instead
-                // of local values so template triggers can override them.
-                PromoteTemplateLocalValuesRecursive(_templateRoot);
-
-                // Reactivate bindings now that the template tree is fully connected
-                // This allows RelativeSource FindAncestor bindings to resolve
-                ReactivateBindingsRecursive(_templateRoot);
-
-                // Apply template triggers
-                // Triggers are attached to the templated control (this) but target elements in the template by name
-                if (template.Triggers.Count > 0)
+                // 开启本次展开的绑定重算轮次。下面三处会各自碰到同一批元素，靠这个轮次戳
+                // 把「同一元素在一次展开里被重算三遍绑定」压成一遍——推导见
+                // DependencyObject 的 "Binding reactivation epoch" 一节。
+                // 嵌套展开（模板里的控件在 AddVisualChild 期间展开自己的模板）由
+                // Begin/End 的保存-还原隔离，因此必须 try/finally。
+                var previousEpoch = DependencyObject.BeginBindingReactivationEpoch();
+                try
                 {
-                    _appliedTemplateTriggers = template.Triggers;
-                    foreach (var trigger in _appliedTemplateTriggers)
-                    {
-                        // Set the parent template triggers so the trigger can find sibling triggers
-                        // when it needs to re-apply values after deactivation
-                        trigger.ParentTemplateTriggers = _appliedTemplateTriggers;
-                        trigger.Attach(this);
-                    }
+                    ExpandTemplateContent(template);
                 }
-
-                // Call OnApplyTemplate for derived classes to get template parts
-                OnApplyTemplate();
+                finally
+                {
+                    DependencyObject.EndBindingReactivationEpoch(previousEpoch);
+                }
 
                 InvalidateMeasure();
                 return true;
@@ -586,6 +562,63 @@ public class Control : FrameworkElement
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// <see cref="ApplyTemplateCore"/> 的主体：把已经 LoadContent 出来的模板树接上、重算、
+    /// 挂触发器。单独拆出来是为了让绑定重算轮次的 try/finally 包住全部三趟递归。
+    /// </summary>
+    private void ExpandTemplateContent(ControlTemplate template)
+    {
+        var templateRoot = _templateRoot!;
+
+        // Set the templated parent for template bindings.
+        // reactivateBindings: false —— 紧接着的 AddVisualChild 会通过 OnVisualParentChanged
+        // 对整棵可视子树重算一遍，够不到的非可视子节点再由下面的 ReactivateBindingsRecursive
+        // 兜住，所以这里不必先算一遍。
+        SetTemplatedParentRecursive(
+            templateRoot, this, reactivateBindings: !DependencyObject.TemplateExpansionDedupEnabled);
+
+        // Mark the template root so Visual.RenderDirect paints it as a
+        // background layer (before this control's OnRender) instead of
+        // as a normal child (after OnRender). Without this flag, a
+        // template with an opaque Background would obscure the output
+        // of a self-drawing control's OnRender — that's the BarChart
+        // (and every other ChartBase-derived control) "blank box" bug.
+        templateRoot.IsTemplatedRoot = true;
+
+        // Add to visual tree.
+        // 这一步经由 FrameworkElement.OnVisualParentChanged 对整棵可视子树做 scope 重算
+        // **并且**重算一遍绑定——那就是本次展开唯一一趟覆盖可视子树的绑定重算。
+        AddVisualChild(templateRoot);
+
+        // Template-authored literal values must participate as template values instead
+        // of local values so template triggers can override them.
+        PromoteTemplateLocalValuesRecursive(templateRoot);
+
+        // Reactivate bindings now that the template tree is fully connected.
+        // This allows RelativeSource FindAncestor bindings to resolve.
+        // 上一步的 AddVisualChild 已经覆盖了整棵可视子树，所以这一趟实际只对「可视树够不到的」
+        // 节点（Popup.Child、尚未进入可视树的 Border.Child / ContentControl.Content /
+        // Panel.Children）真正做事；其余节点靠轮次戳跳过重复重算，遍历照旧。
+        ReactivateBindingsRecursive(templateRoot);
+
+        // Apply template triggers
+        // Triggers are attached to the templated control (this) but target elements in the template by name
+        if (template.Triggers.Count > 0)
+        {
+            _appliedTemplateTriggers = template.Triggers;
+            foreach (var trigger in _appliedTemplateTriggers)
+            {
+                // Set the parent template triggers so the trigger can find sibling triggers
+                // when it needs to re-apply values after deactivation
+                trigger.ParentTemplateTriggers = _appliedTemplateTriggers;
+                trigger.Attach(this);
+            }
+        }
+
+        // Call OnApplyTemplate for derived classes to get template parts
+        OnApplyTemplate();
     }
 
     /// <summary>
@@ -699,26 +732,81 @@ public class Control : FrameworkElement
         _templateRegisteredNames.Add(name, element);
     }
 
-    internal static void SetTemplatedParentRecursive(FrameworkElement element, FrameworkElement parent)
+    // 环检测集合的线程内复用池。模板展开是整页构建里最高频的操作之一——页面上**每个**带
+    // ControlTemplate 的控件都要走一次这个递归，原先每次都新分配一个 HashSet。实测一个真实
+    // 页面有几百个带模板控件（向导页 920 个可视元素里绝大多数由模板展开产生），于是这里是
+    // 每页几百次纯属多余的分配 + 随之而来的 Gen0 压力。
+    //
+    // 复用是安全的：这个集合的生命周期严格限定在一次同步递归内，退出时清空；递归不跨线程
+    // （模板展开在 UI 线程上做），[ThreadStatic] 天然隔离。嵌套调用（模板里的控件在自己的
+    // 展开过程中又触发一次模板展开）用「借出即置空、归还时才写回」处理——嵌套那次拿不到
+    // 池里的实例，自己新分配一个，不会与外层共用同一个集合。
+    [ThreadStatic]
+    private static HashSet<FrameworkElement>? t_templatedParentVisitedPool;
+
+    /// <summary>
+    /// 借出环检测集合。三趟模板递归共用一个池：它们在一次展开里顺序执行、互不嵌套，
+    /// 而「借出即置空」的写法让万一发生的嵌套（例如某个 DP 写入间接引发另一次模板展开）
+    /// 自行新分配，永远不会两层共用同一个集合。
+    /// </summary>
+    private static HashSet<FrameworkElement> RentTemplateWalkVisitedSet()
     {
-        // The first element of the walk is the root of this expanded template instance; every
-        // ItemsPresenter reached from here is stamped with it so a discarded presenter can be
-        // told apart from the live one (see ItemsPresenter.AttachToOwner).
-        SetTemplatedParentRecursive(element, parent, element, new HashSet<FrameworkElement>(ReferenceEqualityComparer.Instance));
+        var visited = t_templatedParentVisitedPool;
+        if (visited is null)
+        {
+            return new HashSet<FrameworkElement>(ReferenceEqualityComparer.Instance);
+        }
+
+        t_templatedParentVisitedPool = null;
+        return visited;
+    }
+
+    private static void ReturnTemplateWalkVisitedSet(HashSet<FrameworkElement> visited)
+    {
+        visited.Clear();
+        t_templatedParentVisitedPool = visited;
+    }
+
+    internal static void SetTemplatedParentRecursive(FrameworkElement element, FrameworkElement parent) =>
+        SetTemplatedParentRecursive(element, parent, reactivateBindings: true);
+
+    /// <param name="reactivateBindings">
+    /// 传 false 表示调用方保证紧接着还会有一趟覆盖本子树的绑定重算——见
+    /// <see cref="FrameworkElement.SetTemplatedParent(FrameworkElement?, bool)"/> 上的推导。
+    /// 模板展开走这条路，把「每个元素重算三遍绑定」压到一遍。
+    /// </param>
+    internal static void SetTemplatedParentRecursive(
+        FrameworkElement element,
+        FrameworkElement parent,
+        bool reactivateBindings)
+    {
+        var visited = RentTemplateWalkVisitedSet();
+        try
+        {
+            // The first element of the walk is the root of this expanded template instance; every
+            // ItemsPresenter reached from here is stamped with it so a discarded presenter can be
+            // told apart from the live one (see ItemsPresenter.AttachToOwner).
+            SetTemplatedParentRecursive(element, parent, element, visited, reactivateBindings);
+        }
+        finally
+        {
+            ReturnTemplateWalkVisitedSet(visited);
+        }
     }
 
     private static void SetTemplatedParentRecursive(
         FrameworkElement element,
         FrameworkElement parent,
         FrameworkElement templateRoot,
-        HashSet<FrameworkElement> visited)
+        HashSet<FrameworkElement> visited,
+        bool reactivateBindings)
     {
         if (!visited.Add(element))
         {
             return;
         }
 
-        element.SetTemplatedParent(parent);
+        element.SetTemplatedParent(parent, reactivateBindings);
 
         // Stamp the presenter with its template instance root so a stray measure of a discarded
         // presenter cannot hijack the owner's live registration.
@@ -747,7 +835,7 @@ public class Control : FrameworkElement
         {
             if (element is ContentControl nestedContentControl && nestedContentControl.Content is FrameworkElement nestedContentChild)
             {
-                SetTemplatedParentRecursive(nestedContentChild, parent, templateRoot, visited);
+                SetTemplatedParentRecursive(nestedContentChild, parent, templateRoot, visited, reactivateBindings);
             }
 
             return;
@@ -759,26 +847,26 @@ public class Control : FrameworkElement
         {
             if (element.InternalGetVisualChild(i) is FrameworkElement child)
             {
-                SetTemplatedParentRecursive(child, parent, templateRoot, visited);
+                SetTemplatedParentRecursive(child, parent, templateRoot, visited, reactivateBindings);
             }
         }
 
         // Special handling for Popup - its Child is not a visual child but needs TemplatedParent
         if (element is Popup popup && popup.Child is FrameworkElement popupChild)
         {
-            SetTemplatedParentRecursive(popupChild, parent, templateRoot, visited);
+            SetTemplatedParentRecursive(popupChild, parent, templateRoot, visited, reactivateBindings);
         }
 
         // Special handling for Border - its Child might not be in visual tree yet
         if (element is Border border && border.Child is FrameworkElement borderChild)
         {
-            SetTemplatedParentRecursive(borderChild, parent, templateRoot, visited);
+            SetTemplatedParentRecursive(borderChild, parent, templateRoot, visited, reactivateBindings);
         }
 
         // Special handling for ContentControl - its content might not be in visual tree yet
         if (element is ContentControl contentControl && contentControl.Content is FrameworkElement contentChild)
         {
-            SetTemplatedParentRecursive(contentChild, parent, templateRoot, visited);
+            SetTemplatedParentRecursive(contentChild, parent, templateRoot, visited, reactivateBindings);
         }
 
         // Special handling for Panel - ensure all children are processed
@@ -788,7 +876,7 @@ public class Control : FrameworkElement
             {
                 if (panelChild is FrameworkElement panelChildElement)
                 {
-                    SetTemplatedParentRecursive(panelChildElement, parent, templateRoot, visited);
+                    SetTemplatedParentRecursive(panelChildElement, parent, templateRoot, visited, reactivateBindings);
                 }
             }
         }
@@ -796,6 +884,37 @@ public class Control : FrameworkElement
 
     internal static void PromoteTemplateLocalValuesRecursive(FrameworkElement element)
     {
+        // visited 为 null 表示关闭环检测（仅基准对照用），此时行为与优化前逐字一致。
+        var visited = DependencyObject.TemplateExpansionDedupEnabled
+            ? RentTemplateWalkVisitedSet()
+            : null;
+        try
+        {
+            PromoteTemplateLocalValuesRecursive(element, visited);
+        }
+        finally
+        {
+            if (visited != null)
+            {
+                ReturnTemplateWalkVisitedSet(visited);
+            }
+        }
+    }
+
+    private static void PromoteTemplateLocalValuesRecursive(
+        FrameworkElement element,
+        HashSet<FrameworkElement>? visited)
+    {
+        // 环检测不是可选的正确性防线，而是复杂度防线：这两趟递归在遍历可视子节点之外，
+        // 还对 Border.Child / Panel.Children / ContentControl.Content 各再走一遍，而这些
+        // 在此刻**已经**是可视子节点，于是同一个节点每下一层就被重复访问一次，整体是
+        // O(2^depth) 而不是 O(n)。去重后行为完全不变——第二次访问本来就是空操作
+        // （Local 层已被搬空、绑定已重算过），只是白跑一遍子树。
+        if (visited != null && !visited.Add(element))
+        {
+            return;
+        }
+
         element.PromoteLocalValuesToLayer(DependencyObject.LayerValueSource.ParentTemplate);
         DynamicResourceBindingOperations.PromoteDynamicResourcesToLayer(
             element,
@@ -812,26 +931,26 @@ public class Control : FrameworkElement
         {
             if (element.InternalGetVisualChild(i) is FrameworkElement child)
             {
-                PromoteTemplateLocalValuesRecursive(child);
+                PromoteTemplateLocalValuesRecursive(child, visited);
             }
         }
 
         // Special handling for Popup - its Child is not a visual child but needs template layering
         if (element is Popup popup && popup.Child is FrameworkElement popupChild)
         {
-            PromoteTemplateLocalValuesRecursive(popupChild);
+            PromoteTemplateLocalValuesRecursive(popupChild, visited);
         }
 
         // Special handling for Border - its Child might not be in visual tree yet
         if (element is Border border && border.Child is FrameworkElement borderChild)
         {
-            PromoteTemplateLocalValuesRecursive(borderChild);
+            PromoteTemplateLocalValuesRecursive(borderChild, visited);
         }
 
         // Special handling for ContentControl - its content might not be in visual tree yet
         if (element is ContentControl contentControl && contentControl.Content is FrameworkElement contentChild)
         {
-            PromoteTemplateLocalValuesRecursive(contentChild);
+            PromoteTemplateLocalValuesRecursive(contentChild, visited);
         }
 
         // Special handling for Panel - ensure all children are processed
@@ -841,7 +960,7 @@ public class Control : FrameworkElement
             {
                 if (panelChild is FrameworkElement panelChildElement)
                 {
-                    PromoteTemplateLocalValuesRecursive(panelChildElement);
+                    PromoteTemplateLocalValuesRecursive(panelChildElement, visited);
                 }
             }
         }
@@ -849,13 +968,67 @@ public class Control : FrameworkElement
 
     internal static void ReactivateBindingsRecursive(FrameworkElement element)
     {
-        // Reactivate bindings on this element
-        element.ReactivateBindings();
+        // visited 为 null 表示关闭环检测（仅基准对照用），此时行为与优化前逐字一致。
+        var visited = DependencyObject.TemplateExpansionDedupEnabled
+            ? RentTemplateWalkVisitedSet()
+            : null;
+        try
+        {
+            ReactivateBindingsRecursive(element, visited);
+        }
+        finally
+        {
+            if (visited != null)
+            {
+                ReturnTemplateWalkVisitedSet(visited);
+            }
+        }
+    }
+
+    private static void ReactivateBindingsRecursive(
+        FrameworkElement element,
+        HashSet<FrameworkElement>? visited)
+    {
+        // 环检测不是可选的正确性防线，而是复杂度防线：这两趟递归在遍历可视子节点之外，
+        // 还对 Border.Child / Panel.Children / ContentControl.Content 各再走一遍，而这些
+        // 在此刻**已经**是可视子节点，于是同一个节点每下一层就被重复访问一次，整体是
+        // O(2^depth) 而不是 O(n)。去重后行为完全不变——第二次访问本来就是空操作
+        // （Local 层已被搬空、绑定已重算过），只是白跑一遍子树。
+        if (visited != null && !visited.Add(element))
+        {
+            return;
+        }
+
+        // Reactivate bindings on this element.
+        //
+        // ★剪枝：模板展开期间，AddVisualChild 触发的 OnVisualParentChanged 已经把整棵**可视**
+        // 子树重算过一遍了。本趟的不可替代价值只在于够到可视树够不到的节点（Popup.Child、
+        // 尚未进入可视树的 Border.Child / ContentControl.Content / Panel.Children）。
+        // 对本轮已经重算过的元素再跑一遍 ReactivateBindings，只是对已激活的绑定重复
+        // UpdateTarget()：取同样的源值、写同样的目标值，可证明无可观察效果。
+        // 于是这里跳过重算、但**照常继续遍历**——遍历本身很便宜，而漏掉它就会漏掉那些
+        // 挂在已重算节点下面的非可视子节点。
+        if (!element.WasBindingReactivationDoneInCurrentEpoch())
+        {
+            element.ReactivateBindings();
+        }
 
         // If this element is a Control that has already applied its own template,
         // do NOT descend into its template children.
         if (element is Control control && control._templateApplied)
+        {
+            // 但外层模板写在它身上的 Content 属于外层模板的命名域，仍归本趟负责——
+            // 这与 SetTemplatedParentRecursive 在 Control 边界上的处理一致（见那里的注释）。
+            // 少了这一条，"模板里嵌一个已展开模板的 ContentControl，其 Content 尚未被
+            // ContentPresenter 实体化" 这种形态就会漏掉绑定重算。
+            if (element is ContentControl nestedContentControl &&
+                nestedContentControl.Content is FrameworkElement nestedContentChild)
+            {
+                ReactivateBindingsRecursive(nestedContentChild, visited);
+            }
+
             return;
+        }
 
         // Process visual children
         var childCount = element.InternalVisualChildrenCount;
@@ -863,26 +1036,26 @@ public class Control : FrameworkElement
         {
             if (element.InternalGetVisualChild(i) is FrameworkElement child)
             {
-                ReactivateBindingsRecursive(child);
+                ReactivateBindingsRecursive(child, visited);
             }
         }
 
         // Special handling for Popup
         if (element is Popup popup && popup.Child is FrameworkElement popupChild)
         {
-            ReactivateBindingsRecursive(popupChild);
+            ReactivateBindingsRecursive(popupChild, visited);
         }
 
         // Special handling for Border
         if (element is Border border && border.Child is FrameworkElement borderChild)
         {
-            ReactivateBindingsRecursive(borderChild);
+            ReactivateBindingsRecursive(borderChild, visited);
         }
 
         // Special handling for ContentControl
         if (element is ContentControl contentControl && contentControl.Content is FrameworkElement contentChild)
         {
-            ReactivateBindingsRecursive(contentChild);
+            ReactivateBindingsRecursive(contentChild, visited);
         }
 
         // Special handling for Panel
@@ -892,7 +1065,7 @@ public class Control : FrameworkElement
             {
                 if (panelChild is FrameworkElement panelChildElement)
                 {
-                    ReactivateBindingsRecursive(panelChildElement);
+                    ReactivateBindingsRecursive(panelChildElement, visited);
                 }
             }
         }

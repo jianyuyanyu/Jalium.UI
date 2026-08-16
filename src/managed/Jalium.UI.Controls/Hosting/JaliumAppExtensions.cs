@@ -180,17 +180,24 @@ public static class JaliumAppExtensions
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Path fills are the dominant per-present GPU cost on weak GPUs (8× stencil-
-    /// then-cover paths measured ~6–7 ms each on an iGPU). Default is
-    /// <see cref="PathAntiAliasing.Msaa8x"/> (unchanged historical behavior).
+    /// This affects LARGE paths only. Icon- and control-scale fills always use
+    /// analytic coverage — exact edges, and cheap at that size — so this knob
+    /// cannot make a small icon look worse (or better). It governs full-page
+    /// vector artwork, where path fills are the dominant per-present GPU cost on
+    /// weak GPUs (8× stencil-then-cover paths measured ~6–7 ms each on an iGPU).
+    /// Default is <see cref="PathAntiAliasing.Msaa8x"/> (unchanged historical
+    /// behavior).
     /// </para>
     /// <list type="bullet">
-    ///   <item><see cref="PathAntiAliasing.Analytic"/> — cheapest; analytic coverage
-    ///   AA (how WPF / Chromium anti-alias 2D vectors). Best for weak integrated GPUs.</item>
+    ///   <item><see cref="PathAntiAliasing.Analytic"/> — cheapest on the GPU; analytic
+    ///   coverage AA (how WPF / Chromium anti-alias 2D vectors) for large paths too,
+    ///   so no MSAA scratch target is allocated at all. Best for weak integrated GPUs.</item>
     ///   <item><see cref="PathAntiAliasing.Msaa4x"/> — the common MSAA baseline; roughly
     ///   halves the path cost vs 8× with near-identical quality.</item>
     ///   <item><see cref="PathAntiAliasing.Msaa8x"/> — historical default.</item>
-    ///   <item><see cref="PathAntiAliasing.Msaa16x"/> — maximum smoothness (GPU permitting).</item>
+    ///   <item><see cref="PathAntiAliasing.Msaa16x"/> — maximum smoothness. Resolved
+    ///   against real device caps and stepped down when unsupported, so it is always
+    ///   safe to ask for; costs a viewport-sized 16× scratch when large paths appear.</item>
     /// </list>
     /// <example>
     /// <code>

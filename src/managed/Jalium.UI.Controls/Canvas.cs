@@ -111,8 +111,8 @@ public class Canvas : Panel
     /// <inheritdoc />
     protected override Size MeasureOverride(Size availableSize)
     {
-        // Canvas measures children with infinite space but returns Size(0,0)
-        // like WPF 閳?it relies on parent layout to determine its actual size.
+        // Canvas measures children with infinite space but returns Size(0,0) like WPF —
+        // it relies on parent layout to determine its actual size.
         foreach (UIElement child in Children.EnumerateStruct())
         {
             if (child is not FrameworkElement fe) continue;
@@ -128,43 +128,51 @@ public class Canvas : Panel
         foreach (UIElement child in Children.EnumerateStruct())
         {
             if (child is not FrameworkElement fe) continue;
-
-            var left = GetLeft(child);
-            var top = GetTop(child);
-            var right = GetRight(child);
-            var bottom = GetBottom(child);
-
-            double x = 0;
-            double y = 0;
-            double width = fe.DesiredSize.Width;
-            double height = fe.DesiredSize.Height;
-
-            // Determine X position
-            if (!double.IsNaN(left))
-            {
-                x = left;
-            }
-            else if (!double.IsNaN(right))
-            {
-                x = finalSize.Width - right - width;
-            }
-
-            // Determine Y position
-            if (!double.IsNaN(top))
-            {
-                y = top;
-            }
-            else if (!double.IsNaN(bottom))
-            {
-                y = finalSize.Height - bottom - height;
-            }
-
-            var arrangeRect = new Rect(x, y, width, height);
-            fe.Arrange(arrangeRect);
-            // Note: Do NOT call SetVisualBounds here - ArrangeCore already handles margin
+            ArrangeChild(fe, finalSize);
         }
 
         return finalSize;
+    }
+
+    /// <summary>
+    /// Arranges a single child at its attached Left/Top/Right/Bottom position using its
+    /// desired size. Derived panels can override this to place specific children in a
+    /// different slot.
+    /// </summary>
+    protected virtual void ArrangeChild(FrameworkElement child, Size finalSize)
+    {
+        var left = GetLeft(child);
+        var top = GetTop(child);
+        var right = GetRight(child);
+        var bottom = GetBottom(child);
+
+        double x = 0;
+        double y = 0;
+        double width = child.DesiredSize.Width;
+        double height = child.DesiredSize.Height;
+
+        // Determine X position
+        if (!double.IsNaN(left))
+        {
+            x = left;
+        }
+        else if (!double.IsNaN(right))
+        {
+            x = finalSize.Width - right - width;
+        }
+
+        // Determine Y position
+        if (!double.IsNaN(top))
+        {
+            y = top;
+        }
+        else if (!double.IsNaN(bottom))
+        {
+            y = finalSize.Height - bottom - height;
+        }
+
+        // Note: Do NOT call SetVisualBounds here - ArrangeCore already handles margin
+        child.Arrange(new Rect(x, y, width, height));
     }
 
     #endregion

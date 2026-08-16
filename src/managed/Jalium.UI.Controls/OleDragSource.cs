@@ -601,17 +601,22 @@ internal static unsafe class OleDragSource
     {
         pixels = null; width = 0; height = 0;
 
-        // Fast path: BitmapImage already holds straight BGRA.
-        if (image is BitmapImage bi && bi.RawPixelData is { Length: > 0 } raw)
+        // Fast path: BitmapImage already holds straight BGRA. Read as one publication — buffer,
+        // dimensions and stride produced together — because a decode worker replaces all four at
+        // once and a drag image built from a mix of two publications is sheared or out of range.
+        if (image is BitmapImage bi &&
+            bi.TryGetPixelSnapshot(out var snapshot) &&
+            snapshot is { Pixels.Length: > 0 })
         {
-            width = bi.PixelWidth;
-            height = bi.PixelHeight;
+            var raw = snapshot.Pixels;
+            width = snapshot.Width;
+            height = snapshot.Height;
             if (width <= 0 || height <= 0) return false;
 
             int dstStride = width * 4;
-            // Use the authoritative row stride — WIC-decoded images can pad rows,
+            // The authoritative row stride — WIC-decoded images can pad rows,
             // so inferring it from the buffer length would shear the drag image.
-            int srcStride = bi.PixelStride > 0 ? bi.PixelStride : dstStride;
+            int srcStride = snapshot.Stride > 0 ? snapshot.Stride : dstStride;
             if (raw.Length < (long)srcStride * height) return false;
 
             if (srcStride == dstStride)
