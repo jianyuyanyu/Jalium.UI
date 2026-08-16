@@ -337,15 +337,20 @@ private:
     bool IdentityMatrixSkip(const float* m);
     void CommitDeferredState();
     void EmitDeferredOp(const DeferredStateOp& op);
+    // Pushes a rounded clip's scissor (outward-expanded to whole pixels) and its
+    // antialiased SDF mask (exact geometry) — deliberately different rects.
+    void EmitRoundedClipPair(float x, float y, float w, float h,
+                             float tl, float tr, float br, float bl,
+                             bool perCorner);
 
     // Brush → SdfRectInstance helpers
     bool FillBrushToInstance(Brush* brush, SdfRectInstance& inst);
-    // Keeps a continuous-corner gradient outline on the analytic SDF path.
-    // Returns false for ordinary rounded rectangles and non-gradient brushes,
-    // allowing their existing rendering routes to remain unchanged.
-    bool TryDrawContinuousGradientStroke(float x, float y, float w, float h,
-                                         float tl, float tr, float br, float bl,
-                                         Brush* brush, float strokeWidth);
+    // Keeps rectangle, rounded-rectangle, and continuous-corner gradient
+    // outlines on the same per-pixel analytic SDF sampler as gradient fills.
+    // Returns false only for non-gradient brushes or invalid stroke geometry.
+    bool TryDrawGradientStroke(float x, float y, float w, float h,
+                               float tl, float tr, float br, float bl,
+                               Brush* brush, float strokeWidth);
     bool ExtractBrushColor(Brush* brush, float& r, float& g, float& b, float& a);
 
     // Brush → EngineBrushData (solid + linear/radial gradients), for the Impeller
@@ -425,7 +430,12 @@ private:
     void SyncScissorToImpeller();
 
     bool isDrawing_ = false;
-    bool lastEffectCaptureOk_ = false;  // tracks whether BeginEffectCapture succeeded
+    // One result per managed BeginEffectCapture scope. D3D12 has a single
+    // element-effect offscreen target, so a nested capture safely degrades to
+    // pass-through; the stack prevents that inner failure from clobbering the
+    // outer capture's successful state before its matching End call.
+    std::vector<bool> effectCaptureScopeStack_;
+    bool lastEffectCaptureOk_ = false;  // result of the most recently ended scope
     bool tearingSupported_ = false;
     bool isComposition_ = false;
     bool vsyncEnabled_ = false;

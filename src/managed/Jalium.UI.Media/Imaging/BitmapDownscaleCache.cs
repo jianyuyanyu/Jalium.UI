@@ -23,20 +23,42 @@ namespace Jalium.UI.Media.Imaging;
 /// </summary>
 internal static class BitmapDownscaleCache
 {
+    /// <summary>
+    /// Cache identity of one thumbnail: which source, at which bucket, synthesised from WHICH
+    /// publication of that source's pixels.
+    /// </summary>
+    /// <remarks>
+    /// <para>The generation is the load-bearing field and it is why this is a struct rather than
+    /// the packed <c>ulong</c> it replaced. That layout was a 32-bit identity hash plus two 16-bit
+    /// bucket edges — 64 bits with not one spare — so there was nowhere to put a generation. The
+    /// consequence was silent and permanent: a deferred bitmap that upgraded its display bucket
+    /// keeps its reference identity, so the key was unchanged, so every later frame was served the
+    /// thumbnail synthesised from the SUPERSEDED small buffer. The upgrade decode ran in full and
+    /// the picture never got sharper, with no crash and no log line to say why.</para>
+    /// <para>Superseded entries are not purged explicitly: their key can never be produced again,
+    /// so they simply age out of the LRU tail.</para>
+    /// </remarks>
+    /// <param name="SourceId">Identity hash of the source bitmap. A collision costs one cache
+    /// miss, never a wrong image, because the generation must match too.</param>
+    /// <param name="BucketW">Quantized target width.</param>
+    /// <param name="BucketH">Quantized target height.</param>
+    /// <param name="Generation">Publication id of the pixels the thumbnail was synthesised from.</param>
+    private readonly record struct DownscaleKey(int SourceId, int BucketW, int BucketH, long Generation);
+
     private sealed class Entry
     {
-        public ulong Key;
+        public DownscaleKey Key;
         public BitmapImage Thumbnail = null!;
         public long Bytes;
     }
 
     private static readonly LinkedList<Entry> s_lru = new();
-    private static readonly Dictionary<ulong, LinkedListNode<Entry>> s_byKey = new();
-    // Set of (source,bucket) keys currently scheduled or being processed.
+    private static readonly Dictionary<DownscaleKey, LinkedListNode<Entry>> s_byKey = new();
+    // Set of (source,bucket,generation) keys currently scheduled or being processed.
     // Guards against the same key being queued twice during a fast scroll
     // burst — the second DrawImage call hits this set and returns instead
     // of stacking another box-filter onto the thread pool.
-    private static readonly HashSet<ulong> s_inFlight = new();
+    private static readonly HashSet<DownscaleKey> s_inFlight = new();
     private static long s_totalBytes;
     private const long MaxBytes = 100L * 1024 * 1024;  // 100 MB managed
     private const int MaxBucketDim = 4096;
@@ -59,13 +81,30 @@ internal static class BitmapDownscaleCache
     /// 合成**,合成请求通过 <see cref="TryGetOrCreate"/> 调用方在 fallback 同时入队的
     /// 异步路径完成。
     /// </summary>
-    public static bool TryGetOrCreate(BitmapImage source, int targetW, int targetH, out BitmapImage thumb)
+    /// <param name="source">The bitmap being drawn; only its identity is used for the key.</param>
+    /// <param name="snapshot">
+    /// The caller's already-resolved publication of <paramref name="source"/>'s pixels. Passed in
+    /// rather than re-read here so the dimensions used for the key, the ratio test and the
+    /// box-filter all come from the SAME publication the caller is drawing — re-reading
+    /// <c>RawPixelData</c>/<c>PixelWidth</c>/<c>PixelStride</c> as separate properties can
+    /// interleave with a publishing decode worker and pair one decode's buffer with another's
+    /// dimensions.
+    /// </param>
+    /// <param name="targetW">Target width in the caller's device-ish pixels.</param>
+    /// <param name="targetH">Target height in the caller's device-ish pixels.</param>
+    /// <param name="thumb">The cached thumbnail on a hit.</param>
+    public static bool TryGetOrCreate(
+        BitmapImage source,
+        BitmapPixelSnapshot snapshot,
+        int targetW,
+        int targetH,
+        out BitmapImage thumb)
     {
         thumb = null!;
-        if (source.RawPixelData == null) return false;
+        if (snapshot is null) return false;
 
-        int srcW = source.PixelWidth;
-        int srcH = source.PixelHeight;
+        int srcW = snapshot.Width;
+        int srcH = snapshot.Height;
         if (srcW <= 0 || srcH <= 0 || targetW <= 0 || targetH <= 0) return false;
 
         long srcPixels = (long)srcW * srcH;
@@ -76,7 +115,7 @@ internal static class BitmapDownscaleCache
         int bucketH = NextPow2Bucket(targetH);
         if (bucketW >= srcW && bucketH >= srcH) return false;  // 不算缩略
 
-        ulong key = MakeKey(source, bucketW, bucketH);
+        var key = MakeKey(source, snapshot, bucketW, bucketH);
 
         lock (s_lock)
         {
@@ -94,21 +133,17 @@ internal static class BitmapDownscaleCache
         // is at capacity). Caller will fall back to the original source for
         // this frame; the next frame that needs the same (source, bucket)
         // either hits cache (synthesis done) or re-fallback (still pending).
-        EnqueueSynthesis(source, srcW, srcH, bucketW, bucketH, key);
+        EnqueueSynthesis(snapshot, bucketW, bucketH, key);
         return false;
     }
 
-    private static ulong MakeKey(BitmapImage source, int bucketW, int bucketH)
-    {
-        // identity hash (32 bit) × bucketW (16 bit) × bucketH (16 bit)
+    private static DownscaleKey MakeKey(
+        BitmapImage source, BitmapPixelSnapshot snapshot, int bucketW, int bucketH) =>
         // identity hash 碰撞概率极低;碰撞最坏 cache miss 一次,无 crash。
-        int sourceId = RuntimeHelpers.GetHashCode(source);
-        return ((ulong)(uint)sourceId << 32)
-             | ((ulong)(ushort)bucketW << 16)
-             | (ulong)(ushort)bucketH;
-    }
+        new(RuntimeHelpers.GetHashCode(source), bucketW, bucketH, snapshot.Generation);
 
-    private static void EnqueueSynthesis(BitmapImage source, int srcW, int srcH, int bucketW, int bucketH, ulong key)
+    private static void EnqueueSynthesis(
+        BitmapPixelSnapshot snapshot, int bucketW, int bucketH, DownscaleKey key)
     {
         lock (s_lock)
         {
@@ -116,19 +151,17 @@ internal static class BitmapDownscaleCache
             if (!s_inFlight.Add(key)) return;  // already scheduled
         }
 
-        // Capture only what we need; the source BitmapImage's RawPixelData is
-        // immutable for static BitmapImage (the only kind we cache), so reading
-        // it from the worker thread is safe.
+        // The captured snapshot is immutable, so reading it from the worker thread is safe and —
+        // unlike re-reading the source's mutable pixel fields — cannot observe a different decode
+        // than the one this key describes. Holding the reference also keeps that exact buffer
+        // alive for the duration of the filter, bounded by MaxInFlight.
         System.Threading.ThreadPool.UnsafeQueueUserWorkItem(static state =>
         {
-            var (src, srcWLocal, srcHLocal, bw, bh, k) = state;
+            var (snap, bw, bh, k) = state;
             try
             {
-                var rawPixels = src.RawPixelData;
-                if (rawPixels == null) return;
-                int stride = src.PixelStride > 0 ? src.PixelStride : srcWLocal * 4;
-
-                byte[] thumbPixels = BoxFilterDownscale(rawPixels, srcWLocal, srcHLocal, stride, bw, bh);
+                byte[] thumbPixels = BoxFilterDownscale(
+                    snap.Pixels, snap.Width, snap.Height, snap.Stride, bw, bh);
                 var newThumb = BitmapImage.FromPixels(thumbPixels, bw, bh, bw * 4);
                 if (newThumb == null) return;
 
@@ -173,7 +206,7 @@ internal static class BitmapDownscaleCache
             {
                 lock (s_lock) s_inFlight.Remove(k);
             }
-        }, (source, srcW, srcH, bucketW, bucketH, key), preferLocal: false);
+        }, (snapshot, bucketW, bucketH, key), preferLocal: false);
     }
 
     /// <summary>

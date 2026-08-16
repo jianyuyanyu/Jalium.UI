@@ -99,6 +99,22 @@ internal sealed class WindowInputDispatcher
         if (_host.OnPreviewWindowMouseMove(position))
             return;
 
+        // A popup promoted to its own top-level window cannot hold the subtree mouse
+        // capture that keeps content under an in-window popup inert, so the parent
+        // keeps receiving its own WM_MOUSEMOVE and everything underneath would go on
+        // lighting up while the menu is open. Reproduce the WPF end state explicitly:
+        // no hover, no cursor change, no move events for the window's own content until
+        // the popup is dismissed. Overlay-hosted popups already block pass-through in
+        // OverlayLayer.HitTestCore, and an active capture still outranks all of this.
+        if (Mouse.Captured == null && HasBlockingExternalPopup())
+        {
+            UpdateTitleBarButtonHover(null);
+            ClearContentMouseOver(timestamp);
+            Mouse.UpdateState(position, null, buttons);
+            ApplyPopupBlockedCursor();
+            return;
+        }
+
         // Check for title bar button hover (for custom title bar)
         if (_host.IsTitleBarVisible())
         {
@@ -203,6 +219,41 @@ internal sealed class WindowInputDispatcher
         }
     }
 
+    /// <summary>
+    /// True when a light-dismiss popup is hosted in its own top-level window. Such a
+    /// popup cannot capture the parent window's pointer input, so the parent has to
+    /// stop reacting to it on its own.
+    /// </summary>
+    private bool HasBlockingExternalPopup()
+    {
+        var popups = _host.ActiveExternalPopups;
+        for (int i = 0; i < popups.Count; i++)
+        {
+            if (!popups[i].StaysOpen)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>Drops the window's hover chain without attributing it to a new element.</summary>
+    private void ClearContentMouseOver(int timestamp)
+    {
+        if (_lastMouseOverElement == null)
+            return;
+
+        RaiseMouseLeaveChain(_lastMouseOverElement, null, timestamp);
+        _lastMouseOverElement = null;
+        UIElement.SetMouseDirectlyOverElement(null);
+    }
+
+    private void ApplyPopupBlockedCursor()
+    {
+        var cursor = Mouse.OverrideCursor ?? Jalium.UI.Input.Cursors.Arrow;
+        Mouse.SetCursor(cursor);
+        _host.SetPlatformCursor((int)cursor.CursorType);
+    }
+
     /// <summary>Handles mouse button down.</summary>
     public void HandleMouseDown(MouseButton button, Point position, MouseButtonStates buttons,
         ModifierKeys modifiers, int clickCount, int timestamp)
@@ -227,7 +278,9 @@ internal sealed class WindowInputDispatcher
         // Light dismiss for external popup windows (rendered outside the parent window)
         if (_host.ActiveExternalPopups.Count > 0)
         {
-            var popupsToClose = _host.ActiveExternalPopups.Where(p => !p.StaysOpen).ToList();
+            var popupsToClose = _host.ActiveExternalPopups
+                .Where(p => !p.StaysOpen && !p.HasPointerCaptureWithin)
+                .ToList();
             foreach (var popup in popupsToClose)
                 popup.IsOpen = false;
             if (popupsToClose.Count > 0)

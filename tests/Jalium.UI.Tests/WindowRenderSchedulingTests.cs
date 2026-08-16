@@ -394,6 +394,73 @@ public class WindowRenderSchedulingTests
     }
 
     [Fact]
+    public void RenderThreadLiveResize_CommitsNativeViewportOnWorkerCapture()
+    {
+        MediaRenderCacheHost.Bootstrap();
+        var native = new RenderTargetTestNative();
+        using var renderTarget = CreateRenderTarget(
+            native,
+            300,
+            200,
+            new nint(0x2116));
+        var window = new Window { Width = 300, Height = 200 };
+        SetPrivateProperty(window, "RenderTarget", renderTarget);
+        SetPrivateField(window, "_rtActive", true);
+
+        InvokePrivateMethod(window, "TryResizeRenderTarget", 360, 240, "WorkerResizeTest");
+
+        Assert.Equal(0, native.ResizeCalls);
+        Assert.True(GetPrivateField<bool>(window, "_hasPendingResize"));
+        long resizeVersion = GetPrivateField<long>(window, "_pendingResizeVersion");
+
+        var captureType = typeof(Window).GetNestedType("FrameCapture", BindingFlags.NonPublic);
+        Assert.NotNull(captureType);
+        var capture = Activator.CreateInstance(captureType!, nonPublic: true);
+        Assert.NotNull(capture);
+        captureType!.GetField("Drawing", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
+            .SetValue(capture, RecordedDrawing.Empty);
+        captureType.GetField("Target", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
+            .SetValue(capture, renderTarget);
+        captureType.GetField("ContextGeneration", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
+            .SetValue(capture, renderTarget.OwnerContextGeneration);
+        captureType.GetField("LifecycleGeneration", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
+            .SetValue(capture, GetPrivateField<int>(window, "_renderLifecycleGeneration"));
+        captureType.GetField("PhysicalWidth", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
+            .SetValue(capture, 360);
+        captureType.GetField("PhysicalHeight", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
+            .SetValue(capture, 240);
+        captureType.GetField("ResizeVersion", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
+            .SetValue(capture, resizeVersion);
+
+        InvokePrivateMethod(window, "PresentCaptureOnRenderThreadCore", capture);
+
+        Assert.Equal(new[] { (360, 240) }, native.ResizeSizes);
+        Assert.Equal(360, renderTarget.Width);
+        Assert.Equal(240, renderTarget.Height);
+        Assert.Equal(resizeVersion, GetPrivateField<long>(window, "_rtCommittedResizeVersion"));
+
+        InvokePrivateMethod(window, "AcknowledgeCommittedRenderThreadResize");
+        Assert.False(GetPrivateField<bool>(window, "_hasPendingResize"));
+
+        SetPrivateField(window, "_rtActive", false);
+    }
+
+    [Fact]
+    public void D3D12RenderWorker_PreservesCompositionTargetPolicy()
+    {
+        var native = new RenderTargetTestNative();
+        using var renderTarget = CreateRenderTarget(
+            native,
+            300,
+            200,
+            new nint(0x2117));
+        var window = new Window { Width = 300, Height = 200 };
+        SetPrivateProperty(window, "RenderTarget", renderTarget);
+
+        Assert.True(InvokePrivateMethod<bool>(window, "ShouldUseCompositionRenderTarget"));
+    }
+
+    [Fact]
     public void RenderThreadPublish_WhenWorkerOwnershipIsGone_PreservesDirtyState()
     {
         MediaRenderCacheHost.Bootstrap();
@@ -780,33 +847,28 @@ public class WindowRenderSchedulingTests
     }
 
     [Fact]
-    public void Window_LiveResize_DebouncesAlternateBufferConvergence()
+    public void Window_LiveResize_DoesNotDelayAlternateBufferConvergence()
     {
         int normalDelay = Window.ComputeBackBufferConvergenceDelayMs(isSizing: false);
         int liveResizeDelay = Window.ComputeBackBufferConvergenceDelayMs(isSizing: true);
 
         Assert.Equal(1, normalDelay);
-        Assert.True(liveResizeDelay >= 32);
-        Assert.True(liveResizeDelay > normalDelay);
+        Assert.Equal(normalDelay, liveResizeDelay);
     }
 
     [Fact]
-    public void Window_LiveResize_ArmsConvergenceBehindDeadline()
+    public void Window_LiveResize_ArmsConvergenceWithoutAQuietPeriodDeadline()
     {
         var window = new Window { Width = 300, Height = 200 };
         var native = new RenderTargetTestNative();
         using var renderTarget = CreateRenderTarget(native, 300, 200, new nint(0x212F));
         SetPrivateProperty(window, "RenderTarget", renderTarget);
         SetPrivateField(window, "_isSizing", true);
-        long before = Environment.TickCount64;
 
         InvokePrivateMethod(window, "HandlePresentedFrameFlush", false);
 
         Assert.Equal(1, GetPrivateField<int>(window, "_partialPresentsToFlush"));
-        Assert.InRange(
-            GetPrivateField<long>(window, "_backBufferConvergenceNotBeforeTick"),
-            before + 32,
-            Environment.TickCount64 + 1000);
+        Assert.Equal(1, Window.ComputeBackBufferConvergenceDelayMs(isSizing: true));
     }
 
     [Fact]

@@ -308,10 +308,23 @@ public class Page : FrameworkElement, IAddChild, IWindowService
         {
             _templateRoot = templateRoot;
             _templateRoot.IsTemplatedRoot = true;
-            Control.SetTemplatedParentRecursive(_templateRoot, this);
-            AddVisualChild(_templateRoot);
-            Control.PromoteTemplateLocalValuesRecursive(_templateRoot);
-            Control.ReactivateBindingsRecursive(_templateRoot);
+
+            // 与 Control.ApplyTemplateCore 完全同构的一次模板展开，因此用同一套绑定重算轮次
+            // 剪枝：SetTemplatedParentRecursive 不再顺带重算（紧接着的 AddVisualChild 会对整棵
+            // 可视子树重算一遍），最后那趟 ReactivateBindingsRecursive 只补可视树够不到的节点。
+            var previousEpoch = DependencyObject.BeginBindingReactivationEpoch();
+            try
+            {
+                Control.SetTemplatedParentRecursive(
+                    _templateRoot, this, reactivateBindings: !DependencyObject.TemplateExpansionDedupEnabled);
+                AddVisualChild(_templateRoot);
+                Control.PromoteTemplateLocalValuesRecursive(_templateRoot);
+                Control.ReactivateBindingsRecursive(_templateRoot);
+            }
+            finally
+            {
+                DependencyObject.EndBindingReactivationEpoch(previousEpoch);
+            }
 
             if (Template.Triggers.Count != 0)
             {

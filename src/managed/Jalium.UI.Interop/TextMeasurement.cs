@@ -482,8 +482,23 @@ public static class TextMeasurement
     }
 
     /// <summary>
-    /// Gets the natural line height for a font using WPF-style calculation.
-    /// Line height = Ascent + Descent + LineGap
+    /// Gets the natural line height for a font.
+    ///
+    /// <para>
+    /// Normally this is the font's own <c>LineHeight</c> (ascent + descent + line gap). But that
+    /// value is a TYPOGRAPHIC recommendation, not a promise about ink: where the glyphs actually
+    /// end is <c>Baseline + Descent</c> — the baseline's offset from the top of the box plus how
+    /// far ink reaches below it. For most families the recommendation is the larger of the two and
+    /// nothing changes; when it is not, a box sized to the recommendation is SHORTER than the text
+    /// drawn inside it, and every consumer inherits the error — the layout slot, any clip derived
+    /// from RenderSize, and any container that sizes to the TextBlock. The visible symptom is
+    /// flat-bottomed descenders (g / y / p) that get worse as the font size grows.
+    /// </para>
+    ///
+    /// <para>
+    /// So the line box is the max of the two. This is a measurement fix, not a padding fudge:
+    /// callers keep getting one number that is simply now guaranteed to contain the glyphs.
+    /// </para>
     /// </summary>
     /// <param name="fontFamily">The font family name.</param>
     /// <param name="fontSize">The font size in DIPs.</param>
@@ -493,7 +508,10 @@ public static class TextMeasurement
     public static double GetLineHeight(string fontFamily, double fontSize, int fontWeight = 400, int fontStyle = 0)
     {
         var metrics = GetFontMetrics(fontFamily, fontSize, fontWeight, fontStyle);
-        return metrics.LineHeight;
+
+        // 墨迹底边 = 基线到盒顶的距离 + 基线以下的降部。
+        var inkBottom = metrics.Baseline + metrics.Descent;
+        return metrics.LineHeight >= inkBottom ? metrics.LineHeight : inkBottom;
     }
 
     /// <summary>
@@ -659,6 +677,59 @@ public static class TextMeasurement
         }
     }
 
+    /// <summary>
+    /// Resolves a CSS-style font-family LIST to a real text format.
+    ///
+    /// <para>
+    /// <c>FontFamily.Source</c> carries the whole stack — "Segoe UI Variable Display, Segoe UI",
+    /// "Cascadia Code, Consolas, JetBrains Mono" — because that is what the markup author wrote.
+    /// DirectWrite's CreateTextFormat takes ONE family name and fails on the list, and the failure
+    /// was silent: the caller degraded to synthesized metrics (lineHeight = 1.2em, ascent = 1em,
+    /// descent = 0.2em). Those numbers are not this font's, so every TextBlock in an app that uses
+    /// font stacks — i.e. essentially every app — was laid out against a fictional font: boxes the
+    /// wrong height, and a baseline sitting at 1em instead of the real ascent, which is what pushed
+    /// descenders past the bottom of their own measured box.
+    /// </para>
+    ///
+    /// <para>
+    /// So resolve the stack the way the author meant it: take the first entry that actually exists,
+    /// exactly like CSS. Only when nothing in the list resolves does the caller fall back to
+    /// approximations — which is now the genuinely-unknown-font case it was written for.
+    /// </para>
+    /// </summary>
+    internal static NativeTextFormat CreateTextFormatFromFamilyList(
+        RenderContext context, string fontFamily, float fontSize, int fontWeight, int fontStyle)
+    {
+        if (fontFamily.IndexOf(',') < 0)
+        {
+            return context.CreateTextFormat(fontFamily, fontSize, fontWeight, fontStyle);
+        }
+
+        Exception? firstFailure = null;
+        foreach (var candidate in fontFamily.Split(','))
+        {
+            // CSS allows quoting family names that contain spaces; strip those so
+            // 'Segoe UI' and "Segoe UI" resolve the same as the bare name.
+            var name = candidate.Trim().Trim('\'', '"').Trim();
+            if (name.Length == 0) continue;
+
+            try
+            {
+                var format = context.CreateTextFormat(name, fontSize, fontWeight, fontStyle);
+                if (format.IsValid) return format;
+            }
+            catch (Exception ex)
+            {
+                firstFailure ??= ex;
+            }
+        }
+
+        // Nothing in the stack resolved. Rethrow the first real error so the caller's
+        // negative cache + diagnostics behave exactly as they did for a single bad name.
+        if (firstFailure != null) throw firstFailure;
+        return context.CreateTextFormat(fontFamily, fontSize, fontWeight, fontStyle);
+    }
+
     private static NativeTextFormat? GetOrCreateFormat(RenderContext context, string fontFamily, float fontSize, int fontWeight, int fontStyle = 0)
     {
         if (string.IsNullOrWhiteSpace(fontFamily))
@@ -704,7 +775,7 @@ public static class TextMeasurement
 
             try
             {
-                var format = context.CreateTextFormat(fontFamily, fontSize, fontWeight, fontStyle);
+                var format = CreateTextFormatFromFamilyList(context, fontFamily, fontSize, fontWeight, fontStyle);
                 // 冷却期满后的重试成功了（或换代后同 key 恢复）——撤销负缓存。
                 _failedFormatKeys.Remove(key);
                 var lruNode = _lruKeys.AddLast(key);

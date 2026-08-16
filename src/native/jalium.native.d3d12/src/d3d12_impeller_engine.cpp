@@ -27,358 +27,90 @@ namespace jalium {
 // (Old GenerateFilledCircleStrip / EllipseStrip / RoundRectStrip /
 //  StrokedCircleStrip / RoundCapLineStrip implementations removed —
 //  the templated versions in jalium_impeller_shapes.h are now used.)
-#if 0
-bool ImpellerD3D12Engine::GenerateFilledCircleStrip_DEAD_DELETE_ME(
-    float cx, float cy, float radius,
-    float r, float g, float b, float a,
-    const EngineTransform& transform)
-{
-    float maxScale = std::max(
-        std::sqrt(transform.m11 * transform.m11 + transform.m12 * transform.m12),
-        std::sqrt(transform.m21 * transform.m21 + transform.m22 * transform.m22));
-    size_t divisions = TrigCache::ComputeDivisions(maxScale * radius);
-    const auto& trigs = trigCache_.Get(divisions);
-
-    ImpellerDrawBatch batch;
-    // 4 vertices per trig entry (2 quadrants × 2 points each), as triangle strip
-    batch.vertices.reserve(trigs.size() * 4);
-
-    // Quadrant 1+4 (left side): bottom-left and top-left
-    for (auto& t : trigs) {
-        float ox = t.cos * radius, oy = t.sin * radius;
-        float px1 = cx - ox, py1 = cy + oy;
-        float px2 = cx - ox, py2 = cy - oy;
-        TransformPoint(px1, py1, transform);
-        TransformPoint(px2, py2, transform);
-        batch.vertices.push_back({ px1, py1, r, g, b, a });
-        batch.vertices.push_back({ px2, py2, r, g, b, a });
-    }
-
-    // Quadrant 2+3 (right side): swap cos/sin for symmetric traversal
-    for (auto& t : trigs) {
-        float ox = t.sin * radius, oy = t.cos * radius;
-        float px1 = cx + ox, py1 = cy + oy;
-        float px2 = cx + ox, py2 = cy - oy;
-        TransformPoint(px1, py1, transform);
-        TransformPoint(px2, py2, transform);
-        batch.vertices.push_back({ px1, py1, r, g, b, a });
-        batch.vertices.push_back({ px2, py2, r, g, b, a });
-    }
-
-    // Triangle strip indices: sequential
-    uint32_t vc = (uint32_t)batch.vertices.size();
-    batch.indices.reserve((vc - 2) * 3);
-    for (uint32_t i = 0; i + 2 < vc; ++i) {
-        if (i % 2 == 0) {
-            batch.indices.push_back(i);
-            batch.indices.push_back(i + 1);
-            batch.indices.push_back(i + 2);
-        } else {
-            batch.indices.push_back(i + 1);
-            batch.indices.push_back(i);
-            batch.indices.push_back(i + 2);
-        }
-    }
-
-    batch.pipelineType = 0;
-    PushBatch(std::move(batch));
-    return true;
-}
-
-bool ImpellerD3D12Engine::GenerateFilledEllipseStrip(
-    float cx, float cy, float rx, float ry,
-    float r, float g, float b, float a,
-    const EngineTransform& transform)
-{
-    if (std::abs(rx - ry) < 0.01f) {
-        return GenerateFilledCircleStrip(cx, cy, rx, r, g, b, a, transform);
-    }
-
-    float maxScale = std::max(
-        std::sqrt(transform.m11 * transform.m11 + transform.m12 * transform.m12),
-        std::sqrt(transform.m21 * transform.m21 + transform.m22 * transform.m22));
-    size_t divisions = TrigCache::ComputeDivisions(maxScale * std::max(rx, ry));
-    const auto& trigs = trigCache_.Get(divisions);
-
-    ImpellerDrawBatch batch;
-    batch.vertices.reserve(trigs.size() * 4);
-
-    // Quadrant 1+4 (left)
-    for (auto& t : trigs) {
-        float ox = t.cos * rx, oy = t.sin * ry;
-        float px1 = cx - ox, py1 = cy + oy;
-        float px2 = cx - ox, py2 = cy - oy;
-        TransformPoint(px1, py1, transform);
-        TransformPoint(px2, py2, transform);
-        batch.vertices.push_back({ px1, py1, r, g, b, a });
-        batch.vertices.push_back({ px2, py2, r, g, b, a });
-    }
-
-    // Quadrant 2+3 (right): swap sin/cos and radii
-    for (auto& t : trigs) {
-        float ox = t.sin * rx, oy = t.cos * ry;
-        float px1 = cx + ox, py1 = cy + oy;
-        float px2 = cx + ox, py2 = cy - oy;
-        TransformPoint(px1, py1, transform);
-        TransformPoint(px2, py2, transform);
-        batch.vertices.push_back({ px1, py1, r, g, b, a });
-        batch.vertices.push_back({ px2, py2, r, g, b, a });
-    }
-
-    uint32_t vc = (uint32_t)batch.vertices.size();
-    batch.indices.reserve((vc - 2) * 3);
-    for (uint32_t i = 0; i + 2 < vc; ++i) {
-        if (i % 2 == 0) {
-            batch.indices.push_back(i);
-            batch.indices.push_back(i + 1);
-            batch.indices.push_back(i + 2);
-        } else {
-            batch.indices.push_back(i + 1);
-            batch.indices.push_back(i);
-            batch.indices.push_back(i + 2);
-        }
-    }
-
-    batch.pipelineType = 0;
-    PushBatch(std::move(batch));
-    return true;
-}
-
-bool ImpellerD3D12Engine::GenerateFilledRoundRectStrip(
-    float x, float y, float w, float h, float rx, float ry,
-    float r, float g, float b, float a,
-    const EngineTransform& transform)
-{
-    // If corner radii fill the entire rect, use ellipse
-    if (rx * 2 >= w && ry * 2 >= h) {
-        return GenerateFilledEllipseStrip(x + w * 0.5f, y + h * 0.5f,
-                                          w * 0.5f, h * 0.5f, r, g, b, a, transform);
-    }
-
-    float maxScale = std::max(
-        std::sqrt(transform.m11 * transform.m11 + transform.m12 * transform.m12),
-        std::sqrt(transform.m21 * transform.m21 + transform.m22 * transform.m22));
-    size_t divisions = TrigCache::ComputeDivisions(maxScale * std::max(rx, ry));
-    const auto& trigs = trigCache_.Get(divisions);
-
-    float left = x + rx;
-    float top = y + ry;
-    float right = x + w - rx;
-    float bottom = y + h - ry;
-
-    ImpellerDrawBatch batch;
-    batch.vertices.reserve(trigs.size() * 4);
-
-    // Quadrant 1+4: top-left and bottom-left corners
-    for (auto& t : trigs) {
-        float ox = t.cos * rx, oy = t.sin * ry;
-        float px1 = left - ox, py1 = bottom + oy;
-        float px2 = left - ox, py2 = top - oy;
-        TransformPoint(px1, py1, transform);
-        TransformPoint(px2, py2, transform);
-        batch.vertices.push_back({ px1, py1, r, g, b, a });
-        batch.vertices.push_back({ px2, py2, r, g, b, a });
-    }
-
-    // Quadrant 2+3: top-right and bottom-right corners
-    for (auto& t : trigs) {
-        float ox = t.sin * rx, oy = t.cos * ry;
-        float px1 = right + ox, py1 = bottom + oy;
-        float px2 = right + ox, py2 = top - oy;
-        TransformPoint(px1, py1, transform);
-        TransformPoint(px2, py2, transform);
-        batch.vertices.push_back({ px1, py1, r, g, b, a });
-        batch.vertices.push_back({ px2, py2, r, g, b, a });
-    }
-
-    uint32_t vc = (uint32_t)batch.vertices.size();
-    batch.indices.reserve((vc - 2) * 3);
-    for (uint32_t i = 0; i + 2 < vc; ++i) {
-        if (i % 2 == 0) {
-            batch.indices.push_back(i);
-            batch.indices.push_back(i + 1);
-            batch.indices.push_back(i + 2);
-        } else {
-            batch.indices.push_back(i + 1);
-            batch.indices.push_back(i);
-            batch.indices.push_back(i + 2);
-        }
-    }
-
-    batch.pipelineType = 0;
-    PushBatch(std::move(batch));
-    return true;
-}
 
 // ============================================================================
-// Stroked Circle (Flutter Impeller: GenerateStrokedCircle)
-// Inner+outer ring as triangle strip, zig-zag between radii.
+// Anti-aliasing route selection lives in jalium_flatten.h
+// (PreferAnalyticFill / TransformedExtent / PathCommandExtent) so every
+// backend and every fill entry point makes the SAME decision — see the
+// long-form rationale there. Only the contour-list overload is local.
 // ============================================================================
+namespace {
 
-bool ImpellerD3D12Engine::GenerateStrokedCircleStrip(
-    float cx, float cy, float radius, float strokeWidth,
-    float r, float g, float b, float a,
-    const EngineTransform& transform)
-{
-    float halfW = strokeWidth * 0.5f;
-    if (halfW <= 0 || halfW >= radius) {
-        // Degenerate: fill instead
-        return GenerateFilledCircleStrip(cx, cy, radius, r, g, b, a, transform);
-    }
-
-    float outerR = radius + halfW;
-    float innerR = radius - halfW;
-    float maxScale = std::max(
-        std::sqrt(transform.m11 * transform.m11 + transform.m12 * transform.m12),
-        std::sqrt(transform.m21 * transform.m21 + transform.m22 * transform.m22));
-    size_t divisions = TrigCache::ComputeDivisions(maxScale * outerR);
-    const auto& trigs = trigCache_.Get(divisions);
-
-    ImpellerDrawBatch batch;
-    // 8 vertices per trig: 4 quadrants × (outer + inner)
-    batch.vertices.reserve(trigs.size() * 8);
-
-    // Generate 4 quadrants, each with outer+inner zig-zag
-    auto emitQuadrant = [&](auto transformOuter, auto transformInner) {
-        for (auto& t : trigs) {
-            float ox, oy, ix, iy;
-            transformOuter(t, outerR, ox, oy);
-            transformInner(t, innerR, ix, iy);
-            float pox = cx + ox, poy = cy + oy;
-            float pix = cx + ix, piy = cy + iy;
-            TransformPoint(pox, poy, transform);
-            TransformPoint(pix, piy, transform);
-            batch.vertices.push_back({ pox, poy, r, g, b, a });
-            batch.vertices.push_back({ pix, piy, r, g, b, a });
-        }
-    };
-
-    // Q1: top-left
-    emitQuadrant(
-        [](const Trig& t, float R, float& x, float& y) { x = -t.cos * R; y = -t.sin * R; },
-        [](const Trig& t, float R, float& x, float& y) { x = -t.cos * R; y = -t.sin * R; });
-    // Actually use the Flutter pattern: outer_radius vs inner_radius
-    // Simpler approach: full circle with outer/inner interleaving
-    batch.vertices.clear();
-
-    uint32_t totalPoints = (uint32_t)(trigs.size() * 4); // full circle
-    batch.vertices.reserve(totalPoints * 2);
-
-    for (uint32_t q = 0; q < 4; ++q) {
-        for (size_t i = 0; i < trigs.size(); ++i) {
-            float tc = trigs[i].cos, ts = trigs[i].sin;
-            float ox, oy;
-            switch (q) {
-                case 0: ox = -tc; oy = -ts; break; // Q1
-                case 1: ox = ts; oy = -tc; break;  // Q2 (swap sin/cos)
-                case 2: ox = tc; oy = ts; break;   // Q3
-                case 3: ox = -ts; oy = tc; break;  // Q4
-            }
-            float pox = cx + ox * outerR, poy = cy + oy * outerR;
-            float pix = cx + ox * innerR, piy = cy + oy * innerR;
-            TransformPoint(pox, poy, transform);
-            TransformPoint(pix, piy, transform);
-            batch.vertices.push_back({ pox, poy, r, g, b, a });
-            batch.vertices.push_back({ pix, piy, r, g, b, a });
+// Local-space AABB over a contour list.
+inline bool ContourExtent(const std::vector<Contour>& contours,
+                          float& minX, float& minY,
+                          float& maxX, float& maxY) noexcept {
+    minX = minY =  std::numeric_limits<float>::infinity();
+    maxX = maxY = -std::numeric_limits<float>::infinity();
+    bool any = false;
+    for (const auto& c : contours) {
+        const uint32_t n = c.VertexCount();
+        for (uint32_t i = 0; i < n; ++i) {
+            const float x = c.X(i), y = c.Y(i);
+            if (x < minX) minX = x;
+            if (y < minY) minY = y;
+            if (x > maxX) maxX = x;
+            if (y > maxY) maxY = y;
+            any = true;
         }
     }
-
-    uint32_t vc = (uint32_t)batch.vertices.size();
-    batch.indices.reserve((vc - 2) * 3);
-    for (uint32_t i = 0; i + 2 < vc; ++i) {
-        if (i % 2 == 0) { batch.indices.push_back(i); batch.indices.push_back(i + 1); batch.indices.push_back(i + 2); }
-        else { batch.indices.push_back(i + 1); batch.indices.push_back(i); batch.indices.push_back(i + 2); }
-    }
-    // Close the ring: connect last pair to first pair
-    if (vc >= 4) {
-        batch.indices.push_back(vc - 2); batch.indices.push_back(vc - 1); batch.indices.push_back(0);
-        batch.indices.push_back(vc - 1); batch.indices.push_back(1); batch.indices.push_back(0);
-    }
-
-    batch.pipelineType = 0;
-    PushBatch(std::move(batch));
-    return true;
+    return any;
 }
 
-// ============================================================================
-// RoundCapLine (Flutter Impeller: GenerateRoundCapLine)
-// Thick line with hemicircle caps at both endpoints.
-// ============================================================================
-
-bool ImpellerD3D12Engine::GenerateRoundCapLineStrip(
-    float x0, float y0, float x1, float y1, float radius,
-    float r, float g, float b, float a,
-    const EngineTransform& transform)
-{
-    float dx = x1 - x0, dy = y1 - y0;
-    float len = std::sqrt(dx * dx + dy * dy);
-    if (len < 1e-6f) {
-        return GenerateFilledCircleStrip((x0 + x1) * 0.5f, (y0 + y1) * 0.5f,
-                                         radius, r, g, b, a, transform);
-    }
-
-    // Along and across vectors, scaled to radius
-    float ax = dx / len * radius, ay = dy / len * radius;
-    float px = -ay, py = ax; // perpendicular
-
-    float maxScale = std::max(
-        std::sqrt(transform.m11 * transform.m11 + transform.m12 * transform.m12),
-        std::sqrt(transform.m21 * transform.m21 + transform.m22 * transform.m22));
-    size_t divisions = TrigCache::ComputeDivisions(maxScale * radius);
-    const auto& trigs = trigCache_.Get(divisions);
-
-    ImpellerDrawBatch batch;
-    batch.vertices.reserve(trigs.size() * 4);
-
-    // First half: hemicircle at p0 (going backwards)
-    for (auto& t : trigs) {
-        float relAlongX = ax * t.cos, relAlongY = ay * t.cos;
-        float relAcrossX = px * t.sin, relAcrossY = py * t.sin;
-        float v1x = x0 - relAlongX + relAcrossX, v1y = y0 - relAlongY + relAcrossY;
-        float v2x = x0 - relAlongX - relAcrossX, v2y = y0 - relAlongY - relAcrossY;
-        TransformPoint(v1x, v1y, transform);
-        TransformPoint(v2x, v2y, transform);
-        batch.vertices.push_back({ v1x, v1y, r, g, b, a });
-        batch.vertices.push_back({ v2x, v2y, r, g, b, a });
-    }
-
-    // Second half: hemicircle at p1 (going forwards, swap sin/cos)
-    for (auto& t : trigs) {
-        float relAlongX = ax * t.sin, relAlongY = ay * t.sin;
-        float relAcrossX = px * t.cos, relAcrossY = py * t.cos;
-        float v1x = x1 + relAlongX + relAcrossX, v1y = y1 + relAlongY + relAcrossY;
-        float v2x = x1 + relAlongX - relAcrossX, v2y = y1 + relAlongY - relAcrossY;
-        TransformPoint(v1x, v1y, transform);
-        TransformPoint(v2x, v2y, transform);
-        batch.vertices.push_back({ v1x, v1y, r, g, b, a });
-        batch.vertices.push_back({ v2x, v2y, r, g, b, a });
-    }
-
-    uint32_t vc = (uint32_t)batch.vertices.size();
-    batch.indices.reserve((vc - 2) * 3);
-    for (uint32_t i = 0; i + 2 < vc; ++i) {
-        if (i % 2 == 0) { batch.indices.push_back(i); batch.indices.push_back(i + 1); batch.indices.push_back(i + 2); }
-        else { batch.indices.push_back(i + 1); batch.indices.push_back(i); batch.indices.push_back(i + 2); }
-    }
-
-    batch.pipelineType = 0;
-    PushBatch(std::move(batch));
-    return true;
-}
-#endif
+}  // namespace
 
 // ============================================================================
-// Gradient Fill (Linear/Radial/Sweep via vertex color interpolation)
+// Gradient Fill (Linear/Radial/Sweep)
 // ============================================================================
 
 bool ImpellerD3D12Engine::EncodeGradientFillPath(
     const std::vector<Contour>& contours,
     const EngineBrushData& brush,
-    const EngineTransform& transform)
+    const EngineTransform& transform,
+    FillRule fillRule)
 {
     if (!brush.stops || brush.stopCount == 0) return false;
+    if (contours.empty()) return false;
 
-    int32_t fr = 0; // even-odd default
+    std::vector<float> stopData;
+    FlattenGradientStops(brush, stopData);
+
+    // ── Analytic route: exact coverage, gradient sampled per emitted corner.
+    // Without this a gradient-filled icon reached NEITHER anti-aliasing
+    // mechanism the backend has — the stencil-then-cover MSAA fast path in
+    // D3D12RenderTarget::FillPath is solid-brush-only, and this function used
+    // to go straight to a raw triangle mesh plus a sub-pixel feather ring.
+    {
+        float lminX, lminY, lmaxX, lmaxY;
+        float devW = 0.0f, devH = 0.0f;
+        if (ContourExtent(contours, lminX, lminY, lmaxX, lmaxY))
+            TransformedExtent(lminX, lminY, lmaxX, lmaxY, transform, devW, devH);
+
+        if (PreferAnalyticFill(devW, devH)) {
+            std::vector<Contour> pxContours = contours;
+            for (auto& c : pxContours) {
+                const uint32_t n = c.VertexCount();
+                for (uint32_t i = 0; i < n; ++i) {
+                    float x = c.points[i * 2], y = c.points[i * 2 + 1];
+                    TransformPoint(x, y, transform);
+                    c.points[i * 2]     = x;
+                    c.points[i * 2 + 1] = y;
+                }
+            }
+            std::vector<PixelRect> rects;
+            rects.reserve(64);
+            RasterizePathToRects(pxContours, fillRule, rects);
+            if (!rects.empty()) {
+                EmitGradientCoverageRects(rects, brush, stopData.data(), transform);
+                return true;
+            }
+            // Empty rect list = entirely sub-pixel; fall through so something
+            // still renders via the triangle mesh below.
+        }
+    }
+
+    // ── Approximate route (large artwork only): triangle mesh + feather ring.
+    const int32_t fr = (fillRule == FillRule::NonZero) ? 1 : 0;
     std::vector<float> triVerts;
     {
         path_stats::ScopedTriangulateTimer triTimer;
@@ -391,9 +123,6 @@ bool ImpellerD3D12Engine::EncodeGradientFillPath(
     ImpellerDrawBatch batch;
     batch.vertices.reserve(vertCount);
     batch.indices.reserve(vertCount);
-
-    std::vector<float> stopData;
-    FlattenGradientStops(brush, stopData);
 
     for (uint32_t i = 0; i < vertCount; ++i) {
         float px = triVerts[i * 2], py = triVerts[i * 2 + 1];
@@ -410,7 +139,111 @@ bool ImpellerD3D12Engine::EncodeGradientFillPath(
 
     batch.pipelineType = 0;
     PushBatch(std::move(batch));
+
+    // Soften the boundary. The interior above is a raw triangle mesh on a
+    // single-sample target, so without this ring every edge stair-steps.
+    // Emitted after the interior so the fade blends over it.
+    EmitContourFeather(contours, transform, 0.0f, 0.0f, 0.0f, 0.0f,
+                       &brush, stopData.data());
     return true;
+}
+
+// ----------------------------------------------------------------------------
+// EmitGradientCoverageRects — paint an analytic-coverage rect list with a
+// gradient brush.
+//
+// RasterizePathToRects hands back axis-aligned rectangles whose alpha is the
+// EXACT fractional coverage of the path in those pixels. For a solid brush the
+// emitter just scales one colour by that alpha. A gradient needs the colour to
+// vary across the rect as well, so every emitted quad corner is mapped back to
+// PATH space (the space the brush geometry is authored in, and the space the
+// gradient sampler expects) and sampled there. Vertex-colour interpolation is
+// then exact for a linear gradient between two stops.
+//
+// Rects are diced to at most kCellPx before emission. Interior runs can be
+// hundreds of pixels wide after run-length coalescing, and across such a span
+// four corner samples cannot represent a RADIAL gradient (nor a linear one that
+// crosses a stop). Dicing costs nothing at icon scale — an icon-sized rect is
+// already smaller than one cell — and bounds the error everywhere else.
+// ----------------------------------------------------------------------------
+void ImpellerD3D12Engine::EmitGradientCoverageRects(
+    const std::vector<PixelRect>& rects,
+    const EngineBrushData& brush,
+    const float* stopData,
+    const EngineTransform& transform)
+{
+    if (rects.empty() || !stopData || brush.stopCount == 0) return;
+
+    // Pixel → path-space inverse of the 2x3 affine. Forward is
+    //   X = m11·x + m21·y + dx ,  Y = m12·x + m22·y + dy
+    // i.e. [x y] through A = [[m11, m21], [m12, m22]].
+    const float det = transform.m11 * transform.m22 - transform.m21 * transform.m12;
+    if (!(std::abs(det) > 1e-12f)) return;   // singular ⇒ nothing visible anyway
+    const float invDet = 1.0f / det;
+
+    ImpellerDrawBatch batch;
+    batch.pipelineType = 0;
+
+    float minX =  std::numeric_limits<float>::infinity();
+    float minY =  std::numeric_limits<float>::infinity();
+    float maxX = -std::numeric_limits<float>::infinity();
+    float maxY = -std::numeric_limits<float>::infinity();
+
+    constexpr int kCellPx = 16;
+
+    size_t cellEstimate = 0;
+    for (const auto& r : rects) {
+        const size_t cx = (size_t)((r.w + kCellPx - 1) / kCellPx);
+        const size_t cy = (size_t)((r.h + kCellPx - 1) / kCellPx);
+        cellEstimate += cx * cy;
+    }
+    batch.vertices.reserve(cellEstimate * 4);
+    batch.indices.reserve(cellEstimate * 6);
+
+    for (const auto& r : rects) {
+        if (r.w <= 0 || r.h <= 0 || r.alpha <= 0.0f) continue;
+        const int rx1 = r.x + r.w;
+        const int ry1 = r.y + r.h;
+
+        for (int cy0 = r.y; cy0 < ry1; cy0 += kCellPx) {
+            const int cy1 = (std::min)(cy0 + kCellPx, ry1);
+            for (int cx0 = r.x; cx0 < rx1; cx0 += kCellPx) {
+                const int cx1 = (std::min)(cx0 + kCellPx, rx1);
+
+                const float qx[4] = { (float)cx0, (float)cx1, (float)cx1, (float)cx0 };
+                const float qy[4] = { (float)cy0, (float)cy0, (float)cy1, (float)cy1 };
+
+                const uint32_t base = (uint32_t)batch.vertices.size();
+                for (int k = 0; k < 4; ++k) {
+                    const float rxp = qx[k] - transform.dx;
+                    const float ryp = qy[k] - transform.dy;
+                    const float pathX = ( transform.m22 * rxp - transform.m21 * ryp) * invDet;
+                    const float pathY = (-transform.m12 * rxp + transform.m11 * ryp) * invDet;
+
+                    GradientColor gc = SampleBrushGradient(brush, stopData, pathX, pathY);
+                    const float a = gc.a * r.alpha;
+                    batch.vertices.push_back({ qx[k], qy[k],
+                                               gc.r * a, gc.g * a, gc.b * a, a });
+                }
+                batch.indices.push_back(base);
+                batch.indices.push_back(base + 1);
+                batch.indices.push_back(base + 2);
+                batch.indices.push_back(base);
+                batch.indices.push_back(base + 2);
+                batch.indices.push_back(base + 3);
+
+                if (qx[0] < minX) minX = qx[0];
+                if (qy[0] < minY) minY = qy[0];
+                if (qx[1] > maxX) maxX = qx[1];
+                if (qy[2] > maxY) maxY = qy[2];
+            }
+        }
+    }
+
+    if (!batch.vertices.empty()) {
+        PushBatchWithCoverage(std::move(batch), minX, minY, maxX, maxY);
+        encodedPathCount_++;
+    }
 }
 
 // ComputeStrokeAlphaCoverage moved to jalium_impeller_shapes.h.
@@ -953,633 +786,13 @@ bool ImpellerD3D12Engine::ExpandStroke(
     return true;
 }
 
-#if 0
-// Legacy inline ExpandStroke body — superseded by jalium::ExpandStrokePath in
-// jalium_impeller_stroke.h. Retained under #if 0 so the diff trivially shows
-// the original algorithm we forwarded to. Will be physically deleted in a
-// follow-up cleanup commit; the templated header is the source of truth now.
-bool ImpellerD3D12Engine::ExpandStroke_LEGACY(
-    const EngineBrushData& brush,
-    float strokeWidth,
-    ImpellerJoin join, float miterLimit,
-    ImpellerCap cap, bool closed,
-    std::vector<Contour>* collectContours)
-{
-    uint32_t pointCount = (uint32_t)(flatPoints_.size() / 2);
-    if (pointCount < 2) return false;
 
-    float halfWidth = strokeWidth * 0.5f;
 
-    // Premultiply alpha
-    float r = brush.r * brush.a;
-    float g = brush.g * brush.a;
-    float b = brush.b * brush.a;
-    float a = brush.a;
-
-    // Sub-pixel stroke handling:
-    //   - Collect mode (going through the analytic AA rasterizer):
-    //     keep the true geometric halfWidth so fractional coverage
-    //     naturally tapers hairlines — no alpha hack needed.
-    //   - Direct mode (legacy, binary GPU rasterization): clamp to
-    //     0.5 and fade alpha by the lost coverage, otherwise very
-    //     thin strokes pop in/out as the transform scales.
-    if (!collectContours && halfWidth < 0.5f && halfWidth > 0.0f) {
-        float fade = halfWidth / 0.5f;
-        r *= fade;
-        g *= fade;
-        b *= fade;
-        a *= fade;
-        halfWidth = 0.5f;
-    }
-
-    ImpellerDrawBatch batch;
-    auto& verts = batch.vertices;
-    auto& indices = batch.indices;
-
-    auto getX = [&](uint32_t i) { return flatPoints_[i * 2]; };
-    auto getY = [&](uint32_t i) { return flatPoints_[i * 2 + 1]; };
-
-    // Compute per-segment normals
-    struct Segment { float nx, ny; };
-    std::vector<Segment> segNormals;
-    segNormals.reserve(pointCount - 1);
-    for (uint32_t i = 0; i + 1 < pointCount; ++i) {
-        float dx = getX(i + 1) - getX(i);
-        float dy = getY(i + 1) - getY(i);
-        float len = std::sqrt(dx * dx + dy * dy);
-        if (len < 1e-6f) { segNormals.push_back({0, 0}); continue; }
-        segNormals.push_back({ -dy / len, dx / len });
-    }
-
-    // ---- Build stroke geometry: one quad per segment ----
-    //
-    // The old code inserted a "sharp-angle bridging" fan at every
-    // segment junction whose angle exceeded 10°, but the bridge's
-    // trailing vertices were never connected to the NEXT segment's
-    // quad start (it pushed fresh vertices), so at each bridge there
-    // was a wedge-shaped gap relying on emitJoin to cover it. That
-    // also double-covered most of the junction. With pixel-space
-    // flattening (see EncodeStrokePath front matter) each curve is
-    // now subdivided densely enough that every junction is below the
-    // bridging threshold anyway, so dropping the bridge fan removes
-    // a source of overdraw and gap artifacts. Corner coverage is now
-    // fully delegated to emitJoin below (miter / bevel / round).
-    for (uint32_t i = 0; i + 1 < pointCount; ++i) {
-        float nx = segNormals[i].nx * halfWidth;
-        float ny = segNormals[i].ny * halfWidth;
-        float x0 = getX(i), y0 = getY(i);
-        float x1 = getX(i + 1), y1 = getY(i + 1);
-
-        uint32_t base = (uint32_t)verts.size();
-        verts.push_back({ x0 + nx, y0 + ny, r, g, b, a });
-        verts.push_back({ x0 - nx, y0 - ny, r, g, b, a });
-        verts.push_back({ x1 + nx, y1 + ny, r, g, b, a });
-        verts.push_back({ x1 - nx, y1 - ny, r, g, b, a });
-        indices.push_back(base); indices.push_back(base + 1); indices.push_back(base + 2);
-        indices.push_back(base + 1); indices.push_back(base + 3); indices.push_back(base + 2);
-    }
-
-    // ---- Joins between segments ----
-    auto emitJoin = [&](float n0x, float n0y, float n1x, float n1y, float cx, float cy) {
-        if (join == ImpellerJoin::Round) {
-            GenerateRoundJoin(verts, indices, cx, cy, n0x, n0y, n1x, n1y, halfWidth, r, g, b, a);
-        } else if (join == ImpellerJoin::Bevel) {
-            // Outer bevel
-            uint32_t base = (uint32_t)verts.size();
-            verts.push_back({ cx, cy, r, g, b, a });
-            verts.push_back({ cx + n0x * halfWidth, cy + n0y * halfWidth, r, g, b, a });
-            verts.push_back({ cx + n1x * halfWidth, cy + n1y * halfWidth, r, g, b, a });
-            indices.push_back(base); indices.push_back(base + 1); indices.push_back(base + 2);
-            // Inner bevel
-            base = (uint32_t)verts.size();
-            verts.push_back({ cx, cy, r, g, b, a });
-            verts.push_back({ cx - n0x * halfWidth, cy - n0y * halfWidth, r, g, b, a });
-            verts.push_back({ cx - n1x * halfWidth, cy - n1y * halfWidth, r, g, b, a });
-            indices.push_back(base); indices.push_back(base + 1); indices.push_back(base + 2);
-        } else {
-            // Miter join (with miter limit fallback to bevel)
-            float dot = n0x * n1x + n0y * n1y;
-            float alignment = (dot + 1.0f) * 0.5f;
-            if (alignment > 0.999f) return; // Nearly straight, no join needed
-
-            float cr = n0x * n1y - n0y * n1x;
-            float dir = cr > 0 ? -1.0f : 1.0f;
-
-            // Bevel base triangle
-            uint32_t base = (uint32_t)verts.size();
-            verts.push_back({ cx, cy, r, g, b, a });
-            verts.push_back({ cx + n0x * halfWidth * dir, cy + n0y * halfWidth * dir, r, g, b, a });
-            verts.push_back({ cx + n1x * halfWidth * dir, cy + n1y * halfWidth * dir, r, g, b, a });
-            indices.push_back(base); indices.push_back(base + 1); indices.push_back(base + 2);
-
-            // Miter extension (if within limit)
-            if (alignment > 1e-6f) {
-                float mx = (n0x + n1x) * 0.5f * halfWidth / alignment;
-                float my = (n0y + n1y) * 0.5f * halfWidth / alignment;
-                float miterDist2 = mx * mx + my * my;
-                float miterLimitDist2 = miterLimit * miterLimit;
-                if (miterDist2 <= miterLimitDist2) {
-                    uint32_t mbase = (uint32_t)verts.size();
-                    verts.push_back({ cx + mx * dir, cy + my * dir, r, g, b, a });
-                    indices.push_back(base); indices.push_back(base + 2); indices.push_back(mbase);
-                }
-            }
-        }
-    };
-
-    for (uint32_t i = 1; i + 1 < pointCount; ++i) {
-        emitJoin(segNormals[i - 1].nx, segNormals[i - 1].ny,
-                 segNormals[i].nx, segNormals[i].ny,
-                 getX(i), getY(i));
-    }
-
-    // Closing join: for a closed contour, the start vertex (== end vertex)
-    // sits between the last segment and the first segment, but the loop
-    // above never visits it. Without this, the corner at the path's start
-    // point shows a wedge-shaped gap — visible as the "notch" on the
-    // top-left of stroked rectangles like the title-bar maximize icon.
-    if (closed && pointCount >= 3 && segNormals.size() >= 2) {
-        uint32_t lastSeg = (uint32_t)segNormals.size() - 1;
-        emitJoin(segNormals[lastSeg].nx, segNormals[lastSeg].ny,
-                 segNormals[0].nx, segNormals[0].ny,
-                 getX(0), getY(0));
-    }
-
-    // ---- Caps ----
-    if (!closed && pointCount >= 2) {
-        // Start cap
-        float nx = segNormals[0].nx, ny = segNormals[0].ny;
-        float cx = getX(0), cy = getY(0);
-        if (cap == ImpellerCap::Round) {
-            GenerateRoundCap(verts, indices, cx, cy, nx, ny, halfWidth, r, g, b, a, true);
-        } else if (cap == ImpellerCap::Square) {
-            float dx = -segNormals[0].ny, dy = segNormals[0].nx;
-            uint32_t base = (uint32_t)verts.size();
-            verts.push_back({ cx + nx * halfWidth - dx * halfWidth, cy + ny * halfWidth - dy * halfWidth, r, g, b, a });
-            verts.push_back({ cx - nx * halfWidth - dx * halfWidth, cy - ny * halfWidth - dy * halfWidth, r, g, b, a });
-            verts.push_back({ cx + nx * halfWidth, cy + ny * halfWidth, r, g, b, a });
-            verts.push_back({ cx - nx * halfWidth, cy - ny * halfWidth, r, g, b, a });
-            indices.push_back(base); indices.push_back(base + 1); indices.push_back(base + 2);
-            indices.push_back(base + 1); indices.push_back(base + 3); indices.push_back(base + 2);
-        }
-
-        // End cap
-        uint32_t lastSeg = (uint32_t)segNormals.size() - 1;
-        nx = segNormals[lastSeg].nx; ny = segNormals[lastSeg].ny;
-        cx = getX(pointCount - 1); cy = getY(pointCount - 1);
-        if (cap == ImpellerCap::Round) {
-            GenerateRoundCap(verts, indices, cx, cy, nx, ny, halfWidth, r, g, b, a, false);
-        } else if (cap == ImpellerCap::Square) {
-            float dx = segNormals[lastSeg].ny, dy = -segNormals[lastSeg].nx;
-            uint32_t base = (uint32_t)verts.size();
-            verts.push_back({ cx + nx * halfWidth, cy + ny * halfWidth, r, g, b, a });
-            verts.push_back({ cx - nx * halfWidth, cy - ny * halfWidth, r, g, b, a });
-            verts.push_back({ cx + nx * halfWidth + dx * halfWidth, cy + ny * halfWidth + dy * halfWidth, r, g, b, a });
-            verts.push_back({ cx - nx * halfWidth + dx * halfWidth, cy - ny * halfWidth + dy * halfWidth, r, g, b, a });
-            indices.push_back(base); indices.push_back(base + 1); indices.push_back(base + 2);
-            indices.push_back(base + 1); indices.push_back(base + 3); indices.push_back(base + 2);
-        }
-    }
-
-    if (verts.empty() || indices.empty()) return true;
-
-    if (collectContours) {
-        // Convert every triangle in the stroke mesh into its own
-        // 3-vertex contour. We force CCW winding (positive signed
-        // area) so that when the whole set is fed to the NonZero
-        // AA rasterizer every triangle contributes +1 inside its
-        // interior — overlaps at joins / bridges simply sum to +2,
-        // +3 ..., still "inside", which is exactly the union we
-        // want for stroke-to-fill conversion. Without this winding
-        // normalization a CW triangle at a join would subtract
-        // coverage and carve a hole through the stroke.
-        //
-        // Color is discarded: the caller rasterizes these contours
-        // with its own brush and uses the per-pixel analytic coverage
-        // as the alpha, which is the whole point of routing strokes
-        // through this path.
-        for (size_t ti = 0; ti + 2 < indices.size(); ti += 3) {
-            uint32_t i0 = indices[ti];
-            uint32_t i1 = indices[ti + 1];
-            uint32_t i2 = indices[ti + 2];
-            if (i0 >= verts.size() || i1 >= verts.size() || i2 >= verts.size()) continue;
-            float ax = verts[i0].x, ay = verts[i0].y;
-            float bx = verts[i1].x, by = verts[i1].y;
-            float cx = verts[i2].x, cy = verts[i2].y;
-            float sa = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-            if (std::abs(sa) < 1e-7f) continue; // degenerate
-            Contour tri;
-            tri.points.reserve(6);
-            tri.points.push_back(ax); tri.points.push_back(ay);
-            if (sa > 0.0f) {
-                tri.points.push_back(bx); tri.points.push_back(by);
-                tri.points.push_back(cx); tri.points.push_back(cy);
-            } else {
-                tri.points.push_back(cx); tri.points.push_back(cy);
-                tri.points.push_back(bx); tri.points.push_back(by);
-            }
-            collectContours->push_back(std::move(tri));
-        }
-        return true;
-    }
-
-    batch.pipelineType = 0;
-    PushBatch(std::move(batch));
-    return true;
-}
-#endif // legacy ExpandStroke
-
-#if 0
-// Legacy GenerateRoundCap / GenerateRoundJoin / ComputeQuadrantDivisions —
-// all moved to jalium_impeller_stroke.h / jalium_impeller_shapes.h.
-void ImpellerD3D12Engine::GenerateRoundCap_LEGACY(
-    std::vector<ImpellerVertex>& verts,
-    std::vector<uint32_t>& indices,
-    float cx, float cy,
-    float nx, float ny,
-    float halfWidth,
-    float r, float g, float b, float a,
-    bool isStart)
-{
-    constexpr uint32_t kSegments = 8;
-    constexpr float kPi = (float)M_PI;
-
-    float angle0 = std::atan2(ny, nx);
-    float startAngle = isStart ? (angle0 + kPi * 0.5f) : (angle0 - kPi * 0.5f);
-    float sweep = isStart ? kPi : -kPi;
-
-    uint32_t base = (uint32_t)verts.size();
-    verts.push_back({ cx, cy, r, g, b, a }); // center
-
-    for (uint32_t i = 0; i <= kSegments; ++i) {
-        float t = (float)i / (float)kSegments;
-        float angle = startAngle + sweep * t;
-        verts.push_back({ cx + halfWidth * std::cos(angle),
-                          cy + halfWidth * std::sin(angle), r, g, b, a });
-    }
-
-    for (uint32_t i = 0; i < kSegments; ++i) {
-        indices.push_back(base);
-        indices.push_back(base + 1 + i);
-        indices.push_back(base + 2 + i);
-    }
-}
-
-void ImpellerD3D12Engine::GenerateRoundJoin_LEGACY(
-    std::vector<ImpellerVertex>& verts,
-    std::vector<uint32_t>& indices,
-    float cx, float cy,
-    float n0x, float n0y,
-    float n1x, float n1y,
-    float halfWidth,
-    float r, float g, float b, float a)
-{
-    // Round join fills only the OUTER side of a corner — the inner side
-    // is already covered by the natural overlap of adjacent segment
-    // quads, so drawing a full circle (as the old code did by emitting
-    // BOTH an n0→n1 fan AND a −n0→−n1 fan) produces a visible bead at
-    // every polyline vertex. Symptom: dense-flattened curves look like
-    // a string of circles instead of a smooth stroke.
-    //
-    // Outer-side detection matches the miter-join convention in
-    // emitJoin: cross(n0, n1) > 0 → outer is on the −n side; otherwise
-    // outer is on the +n side. We rotate the arc to sweep across the
-    // outer side and emit a single triangle fan from the corner point.
-    float cr = n0x * n1y - n0y * n1x;
-    // Nearly-collinear normals → no meaningful corner to fill.
-    if (std::abs(cr) < 1e-5f) return;
-
-    float sign = (cr > 0.0f) ? -1.0f : 1.0f;
-    float a0x = n0x * sign, a0y = n0y * sign;
-    float a1x = n1x * sign, a1y = n1y * sign;
-
-    float angle0 = std::atan2(a0y, a0x);
-    float angle1 = std::atan2(a1y, a1x);
-    float diff = angle1 - angle0;
-    while (diff >  (float)M_PI) diff -= 2.0f * (float)M_PI;
-    while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
-
-    // Segment count proportional to angular span, roughly tracking the
-    // round-cap tessellation density (8 segments per 180°).
-    uint32_t segments = std::max(2u, (uint32_t)std::ceil(std::abs(diff) / (float)M_PI * 8.0f));
-
-    uint32_t base = (uint32_t)verts.size();
-    verts.push_back({ cx, cy, r, g, b, a });
-    for (uint32_t i = 0; i <= segments; ++i) {
-        float t = (float)i / (float)segments;
-        float angle = angle0 + diff * t;
-        verts.push_back({ cx + halfWidth * std::cos(angle),
-                          cy + halfWidth * std::sin(angle), r, g, b, a });
-    }
-    for (uint32_t i = 0; i < segments; ++i) {
-        indices.push_back(base);
-        indices.push_back(base + 1 + i);
-        indices.push_back(base + 2 + i);
-    }
-}
-
-uint32_t ImpellerD3D12Engine::ComputeQuadrantDivisions_LEGACY(float pixelRadius) {
-    constexpr float kCircleTolerance = 0.1f;
-    if (pixelRadius <= 0.0f) return 1;
-    float k = kCircleTolerance / pixelRadius;
-    if (k >= 1.0f) return 1;
-    float n = std::ceil((float)M_PI / 4.0f / std::acos(1.0f - k));
-    return std::max(1u, std::min((uint32_t)n, 64u));
-}
-#endif // legacy GenerateRoundCap / GenerateRoundJoin / ComputeQuadrantDivisions
-
-// PixelRect / RasterizePathToRects moved to jalium_scanline_rasterizer.h so
-// the Vulkan Impeller engine shares the exact pixel output. The legacy
-// in-place implementation is parked under `#if 0` below to keep the original
-// algorithm visible in this commit's diff; it will be physically removed in
-// a follow-up cleanup pass.
-#if 0
-
-namespace {
-
-struct PixelRect_LEGACY { int x; int y; int w; int h; float alpha; };
-
-// ----------------------------------------------------------------------------
-// RasterizePathToRects — analytic anti-aliased scanline rasterizer
-//
-// Converts arbitrary contours (any number, any winding, any fill rule,
-// concave / self-intersecting / with holes) into a list of axis-aligned
-// rectangles whose per-rect alpha encodes the exact fractional coverage
-// of the source path. This replaces the previous binary-coverage AET:
-// the old output matched D3D's top-left rule pixel-for-pixel but was
-// visibly jagged on curves and diagonal triangle edges (scrollbar
-// arrows, tab corners, rounded icons).
-//
-// Algorithm: 4× vertical subpixel sampling with exact horizontal coverage.
-//
-//   1. All non-horizontal edges are collected into a flat list, each
-//      storing its y range [yMin, yMax) and inverse slope (dxdy).
-//   2. For each integer scanline row py ∈ [yStart, yEnd):
-//        a. A coverage[] accumulator (one float per pixel column over
-//           the path's x bbox) is zeroed.
-//        b. Four sub-scanlines are evaluated at fy = py + 0.125, 0.375,
-//           0.625, 0.875 — i.e. the center of each vertical quarter of
-//           the pixel. Each sub-scanline:
-//              - Finds every edge where fy ∈ [yMin, yMax) (half-open,
-//                so a vertex touching the scanline is counted exactly
-//                once, preventing parity flips).
-//              - Computes the x crossing, sorts them, walks in/out
-//                pairs under the selected fill rule, producing float
-//                spans [fillFrom, fillTo) in pixel units.
-//              - For each float span, distributes horizontal coverage
-//                to every pixel column px the span touches:
-//                    overlap = max(0, min(px+1, fillTo) - max(px, fillFrom))
-//                    coverage[px - xOffset] += overlap * 0.25
-//                The 0.25 factor is 1/kSub — each sub-scanline
-//                represents a quarter of the pixel's vertical extent,
-//                so four full-horizontal sub-scanlines sum to 1.0.
-//        c. coverage[] now holds the exact fractional area the path
-//           occupies in each pixel of this row (modulo the 4× vertical
-//           quantization).
-//        d. coverage[] is run-length encoded into (x, w, alpha) runs,
-//           quantizing alpha to 8 bits so tiny float noise doesn't
-//           split runs.
-//   3. Consecutive scanlines whose RLE row layouts match (including
-//      quantized alpha) are coalesced into a single taller rect. A
-//      solid-interior rectangle thus becomes a handful of rects (top
-//      and bottom edge rows plus one tall interior rect) instead of
-//      one rect per scanline.
-//
-// Quality: 4× vertical × continuous horizontal gives roughly 32 unique
-// coverage levels at edge pixels, which is visually indistinguishable
-// from 8-bit AA on typical UI shapes. Straight horizontal/vertical
-// edges remain perfectly sharp.
-//
-// Correctness notes:
-//   - Half-open [yMin, yMax) on edges + half-open [fillFrom, fillTo)
-//     on spans means a pixel center exactly on an edge is attributed
-//     to exactly one side, never both (no double-cover seam darkening).
-//   - The 4 sub-scanlines are sampled at (k+0.5)/4 offsets so the
-//     overall coverage is symmetric: a horizontal edge landing on the
-//     pixel's top or bottom boundary gives 0 or 1, not 0 or 1 modulo
-//     bias.
-//   - Path points exactly on an integer coordinate no longer drop
-//     interior pixels on triangles (this was the "scrollbar arrow has
-//     holes in the middle" bug under binary coverage — partial cover
-//     at any nearby sub-row now carries the pixel).
-// ----------------------------------------------------------------------------
-struct RasterEdge {
-    float yMin, yMax; // half-open [yMin, yMax)
-    float xAtYMin;    // x coordinate at y = yMin
-    float dxdy;       // dx per unit dy (inverse slope)
-    int   dir;        // +1 if the edge goes down, -1 if it goes up
-};
-
-inline void RasterizePathToRects(
-    const std::vector<Contour>& contours,
-    FillRule rule,
-    std::vector<PixelRect>& outRects)
-{
-    if (contours.empty()) return;
-
-    std::vector<RasterEdge> edges;
-    edges.reserve(64);
-
-    float minY =  std::numeric_limits<float>::infinity();
-    float maxY = -std::numeric_limits<float>::infinity();
-    float minX =  std::numeric_limits<float>::infinity();
-    float maxX = -std::numeric_limits<float>::infinity();
-
-    auto addEdge = [&](float x0, float y0, float x1, float y1) {
-        if (x0 < minX) minX = x0;
-        if (x1 < minX) minX = x1;
-        if (x0 > maxX) maxX = x0;
-        if (x1 > maxX) maxX = x1;
-        if (y0 < minY) minY = y0;
-        if (y1 < minY) minY = y1;
-        if (y0 > maxY) maxY = y0;
-        if (y1 > maxY) maxY = y1;
-
-        float dy = y1 - y0;
-        if (std::abs(dy) < 1e-7f) return; // horizontal: no scanline crossings
-
-        RasterEdge e;
-        if (y0 < y1) {
-            e.yMin = y0; e.yMax = y1;
-            e.xAtYMin = x0;
-            e.dxdy = (x1 - x0) / (y1 - y0);
-            e.dir  = +1;
-        } else {
-            e.yMin = y1; e.yMax = y0;
-            e.xAtYMin = x1;
-            e.dxdy = (x0 - x1) / (y0 - y1);
-            e.dir  = -1;
-        }
-        edges.push_back(e);
-    };
-
-    for (const auto& c : contours) {
-        uint32_t n = c.VertexCount();
-        if (n < 2) continue;
-        for (uint32_t i = 0; i + 1 < n; ++i) {
-            addEdge(c.X(i), c.Y(i), c.X(i + 1), c.Y(i + 1));
-        }
-        // Implicit close if the last vertex isn't already the first.
-        if (n >= 3) {
-            float fx0 = c.X(0),     fy0 = c.Y(0);
-            float lx  = c.X(n - 1), ly  = c.Y(n - 1);
-            if (std::abs(fx0 - lx) > 1e-6f || std::abs(fy0 - ly) > 1e-6f) {
-                addEdge(lx, ly, fx0, fy0);
-            }
-        }
-    }
-
-    if (edges.empty()) return;
-
-    // Pixel-column range for the coverage accumulator. One pixel of
-    // padding on each side lets partial-coverage edges at the bounding
-    // box extend into an adjacent column without special-casing.
-    int pxX0 = (int)std::floor(minX) - 1;
-    int pxX1 = (int)std::ceil (maxX) + 1;
-    int pxWidth = pxX1 - pxX0;
-    if (pxWidth <= 0) return;
-
-    int yStart = (int)std::floor(minY);
-    int yEnd   = (int)std::ceil (maxY);
-    if (yEnd <= yStart) return;
-
-    constexpr int   kSub     = 4;
-    constexpr float kSubStep = 1.0f / (float)kSub;
-
-    std::vector<float> coverage((size_t)pxWidth, 0.0f);
-    std::vector<std::pair<float, int>> crossings;
-    crossings.reserve(edges.size());
-
-    // RLE row buffer and vertical coalescing state.
-    struct RunSpan { int x; int w; uint8_t qAlpha; };
-    std::vector<RunSpan> prevSpans;
-    std::vector<RunSpan> curSpans;
-    int  runStartY = 0;
-    bool runOpen   = false;
-
-    auto flushRun = [&](int yExclusive) {
-        if (!runOpen) return;
-        int h = yExclusive - runStartY;
-        if (h > 0) {
-            for (const auto& s : prevSpans) {
-                outRects.push_back({
-                    s.x, runStartY, s.w, h,
-                    (float)s.qAlpha / 255.0f
-                });
-            }
-        }
-        runOpen = false;
-        prevSpans.clear();
-    };
-
-    for (int py = yStart; py < yEnd; ++py) {
-        std::fill(coverage.begin(), coverage.end(), 0.0f);
-
-        for (int k = 0; k < kSub; ++k) {
-            float fy = (float)py + ((float)k + 0.5f) * kSubStep;
-            if (fy < minY || fy >= maxY) continue;
-
-            crossings.clear();
-            for (const auto& e : edges) {
-                if (fy < e.yMin || fy >= e.yMax) continue;
-                float x = e.xAtYMin + (fy - e.yMin) * e.dxdy;
-                crossings.push_back({ x, e.dir });
-            }
-            if (crossings.empty()) continue;
-
-            std::sort(crossings.begin(), crossings.end(),
-                [](const std::pair<float,int>& a, const std::pair<float,int>& b) {
-                    return a.first < b.first;
-                });
-
-            int   winding  = 0;
-            bool  inside   = false;
-            float fillFrom = 0.0f;
-            for (const auto& cr : crossings) {
-                bool was = inside;
-                if (rule == FillRule::NonZero) {
-                    winding += cr.second;
-                    inside   = (winding != 0);
-                } else {
-                    winding ^= 1;
-                    inside   = (winding != 0);
-                }
-                if (!was && inside) {
-                    fillFrom = cr.first;
-                } else if (was && !inside) {
-                    float fillTo = cr.first;
-                    if (fillTo <= fillFrom) continue;
-
-                    int pxA = (int)std::floor(fillFrom) - pxX0;
-                    int pxB = (int)std::ceil (fillTo)   - pxX0;
-                    if (pxA < 0) pxA = 0;
-                    if (pxB > pxWidth) pxB = pxWidth;
-
-                    for (int px = pxA; px < pxB; ++px) {
-                        float pxLeft  = (float)(px + pxX0);
-                        float pxRight = pxLeft + 1.0f;
-                        float l = pxLeft  > fillFrom ? pxLeft  : fillFrom;
-                        float r = pxRight < fillTo   ? pxRight : fillTo;
-                        if (r > l) {
-                            coverage[(size_t)px] += (r - l) * kSubStep;
-                        }
-                    }
-                }
-            }
-        }
-
-        // RLE the coverage row into runs of identical quantized alpha.
-        curSpans.clear();
-        {
-            int px = 0;
-            while (px < pxWidth) {
-                float c0 = coverage[(size_t)px];
-                if (c0 > 1.0f) c0 = 1.0f;
-                int q0 = (int)(c0 * 255.0f + 0.5f);
-                if (q0 <= 0) { ++px; continue; }
-
-                int runEnd = px + 1;
-                while (runEnd < pxWidth) {
-                    float c1 = coverage[(size_t)runEnd];
-                    if (c1 > 1.0f) c1 = 1.0f;
-                    int q1 = (int)(c1 * 255.0f + 0.5f);
-                    if (q1 != q0) break;
-                    ++runEnd;
-                }
-
-                curSpans.push_back({
-                    px + pxX0,
-                    runEnd - px,
-                    (uint8_t)q0
-                });
-                px = runEnd;
-            }
-        }
-
-        // Vertical coalescing vs the currently-open run.
-        bool same =
-            runOpen &&
-            curSpans.size() == prevSpans.size() &&
-            std::equal(curSpans.begin(), curSpans.end(), prevSpans.begin(),
-                [](const RunSpan& a, const RunSpan& b) {
-                    return a.x == b.x && a.w == b.w && a.qAlpha == b.qAlpha;
-                });
-
-        if (!same) {
-            flushRun(py);
-            if (!curSpans.empty()) {
-                prevSpans = curSpans;
-                runStartY = py;
-                runOpen   = true;
-            }
-        }
-    }
-
-    flushRun(yEnd);
-}
-
-} // namespace
-#endif // legacy in-place RasterizePathToRects (now in jalium_scanline_rasterizer.h)
+// PixelRect / RasterizePathToRects live in jalium_scanline_rasterizer.h so the
+// Vulkan Impeller engine shares the exact pixel output — and so an AA fix
+// lands once. (The parked `#if 0` copy of the old in-place implementation that
+// used to sit here has been deleted; a second copy of a rasterizer is exactly
+// how the two backends drift apart.)
 
 // ============================================================================
 // Path Encoding Entry Points
@@ -1705,6 +918,26 @@ bool ImpellerD3D12Engine::EncodeFillPath(
         }
     }
 
+    // ── Anti-aliasing route gate ────────────────────────────────────────
+    // Anything at icon / control scale goes to the analytic-coverage
+    // rasterizer instead of the triangulate + feather approximation below.
+    // The feather ring cannot anti-alias the INSIDE of an edge (the interior
+    // mesh rasterizes with binary pixel-centre coverage under it), so on small
+    // geometry it reads as a hard staircase with a faint halo. See
+    // PreferAnalyticFill.
+    {
+        float lminX, lminY, lmaxX, lmaxY;
+        if (PathCommandExtent(startX, startY, commands, commandLength,
+                              lminX, lminY, lmaxX, lmaxY)) {
+            float devW, devH;
+            TransformedExtent(lminX, lminY, lmaxX, lmaxY, transformIn, devW, devH);
+            if (PreferAnalyticFill(devW, devH)) {
+                return EncodeFillPathScanline(startX, startY, commands, commandLength,
+                                              brush, fillRule, transformIn, edgeMode);
+            }
+        }
+    }
+
     const float maxScale     = MaxScaleFromTransform(transformIn);
     const uint32_t scaleBkt  = ScaleBucketFromMaxScale(maxScale);
     const uint64_t key = HashPathInput(startX, startY, commands, commandLength,
@@ -1822,7 +1055,7 @@ bool ImpellerD3D12Engine::EncodeFillPath(
 
     // Edge AA: constant-width feather ring around every boundary contour,
     // built in pixel space from the cached local contours so the soft edge
-    // stays ~0.6 px on screen at any transform.
+    // stays ~1 px on screen at any transform.
     EmitContourFeather(geom->contours, transformIn, r, g, b, a);
 
     encodedPathCount_++;
@@ -1830,24 +1063,54 @@ bool ImpellerD3D12Engine::EncodeFillPath(
 }
 
 // ----------------------------------------------------------------------------
-// EmitContourFeather — 1 px-ish alpha-fade ring along each boundary contour.
+// EmitContourFeather — 1 px alpha-fade ring along each boundary contour.
 //
-// Our solid-fill PSO renders to a single-sample target (no MSAA), so raw
-// triangle edges would stair-step. For every contour we emit a centred ring:
-// each boundary vertex contributes an inner vertex (full fill alpha, ~0.3 px
-// inside) and an outer vertex (alpha 0, ~0.3 px outside) along the averaged
-// edge normal; consecutive pairs form a triangle strip. GPU bilinear blend of
-// the per-vertex alpha gives a clean ~0.6 px feather. The ring is centred so
-// it always overlaps the interior mesh — no seam, and the inner-side normal
-// sign is irrelevant to quality.
+// The APPROXIMATE anti-aliasing route, reached only by fills too large for the
+// analytic rasterizer (PreferAnalyticFill). Our solid-fill PSO renders to a
+// single-sample target, so the interior triangle mesh has binary pixel-centre
+// coverage and its raw edges stair-step. For every contour we emit a ring
+// centred on the boundary: each vertex contributes an inner vertex (full fill
+// alpha, half a pixel inside) and an outer vertex (alpha 0, half a pixel
+// outside); consecutive pairs form a triangle strip and the GPU's per-vertex
+// alpha interpolation becomes the soft edge.
+//
+// Two properties this depends on, both of which were wrong before:
+//
+//   • Ring WIDTH. At 0.6 px total the ring's inner half sits under the opaque
+//     interior mesh, leaving barely a third of a pixel of actual fade outside
+//     the hard edge — indistinguishable from no anti-aliasing. A full pixel
+//     (±0.5) puts a real ramp on the outside where it can be seen.
+//
+//   • Offset DIRECTION. Using the chord `next − prev` as the edge direction
+//     collapses at a spike: on a star tip prev and next are nearly the same
+//     point, the chord length underflows, and the vertex got NO offset at all —
+//     so the sharpest, most visible corners of an icon were the ones left
+//     completely aliased. We now bisect the two adjacent EDGE normals (with a
+//     miter clamp, and a fallback to one edge normal when the turn approaches
+//     180°), which is well-defined for any corner angle.
+//
+// The ring is centred on the boundary so it always overlaps the interior mesh
+// — no seam — and the sign of the normal (which side is "outside") does not
+// affect the result, so contour winding need not be known.
+//
+// Pass gradientBrush + gradientStops to colour the inner edge from a gradient
+// instead of the flat r/g/b/a; the sample is taken at the un-offset PATH-space
+// vertex, the same space and sampler the interior mesh uses, so ring and
+// interior agree in colour.
 // ----------------------------------------------------------------------------
 void ImpellerD3D12Engine::EmitContourFeather(
     const std::vector<Contour>& contours,
     const EngineTransform& transform,
-    float r, float g, float b, float a)
+    float r, float g, float b, float a,
+    const EngineBrushData* gradientBrush,
+    const float* gradientStops)
 {
-    if (a <= 0.0f) return;
-    constexpr float kHalfFeatherPx = 0.3f;  // ⇒ ~0.6 px total soft edge
+    const bool useGradient = (gradientBrush != nullptr) && (gradientStops != nullptr)
+                             && gradientBrush->stopCount > 0;
+    if (!useGradient && a <= 0.0f) return;
+
+    constexpr float kHalfFeatherPx = 0.5f;   // ⇒ 1 px total soft edge
+    constexpr float kMaxMiter      = 4.0f;   // clamp so needle corners stay sane
 
     ImpellerDrawBatch batch;
     batch.pipelineType = 0;
@@ -1881,21 +1144,53 @@ void ImpellerD3D12Engine::EmitContourFeather(
         for (uint32_t i = 0; i < n; ++i) {
             const uint32_t prev = (i + n - 1) % n;
             const uint32_t next = (i + 1) % n;
-            // Averaged adjacent-edge direction → outward normal (perp).
-            float dx = p[next * 2]     - p[prev * 2];
-            float dy = p[next * 2 + 1] - p[prev * 2 + 1];
-            float len = std::sqrt(dx * dx + dy * dy);
-            float nx, ny;
-            if (len > 1e-6f) { nx = -dy / len; ny = dx / len; }
-            else             { nx = 0.0f;      ny = 0.0f; }
             const float px = p[i * 2], py = p[i * 2 + 1];
-            const float ix = px - nx * kHalfFeatherPx;
-            const float iy = py - ny * kHalfFeatherPx;
-            const float ox = px + nx * kHalfFeatherPx;
-            const float oy = py + ny * kHalfFeatherPx;
-            // Inner (solid) then outer (transparent).
-            batch.vertices.push_back({ ix, iy, r, g, b, a });
+
+            // Normals of the two edges meeting at this vertex, perp = (-dy, dx).
+            float e0x = px - p[prev * 2], e0y = py - p[prev * 2 + 1];
+            float e1x = p[next * 2] - px, e1y = p[next * 2 + 1] - py;
+            const float l0 = std::sqrt(e0x * e0x + e0y * e0y);
+            const float l1 = std::sqrt(e1x * e1x + e1y * e1y);
+
+            float n0x = 0.0f, n0y = 0.0f, n1x = 0.0f, n1y = 0.0f;
+            if (l0 > 1e-6f) { n0x = -e0y / l0; n0y = e0x / l0; }
+            if (l1 > 1e-6f) { n1x = -e1y / l1; n1y = e1x / l1; }
+            if (l0 <= 1e-6f) { n0x = n1x; n0y = n1y; }
+            if (l1 <= 1e-6f) { n1x = n0x; n1y = n0y; }
+
+            // Miter = normalized bisector scaled by 1/cos(half-angle). At a
+            // near-180° turn (a needle spike) the bisector cancels out; fall
+            // back to a single edge normal rather than emitting a zero offset,
+            // which is what used to leave star tips completely un-feathered.
+            float bx = n0x + n1x, by = n0y + n1y;
+            float bl = std::sqrt(bx * bx + by * by);
+            float ox_n, oy_n;
+            if (bl > 1e-4f) {
+                bx /= bl; by /= bl;
+                float cosHalf = bx * n1x + by * n1y;
+                if (cosHalf < 1.0f / kMaxMiter) cosHalf = 1.0f / kMaxMiter;
+                ox_n = bx / cosHalf;
+                oy_n = by / cosHalf;
+            } else {
+                ox_n = n1x; oy_n = n1y;
+            }
+
+            const float ix = px - ox_n * kHalfFeatherPx;
+            const float iy = py - oy_n * kHalfFeatherPx;
+            const float ox = px + ox_n * kHalfFeatherPx;
+            const float oy = py + oy_n * kHalfFeatherPx;
+
+            // Inner (opaque) then outer (transparent).
+            if (useGradient) {
+                GradientColor gc = SampleBrushGradient(*gradientBrush, gradientStops,
+                                                       c.X(i), c.Y(i));
+                batch.vertices.push_back({ ix, iy,
+                                           gc.r * gc.a, gc.g * gc.a, gc.b * gc.a, gc.a });
+            } else {
+                batch.vertices.push_back({ ix, iy, r, g, b, a });
+            }
             batch.vertices.push_back({ ox, oy, 0, 0, 0, 0 });
+
             // Independent min/max checks on every vertex — the inner/outer
             // pair is centred on the boundary, so neither dominates.
             if (ix < minX) minX = ix;
@@ -1979,7 +1274,7 @@ bool ImpellerD3D12Engine::EncodeFillPathScanline(
         }
         if (gradContours.empty()) return false;
 
-        bool gradOk = EncodeGradientFillPath(gradContours, brush, transformIn);
+        bool gradOk = EncodeGradientFillPath(gradContours, brush, transformIn, fillRule);
         if (gradOk) encodedPathCount_++;
         return gradOk;
     }
@@ -3391,19 +2686,25 @@ bool ImpellerD3D12Engine::EncodeStrokePathPixelCached(
 }
 
 // ============================================================================
-// EncodeFillPolygon — transform-independent local-space cache (same fix as
-// EncodeFillPath). This is THE hot path for straight-line filled figures
-// (Path/Shape Data without curves, ScrollBar/RepeatButton glyphs): managed
-// DrawPathFigurePolygon → RenderTarget.FillPolygon → here. The legacy body
-// (now EncodeFillPolygonScanline) re-ran the full AET scanline rasterizer for
-// EVERY polygon EVERY frame with NO cache at all — profiled at ~3.3 ms × 38
-// polygons = 127 ms/frame, the dominant "Geometry drawing is laggy" cost.
+// EncodeFillPolygon — straight-line filled figures. This is THE icon path:
+// managed DrawPathFigurePolygon → RenderTarget.FillPolygon → here, taken by
+// every Path/Shape whose Data has no curves (most SVG icons, ScrollBar and
+// RepeatButton glyphs, chevrons, stars).
 //
-// The incoming points carry the element's stable layout Offset (baked managed-
-// side) but NOT scroll/animation — those live in `transform`, applied per
-// frame at emit. So hashing the raw points + fillRule + scaleBucket gives a
-// frame-stable key: triangulate once, then only an O(N) vertex transform per
-// frame. Mirrors VulkanRenderTarget::FillPath / our EncodeFillPath exactly.
+// Two routes, chosen by PreferAnalyticFill:
+//
+//   • Icon / control scale (and every gradient) → EncodeFillPolygonAsPath →
+//     the shared analytic-coverage rasterizer. Exact edges, PixelRect list
+//     cached on (points, fill rule, transform-minus-integer-translation) so a
+//     static or scrolling UI rasterizes each shape once.
+//
+//   • Large artwork → transform-independent local-space triangulation cache
+//     below. The incoming points carry the element's stable layout Offset
+//     (baked managed-side) but NOT scroll/animation — those live in
+//     `transform`, applied per frame at emit — so hashing raw points +
+//     fillRule + scaleBucket gives a frame-stable key: triangulate once, then
+//     only an O(N) vertex transform per frame. Edges get the approximate
+//     feather ring; at that size the approximation is not visible.
 // ============================================================================
 bool ImpellerD3D12Engine::EncodeFillPolygon(
     const float* points, uint32_t pointCount,
@@ -3413,11 +2714,31 @@ bool ImpellerD3D12Engine::EncodeFillPolygon(
 {
     if (pointCount < 3 || !points) return false;
 
-    // Gradient brushes (sampled in path-local space) and the no-cache safety
-    // case defer to the legacy per-call scanline rasterizer unchanged.
-    if (brush.type == 1 || brush.type == 2 || !pathGeometryCache_) {
-        return EncodeFillPolygonScanline(points, pointCount, brush, fillRule,
-                                         transform);
+    // ── Anti-aliasing route gate ────────────────────────────────────────
+    // Straight-line filled figures are THE icon path (managed
+    // DrawPathFigurePolygon → RenderTarget.FillPolygon → here), so this gate
+    // is what decides whether an application's icons look crisp. Anything at
+    // icon / control scale — plus every gradient, which the triangulate route
+    // cannot anti-alias at all — goes to the analytic-coverage rasterizer.
+    // See PreferAnalyticFill.
+    {
+        float lminX = points[0], lmaxX = points[0];
+        float lminY = points[1], lmaxY = points[1];
+        for (uint32_t i = 1; i < pointCount; ++i) {
+            const float x = points[i * 2], y = points[i * 2 + 1];
+            if (x < lminX) lminX = x;
+            if (y < lminY) lminY = y;
+            if (x > lmaxX) lmaxX = x;
+            if (y > lmaxY) lmaxY = y;
+        }
+        float devW, devH;
+        TransformedExtent(lminX, lminY, lmaxX, lmaxY, transform, devW, devH);
+
+        if (brush.type == 1 || brush.type == 2 || !pathGeometryCache_ ||
+            PreferAnalyticFill(devW, devH)) {
+            return EncodeFillPolygonAsPath(points, pointCount, brush, fillRule,
+                                           transform);
+        }
     }
 
     const float maxScale    = MaxScaleFromTransform(transform);
@@ -3454,8 +2775,8 @@ bool ImpellerD3D12Engine::EncodeFillPolygon(
 
     if (!geom->triangulationSucceeded || geom->localTriangles.empty()) {
         // Near-degenerate / self-intersecting: preserve the analytic slow path.
-        return EncodeFillPolygonScanline(points, pointCount, brush, fillRule,
-                                         transform);
+        return EncodeFillPolygonAsPath(points, pointCount, brush, fillRule,
+                                       transform);
     }
 
     const float r = brush.r * brush.a;
@@ -3501,80 +2822,41 @@ bool ImpellerD3D12Engine::EncodeFillPolygon(
 }
 
 // ============================================================================
-// EncodeFillPolygonScanline — legacy per-call pixel-space scanline fill
-// (UNCHANGED). Fallback for gradient brushes and polygons EncodeFillPolygon's
-// triangulator rejects.
+// EncodeFillPolygonAsPath — re-express a polygon as path commands and hand it
+// to the ONE analytic-AA fill implementation.
+//
+// This used to be a second, near-identical scanline rasterizer
+// (EncodeFillPolygonScanline). Two copies meant two behaviours: the path one
+// splits the transform's translation into an integer part plus a 1/8-px
+// fractional bucket and caches the resulting PixelRect list, so a static or
+// scrolling UI rasterizes each shape once; the polygon one rasterized from
+// scratch on every frame and did not support gradients at all. Routing through
+// the path implementation gives polygons the cache, the gradient support, and
+// any future fix, for the cost of building a small command vector.
+//
+// Command encoding matches jalium_triangulate.h: LineTo = 0, ClosePath = 5;
+// the first point travels as the path's start position.
 // ============================================================================
-bool ImpellerD3D12Engine::EncodeFillPolygonScanline(
+bool ImpellerD3D12Engine::EncodeFillPolygonAsPath(
     const float* points, uint32_t pointCount,
     const EngineBrushData& brush,
     FillRule fillRule,
     const EngineTransform& transform)
 {
-    if (pointCount < 3) return false;
+    if (pointCount < 3 || !points) return false;
 
-    // Premultiply alpha
-    float r = brush.r * brush.a;
-    float g = brush.g * brush.a;
-    float b = brush.b * brush.a;
-    float a = brush.a;
-
-    // Transform points into pixel space and build a single Contour so we
-    // can feed the same AET scanline rasterizer EncodeFillPath uses. This
-    // is the entry point ScrollBar / RepeatButton / Path elements with
-    // straight-line geometry hit, and the former ear-clipping code here
-    // was the actual source of the "triangle corners render but interior
-    // has gaps" bug — small integer-aligned triangles cracked at the tip
-    // because TriangulatePolygon produced near-degenerate ears that the
-    // GPU rasterizer then dropped under the top-left rule.
-    std::vector<Contour> contours(1);
-    Contour& c = contours[0];
-    c.points.reserve(pointCount * 2);
-    for (uint32_t i = 0; i < pointCount; ++i) {
-        float x = points[i * 2], y = points[i * 2 + 1];
-        TransformPoint(x, y, transform);
-        c.points.push_back(x);
-        c.points.push_back(y);
+    std::vector<float> cmds;
+    cmds.reserve((size_t)pointCount * 3 + 1);
+    for (uint32_t i = 1; i < pointCount; ++i) {
+        cmds.push_back(0.0f);                  // LineTo
+        cmds.push_back(points[i * 2]);
+        cmds.push_back(points[i * 2 + 1]);
     }
+    cmds.push_back(5.0f);                      // ClosePath
 
-    std::vector<PixelRect> rects;
-    rects.reserve(32);
-    RasterizePathToRects(contours, fillRule, rects);
-
-    if (!rects.empty()) {
-        ImpellerDrawBatch batch;
-        batch.vertices.reserve(rects.size() * 4);
-        batch.indices.reserve(rects.size() * 6);
-        for (const auto& rect : rects) {
-            float x0 = (float)rect.x;
-            float y0 = (float)rect.y;
-            float x1 = (float)(rect.x + rect.w);
-            float y1 = (float)(rect.y + rect.h);
-            // Apply analytic coverage to premult-alpha brush color.
-            float ra = r * rect.alpha;
-            float ga = g * rect.alpha;
-            float ba = b * rect.alpha;
-            float aa = a * rect.alpha;
-            uint32_t base = (uint32_t)batch.vertices.size();
-            batch.vertices.push_back({ x0, y0, ra, ga, ba, aa });
-            batch.vertices.push_back({ x1, y0, ra, ga, ba, aa });
-            batch.vertices.push_back({ x1, y1, ra, ga, ba, aa });
-            batch.vertices.push_back({ x0, y1, ra, ga, ba, aa });
-            batch.indices.push_back(base);
-            batch.indices.push_back(base + 1);
-            batch.indices.push_back(base + 2);
-            batch.indices.push_back(base);
-            batch.indices.push_back(base + 2);
-            batch.indices.push_back(base + 3);
-        }
-        batch.pipelineType = 0;
-        PushBatch(std::move(batch));
-        encodedPathCount_++;
-        return true;
-    }
-
-    // Degenerate / sub-pixel polygon — nothing to draw.
-    return false;
+    return EncodeFillPathScanline(points[0], points[1],
+                                  cmds.data(), (uint32_t)cmds.size(),
+                                  brush, fillRule, transform, /*edgeMode*/ -1);
 }
 
 bool ImpellerD3D12Engine::EncodeFillEllipse(

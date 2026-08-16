@@ -138,6 +138,32 @@ public class CompositionInvalidationTests
     }
 
     [Fact]
+    public void PositionOnlyArrange_DoesNotInvalidateLocalDrawing()
+    {
+        var element = new TestVisualElement { Width = 80, Height = 40 };
+        element.Measure(new Size(200, 200));
+        element.Arrange(new Rect(10, 10, 80, 40));
+        ClearIsRenderDirty(element);
+
+        element.Arrange(new Rect(70, 55, 80, 40));
+
+        Assert.False(GetIsRenderDirty(element));
+    }
+
+    [Fact]
+    public void SizeChangingArrange_StillInvalidatesLocalDrawing()
+    {
+        var element = new TestVisualElement();
+        element.Measure(new Size(200, 200));
+        element.Arrange(new Rect(10, 10, 80, 40));
+        ClearIsRenderDirty(element);
+
+        element.Arrange(new Rect(10, 10, 120, 60));
+
+        Assert.True(GetIsRenderDirty(element));
+    }
+
+    [Fact]
     public void OpacityProperty_IsCompositionOnly()
     {
         var meta = UIElement.OpacityProperty.DefaultMetadata as FrameworkPropertyMetadata;

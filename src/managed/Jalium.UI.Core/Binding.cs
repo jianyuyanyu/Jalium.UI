@@ -2166,9 +2166,10 @@ public sealed class BindingExpression : BindingExpressionBase
         if (_binding.Mode != BindingMode.Default)
             return _binding.Mode;
 
-        // Default mode based on property metadata would go here
-        // For now, default to OneWay
-        return BindingMode.OneWay;
+        var metadata = TargetProperty.GetMetadata(Target.GetType());
+        return metadata is FrameworkPropertyMetadata { BindsTwoWayByDefault: true }
+            ? BindingMode.TwoWay
+            : BindingMode.OneWay;
     }
 }
 

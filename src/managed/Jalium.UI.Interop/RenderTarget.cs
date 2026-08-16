@@ -1148,17 +1148,23 @@ public sealed class RenderTarget : IDisposable
     }
 
     /// <summary>
-    /// Sets the path anti-aliasing mode for filled vector paths, applied at the
-    /// next frame boundary. Non-zero values are stencil-then-cover MSAA sample
-    /// counts (clamped to 1/2/4/8); lower counts trade path edge anti-aliasing
-    /// quality for GPU time; 8 is the highest-quality default. The value
-    /// <c>0</c> is a sentinel meaning <b>analytic</b>: no GPU MSAA — solid path
-    /// fills are routed to the engine's analytic coverage rasterizer
-    /// (WPF/Skia-style per-pixel coverage AA), the cheapest option on weak GPUs.
+    /// Sets the path anti-aliasing mode for LARGE filled vector paths, applied at
+    /// the next frame boundary. Non-zero values are stencil-then-cover MSAA sample
+    /// counts (normalized to 1/2/4/8/16, then resolved down to what the device
+    /// advertises for the scratch target's colour and depth-stencil formats);
+    /// lower counts trade path edge anti-aliasing quality for GPU time and for
+    /// the size of the viewport-sized MSAA scratch. The value <c>0</c> is a
+    /// sentinel meaning <b>analytic</b>: no GPU MSAA — solid path fills are
+    /// routed to the engine's analytic coverage rasterizer (WPF/Skia-style
+    /// per-pixel coverage AA), the cheapest option on weak GPUs.
+    /// <para>
+    /// Icon- and control-scale fills take the analytic rasterizer regardless of
+    /// this value, so it does not affect them.
+    /// </para>
     /// See <see cref="Jalium.UI.Hosting.PathAntiAliasing"/>. Backends without an
     /// MSAA path renderer ignore the MSAA counts.
     /// </summary>
-    /// <param name="sampleCount">MSAA sample count (1, 2, 4, or 8), or 0 for analytic coverage AA.</param>
+    /// <param name="sampleCount">MSAA sample count (1, 2, 4, 8, or 16), or 0 for analytic coverage AA.</param>
     public void SetPathMsaaSampleCount(uint sampleCount)
     {
         ThrowIfDisposed();

@@ -76,6 +76,7 @@ internal sealed class OverlayLayer : Canvas
         {
             Children.Add(root);
             InvalidateMeasure();
+            InvalidateArrange();
             InvalidateVisual();
         }
     }
@@ -89,6 +90,7 @@ internal sealed class OverlayLayer : Canvas
         {
             Children.Remove(root);
             InvalidateMeasure();
+            InvalidateArrange();
             InvalidateVisual();
         }
     }
@@ -100,6 +102,13 @@ internal sealed class OverlayLayer : Canvas
     public bool TryHandleLightDismiss(Point windowPosition)
     {
         if (_lightDismissRoots.Count == 0) return false;
+
+        // A captured pointer belongs to an interaction that started inside popup content
+        // (most commonly dragging a ScrollBar Thumb). Capture deliberately continues when
+        // the pointer leaves the popup bounds, so an out-of-bounds sample is not a new
+        // outside click and must not close the popup mid-gesture.
+        if (_lightDismissRoots.Any(static root => root.HasPointerCaptureWithin))
+            return false;
 
         // Check if click is inside any popup root
         foreach (var root in _lightDismissRoots)
@@ -181,12 +190,32 @@ internal sealed class OverlayLayer : Canvas
     /// </summary>
     protected override Size MeasureOverride(Size constraint)
     {
-        // Measure all children with infinite space (they position themselves absolutely)
+        // Popup roots position themselves absolutely and keep the Canvas contract of an
+        // unbounded measure. A modal root is a different animal: it covers the whole host
+        // viewport, so it is measured against this layer's own constraint — which Window
+        // passes straight through from the live client size. Deriving the modal size from
+        // the layout constraint is what keeps it exact across a maximize/restore; a modal
+        // that copies Window.ActualWidth/ActualHeight instead reads the value from the
+        // *previous* arrange pass and ends up one resize behind.
         foreach (UIElement child in Children.EnumerateStruct())
         {
-            child.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+            child.Measure(_modalRoots.Contains(child)
+                ? constraint
+                : new Size(double.PositiveInfinity, double.PositiveInfinity));
         }
 
         return default(Size);
+    }
+
+    /// <inheritdoc />
+    protected override void ArrangeChild(FrameworkElement child, Size finalSize)
+    {
+        if (_modalRoots.Contains(child))
+        {
+            child.Arrange(new Rect(0, 0, finalSize.Width, finalSize.Height));
+            return;
+        }
+
+        base.ArrangeChild(child, finalSize);
     }
 }

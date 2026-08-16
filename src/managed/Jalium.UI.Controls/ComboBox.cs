@@ -455,6 +455,7 @@ public class ComboBox : Selector
         }
 
         UpdatePopupPlacementAndWidth();
+        SyncPopupOpenState();
 
         // Find the arrow Path inside ToggleButton's template for the open/close indicator.
         _arrowPath = FindDescendant<Shapes.Path>(_toggleButton);
@@ -478,12 +479,6 @@ public class ComboBox : Selector
     /// <inheritdoc />
     internal override void OnTemplateContentClearing()
     {
-        // base clears ItemsControl's ItemsPresenter (ComboBox's presenter lives in PART_Popup,
-        // TemplatedParent == this, so the base membership test reaches it); then release our own
-        // parts so the open/close popup animation and the editable-text sync no longer resolve
-        // into the discarded tree once the template is cleared and never re-applied.
-        base.OnTemplateContentClearing();
-
         _popupAnimTimer?.Stop();
         _popupAnimTimer = null;
         _arrowAnimTimer?.Stop();
@@ -496,7 +491,14 @@ public class ComboBox : Selector
         }
         if (_popup != null)
         {
+            // A Popup moves its Child into the Window overlay while it is open. Merely
+            // discarding the ComboBox template therefore does not remove that PopupRoot:
+            // the old root survives as an empty/zombie flyout while the replacement
+            // template opens a second, live popup. Unsubscribe first so this mechanical
+            // teardown does not feed a false close back into IsDropDownOpen; the new
+            // PART_Popup will inherit and continue the same logical open state.
             _popup.Closed -= OnPopupClosed;
+            _popup.IsOpen = false;
         }
         if (_editableTextBox != null)
         {
@@ -509,6 +511,11 @@ public class ComboBox : Selector
         _selectionPresenter = null;
         _dropDownArea = null;
         _arrowPath = null;
+
+        // ItemsControl retires the ItemsPresenter that used to live under PART_Popup.
+        // Run this after closing the popup host so no detached overlay tree can outlive
+        // the part caches being cleared.
+        base.OnTemplateContentClearing();
     }
 
     private void OnToggleButtonChecked(object? sender, RoutedEventArgs e)
@@ -1323,6 +1330,27 @@ public class ComboBox : Selector
             _popup.Width = popupWidth;
             _popup.MinWidth = popupWidth;
             _popup.MaxWidth = popupWidth;
+        }
+    }
+
+    private void SyncPopupOpenState()
+    {
+        if (_popup == null)
+            return;
+
+        var shouldBeOpen = IsDropDownOpen;
+        if (_popup.IsOpen != shouldBeOpen)
+        {
+            _popup.IsOpen = shouldBeOpen;
+        }
+
+        // TemplateBinding can assign IsOpen before the freshly expanded template is
+        // connected to a Window. In that case Popup's first open attempt has no host,
+        // while the value already reads true and will not produce another DP callback.
+        // Retry after OnApplyTemplate, when the visual ancestry is complete.
+        if (shouldBeOpen)
+        {
+            _popup.EnsureOpen();
         }
     }
 

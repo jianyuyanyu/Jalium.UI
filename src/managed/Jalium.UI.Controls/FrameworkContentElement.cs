@@ -606,7 +606,9 @@ public class FrameworkContentElement : ContentElement, IFrameworkInputElement, I
                 return local;
             }
 
-            if (current.Style?.Resources.TryGetValue(resourceKey, out object? styled) == true)
+            // 走 ResourcesOrNull：Style 实例跨元素共享，public Resources getter 的懒构造
+            // 会把空字典挂到共享 theme style 上（上一行的 _resources? 已是正确写法）。
+            if (current.Style?.ResourcesOrNull?.TryGetValue(resourceKey, out object? styled) == true)
             {
                 return styled;
             }

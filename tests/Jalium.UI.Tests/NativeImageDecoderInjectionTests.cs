@@ -8,6 +8,8 @@ namespace Jalium.UI.Tests;
 /// 验证 <see cref="BitmapImage"/> 的 <see cref="INativeImageDecoder"/> 注入路径不依赖原生
 /// jalium.native.media DLL — 测试时可用 mock 替代真实解码。
 /// </summary>
+// SetDecoder is process-global; serialize with every other decoder-injecting class.
+[Collection("Application")]
 public class NativeImageDecoderInjectionTests
 {
     private sealed class FakeDecoder : INativeImageDecoder

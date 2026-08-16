@@ -78,4 +78,12 @@ internal interface IRenderCacheHost
     /// <returns>A whole-frame recorder, or <c>null</c> if the host does not
     /// support whole-frame capture (callers must fall back to direct render).</returns>
     DrawingContext? CreateFrameRecorder() => null;
+
+    /// <summary>
+    /// Starts a whole-frame recording with a frame-consistent element-effect
+    /// policy. Live resize can suppress offscreen element effects while still
+    /// recording every current layout/position update.
+    /// </summary>
+    DrawingContext? CreateFrameRecorder(bool simplifyElementEffects) =>
+        CreateFrameRecorder();
 }

@@ -104,11 +104,23 @@
   <ItemGroup Condition="'$(UseJaliumNativeAot)' != 'true' and '$(_JaliumNativeRuntimeRid)' != '' and (Exists('$(JaliumNativeOutputRoot)/$(_JaliumNativeRuntimeRid)/$(JaliumNativeConfiguration)/.jalium-native-complete') or '$(JaliumNativePayloadValidated)' == 'true')">
     <None Include="$(JaliumNativeOutputRoot)/$(_JaliumNativeRuntimeRid)/$(JaliumNativeConfiguration)/*.dll;$(JaliumNativeOutputRoot)/$(_JaliumNativeRuntimeRid)/$(JaliumNativeConfiguration)/*.so" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Pack="false" Visible="false" />
   </ItemGroup>
-  <ItemGroup Condition="'$(UseJaliumNativeAot)' != 'true' and '$(_JaliumNativeRuntimeRid)' == 'win-x64' and !Exists('$(JaliumNativeOutputRoot)/win-x64/$(JaliumNativeConfiguration)/.jalium-native-complete')">
+
+  <!-- A focused native project build intentionally removes the package-complete
+       stamp before linking and does not recreate it unless the aggregate
+       jalium.native.package.complete target is built. That stamp must remain a
+       hard requirement for packing, but it must not make project-reference
+       development silently fall back to the legacy directory: doing so can
+       load an older embedded shader even though the just-linked RID-specific
+       DLL is present. Prefer that current RID payload for local build/run. -->
+  <ItemGroup Condition="'$(UseJaliumNativeAot)' != 'true' and '$(JaliumNativePayloadValidated)' != 'true' and '$(_JaliumNativeRuntimeRid)' != '' and !Exists('$(JaliumNativeOutputRoot)/$(_JaliumNativeRuntimeRid)/$(JaliumNativeConfiguration)/.jalium-native-complete') and Exists('$(JaliumNativeOutputRoot)/$(_JaliumNativeRuntimeRid)/$(JaliumNativeConfiguration)/jalium.native.core.dll')">
+    <None Include="$(JaliumNativeOutputRoot)/$(_JaliumNativeRuntimeRid)/$(JaliumNativeConfiguration)/*.dll;$(JaliumNativeOutputRoot)/$(_JaliumNativeRuntimeRid)/$(JaliumNativeConfiguration)/*.so" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Pack="false" Visible="false" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(UseJaliumNativeAot)' != 'true' and '$(JaliumNativePayloadValidated)' != 'true' and '$(_JaliumNativeRuntimeRid)' == 'win-x64' and !Exists('$(JaliumNativeOutputRoot)/win-x64/$(JaliumNativeConfiguration)/.jalium-native-complete') and !Exists('$(JaliumNativeOutputRoot)/win-x64/$(JaliumNativeConfiguration)/jalium.native.core.dll')">
     <None Include="$(JaliumNativeOutputRoot)/$(JaliumNativeConfiguration)/*.dll" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Pack="false" Visible="false" />
   </ItemGroup>
   <ItemGroup Condition="'$(UseJaliumNativeAot)' != 'true' and ('$(_JaliumNativeRuntimeRid)' == 'win-x64' or '$(_JaliumNativeRuntimeRid)' == 'win-arm64')">
-    <None Include="$(MSBuildThisFileDirectory)../../native/jalium.native.browser/redist/$(_JaliumNativeRuntimeRid)/WebView2Loader.dll" Link="WebView2Loader.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Pack="false" Visible="false" Condition="Exists('$(MSBuildThisFileDirectory)../../native/jalium.native.browser/redist/$(_JaliumNativeRuntimeRid)/WebView2Loader.dll') and (Exists('$(JaliumNativeOutputRoot)/$(_JaliumNativeRuntimeRid)/$(JaliumNativeConfiguration)/.jalium-native-complete') or ('$(_JaliumNativeRuntimeRid)' == 'win-x64' and Exists('$(JaliumNativeOutputRoot)/$(JaliumNativeConfiguration)/jalium.native.core.dll')))" />
+    <None Include="$(MSBuildThisFileDirectory)../../native/jalium.native.browser/redist/$(_JaliumNativeRuntimeRid)/WebView2Loader.dll" Link="WebView2Loader.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Pack="false" Visible="false" Condition="Exists('$(MSBuildThisFileDirectory)../../native/jalium.native.browser/redist/$(_JaliumNativeRuntimeRid)/WebView2Loader.dll') and (Exists('$(JaliumNativeOutputRoot)/$(_JaliumNativeRuntimeRid)/$(JaliumNativeConfiguration)/.jalium-native-complete') or Exists('$(JaliumNativeOutputRoot)/$(_JaliumNativeRuntimeRid)/$(JaliumNativeConfiguration)/jalium.native.core.dll') or ('$(_JaliumNativeRuntimeRid)' == 'win-x64' and Exists('$(JaliumNativeOutputRoot)/$(JaliumNativeConfiguration)/jalium.native.core.dll')))" />
   </ItemGroup>
 
   <!-- A single-RID CI pack is an explicit release request; fail instead of

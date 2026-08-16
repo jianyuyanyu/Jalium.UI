@@ -350,6 +350,14 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
             return;
         }
 
+        // Coalescing consecutive property sets until the first Measure was tried here to
+        // remove the measured 2.00x container rebuild (ItemsControlRefreshCoalescingTests)
+        // and reverted: virtualizing panels depend on RefreshItems taking effect
+        // immediately, so containers are NOT unobservable before Measure. The fix belongs
+        // in an incremental ItemTemplate change (retemplate the existing containers instead
+        // of rebuilding them), or in BeginInit/EndInit around the generated setters — the
+        // coalescing facility itself already exists (_itemsControlInitializationDepth).
+
         UpdateItemsControlState();
 
         // Get the panel (either from ItemsPresenter or fallback)
@@ -421,6 +429,8 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
 
         // Non-virtualizing path: materialize all containers.
         panel.Children.Clear();
+        var nonVirtualizingGenerator = EnsureItemContainerGenerator();
+        nonVirtualizingGenerator.RemoveAll();
 
         // Add items from the stable ItemCollection view. Walking raw ItemsSource here
         // re-enumerates lazy/single-pass sources and bypasses sorting/filtering.
@@ -431,9 +441,11 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
             panel.Children.BeginBatchUpdate();
             try
             {
-                foreach (var item in source)
+                var itemIndex = 0;
+                foreach (var _ in source)
                 {
-                    AddItemToPanel(item);
+                    AddItemToPanel(itemIndex, nonVirtualizingGenerator);
+                    itemIndex++;
                 }
             }
             finally
@@ -491,21 +503,19 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
         panel.IsItemsHost = false;
     }
 
-    private void AddItemToPanel(object item)
+    private void AddItemToPanel(
+        int index,
+        ItemContainerGenerator generator)
     {
         if (ItemsHost == null) return;
 
-        FrameworkElement container;
-        if (IsItemItsOwnContainer(item))
-        {
-            container = (FrameworkElement)item;
-            PrepareContainerForItemOverride(container, item);
-        }
-        else
-        {
-            container = GetContainerForItem(item);
-            PrepareContainerForItemOverride(container, item);
-        }
+        // Non-virtualizing panels still participate in ItemContainerGenerator.
+        // Creating containers directly left its maps empty, so controls could render
+        // items but could not translate a clicked container back to its logical item.
+        if (generator.GetOrCreateContainerForIndex(index, out _) is not FrameworkElement container)
+            return;
+
+        generator.PrepareItemContainer(container);
 
         ItemsHost.Children.Add(container);
         SetAlternationIndex(container, ItemsHost.Children.Count - 1);
@@ -646,7 +656,10 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
         if (d is ItemsControl itemsControl)
         {
             itemsControl.OnItemTemplateChanged((DataTemplate?)e.OldValue, (DataTemplate?)e.NewValue);
-            itemsControl.RefreshItems();
+            if (!itemsControl.TryRetemplateRealizedContainers())
+            {
+                itemsControl.RefreshItems();
+            }
         }
     }
 
@@ -655,8 +668,62 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
         if (d is ItemsControl ic)
         {
             ic.OnItemTemplateSelectorChanged((DataTemplateSelector?)e.OldValue, (DataTemplateSelector?)e.NewValue);
-            ic.RefreshItems();
+            if (!ic.TryRetemplateRealizedContainers())
+            {
+                ic.RefreshItems();
+            }
         }
+    }
+
+    /// <summary>
+    /// 模板类属性变化时，就地更新**已生成**的容器，而不是把它们全部销毁重建。
+    ///
+    /// <para>动机：构树时同一个 ItemsControl 会被连续设多个属性（ItemsSource 的编译绑定、
+    /// ItemTemplate 的 StaticResource…）。若此刻 DataContext 已可继承，设 ItemsSource 就把
+    /// N 个容器全建了出来，紧接着设 ItemTemplate 又通过 RefreshItems 把它们整批推倒重建——
+    /// 实测（ItemsControlRefreshCoalescingTests）这两步就是 2.00 倍容器创建。而模板变化其实
+    /// 只需要换掉容器的 ContentTemplate，容器本身完全可以留用。</para>
+    ///
+    /// <para>与「延迟合并」方案的区别：这里不推迟任何事，调用返回时容器就已是最新状态，
+    /// 因此不触碰虚拟化面板依赖的「RefreshItems 立即生效」语义。</para>
+    /// </summary>
+    /// <returns>
+    /// 就地更新成功返回 <see langword="true"/>；调用方应改走完整
+    /// <see cref="RefreshItems"/> 时返回 <see langword="false"/>。
+    /// </returns>
+    private bool TryRetemplateRealizedContainers()
+    {
+        // 生成器还不存在 ⇒ 一个容器都没建过，交给完整刷新去负责首次生成。
+        var generator = _itemContainerGenerator;
+        if (generator is null)
+        {
+            return false;
+        }
+
+        var index = 0;
+        var retemplatedAny = false;
+        foreach (var item in (IEnumerable)Items)
+        {
+            // 虚拟化下只有视口附近的项被 realize，其余取到 null——跳过即可：
+            // 它们将来被 realize 时本来就会经由 PrepareContainerForItem 用上新模板。
+            if (generator.ContainerFromIndex(index) is FrameworkElement container)
+            {
+                PrepareContainerForItem(container, item!);
+                retemplatedAny = true;
+            }
+
+            index++;
+        }
+
+        // 一个已 realize 的容器都没有（例如生成器刚建好还没产出）⇒ 保守回退，
+        // 让完整刷新按既有路径处理，避免这里吞掉本该发生的首次生成。
+        if (!retemplatedAny)
+        {
+            return false;
+        }
+
+        InvalidateMeasure();
+        return true;
     }
 
     private static void OnItemsPanelChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
@@ -725,7 +792,7 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
                 {
                     if (item != null)
                     {
-                        InsertItemToPanel(item, insertIndex);
+                        InsertItemToPanel(insertIndex);
                         insertIndex++;
                     }
                 }
@@ -749,7 +816,7 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
                     if (replaceIndex >= 0 && replaceIndex < panel.Children.Count && e.NewItems[i] != null)
                     {
                         panel.Children.RemoveAt(replaceIndex);
-                        InsertItemToPanel(e.NewItems[i]!, replaceIndex);
+                        InsertItemToPanel(replaceIndex);
                     }
                 }
                 break;
@@ -795,7 +862,7 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
                     {
                         if (item != null)
                         {
-                            InsertItemToPanel(item, insertIndex);
+                            InsertItemToPanel(insertIndex);
                             insertIndex++;
                         }
                     }
@@ -1045,21 +1112,15 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
         RaiseEvent(e);
     }
 
-    private void InsertItemToPanel(object item, int index)
+    private void InsertItemToPanel(int index)
     {
         if (ItemsHost == null) return;
 
-        FrameworkElement container;
-        if (IsItemItsOwnContainer(item))
-        {
-            container = (FrameworkElement)item;
-            PrepareContainerForItemOverride(container, item);
-        }
-        else
-        {
-            container = GetContainerForItem(item);
-            PrepareContainerForItemOverride(container, item);
-        }
+        var generator = EnsureItemContainerGenerator();
+        if (generator.GetOrCreateContainerForIndex(index, out _) is not FrameworkElement container)
+            return;
+
+        generator.PrepareItemContainer(container);
 
         if (index >= 0 && index <= ItemsHost.Children.Count)
         {
@@ -1382,7 +1443,17 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
 
     void Jalium.UI.Markup.IAddChild.AddText(string text) => AddText(text);
 
-    protected virtual DependencyObject GetContainerForItemOverride() => new ContentPresenter();
+    protected virtual DependencyObject GetContainerForItemOverride()
+    {
+        var presenter = new ContentPresenter();
+        // Generated item containers are natural retained-composition boundaries:
+        // their content is independent while panels may move the container during
+        // wrap/reflow. Keeping the boundary on the existing ContentPresenter type
+        // preserves WPF-compatible container identity and lets the renderer reuse
+        // a card/row layer instead of re-emitting every descendant on each move.
+        presenter._isCompositorBoundary = true;
+        return presenter;
+    }
 
     protected virtual void PrepareContainerForItemOverride(DependencyObject element, object item)
     {

@@ -1,6 +1,8 @@
 using Jalium.UI;
+using Jalium.UI.Controls;
 using Jalium.UI.Media;
 using Jalium.UI.Media.Rendering;
+using Jalium.UI.Rendering;
 using Xunit;
 using Drawing = Jalium.UI.Media.Rendering.RecordedDrawing;
 
@@ -60,6 +62,82 @@ public sealed class WholeFrameRecorderFreezeCloneTests : System.IDisposable
         var draw = Assert.Single(sink.Events, e => e.StartsWith("DrawRectangle"));
         Assert.Contains("FFFF0000", draw);        // original red stop preserved
         Assert.DoesNotContain("FF00FF00", draw);  // mutated green did not leak
+    }
+
+    [Fact]
+    public void NestedVisualDrawing_GradientIsSnapshottedBeforeCrossThreadPublication()
+    {
+        MediaRenderCacheHost.Bootstrap();
+        var gradient = new LinearGradientBrush(
+            Color.FromArgb(255, 255, 0, 0),
+            Color.FromArgb(255, 0, 0, 255),
+            0);
+        var visual = new Border
+        {
+            Width = 40,
+            Height = 20,
+            Background = gradient,
+        };
+        visual.Measure(new Size(40, 20));
+        visual.Arrange(new Rect(0, 0, 40, 20));
+
+        var host = new MediaRenderCacheHost();
+        var recorder = host.CreateFrameRecorder()!;
+        visual.Render(recorder);
+        var drawing = (Drawing)host.FinishRecord(recorder);
+
+        gradient.GradientStops[0].Color = Color.FromArgb(255, 0, 255, 0);
+
+        var sink = new RecordingRenderSink();
+        host.Replay(drawing, sink);
+
+        var draw = Assert.Single(sink.Events, entry => entry.StartsWith("DrawRoundedRectangle"));
+        Assert.Contains("FFFF0000", draw);
+        Assert.DoesNotContain("FF00FF00", draw);
+    }
+
+    [Fact]
+    public async Task NestedVisualDrawing_PathGeometryIsFrozenBeforeCrossThreadPublication()
+    {
+        MediaRenderCacheHost.Bootstrap();
+        var source = (PathGeometry)Geometry.Parse("M0,0 L20,0 L20,10 Z");
+        var visual = new GeometryRenderElement(source)
+        {
+            Width = 20,
+            Height = 10,
+        };
+        visual.Measure(new Size(20, 10));
+        visual.Arrange(new Rect(0, 0, 20, 10));
+
+        // Prime the retained drawing through the inline/cacheable path first,
+        // matching Window's pre-show frame before the D3D12 worker starts.
+        visual.Render(new InlineCacheSink());
+
+        var host = new MediaRenderCacheHost();
+        var recorder = host.CreateFrameRecorder()!;
+        visual.Render(recorder);
+        var drawing = (Drawing)host.FinishRecord(recorder);
+
+        var node = Assert.Single(
+            drawing.Commands,
+            command => command.Kind == DrawCommandKind.DrawRecordedDrawing);
+        var nested = (Drawing)node.A!;
+        var geometryCommand = Assert.Single(
+            nested.Commands,
+            command => command.Kind == DrawCommandKind.DrawGeometry);
+        var snapshot = (Geometry)geometryCommand.C!;
+
+        Assert.NotSame(source, snapshot);
+        Assert.True(snapshot.IsFrozen);
+
+        // Mutate the dispatcher-owned source after publication. Replaying on a
+        // worker must read only the frozen snapshot and therefore neither throw
+        // nor observe the mutation.
+        source.Clear();
+        var sink = new RecordingRenderSink();
+        await Task.Run(() => host.Replay(drawing, sink));
+
+        Assert.Single(sink.Events, entry => entry.StartsWith("DrawGeometry"));
     }
 
     [Fact]
@@ -129,5 +207,18 @@ public sealed class WholeFrameRecorderFreezeCloneTests : System.IDisposable
 
         Assert.NotSame(snap1, snap2);   // re-snapshotted (Same == frozen — the pre-fix bug)
         Assert.Equal(new Point(1, 1), ((LinearGradientBrush)snap2!).StartPoint);
+    }
+
+    private sealed class GeometryRenderElement(PathGeometry geometry) : FrameworkElement
+    {
+        protected override void OnRender(DrawingContext drawingContext)
+            => drawingContext.DrawGeometry(
+                new SolidColorBrush(Color.FromArgb(255, 20, 40, 60)),
+                null,
+                geometry);
+    }
+
+    private sealed class InlineCacheSink : RecordingRenderSink, ICacheableDrawingContext
+    {
     }
 }

@@ -1168,7 +1168,7 @@ public:
     uint32_t        stencilCoverW = 0, stencilCoverH = 0;
     VkSampleCountFlagBits stencilSampleCount = VK_SAMPLE_COUNT_1_BIT;
     // E4: the sample count the path-MSAA knob asks for (0=analytic-only never
-    // reaches EnsureStencilCoverResources; 1/2/4/8 clamped to device caps). Set
+    // reaches EnsureStencilCoverResources; 1/2/4/8/16 clamped to device caps). Set
     // by VulkanRenderTarget::SetPathMsaaSampleCount and folded into the stencil
     // rebuild key alongside width/height so a runtime knob change re-creates the
     // stencil FB/PSOs at the new count. Default 8 (device caps still clamp it).
@@ -10978,6 +10978,14 @@ bool VulkanRenderTarget::Impl::EnsureStencilCoverResources(VkExtent2D extent)
     // Count(4) genuinely produces a 4× stencil target. The default knob is 8, so
     // an 8×-capable device still lands on 8× exactly as before (parity default
     // unchanged). Falls to 1× if MSAA is unavailable or the knob asked for 1.
+    //
+    // 16× is in the ladder to match D3D12's PathAntiAliasing.Msaa16x tier. Few
+    // devices advertise it for all three of colour/depth/stencil, and the
+    // request→caps descent is exactly what makes asking for it safe: a 16×
+    // request on an 8×-only device lands on 8× instead of failing framebuffer
+    // creation. NOTE the rebuild key (stencilBuiltForSamples) stores the
+    // REQUEST, not the resolved count, so those two requests stay distinct and
+    // neither re-triggers a rebuild every frame.
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     {
         auto getProps = LoadInstanceProc<PFN_vkGetPhysicalDeviceProperties>(getInstanceProcAddr, instance, "vkGetPhysicalDeviceProperties");
@@ -10990,13 +10998,14 @@ bool VulkanRenderTarget::Impl::EnsureStencilCoverResources(VkExtent2D extent)
                  & props.limits.framebufferStencilSampleCounts;
         }
         // Descend from the knob's requested count; take the first the device
-        // supports. desiredSamples is one of {1,2,4,8}; each candidate is skipped
-        // when it exceeds the request so a 4× request never yields 8×.
+        // supports. desiredSamples is one of {1,2,4,8,16}; each candidate is
+        // skipped when it exceeds the request so a 4× request never yields 8×.
         const uint32_t req = pathMsaaDesiredSamples;
         const struct { uint32_t n; VkSampleCountFlagBits bit; } order[] = {
-            { 8u, VK_SAMPLE_COUNT_8_BIT },
-            { 4u, VK_SAMPLE_COUNT_4_BIT },
-            { 2u, VK_SAMPLE_COUNT_2_BIT },
+            { 16u, VK_SAMPLE_COUNT_16_BIT },
+            {  8u, VK_SAMPLE_COUNT_8_BIT  },
+            {  4u, VK_SAMPLE_COUNT_4_BIT  },
+            {  2u, VK_SAMPLE_COUNT_2_BIT  },
         };
         for (const auto& o : order) {
             if (o.n <= req && (caps & o.bit)) { samples = o.bit; break; }
@@ -16500,8 +16509,22 @@ bool VulkanRenderTarget::TryPopulateReplayClip(GpuReplayCommand& command) const
         // shows a hard seam at the damage-rect edge on partial frames. Real
         // ancestor clips (non-aliased) still bound the content, and the effect
         // OUTPUT commands (recorded after EndEffectCapture, suspend popped)
-        // keep the dirty scissor — D3D12 parity, whose BeginOffscreenCapture
-        // saves & clears the scissor stack for exactly this reason.
+        // keep the dirty scissor.
+        //
+        // This is a DELIBERATE divergence from D3D12, not parity — do not
+        // "align" it by dropping ancestor clips here. D3D12's capture redirects
+        // into a capture-SIZED offscreen texture and shifts the coordinate space
+        // by (-captureX, -captureY), so ancestor clips (both the scissor stack
+        // and the rounded-clip channel) MUST be cleared for its capture's
+        // duration — they are recorded in screen space and would mask the whole
+        // capture away — and are re-applied to its composite-back instead.
+        // Vulkan's offscreen image is FRAME-sized and the region's draws keep
+        // their screen coordinates, so ancestor clips stay meaningful in here;
+        // and since the composite-back is a plain AABB-bounded quad
+        // (OffscreenEnd sets hasRoundedClip=false), clipping the content at
+        // capture time is the only place a rounded ancestor mask gets applied
+        // at all. Dropping it would let effected content spill past a rounded
+        // card's corners.
         if (effectCaptureClipSuspendDepth_ > 0 && clip.aliased) {
             continue;
         }
@@ -20943,16 +20966,6 @@ bool VulkanRenderTarget::TryRecordGradientFanInOrder(const std::vector<float>& p
         return false;  // solid / image brush — not our job
     }
 
-    // Mirror D3D12's SdfRect stop cap: FillBrushToInstance carries at most
-    // FOUR stops into the per-pixel shader — a 5th+ stop is silently dropped
-    // there (t beyond stop[3] clamps to its colour). Sampling it here would
-    // render "more correctly" than D3D12 and diff forever on the parity
-    // harness, so cap identically. Lift BOTH caps together when the
-    // per-pixel UBO-ramp branch lands.
-    if (bd.stopCount > 4) {
-        bd.stopCount = 4;
-    }
-
     std::vector<float> flatStops;
     FlattenGradientStops(bd, flatStops);
 
@@ -21000,14 +21013,7 @@ bool VulkanRenderTarget::TryRecordGradientFanInOrder(const std::vector<float>& p
     // linear interpolation reproduces the per-pixel ramp (exactly for linear,
     // chord-limited for radial).
     std::vector<float> stopPos;
-    stopPos.reserve(bd.stopCount);
-    for (uint32_t i = 0; i < bd.stopCount; ++i) {
-        stopPos.push_back(std::clamp(flatStops[i * 5], 0.0f, 1.0f));
-    }
-    std::sort(stopPos.begin(), stopPos.end());
-    stopPos.erase(std::unique(stopPos.begin(), stopPos.end(),
-                              [](float a, float b) { return std::fabs(a - b) < 1e-4f; }),
-                  stopPos.end());
+    BuildGradientRampBreakpoints(bd, stopPos);
 
     bool subdivided = false;
     if (bd.type == 1 && stopPos.size() > 1) {
@@ -21528,10 +21534,63 @@ void VulkanRenderTarget::FillPerCornerRoundedRectangle(float x, float y, float w
     }
 }
 
+bool VulkanRenderTarget::TryStrokeGradientRoundedOutline(
+    float x, float y, float w, float h,
+    float tl, float tr, float br, float bl,
+    Brush* brush, float strokeWidth)
+{
+    if (!brush || w <= 0.0f || h <= 0.0f || strokeWidth <= 0.0f) {
+        return false;
+    }
+
+    EngineBrushData brushData {};
+    std::vector<EngineBrushData::GradientStop> stops;
+    if (!BuildEngineBrush(brush, GetCurrentOpacity(), brushData, stops) ||
+        brushData.type == 0) {
+        return false;
+    }
+
+    std::vector<float> outline;
+    if (currentShapeType_ == 1) {
+        BuildSuperEllipsePolygon(x, y, w, h, tl, tr, br, bl, outline);
+    } else {
+        BuildRoundedRectPolygon(x, y, w, h, tl, tr, br, bl, outline);
+    }
+
+    const size_t pointCount = outline.size() / 2;
+    if (pointCount < 3) {
+        return false;
+    }
+
+    std::vector<float> commands;
+    commands.reserve(pointCount * 3u);
+    for (size_t i = 1; i < pointCount; ++i) {
+        commands.push_back(0.0f);
+        commands.push_back(outline[i * 2]);
+        commands.push_back(outline[i * 2 + 1]);
+    }
+
+    StrokePath(
+        outline[0], outline[1],
+        commands.data(), static_cast<uint32_t>(commands.size()),
+        brush, strokeWidth, /*closed*/ true,
+        /*lineJoin*/ 2, /*miterLimit*/ 10.0f,
+        /*lineCap*/ 0, nullptr, 0, 0.0f, /*edgeMode*/ -1);
+    return true;
+}
+
 void VulkanRenderTarget::DrawPerCornerRoundedRectangle(float x, float y, float w, float h,
     float tl, float tr, float br, float bl, Brush* brush, float strokeWidth)
 {
     TouchFrame();
+
+    // Border uses this per-corner entry point even for four equal radii.
+    // Dispatch gradients before the analytic replay recorders, which retain
+    // only a representative solid colour.
+    if (TryStrokeGradientRoundedOutline(
+            x, y, w, h, tl, tr, br, bl, brush, strokeWidth)) {
+        return;
+    }
 
     // SuperEllipse border stroke via the per-corner overload (see the fill above).
     if (currentShapeType_ == 1 && brush && w > 0.0f && h > 0.0f && strokeWidth > 0.0f) {
@@ -21558,6 +21617,11 @@ void VulkanRenderTarget::DrawRoundedRectangle(float x, float y, float w, float h
 {
     TouchFrame();
 
+    if (TryStrokeGradientRoundedOutline(
+            x, y, w, h, rx, rx, rx, rx, brush, strokeWidth)) {
+        return;
+    }
+
     // SuperEllipse border stroke mirrors the fill path. The analytic recorder is
     // preferred; DrawPolygon is the local continuous-corner fallback for brushes
     // the SolidRect pipeline cannot represent.
@@ -21575,31 +21639,6 @@ void VulkanRenderTarget::DrawRoundedRectangle(float x, float y, float w, float h
         }
     }
 
-    // Gradient border: true per-vertex gradient via StrokePath over the rounded-rect
-    // outline (same BuildRoundedRectPolygon the gradient FILL path uses). Solid/image
-    // brushes fall through to the GPU stroke record below.
-    if (brush && w > 0.0f && h > 0.0f) {
-        EngineBrushData gbd {};
-        std::vector<EngineBrushData::GradientStop> gstops;
-        if (BuildEngineBrush(brush, GetCurrentOpacity(), gbd, gstops) && gbd.type != 0) {
-            std::vector<float> goutline;
-            BuildRoundedRectPolygon(x, y, w, h, rx, rx, rx, rx, goutline);
-            const size_t gn = goutline.size() / 2;
-            if (gn >= 3) {
-                std::vector<float> gcmds;
-                gcmds.reserve(gn * 3u);
-                for (size_t gi = 1; gi < gn; ++gi) {
-                    gcmds.push_back(0.0f);
-                    gcmds.push_back(goutline[gi * 2]);
-                    gcmds.push_back(goutline[gi * 2 + 1]);
-                }
-                StrokePath(goutline[0], goutline[1], gcmds.data(), static_cast<uint32_t>(gcmds.size()),
-                           brush, strokeWidth, /*closed*/ true, /*lineJoin*/ 2, /*miterLimit*/ 10.0f,
-                           /*lineCap*/ 0, nullptr, 0, 0.0f, /*edgeMode*/ -1);
-                return;
-            }
-        }
-    }
     if (!TryRecordGpuRoundedRectStrokeCommand(x, y, w, h, rx, ry, strokeWidth, brush)) {
         /* drop: skip this primitive but keep replay path */ (void)__FUNCTION__;
     }
@@ -22901,20 +22940,23 @@ void VulkanRenderTarget::SetPathMsaaSampleCount(uint32_t sampleCount) {
     //              and take the analytic-AA scanline rasterizer (WPF/Skia-style),
     //              much cheaper than N× stencil on weak GPUs. The engines' emit
     //              paths honour this via SetPathAnalyticOnly → UseStencilPath().
-    //   1/2/4/8  = the requested stencil MSAA sample count. Clamped to the same
-    //              set D3D12 accepts; the actual count is min(request, device
-    //              caps) picked in EnsureStencilCoverResources, whose rebuild key
-    //              now includes the count so a runtime change rebuilds the FB/PSOs
-    //              at the next frame boundary.
+    //   1/2/4/8/16 = the requested stencil MSAA sample count. Normalized to the
+    //              same set D3D12 accepts; the actual count is min(request,
+    //              device caps) picked in EnsureStencilCoverResources, whose
+    //              rebuild key now includes the count so a runtime change
+    //              rebuilds the FB/PSOs at the next frame boundary. 16× exists
+    //              to serve PathAntiAliasing.Msaa16x and quietly degrades to
+    //              whatever the device does advertise.
     // Unlike the previous Vulkan behaviour this NO LONGER perturbs tessellation
     // density (PathTessellationQualityScale is fixed at 1.0) — D3D12 keeps a fixed
     // flatten tolerance regardless of MSAA, and matching that is what holds the
     // path-fill parity at 0.000%.
     const uint32_t normalized = sampleCount == 0
         ? 0u
-        : (sampleCount >= 8) ? 8u
-        : (sampleCount >= 4) ? 4u
-        : (sampleCount >= 2) ? 2u
+        : (sampleCount >= 16) ? 16u
+        : (sampleCount >= 8)  ?  8u
+        : (sampleCount >= 4)  ?  4u
+        : (sampleCount >= 2)  ?  2u
         : 1u;
     // This API may arrive concurrently with an open render frame. Publish only
     // the request here; BeginDraw applies it while owning the lifecycle gate.
@@ -23396,6 +23438,58 @@ void VulkanRenderTarget::RenderText(const wchar_t* text, uint32_t textLength, Te
         if (crispAxisAligned) {
             gi.posX = std::round(gi.posX);
             gi.posY = std::round(gi.posY);
+        }
+    }
+
+    // ── Gradient foreground: recolour each glyph quad from the brush ──────────
+    //
+    // Mirrors the D3D12 path (d3d12_direct_renderer.cpp AddText). The stop-average
+    // computed above stays as the fallback for every sink that can't take a
+    // gradient; when the brush IS a linear/radial gradient the run is repainted
+    // here, one sample per glyph at that glyph's centre, so the colour varies
+    // across the run instead of collapsing to a single representative colour.
+    // Glyph granularity is the finest this instance format can express (colour is
+    // per VkGlyphInstance), and it is enough for a highlight to visibly travel
+    // through the text.
+    //
+    // Runs AFTER the re-magnify + snap loop so every quad is final, and maps each
+    // quad centre back through (tx, ty) + the per-axis scale because the brush's
+    // coordinates are in the caller's PRE-transform space while the quads are now
+    // in physical pixels (Vulkan's transform carries the DPI root scale).
+    //
+    // opacity 1.0f into BuildEngineBrush on purpose: the per-glyph alpha is
+    // multiplied by GetCurrentOpacity() below, exactly as effectiveA does for the
+    // solid path. Folding it into the stops as well would square it.
+    {
+        EngineBrushData textGradient {};
+        std::vector<EngineBrushData::GradientStop> textGradientStops;
+        if (BuildEngineBrush(brush, 1.0f, textGradient, textGradientStops) &&
+            (textGradient.type == 1 || textGradient.type == 2) &&
+            textGradient.stops && textGradient.stopCount > 0) {
+            std::vector<float> stopData;
+            FlattenGradientStops(textGradient, stopData);
+            if (!stopData.empty()) {
+                const float invSx = (scaled && std::abs(txScaleX) > 1e-6f) ? 1.0f / txScaleX : 1.0f;
+                const float invSy = (scaled && std::abs(txScaleY) > 1e-6f) ? 1.0f / txScaleY : 1.0f;
+                const float runOpacity = GetCurrentOpacity();
+                for (uint32_t i = startIdx; i < startIdx + count && i < instances.size(); ++i) {
+                    auto& gi = instances[i];
+                    // Colour-emoji glyphs bake their own palette into the atlas and flag
+                    // it with a negative-R sentinel — tinting them is wrong for a solid
+                    // foreground and equally wrong for a gradient.
+                    if (gi.colorR < 0.0f) continue;
+
+                    const float cx = x + ((gi.posX + gi.sizeX * 0.5f) - tx) * invSx;
+                    const float cy = y + ((gi.posY + gi.sizeY * 0.5f) - ty) * invSy;
+
+                    GradientColor gc = SampleBrushGradient(textGradient, stopData.data(), cx, cy);
+                    const float ga = gc.a * runOpacity;
+                    gi.colorR = gc.r * ga;
+                    gi.colorG = gc.g * ga;
+                    gi.colorB = gc.b * ga;
+                    gi.colorA = ga;
+                }
+            }
         }
     }
 

@@ -132,8 +132,20 @@ internal sealed partial class PopupWindow : Decorator, IWindowHost, ILayoutManag
         {
             RegisterPopupWindowClass();
 
+            // Content declared non-hit-testable (tooltips) must stay transparent to the
+            // pointer at the HWND level too. A topmost popup that answers hit tests takes
+            // hover away from the owner window the moment it covers the cursor: the owner
+            // gets WM_MOUSELEAVE, hides the tooltip, then sees the cursor re-enter and shows
+            // it again — an endless flicker near screen edges where the popup is clamped
+            // back onto the pointer.
+            uint exStyle = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP;
+            if (Child is PopupRoot { IsHitTestVisible: false })
+            {
+                exStyle |= WS_EX_TRANSPARENT;
+            }
+
             _hwnd = CreateWindowEx(
-                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP,
+                exStyle,
                 PopupWindowClassName,
                 "",
                 WS_POPUP,
@@ -1006,6 +1018,7 @@ internal sealed partial class PopupWindow : Decorator, IWindowHost, ILayoutManag
             case PlatformEventType.MouseDown:
             {
                 if (Child is PopupRoot { IsLightDismiss: true } dismissRoot &&
+                    !dismissRoot.HasPointerCaptureWithin &&
                     (evt.MouseX < 0 || evt.MouseY < 0 ||
                      evt.MouseX >= _width || evt.MouseY >= _height))
                 {
@@ -1466,11 +1479,43 @@ internal sealed partial class PopupWindow : Decorator, IWindowHost, ILayoutManag
             return;
 
         if (pointerData.Kind == PointerInputKind.Mouse)
+        {
+            // WM_MOUSEMOVE messages promoted by the Windows pointer stack are filtered
+            // in PopupWndProc to avoid duplicate delivery. The matching mouse-kind
+            // WM_POINTERUPDATE therefore has to feed the legacy mouse pipeline; dropping
+            // both messages leaves external popups clickable but without hover feedback.
+            if (msg == Win32PointerInterop.WM_POINTERUPDATE)
+            {
+                DispatchMousePointerUpdate(pointerData);
+            }
+
             return;
+        }
 
         bool isDown = msg == Win32PointerInterop.WM_POINTERDOWN;
         bool isUp = msg == Win32PointerInterop.WM_POINTERUP;
         DispatchPointerInput(pointerData, isDown, isUp);
+    }
+
+    private void DispatchMousePointerUpdate(PointerInputData pointerData)
+    {
+        var properties = pointerData.Point.Properties;
+        var buttons = new MouseButtonStates
+        {
+            Left = properties.IsLeftButtonPressed ? MouseButtonState.Pressed : MouseButtonState.Released,
+            Middle = properties.IsMiddleButtonPressed ? MouseButtonState.Pressed : MouseButtonState.Released,
+            Right = properties.IsRightButtonPressed ? MouseButtonState.Pressed : MouseButtonState.Released,
+            XButton1 = properties.IsXButton1Pressed ? MouseButtonState.Pressed : MouseButtonState.Released,
+            XButton2 = properties.IsXButton2Pressed ? MouseButtonState.Pressed : MouseButtonState.Released,
+        };
+        var dpiScale = _parentWindow.DpiScale > 0 ? _parentWindow.DpiScale : 1.0;
+
+        OnMouseMove(
+            BuildMouseWParam(buttons),
+            PackClientPoint(
+                (float)(pointerData.Position.X * dpiScale),
+                (float)(pointerData.Position.Y * dpiScale)),
+            pointerData.Modifiers);
     }
 
     private void OnPlatformPointerEvent(PlatformEvent evt)

@@ -72,10 +72,10 @@ public class DataGrid : MultiSelector, IColumnHeaderHost
     {
         Selector.SelectedItemProperty.OverrideMetadata(
             typeof(DataGrid),
-            new PropertyMetadata(null, OnSelectedItemChanged));
+            new FrameworkPropertyMetadata(null, OnSelectedItemChanged));
         Selector.SelectedIndexProperty.OverrideMetadata(
             typeof(DataGrid),
-            new PropertyMetadata(-1, OnSelectedIndexChanged));
+            new FrameworkPropertyMetadata(-1, OnSelectedIndexChanged));
     }
 
     /// <summary>Gets the command that deletes the selected rows.</summary>

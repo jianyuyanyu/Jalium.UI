@@ -3,6 +3,7 @@ using Jalium.UI;
 using Jalium.UI.Controls;
 using Jalium.UI.Shapes;
 using Jalium.UI.Media;
+using Jalium.UI.Media.Effects;
 using AnimationDuration = Jalium.UI.Duration;
 using MediaPointCollection = Jalium.UI.Media.PointCollection;
 
@@ -67,6 +68,52 @@ public sealed class GeometryTypeConverter : TypeConverter
         if (value is not string str) return null;
         try { return Geometry.Parse(str); }
         catch (FormatException) { return null; }
+    }
+}
+
+/// <summary>
+/// Converts strings / <see cref="Uri"/> to <see cref="ImageSource"/>, so XAML can write
+/// <c>&lt;Image Source="Assets/Brand/logo.png"/&gt;</c> as a literal attribute.
+///
+/// <para>Without this entry <see cref="TypeConverterRegistry.ConvertValue"/> found no converter
+/// for <see cref="ImageSource"/> and returned <see langword="null"/> — the element kept its
+/// explicit Width/Height, took up layout space and drew nothing, with no exception and no log.
+/// That is indistinguishable from a fully transparent image.</para>
+///
+/// <para><see cref="Jalium.UI.Media.ImageSourceConverter"/> already covers the same conversion but
+/// derives from <see cref="System.ComponentModel.TypeConverter"/>, which is a different hierarchy
+/// from the <see cref="Jalium.UI.Markup.TypeConverter"/> this registry stores; it therefore cannot
+/// be registered here. Both delegate to <see cref="ImageSourceLoader.FromUri"/>, so the XAML and
+/// the <c>TypeDescriptor</c> paths stay in agreement.</para>
+/// </summary>
+public sealed class ImageSourceTypeConverter : TypeConverter
+{
+    public override bool CanConvertFrom(Type sourceType) =>
+        sourceType == typeof(string) ||
+        sourceType == typeof(Uri) ||
+        typeof(ImageSource).IsAssignableFrom(sourceType);
+
+    public override object? ConvertFrom(object? value)
+    {
+        if (value is ImageSource source) return source;
+
+        Uri? uri;
+        switch (value)
+        {
+            case Uri u:
+                uri = u;
+                break;
+            case string s when !string.IsNullOrWhiteSpace(s):
+                if (!Uri.TryCreate(s.Trim(), UriKind.RelativeOrAbsolute, out uri)) return null;
+                break;
+            default:
+                return null;
+        }
+
+        // SvgImage keeps its own vector pipeline; ImageSourceLoader would hand it to the raster
+        // decoder. Probe the path the same way ImageSourceConverter does.
+        var path = uri.IsAbsoluteUri ? uri.AbsolutePath : uri.OriginalString;
+        return SvgImage.IsSvgFile(path) ? new SvgImage(uri) : ImageSourceLoader.FromUri(uri);
     }
 }
 
@@ -557,6 +604,49 @@ internal sealed class SizeConverter : TypeConverter
 }
 
 /// <summary>
+/// Converts the standard row-major 4x5 color-matrix text form into a
+/// <see cref="ColorMatrix"/>. Values may be separated by whitespace, commas,
+/// or semicolons.
+/// </summary>
+internal sealed class ColorMatrixConverter : TypeConverter
+{
+    public override object? ConvertFrom(object? value)
+    {
+        if (value is ColorMatrix matrix)
+            return matrix;
+        if (value is not string source)
+            return null;
+
+        source = source.Trim();
+        if (string.Equals(source, "Identity", StringComparison.OrdinalIgnoreCase))
+            return ColorMatrix.Identity;
+
+        var parts = source.Split(
+            [',', ';', ' ', '\t', '\r', '\n'],
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length != 20)
+        {
+            throw new FormatException(
+                $"A ColorMatrix requires exactly 20 row-major values; received {parts.Length}.");
+        }
+
+        Span<float> values = stackalloc float[20];
+        for (int i = 0; i < values.Length; i++)
+        {
+            values[i] = float.Parse(parts[i], NumberStyles.Float, CultureInfo.InvariantCulture);
+        }
+
+        return new ColorMatrix
+        {
+            M11 = values[0], M12 = values[1], M13 = values[2], M14 = values[3], M15 = values[4],
+            M21 = values[5], M22 = values[6], M23 = values[7], M24 = values[8], M25 = values[9],
+            M31 = values[10], M32 = values[11], M33 = values[12], M34 = values[13], M35 = values[14],
+            M41 = values[15], M42 = values[16], M43 = values[17], M44 = values[18], M45 = values[19],
+        };
+    }
+}
+
+/// <summary>
 /// Registry of type converters.
 /// </summary>
 public static class TypeConverterRegistry
@@ -584,6 +674,10 @@ public static class TypeConverterRegistry
         [typeof(Vector)] = new VectorConverter(),
         [typeof(Size)] = new SizeConverter(),
         [typeof(Geometry)] = new GeometryTypeConverter(),
+        [typeof(ColorMatrix)] = new ColorMatrixConverter(),
+        // 基类一条即可：GetConverter 找不到精确匹配时会按 IsAssignableFrom 回退，
+        // 所以 BitmapImage / SvgImage 这些派生类型的属性也一并覆盖。
+        [typeof(ImageSource)] = new ImageSourceTypeConverter(),
     };
 
     /// <summary>

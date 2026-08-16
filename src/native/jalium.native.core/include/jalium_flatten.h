@@ -84,4 +84,109 @@ inline uint32_t ScaleBucketFromMaxScale(float maxScale) noexcept {
     return static_cast<uint32_t>(b);
 }
 
+// ---------------------------------------------------------------------------
+// Anti-aliasing route selection.
+//
+// A filled path can get its soft edges two ways, and they are not equal:
+//
+//   • Analytic coverage (jalium_scanline_rasterizer.h RasterizePathToRects).
+//     Exact horizontal span area × 16 vertical sub-scanlines, emitted as
+//     per-pixel-alpha rectangles. WPF/Skia-grade edges, and the rect list is
+//     cacheable, so a static or merely scrolling UI pays for it once. Cost
+//     scales with the path's DEVICE-SPACE AREA, which is why it cannot be
+//     unconditional.
+//
+//   • An approximation: MSAA stencil-then-cover, or a triangle mesh plus a
+//     boundary feather ring. Constant cost per path regardless of size, but
+//     the edge quality is capped (a handful of coverage levels for MSAA;
+//     for the feather ring, only the OUTSIDE of the edge softens at all,
+//     because the interior mesh under it still rasterizes with binary
+//     pixel-centre coverage).
+//
+// Icons, glyphs and control ornaments — very nearly every Path/Shape in a real
+// UI — must take the analytic route or their edges visibly stair-step. Only
+// genuinely large vector artwork, where per-frame rasterization would show up
+// in the frame budget, keeps an approximation.
+//
+// This predicate is the single place that decision is made; every backend and
+// every fill entry point routes through it so the same shape never renders at
+// two different qualities depending on which entry point it happened to reach.
+// ---------------------------------------------------------------------------
+constexpr float kAnalyticFillMaxAreaPx = 512.0f * 512.0f;
+
+inline bool PreferAnalyticFill(float devW, float devH) noexcept {
+    // Degenerate extents are cheap to rasterize and are exactly what the
+    // approximations handle worst (a sub-pixel sliver has no interior at all),
+    // so route them analytically too. The !(x > 0) form also catches NaN.
+    if (!(devW > 0.0f) || !(devH > 0.0f)) return true;
+    return (devW * devH) <= kAnalyticFillMaxAreaPx;
+}
+
+// Device-space extent of a local-space AABB under a 2x3 affine.
+inline void TransformedExtent(float minX, float minY, float maxX, float maxY,
+                              float m11, float m12, float m21, float m22,
+                              float dx, float dy,
+                              float& outW, float& outH) noexcept {
+    const float xs[4] = { minX, maxX, maxX, minX };
+    const float ys[4] = { minY, minY, maxY, maxY };
+    float loX = xs[0] * m11 + ys[0] * m21 + dx;
+    float loY = xs[0] * m12 + ys[0] * m22 + dy;
+    float hiX = loX, hiY = loY;
+    for (int i = 1; i < 4; ++i) {
+        const float x = m11 * xs[i] + m21 * ys[i] + dx;
+        const float y = m12 * xs[i] + m22 * ys[i] + dy;
+        if (x < loX) loX = x;
+        if (y < loY) loY = y;
+        if (x > hiX) hiX = x;
+        if (y > hiY) hiY = y;
+    }
+    outW = hiX - loX;
+    outH = hiY - loY;
+}
+
+inline void TransformedExtent(float minX, float minY, float maxX, float maxY,
+                              const EngineTransform& t,
+                              float& outW, float& outH) noexcept {
+    TransformedExtent(minX, minY, maxX, maxY,
+                      t.m11, t.m12, t.m21, t.m22, t.dx, t.dy, outW, outH);
+}
+
+// Local-space AABB over every coordinate pair in a path command buffer.
+// Bezier control points bound their curve, so this over-estimates slightly —
+// which is what a routing gate wants: it can only push work toward the cheaper
+// route, never the reverse. Returns false only when there are no commands.
+//
+// Tags match jalium_triangulate.h: 0 LineTo, 1 CubicTo, 2 MoveTo, 3 QuadTo,
+// 5 ClosePath. An unknown tag stops the walk and keeps what was measured.
+inline bool PathCommandExtent(float startX, float startY,
+                              const float* commands, uint32_t commandLength,
+                              float& minX, float& minY,
+                              float& maxX, float& maxY) noexcept {
+    if (!commands || commandLength == 0) return false;
+    minX = maxX = startX;
+    minY = maxY = startY;
+    for (uint32_t i = 0; i < commandLength; ) {
+        int pairs;
+        switch (static_cast<int>(commands[i])) {
+            case 0: pairs = 1; break;   // LineTo   [tag, x, y]
+            case 1: pairs = 3; break;   // CubicTo  [tag, c1, c2, end]
+            case 2: pairs = 1; break;   // MoveTo   [tag, x, y]
+            case 3: pairs = 2; break;   // QuadTo   [tag, c, end]
+            case 5: pairs = 0; break;   // ClosePath[tag]
+            default: return true;
+        }
+        if (i + 1u + static_cast<uint32_t>(pairs) * 2u > commandLength) return true;
+        for (int p = 0; p < pairs; ++p) {
+            const float x = commands[i + 1 + p * 2];
+            const float y = commands[i + 2 + p * 2];
+            if (x < minX) minX = x;
+            if (y < minY) minY = y;
+            if (x > maxX) maxX = x;
+            if (y > maxY) maxY = y;
+        }
+        i += 1u + static_cast<uint32_t>(pairs) * 2u;
+    }
+    return true;
+}
+
 }  // namespace jalium

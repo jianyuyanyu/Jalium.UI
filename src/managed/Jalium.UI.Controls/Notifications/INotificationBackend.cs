@@ -110,9 +110,13 @@ public static class NotificationImageHelper
             if (bitmapImage.ImageData is { Length: > 0 } data)
                 return WriteTempFile(data, ".png");
 
-            // Has raw BGRA pixels – encode as BMP/PNG
-            if (bitmapImage.RawPixelData is { Length: > 0 } pixels)
-                return WriteTempBgra(pixels, bitmapImage.PixelWidth, bitmapImage.PixelHeight);
+            // Has decoded pixels – encode as BMP/PNG. Read as one publication rather than as
+            // RawPixelData + PixelWidth + PixelHeight: those are three independent reads of state a
+            // decode worker replaces atomically, and pairing one decode's buffer with another's
+            // dimensions writes a BMP header that does not describe its own pixel data.
+            if (bitmapImage.TryGetPixelSnapshot(out var snapshot) &&
+                snapshot is { Pixels.Length: > 0 })
+                return WriteTempBgra(snapshot.Pixels, snapshot.Width, snapshot.Height, snapshot.Stride);
         }
 
         // BitmapSource with pixel copy support
@@ -121,7 +125,7 @@ public static class NotificationImageHelper
             int stride = bitmapSource.PixelWidth * 4;
             byte[] pixels = new byte[stride * bitmapSource.PixelHeight];
             bitmapSource.CopyPixels(pixels, stride, 0);
-            return WriteTempBgra(pixels, bitmapSource.PixelWidth, bitmapSource.PixelHeight);
+            return WriteTempBgra(pixels, bitmapSource.PixelWidth, bitmapSource.PixelHeight, stride);
         }
 
         return null;
@@ -138,7 +142,15 @@ public static class NotificationImageHelper
     /// <summary>
     /// Writes raw BGRA8 pixels as a minimal BMP file (no compression, universal support).
     /// </summary>
-    private static string WriteTempBgra(byte[] pixels, int width, int height)
+    /// <param name="pixels">Source buffer, straight BGRA8.</param>
+    /// <param name="width">Pixel width.</param>
+    /// <param name="height">Pixel height.</param>
+    /// <param name="sourceStride">
+    /// Bytes per row in <paramref name="pixels"/>. A WIC-decoded buffer can carry row padding, and
+    /// a 32-bpp BMP has none — writing the padded buffer verbatim shears the icon diagonally.
+    /// Passing the authoritative stride is what lets the rows be compacted below.
+    /// </param>
+    private static string WriteTempBgra(byte[] pixels, int width, int height, int sourceStride)
     {
         Directory.CreateDirectory(s_tempDir);
         string path = Path.Combine(s_tempDir, $"notif_{Guid.NewGuid():N}.bmp");
@@ -169,8 +181,19 @@ public static class NotificationImageHelper
         bw.Write(0);              // colors in palette
         bw.Write(0);              // important colors
 
-        // Pixel data (already BGRA, which is BMP's native format)
-        bw.Write(pixels);
+        // Pixel data (already BGRA, which is BMP's native format). Row-by-row when the source is
+        // padded, so the BMP's implicit tight stride is honoured.
+        if (sourceStride > 0 && sourceStride != stride && (long)sourceStride * height <= pixels.Length)
+        {
+            for (int y = 0; y < height; y++)
+            {
+                bw.Write(pixels, y * sourceStride, stride);
+            }
+        }
+        else
+        {
+            bw.Write(pixels, 0, Math.Min(pixels.Length, imageSize));
+        }
 
         return path;
     }

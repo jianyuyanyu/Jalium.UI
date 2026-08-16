@@ -3,6 +3,7 @@
 #include "d3d12_backend.h"
 #include "d3d12_glyph_atlas.h"
 #include "jalium_stencil_path.h"
+#include "jalium_gradient_sample.h"   // EngineBrushData / SampleBrushGradient (AddText gradients)
 #include <vector>
 #include <stack>
 #include <memory>
@@ -36,12 +37,19 @@ struct Transform2D {
 };
 
 // ============================================================================
-// Instance data layout for SDF rect shader (224 bytes, 16-byte aligned)
+// Instance data layout for SDF rect shader (160 bytes, 16-byte aligned)
 //
 // Supports solid fills and linear/radial gradient fills.
 // When gradientType == 0, fillR/G/B/A is used as a flat premultiplied color.
-// When gradientType != 0, gradient stops are sampled in the pixel shader.
+// When gradientType != 0, gradient stops are sampled from the per-frame
+// dynamically-sized stop table in the pixel shader.
 // ============================================================================
+
+struct SdfGradientStop {
+    float position;
+    float r, g, b, a;
+};
+static_assert(sizeof(SdfGradientStop) == 20, "SdfGradientStop must be 20 bytes");
 
 struct SdfRectInstance {
     // --- geometry (16 bytes) ---
@@ -61,19 +69,16 @@ struct SdfRectInstance {
     float borderWidth;
     float opacity;
     uint32_t gradientType;      // 0=solid, 1=linear, 2=radial
-    uint32_t stopCount;         // number of gradient stops (0-4)
+    uint32_t stopCount;         // number of gradient stops
 
     // --- gradient geometry (16 bytes) ---
     // linear: startX, startY, endX, endY (in rect-local pixels)
     // radial: centerX, centerY, radiusX, radiusY
     float gradGeom0, gradGeom1, gradGeom2, gradGeom3;
 
-    // --- gradient stops (4 × 20 bytes = 80 bytes) ---
-    // Each stop: position, R, G, B, A (linear premultiplied)
-    float stop0Pos, stop0R, stop0G, stop0B, stop0A;
-    float stop1Pos, stop1R, stop1G, stop1B, stop1A;
-    float stop2Pos, stop2R, stop2G, stop2B, stop2A;
-    float stop3Pos, stop3R, stop3G, stop3B, stop3A;
+    // --- gradient stop table reference (16 bytes) ---
+    uint32_t stopOffset;
+    uint32_t _stopPad0, _stopPad1, _stopPad2;
 
     // --- shape type (16 bytes) ---
     float shapeType;            // 0=rounded, 1=local continuous corners, 2=internal ellipse
@@ -89,12 +94,12 @@ struct SdfRectInstance {
     // width/gradient geometry are kept in the caller's pre-transform space; the
     // VS builds the local quad then applies this matrix. For an un-rotated element
     // this is identity and the output is bit-identical to the old path.
-    float xfM11, xfM12, xfM21, xfM22;   // linear part   (offset 192)
-    float xfDx, xfDy, _xfPad0, _xfPad1; // translation (offset 208); _xfPad0/_xfPad1 are
+    float xfM11, xfM12, xfM21, xfM22;   // linear part   (offset 128)
+    float xfDx, xfDy, _xfPad0, _xfPad1; // translation (offset 144); _xfPad0/_xfPad1 are
                                         // reused as shadowMode/sigma on the DropShadow path
                                         // (= HLSL xform1.zw) — don't repurpose/clear blindly
 };
-static_assert(sizeof(SdfRectInstance) == 224, "SdfRectInstance must be 224 bytes");
+static_assert(sizeof(SdfRectInstance) == 160, "SdfRectInstance must be 160 bytes");
 
 // ============================================================================
 // Instance data layout for bitmap quad shader (48 bytes, 16-byte aligned)
@@ -280,6 +285,10 @@ public:
     bool CheckFrameDeviceAlive();
 
     // --- Draw commands (called between BeginFrame/EndFrame) ---
+    bool AppendSdfGradientStops(
+        const SdfGradientStop* stops,
+        uint32_t count,
+        uint32_t& startOffset);
     void AddSdfRect(const SdfRectInstance& inst);
     /// Records a text draw. `aaMode` (JALIUM_TEXT_AA_*) and `hintingMode`
     /// (0=Auto, 1=Fixed, 2=Animated) come from the source TextFormat's
@@ -289,11 +298,22 @@ public:
     /// to 0 (Auto) for legacy callers that haven't been retrofitted to
     /// plumb per-format modes yet — those fall back to the process-wide
     /// jalium_text_set_global_antialias_mode value.
+    /// `gradientBrush` (optional) turns the run's foreground into a real gradient
+    /// instead of the single r/g/b/a tint. The glyph pipeline stores one colour per
+    /// glyph quad (GlyphQuadInstance), so the gradient is evaluated once per glyph at
+    /// that glyph's centre — a gradient across the RUN, at glyph granularity. That is
+    /// the finest resolution this instance format can express without a new PSO, and
+    /// it is what makes a highlight visibly travel THROUGH the text. When null the
+    /// behaviour is exactly as before (flat r/g/b/a).
+    ///
+    /// The caller keeps `gradientBrush` (and the stop array it points at) alive for
+    /// the duration of the call; nothing is retained past return.
     void AddText(IDWriteTextLayout* layout, float x, float y,
                  float r, float g, float b, float a,
                  uint64_t layoutKey = 0,
                  int32_t aaMode = 0,
-                 int32_t hintingMode = 0);
+                 int32_t hintingMode = 0,
+                 const EngineBrushData* gradientBrush = nullptr);
     void AddBitmap(float x, float y, float w, float h, float opacity,
                    ID3D12Resource* textureResource, DXGI_FORMAT format,
                    float uvMaxX = 1.0f, float uvMaxY = 1.0f,
@@ -591,8 +611,12 @@ public:
     UINT GetOffscreenCaptureW(int slot) const { return (slot >= 0 && slot <= 1) ? (UINT)offscreenCaptureW_[slot] : 0; }
     UINT GetOffscreenCaptureH(int slot) const { return (slot >= 0 && slot <= 1) ? (UINT)offscreenCaptureH_[slot] : 0; }
 
-    // --- Path MSAA quality (1/2/4/8) ---
-    // Takes effect at the next BeginFrame. Values are clamped to {1,2,4,8}.
+    // --- Path MSAA quality (1/2/4/8/16, or 0 = analytic-only) ---
+    // Takes effect at the next BeginFrame. The request is normalized to
+    // {1,2,4,8,16} and then resolved DOWN to what this device actually
+    // advertises for the MSAA scratch's color + depth-stencil formats — asking
+    // for 16 on hardware that only does 8 lands on 8 rather than failing PSO
+    // creation. GetPathMsaaSampleCount returns the resolved (effective) count.
     void SetPathMsaaSampleCount(uint32_t sampleCount);
     uint32_t GetPathMsaaSampleCount() const { return pathMsaaSampleCount_; }
 
@@ -670,16 +694,12 @@ public:
     D3D12GlyphAtlas* GetGlyphAtlas() const { return glyphAtlas_.get(); }
     int32_t GetBitmapBatchTextureCount() const { return static_cast<int32_t>(bitmapTextures_.size()); }
 
-    /// Drops every cached custom-shader pipeline state. The PSO ComPtrs
-    /// auto-release; any GPU work that referenced them earlier in the frame
-    /// keeps an implicit ref through the open command list until the frame's
-    /// fence completes (D3D12 ID3D12PipelineState lifetime is fence-bound).
-    /// Called from D3D12RenderTarget::ReclaimIdleResources when the
-    /// idle-resource reclaimer signals the application has been quiet long
-    /// enough that holding the cache is no longer worth the memory; rebuilt
-    /// lazily by GetOrCreateCustomShaderPSO on the next draw that needs a
-    /// custom shader.
-    void ClearCustomShaderCache() { customShaderCache_.clear(); }
+    /// Evicts every cached custom-shader pipeline state without releasing a
+    /// PSO that an open or in-flight command list can still reference. D3D12
+    /// command lists do NOT retain PSO COM references for the application, so
+    /// the entries are moved to a fence-gated retired list and reclaimed only
+    /// after the submission that can reference them has completed.
+    void ClearCustomShaderCache();
     int64_t GetBitmapBatchTextureBytes() const {
         int64_t total = 0;
         for (const auto& tx : bitmapTextures_) {
@@ -726,6 +746,10 @@ private:
     // from CreateStencilPathResources and again whenever the sample count
     // changes at a frame boundary.
     bool RebuildStencilCoverPSOs();
+    // Highest sample count ≤ `requested` that this device advertises for BOTH
+    // the MSAA scratch color format and its depth-stencil format. Returns 1 if
+    // nothing above 1× is supported (or the device is not up yet).
+    UINT ResolveSupportedPathMsaaSampleCount(UINT requested) const;
     // Applies a pending path-MSAA sample-count change (rebuild PSOs + force the
     // scratch RT/depth to recreate). Invoked from BeginFrame after the fence
     // wait so the old MSAA resources are guaranteed idle.
@@ -736,6 +760,8 @@ private:
     bool EnsureBlurTemps(UINT requiredWidth, UINT requiredHeight);
     bool EnsureOffscreenTargets(UINT requiredWidth, UINT requiredHeight);
     ID3D12PipelineState* GetOrCreateCustomShaderPSO(const uint8_t* shaderBytecode, uint32_t shaderBytecodeSize);
+    void RetirePendingPipelineStates(uint64_t submissionFenceValue);
+    void ReclaimRetiredPipelineStates(uint64_t completedFenceValue);
     void UploadInstances();
     void RecordDrawCommands();
 
@@ -753,6 +779,7 @@ private:
         ComPtr<ID3D12Resource> constantsBuffer;       // ring-buffer for per-flush constants
         void* constantsMappedPtr = nullptr;
         UINT constantsRingOffset = 0;                 // next free 256-byte slot in ring buffer
+        UINT constantsCapacity = 0;                   // current byte size of constantsBuffer (grows on demand)
         uint64_t fenceValue = 0;
 
         // Instance upload buffers retired by mid-frame growth.  When EnsureFrameInstanceCapacity
@@ -776,7 +803,21 @@ private:
     // is parked on FrameResources::retiredInstanceBuffers so the descriptors of
     // already-recorded draws stay valid until BeginFrame's fence wait clears them.
     bool EnsureFrameInstanceCapacity(FrameResources& fr, size_t requiredBytes);
-    static constexpr UINT kConstantsRingSize = 256 * 64;  // 64 flush slots per frame
+
+    // Per-flush constants ring.  D3D12 requires root-CBV addresses to be 256-byte
+    // aligned, so one flush = one 256-byte slot.  The ring starts at 64 slots and
+    // GROWS on exhaustion rather than wrapping — see AcquireConstantsSlot for why
+    // wrapping silently deleted draws.
+    static constexpr UINT kConstantsSlotSize = 256;
+    static constexpr UINT kConstantsRingInitialSize = kConstantsSlotSize * 64;
+    static constexpr UINT kConstantsRingMaxSize = kConstantsSlotSize * 8192;  // 2 MB backstop
+    static constexpr UINT kInvalidConstantsSlot = 0xFFFFFFFFu;
+
+    // Reserve the next 256-byte constants slot for this frame, growing the ring
+    // buffer when it is exhausted.  Returns the byte offset to write and bind, or
+    // kInvalidConstantsSlot when no mapped storage could be obtained (removed
+    // device — the frame aborts anyway).
+    UINT AcquireConstantsSlot(FrameResources& fr);
     FrameResources frames_[kMaxFrames];
     UINT frameCount_ = 0;
     UINT currentFrame_ = 0;
@@ -1029,14 +1070,29 @@ private:
     ComPtr<ID3D12DescriptorHeap> stencilDsvHeap_;  // 8× DSV for pathMsaaDepth_
     UINT  pathMsaaWidth_  = 0;
     UINT  pathMsaaHeight_ = 0;
-    // Path stencil-then-cover MSAA sample count. Runtime-configurable (1/2/4/8)
-    // so low-end GPUs / high-load scenes can trade path edge AA quality for
-    // GPU time — 8× is the highest quality default; 4× roughly halves the
-    // path GPU cost. `pending` is applied at the next BeginFrame boundary
-    // (GPU idle after the fence wait), which rebuilds the stencil/cover PSOs
-    // and forces the MSAA scratch RT + depth to be recreated at the new count.
-    UINT  pathMsaaSampleCount_        = 8;
-    UINT  pendingPathMsaaSampleCount_ = 8;
+    // Path stencil-then-cover MSAA sample count. Runtime-configurable
+    // (1/2/4/8/16) so low-end GPUs / high-load scenes can trade path edge AA
+    // quality for GPU time — 4× roughly halves the path GPU cost against the
+    // 8× default, 16× buys the last bit of smoothness where the hardware
+    // offers it. `pending` is applied at the next BeginFrame boundary (GPU idle
+    // after the fence wait), which rebuilds the stencil/cover PSOs and forces
+    // the MSAA scratch RT + depth to be recreated at the new count.
+    //
+    // THREE values, not two, because the request and the effective count can
+    // legitimately differ: a 16× request on 8×-only hardware resolves to 8.
+    // Comparing `pending` against the EFFECTIVE count would then never settle
+    // and BeginFrame would rebuild the PSOs every single frame, so the
+    // "already applied" test compares against the REQUEST that produced the
+    // current effective count.
+    //
+    // Note the memory cost before raising this: the scratch is viewport-sized,
+    // so at 2560×1440 an 8× RGBA16F color + D24S8 depth is ~350 MB and 16×
+    // doubles it. Since icon-scale fills now take the analytic rasterizer
+    // (PreferAnalyticFill), a typical UI never allocates it at all — but a page
+    // of large vector artwork will.
+    UINT  pathMsaaSampleCount_        = 8;   // effective (device-resolved)
+    UINT  pathMsaaSampleCountRequest_ = 8;   // request behind the effective one
+    UINT  pendingPathMsaaSampleCount_ = 8;   // newest request, not yet applied
     // Analytic-only path AA: when true, a solid FillPath skips the MSAA stencil-
     // then-cover fast path and instead uses the active engine's analytic-coverage
     // rasterizer (the same path gradient fills take) — WPF/Skia-style AA that is
@@ -1078,6 +1134,7 @@ private:
 
     // Instance collection (CPU side, per frame)
     std::vector<SdfRectInstance> rectInstances_;
+    std::vector<SdfGradientStop> gradientStops_;
     std::vector<GlyphQuadInstance> textInstances_;
     std::vector<BitmapQuadInstance> bitmapInstances_;
     std::vector<TriangleVertex> triangleVertices_;
@@ -1108,6 +1165,17 @@ private:
         ComPtr<ID3D12PipelineState> pso;
     };
     std::vector<CustomShaderCacheEntry> customShaderCache_;
+
+    struct RetiredPipelineState {
+        ComPtr<ID3D12PipelineState> pso;
+        uint64_t fenceValue = 0;
+    };
+    // PSOs evicted while the main list is open cannot be tagged with
+    // nextFenceValue_: auxiliary queue signals may consume that value before
+    // the list is submitted. EndFrame moves these entries to the retired list
+    // using the fence value actually signaled after ExecuteCommandLists.
+    std::vector<ComPtr<ID3D12PipelineState>> pendingPipelineStates_;
+    std::vector<RetiredPipelineState> retiredPipelineStates_;
 
     // State stacks
     std::stack<D3D12_RECT> scissorStack_;
@@ -1177,6 +1245,7 @@ private:
     // via SetGraphicsRoot32BitConstants (avoiding the CBV race condition).
     DirectFrameConstants currentFrameConstants_ = {};
     bool initialized_ = false;
+    size_t gradientStopBufferByteOffset_ = 0;
     size_t textBufferByteOffset_ = 0;    // byte offset of text instances in upload buffer
     size_t bitmapBufferByteOffset_ = 0;  // byte offset of bitmap instances in upload buffer
     size_t triBufferByteOffset_ = 0;     // byte offset of triangle vertices in upload buffer
@@ -1225,10 +1294,26 @@ private:
     // Give each frame a shader-visible descriptor region big enough to handle
     // a few hundred FlushGraphicsForCompute calls (8 SRV slots each) without
     // wrapping the ring and overwriting tables still referenced by earlier
-    // draws on the same command list.  1024 × 32 B = 32 KB total — this is
-    // shader-visible memory, kept tight on purpose now that we serve real
-    // overhead reductions elsewhere.
-    static constexpr UINT kMaxSrvDescriptors = 1024;
+    // draws on the same command list.
+    //
+    // Sizing: the heap is split into one region per in-flight frame
+    // (frameSrvRegionSize_ = (kMaxSrvDescriptors - 16) / frameCount_) and every
+    // flush inside a frame permanently consumes 8 + 2*bitmapBatches + pathResolves
+    // slots from its region — the ring can never be rewound mid-frame because
+    // already-recorded draws still reference their descriptors.  Overflow is NOT
+    // benign: RecordDrawCommands drops every pending batch and returns, so the rest
+    // of the frame silently disappears.
+    //
+    // The historical 1024 gave only (1024-16)/3 = 336 slots per frame.  Each
+    // element-level effect (DropShadow / Glow / Blur) costs ~3 flushes plus a
+    // bitmap composite pair, so a page crossed the cliff at roughly a dozen
+    // effects — observed as "the sidebar and status bar vanish once the welcome
+    // page carries ~15 DropShadowEffects", with everything recorded after the
+    // overflow point missing.  16384 raises the per-frame budget to 5456 slots
+    // (~16x) for 512 KB of shader-visible memory; D3D12 resource binding tier 1
+    // guarantees at least 1,000,000 CBV_SRV_UAV descriptors per heap, so this is
+    // universally supported and still tiny.
+    static constexpr UINT kMaxSrvDescriptors = 16384;
 
     // --- Snapshot resources (for backdrop filter, liquid glass) ---
     ComPtr<ID3D12Resource> snapshotTexture_;
@@ -1265,6 +1350,16 @@ private:
     bool inOffscreenCapture_ = false;
     bool offscreenResourcesUsedThisFrame_ = false;
     std::stack<D3D12_RECT> savedScissorStack_;  // scissor stack saved during offscreen capture
+    // Rounded clips are a SECOND clip channel, independent of the hardware
+    // scissor: RoundedClipState snapshots the transform at push time, so a clip
+    // pushed by an ancestor resolves to SCREEN-space physical pixels, which the
+    // pixel-shader SDF compares against SV_Position. Inside an offscreen capture
+    // SV_Position is CAPTURE-LOCAL, so leaving an ancestor's mask active discards
+    // every captured pixel and the effect composites an empty texture (the
+    // element simply disappears). Saved and cleared for the capture's duration,
+    // exactly like savedRetainedRoundedClipStack_ does for retained layers; the
+    // composite draw re-applies the live clip in screen space where it is correct.
+    std::vector<RoundedClipState> savedOffscreenRoundedClipStack_;
 
     // --- Retained layer capture (shares the RT-redirect machinery; mutually
     //     exclusive with offscreen capture to avoid nested RT redirects) ---

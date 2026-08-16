@@ -73,6 +73,22 @@ public class ExternalPresentPacingTests
     }
 
     [Fact]
+    public void TryBeginDraw_DuringLiveResize_StillUsesPresentCredit()
+    {
+        var (window, native) = CreatePacedWindow(beginDrawResult: (int)JaliumResult.Ok);
+        SetPrivateField(window, "_isSizing", true);
+        SetSwapCredit(window, 0);
+
+        bool began = InvokeTryBeginDrawOrScheduleRetry(window);
+
+        Assert.False(began);
+        Assert.Equal(0, native.BeginDrawCalls);
+        Assert.Equal(0, GetSwapCredit(window));
+        Assert.True((bool)GetPrivateField(window, "_renderPendingOnSwap")!);
+        Assert.Null(GetPrivateField(window, "_renderThrottleTimer"));
+    }
+
+    [Fact]
     public void RecoverableFailureFunnel_ReturnsCredit()
     {
         // HandleRecoverableRenderPipelineFailure is the single funnel all

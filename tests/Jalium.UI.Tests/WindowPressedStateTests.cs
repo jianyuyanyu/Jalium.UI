@@ -527,7 +527,7 @@ public class WindowPressedStateTests
 
             var futureClickPoint = new Point(48, 40);
             var cachedHit = InvokeHitTestElement(window, futureClickPoint);
-            Assert.Same(popup, cachedHit);
+            Assert.Same(background, cachedHit);
 
             popup.IsOpen = true;
             window.Measure(new Size(320, 240));

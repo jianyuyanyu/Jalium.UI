@@ -315,7 +315,10 @@ public class ToolTip : ContentControl
             StaysOpen = StaysOpen,
             AllowsTransparency = true,
             PopupAnimation = SystemParameters.ToolTipPopupAnimation,
-            ShouldConstrainToRootBounds = true, // Force overlay mode (simpler, avoids external window issues)
+            // Keep the lightweight overlay while it fits. Popup promotes it to a
+            // native window only when the requested placement crosses owner bounds.
+            ShouldConstrainToRootBounds = false,
+            PreferExternalWindow = false,
             IsHitTestVisible = false // Prevent tooltip overlay from stealing mouse events
         };
 

@@ -9,38 +9,33 @@ namespace Jalium.UI.Tests;
 public class DependencyPropertyTests
 {
     [Fact]
-    public void ValueLayerStorage_ShouldRemainLazyAndReleaseTheLastLocalValue()
+    public void UnifiedValueStore_ShouldRemainLazyAndReleaseTheLastLocalValue()
     {
         var obj = new TestDependencyObject();
         _ = obj.GetValue(TestDependencyObject.NameProperty);
 
-        string[] layerFields =
+        string[] coldFields =
         {
-            "_localValues",
-            "_parentTemplateValues",
-            "_styleTriggerValues",
-            "_templateTriggerValues",
-            "_styleSetterValues",
-            "_currentValues",
+            "_valueStore",
             "_bindings",
             "_animatedValues"
         };
 
-        foreach (var fieldName in layerFields)
+        foreach (var fieldName in coldFields)
         {
             Assert.Null(GetValueLayer(obj, fieldName));
         }
 
         obj.SetValue(TestDependencyObject.NameProperty, "local");
 
-        Assert.NotNull(GetValueLayer(obj, "_localValues"));
-        foreach (var fieldName in layerFields[1..])
+        Assert.NotNull(GetValueLayer(obj, "_valueStore"));
+        foreach (var fieldName in coldFields[1..])
         {
             Assert.Null(GetValueLayer(obj, fieldName));
         }
 
         obj.ClearValue(TestDependencyObject.NameProperty);
-        Assert.Null(GetValueLayer(obj, "_localValues"));
+        Assert.Null(GetValueLayer(obj, "_valueStore"));
     }
 
     private static object? GetValueLayer(DependencyObject obj, string fieldName) =>

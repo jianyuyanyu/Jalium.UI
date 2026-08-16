@@ -7,11 +7,39 @@ public sealed class SuperEllipseNativeRenderingTests
 {
     private const int Width = 176;
     private const int Height = 128;
+    private const int FullAbiGradientStopCount = 65_536;
     private static readonly float[] s_themeGradientStops =
     [
         0f, 0.00f, 0.35f, 1.00f, 1f,
         1f, 0.05f, 0.95f, 1.00f, 1f
     ];
+    private static readonly float[] s_fiveStopFadeStops =
+    [
+        0.00f, 1f, 0f, 0f, 1f,
+        0.25f, 0f, 1f, 0f, 1f,
+        0.50f, 0f, 0f, 1f, 1f,
+        0.75f, 1f, 1f, 1f, 1f,
+        1.00f, 1f, 1f, 1f, 0f,
+    ];
+    private static readonly float[] s_highlightSweepStops =
+    [
+        0.000f, 68f / 255f, 199f / 255f, 181f / 255f, 220f / 255f,
+        0.040f, 68f / 255f, 199f / 255f, 181f / 255f, 220f / 255f,
+        0.120f, 1f,         195f / 255f, 122f / 255f,  18f / 255f,
+        0.260f, 1f,         195f / 255f, 122f / 255f,  40f / 255f,
+        0.420f, 1f,         195f / 255f, 122f / 255f,  72f / 255f,
+        0.560f, 1f,         195f / 255f, 122f / 255f, 112f / 255f,
+        0.680f, 1f,         195f / 255f, 122f / 255f, 156f / 255f,
+        0.780f, 1f,         195f / 255f, 122f / 255f, 196f / 255f,
+        0.840f, 222f / 255f, 177f / 255f, 1f,         216f / 255f,
+        0.890f, 222f / 255f, 177f / 255f, 1f,         234f / 255f,
+        0.930f, 222f / 255f, 177f / 255f, 1f,         246f / 255f,
+        0.955f, 1f,          1f,          1f,         252f / 255f,
+        0.970f, 1f,          1f,          1f,         1f,
+        1.000f, 1f,          1f,          1f,         0f,
+    ];
+    private static readonly float[] s_manyStopFadeStops =
+        CreateManyStopFadeStops(FullAbiGradientStopCount);
 
 
     [RequiresWindowsBackendFact(RenderBackend.D3D12)]
@@ -72,10 +100,258 @@ public sealed class SuperEllipseNativeRenderingTests
         AssertGradientFillAndStroke(RenderBackend.D3D12);
     }
 
+    [RequiresWindowsBackendFact(RenderBackend.D3D12)]
+    public void D3D12_GradientFill_PreservesFifthStop() =>
+        AssertGradientFillPreservesFifthStop(RenderBackend.D3D12);
+
+    [RequiresBackendFact(RenderBackend.Vulkan)]
+    public void Vulkan_GradientFill_PreservesFifthStop() =>
+        AssertGradientFillPreservesFifthStop(RenderBackend.Vulkan);
+
+    [RequiresWindowsBackendFact(RenderBackend.D3D12)]
+    public void D3D12_GradientFill_PreservesFullStopTable() =>
+        AssertGradientFillPreservesFullStopTable(RenderBackend.D3D12);
+
+    [RequiresBackendFact(RenderBackend.Vulkan)]
+    public void Vulkan_GradientFill_PreservesFullStopTable() =>
+        AssertGradientFillPreservesFullStopTable(RenderBackend.Vulkan);
+
+    [RequiresWindowsBackendFact(RenderBackend.D3D12)]
+    public void D3D12_HighlightSweep_PreservesColorSequenceAndTransparentEdge() =>
+        AssertHighlightSweepPreservesColorSequenceAndTransparentEdge(
+            RenderBackend.D3D12);
+
+    [RequiresBackendFact(RenderBackend.Vulkan)]
+    public void Vulkan_HighlightSweep_PreservesColorSequenceAndTransparentEdge() =>
+        AssertHighlightSweepPreservesColorSequenceAndTransparentEdge(
+            RenderBackend.Vulkan);
+
+    [RequiresBackendFact(RenderBackend.Vulkan)]
+    public void Vulkan_HighlightSweepStroke_PreservesColorSequenceAndTransparentEdge()
+        => AssertPerCornerHighlightSweepStrokePreservesColorSequenceAndTransparentEdge(
+            RenderBackend.Vulkan);
+
+    [RequiresWindowsBackendFact(RenderBackend.D3D12)]
+    public void D3D12_PerCornerHighlightSweepStroke_PreservesColorSequenceAndTransparentEdge()
+        => AssertPerCornerHighlightSweepStrokePreservesColorSequenceAndTransparentEdge(
+            RenderBackend.D3D12);
+
+    private static void AssertPerCornerHighlightSweepStrokePreservesColorSequenceAndTransparentEdge(
+        RenderBackend backend)
+    {
+        var pixels = RenderLinearGradient(
+            backend,
+            startX: 52f,
+            startY: 48f,
+            endX: 148f,
+            endY: 48f,
+            s_highlightSweepStops,
+            stopCount: 14,
+            static (target, gradient) =>
+            {
+                // Border.DrawStrokeAboveChildren uses the CornerRadius overload,
+                // which reaches this native per-corner entry point even when all
+                // four radii are equal.
+                target.DrawPerCornerRoundedRectangle(
+                    8f,
+                    32f,
+                    160f,
+                    64f,
+                    8f,
+                    8f,
+                    8f,
+                    8f,
+                    gradient,
+                    strokeWidth: 8f);
+            });
+
+        AssertHighlightColorSamples(
+            backend,
+            pixels,
+            sampleY: 32,
+            primitive: "per-corner stroke");
+    }
+
+    [RequiresBackendFact(RenderBackend.Vulkan)]
+    public void Vulkan_GradientStroke_PreservesFullStopTable()
+    {
+        var pixels = RenderLinearGradient(
+            RenderBackend.Vulkan,
+            startX: 16f,
+            startY: 48f,
+            endX: 160f,
+            endY: 48f,
+            s_manyStopFadeStops,
+            stopCount: FullAbiGradientStopCount,
+            static (target, gradient) =>
+            {
+                target.DrawRoundedRectangle(
+                    8f,
+                    32f,
+                    160f,
+                    64f,
+                    8f,
+                    8f,
+                    gradient,
+                    strokeWidth: 8f);
+            });
+
+        AssertFullStopFadeSamples(
+            RenderBackend.Vulkan,
+            pixels,
+            sampleY: 32,
+            primitive: "stroke");
+    }
+
     [RequiresBackendFact(RenderBackend.Vulkan)]
     public void Vulkan_GradientFillAndStroke_UseLocalContinuousCorners()
     {
         AssertGradientFillAndStroke(RenderBackend.Vulkan);
+    }
+
+    private static void AssertGradientFillPreservesFifthStop(
+        RenderBackend backend)
+    {
+        var pixels = RenderLinearGradient(
+            backend,
+            startX: 16f,
+            startY: 48f,
+            endX: 160f,
+            endY: 48f,
+            s_fiveStopFadeStops,
+            stopCount: 5,
+            static (target, gradient) =>
+            {
+                target.FillRoundedRectangle(
+                    16f,
+                    32f,
+                    144f,
+                    32f,
+                    4f,
+                    4f,
+                    gradient);
+            });
+
+        byte shoulder = GetBlue(pixels, 128, 48);
+        byte transparentTail = GetBlue(pixels, 156, 48);
+        Assert.True(
+            shoulder >= 150 && transparentTail <= 64,
+            $"{backend}: the fifth transparent stop must fade the fourth " +
+            $"white stop; shoulder={shoulder}, tail={transparentTail}.");
+    }
+
+    private static void AssertGradientFillPreservesFullStopTable(
+        RenderBackend backend)
+    {
+        var pixels = RenderLinearGradient(
+            backend,
+            startX: 16f,
+            startY: 48f,
+            endX: 160f,
+            endY: 48f,
+            s_manyStopFadeStops,
+            stopCount: FullAbiGradientStopCount,
+            static (target, gradient) =>
+            {
+                target.FillRoundedRectangle(
+                    16f,
+                    32f,
+                    144f,
+                    32f,
+                    4f,
+                    4f,
+                    gradient);
+            });
+
+        AssertFullStopFadeSamples(
+            backend,
+            pixels,
+            sampleY: 48,
+            primitive: "fill");
+    }
+
+    private static void AssertFullStopFadeSamples(
+        RenderBackend backend,
+        byte[] pixels,
+        int sampleY,
+        string primitive)
+    {
+        byte opaquePlateau = GetBlue(pixels, 80, sampleY);
+        byte fadeMidpoint = GetBlue(pixels, 124, sampleY);
+        byte transparentTail = GetBlue(pixels, 156, sampleY);
+        Assert.True(
+            opaquePlateau >= 240 &&
+            fadeMidpoint is >= 80 and <= 180 &&
+            transparentTail <= 40,
+            $"{backend}: all {FullAbiGradientStopCount} stops must reach the " +
+            $"{primitive} renderer so the final stop controls the fade; " +
+            $"plateau={opaquePlateau}, midpoint={fadeMidpoint}, " +
+            $"tail={transparentTail}.");
+    }
+
+    private static void
+        AssertHighlightSweepPreservesColorSequenceAndTransparentEdge(
+            RenderBackend backend)
+    {
+        var pixels = RenderLinearGradient(
+            backend,
+            startX: 52f,
+            startY: 48f,
+            endX: 148f,
+            endY: 48f,
+            s_highlightSweepStops,
+            stopCount: 14,
+            static (target, gradient) =>
+            {
+                target.FillRoundedRectangle(
+                    16f,
+                    32f,
+                    144f,
+                    32f,
+                    4f,
+                    4f,
+                    gradient);
+            });
+
+        AssertHighlightColorSamples(
+            backend,
+            pixels,
+            sampleY: 48,
+            primitive: "fill");
+    }
+
+    private static void AssertHighlightColorSamples(
+        RenderBackend backend,
+        byte[] pixels,
+        int sampleY,
+        string primitive)
+    {
+        var orange = GetPixel(pixels, 119, sampleY);
+        var purple = GetPixel(pixels, 139, sampleY);
+        var white = GetPixel(pixels, 145, sampleY);
+        var transparentEdge = GetPixel(pixels, 155, sampleY);
+
+        Assert.True(
+            orange.R > orange.G &&
+            orange.G > orange.B &&
+            orange.R >= 120,
+            $"{backend} {primitive}: orange segment was lost: {orange}.");
+        Assert.True(
+            purple.B > purple.R &&
+            purple.R > purple.G &&
+            purple.B >= 180,
+            $"{backend} {primitive}: purple segment was lost: {purple}.");
+        Assert.True(
+            white.R >= 220 &&
+            white.G >= 220 &&
+            white.B >= 220,
+            $"{backend} {primitive}: white segment was lost: {white}.");
+        Assert.True(
+            transparentEdge.R <= 8 &&
+            transparentEdge.G <= 8 &&
+            transparentEdge.B <= 8,
+            $"{backend} {primitive}: the leading edge must return to " +
+            $"transparent: {transparentEdge}.");
     }
 
 
@@ -396,6 +672,68 @@ public sealed class SuperEllipseNativeRenderingTests
             $"partialCoveragePixels={partialCoveragePixels}.");
     }
 
+    private static byte[] RenderLinearGradient(
+        RenderBackend backend,
+        float startX,
+        float startY,
+        float endX,
+        float endY,
+        float[] stops,
+        int stopCount,
+        Action<RenderTarget, NativeBrush> draw)
+    {
+        using var window = new HiddenNativeWindow(Width, Height);
+        using var context = new RenderContext(
+            backend,
+            GpuPreference.Auto,
+            RenderingEngine.Impeller);
+        using var gradient = context.CreateLinearGradientBrush(
+            startX,
+            startY,
+            endX,
+            endY,
+            stops,
+            (uint)stopCount);
+        using var target =
+            context.CreateRenderTarget(window.Hwnd, Width, Height);
+
+        Assert.Equal(backend, context.Backend);
+        Assert.True(gradient.IsValid);
+        Assert.True(target.IsValid);
+
+        var frameCount = backend == RenderBackend.Vulkan ? 2 : 1;
+        for (var frame = 0; frame < frameCount; frame++)
+        {
+            Assert.True(target.TryBeginDraw());
+            target.Clear(0f, 0f, 0f);
+            // Vulkan needs one replay frame before readback can be armed.
+            // Leave that warm-up frame empty so translucent pixels are not
+            // source-over composited twice in the retained frame.
+            if (backend != RenderBackend.Vulkan ||
+                frame == frameCount - 1)
+            {
+                draw(target, gradient);
+            }
+            if (frame == frameCount - 1)
+            {
+                Assert.Equal(JaliumResult.Ok, target.RequestReadback());
+            }
+            Assert.Equal(JaliumResult.Ok, target.TryEndDraw());
+        }
+
+        var pixels = new byte[Width * Height * 4];
+        Assert.Equal(
+            JaliumResult.Ok,
+            target.FetchReadback(
+                pixels,
+                Width * 4u,
+                out var capturedWidth,
+                out var capturedHeight));
+        Assert.Equal(Width, capturedWidth);
+        Assert.Equal(Height, capturedHeight);
+        return pixels;
+    }
+
 
     private static byte[] Render(
         RenderBackend backend,
@@ -559,6 +897,42 @@ public sealed class SuperEllipseNativeRenderingTests
         return float.Lerp(top, bottom, ty);
     }
 
+    private static float[] CreateManyStopFadeStops(int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(count, 2);
+        var stops = new float[count * 5];
+        var opaqueStopCount = count - 1;
+        for (var i = 0; i < opaqueStopCount; i++)
+        {
+            var offset = i * 5;
+            stops[offset] = 0.5f * i / (opaqueStopCount - 1);
+            stops[offset + 1] = 1f;
+            stops[offset + 2] = 1f;
+            stops[offset + 3] = 1f;
+            stops[offset + 4] = 1f;
+        }
+
+        var finalOffset = (count - 1) * 5;
+        stops[finalOffset] = 1f;
+        stops[finalOffset + 1] = 1f;
+        stops[finalOffset + 2] = 1f;
+        stops[finalOffset + 3] = 1f;
+        stops[finalOffset + 4] = 0f;
+        return stops;
+    }
+
     private static byte GetBlue(byte[] pixels, int x, int y) =>
         pixels[(y * Width + x) * 4];
+
+    private static (byte R, byte G, byte B) GetPixel(
+        byte[] pixels,
+        int x,
+        int y)
+    {
+        var offset = (y * Width + x) * 4;
+        return (
+            pixels[offset + 2],
+            pixels[offset + 1],
+            pixels[offset]);
+    }
 }

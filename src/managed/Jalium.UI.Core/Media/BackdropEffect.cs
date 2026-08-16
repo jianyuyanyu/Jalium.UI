@@ -1,4 +1,7 @@
+using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using Jalium.UI;
+using Jalium.UI.Markup;
 
 namespace Jalium.UI.Media;
 
@@ -42,59 +45,141 @@ public enum WindowBackdropType
 /// </summary>
 public abstract class BackdropEffect : IBackdropEffect
 {
-    /// <inheritdoc />
-    public virtual float BlurRadius { get; set; }
+    private float _blurRadius;
+    private float _blurSigma;
+    private BackdropBlurType _blurType = BackdropBlurType.Gaussian;
+    private float _noiseIntensity;
+    private float _brightness = 1.0f;
+    private float _contrast = 1.0f;
+    private float _saturation = 1.0f;
+    private float _hueRotation;
+    private float _grayscale;
+    private float _sepia;
+    private float _invert;
+    private float _opacity = 1.0f;
+    private Color _tintColor = Color.Transparent;
+    private float _tintOpacity;
+    private float _luminosity = 1.0f;
+    private int _deferChangeDepth;
+    private bool _hasDeferredChange;
+
+    /// <summary>Raised whenever a render-affecting backdrop parameter changes.</summary>
+    public event EventHandler? EffectChanged;
 
     /// <inheritdoc />
-    public virtual float BlurSigma { get; set; }
+    public virtual float BlurRadius
+    {
+        get => _blurRadius;
+        set => SetField(ref _blurRadius, value);
+    }
 
     /// <inheritdoc />
-    public virtual BackdropBlurType BlurType { get; set; } = BackdropBlurType.Gaussian;
+    public virtual float BlurSigma
+    {
+        get => _blurSigma;
+        set => SetField(ref _blurSigma, value);
+    }
 
     /// <inheritdoc />
-    public virtual float NoiseIntensity { get; set; }
+    public virtual BackdropBlurType BlurType
+    {
+        get => _blurType;
+        set => SetField(ref _blurType, value);
+    }
 
     /// <inheritdoc />
-    public virtual float Brightness { get; set; } = 1.0f;
+    public virtual float NoiseIntensity
+    {
+        get => _noiseIntensity;
+        set => SetField(ref _noiseIntensity, value);
+    }
 
     /// <inheritdoc />
-    public virtual float Contrast { get; set; } = 1.0f;
+    public virtual float Brightness
+    {
+        get => _brightness;
+        set => SetField(ref _brightness, value);
+    }
 
     /// <inheritdoc />
-    public virtual float Saturation { get; set; } = 1.0f;
+    public virtual float Contrast
+    {
+        get => _contrast;
+        set => SetField(ref _contrast, value);
+    }
 
     /// <inheritdoc />
-    public virtual float HueRotation { get; set; }
+    public virtual float Saturation
+    {
+        get => _saturation;
+        set => SetField(ref _saturation, value);
+    }
 
     /// <inheritdoc />
-    public virtual float Grayscale { get; set; }
+    public virtual float HueRotation
+    {
+        get => _hueRotation;
+        set => SetField(ref _hueRotation, value);
+    }
 
     /// <inheritdoc />
-    public virtual float Sepia { get; set; }
+    public virtual float Grayscale
+    {
+        get => _grayscale;
+        set => SetField(ref _grayscale, value);
+    }
 
     /// <inheritdoc />
-    public virtual float Invert { get; set; }
+    public virtual float Sepia
+    {
+        get => _sepia;
+        set => SetField(ref _sepia, value);
+    }
 
     /// <inheritdoc />
-    public virtual float Opacity { get; set; } = 1.0f;
+    public virtual float Invert
+    {
+        get => _invert;
+        set => SetField(ref _invert, value);
+    }
+
+    /// <inheritdoc />
+    public virtual float Opacity
+    {
+        get => _opacity;
+        set => SetField(ref _opacity, value);
+    }
 
     /// <summary>
     /// Gets or sets the tint color.
     /// </summary>
-    public virtual Color TintColor { get; set; } = Color.Transparent;
+    public virtual Color TintColor
+    {
+        get => _tintColor;
+        set => SetField(ref _tintColor, value);
+    }
 
     /// <inheritdoc />
     public uint TintColorArgb => TintColor.ToArgb();
 
     /// <inheritdoc />
-    public virtual float TintOpacity { get; set; }
+    public virtual float TintOpacity
+    {
+        get => _tintOpacity;
+        set => SetField(ref _tintOpacity, value);
+    }
 
     /// <inheritdoc />
-    public virtual float Luminosity { get; set; } = 1.0f;
+    public virtual float Luminosity
+    {
+        get => _luminosity;
+        set => SetField(ref _luminosity, value);
+    }
 
     /// <inheritdoc />
     public virtual bool HasEffect =>
         BlurRadius > 0 ||
+        NoiseIntensity > 0 ||
         Math.Abs(Brightness - 1.0f) > 0.001f ||
         Math.Abs(Contrast - 1.0f) > 0.001f ||
         Math.Abs(Saturation - 1.0f) > 0.001f ||
@@ -103,7 +188,41 @@ public abstract class BackdropEffect : IBackdropEffect
         Sepia > 0 ||
         Invert > 0 ||
         Math.Abs(Opacity - 1.0f) > 0.001f ||
-        TintOpacity > 0;
+        TintOpacity > 0 ||
+        Math.Abs(Luminosity - 1.0f) > 0.001f;
+
+    /// <summary>Defers change notifications while several related values are updated.</summary>
+    protected void BeginEffectUpdate() => _deferChangeDepth++;
+
+    /// <summary>Ends a deferred update and emits one consolidated notification.</summary>
+    protected void EndEffectUpdate()
+    {
+        if (_deferChangeDepth <= 0)
+            return;
+
+        _deferChangeDepth--;
+        if (_deferChangeDepth == 0 && _hasDeferredChange)
+        {
+            _hasDeferredChange = false;
+            EffectChanged?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    private void SetField<T>(ref T field, T value)
+    {
+        if (EqualityComparer<T>.Default.Equals(field, value))
+            return;
+
+        field = value;
+        if (_deferChangeDepth > 0)
+        {
+            _hasDeferredChange = true;
+        }
+        else
+        {
+            EffectChanged?.Invoke(this, EventArgs.Empty);
+        }
+    }
 }
 
 /// <summary>
@@ -298,22 +417,31 @@ public sealed class ColorAdjustmentEffect : BackdropEffect
 /// <summary>
 /// A composite effect that combines multiple backdrop effects.
 /// </summary>
+[ContentProperty(nameof(Effects))]
 public sealed class CompositeBackdropEffect : BackdropEffect
 {
-    private readonly List<IBackdropEffect> _effects = new();
+    private readonly ObservableCollection<IBackdropEffect> _effects = new();
+    private readonly HashSet<BackdropEffect> _subscribedEffects = new();
+    private bool _isUpdatingCombinedValues;
+
+    /// <summary>Initializes an empty composite backdrop effect.</summary>
+    public CompositeBackdropEffect()
+    {
+        _effects.CollectionChanged += OnEffectsCollectionChanged;
+    }
 
     /// <summary>
     /// Gets the list of effects to combine.
     /// </summary>
-    public IReadOnlyList<IBackdropEffect> Effects => _effects;
+    public ObservableCollection<IBackdropEffect> Effects => _effects;
 
     /// <summary>
     /// Adds an effect to the composite.
     /// </summary>
     public CompositeBackdropEffect Add(IBackdropEffect effect)
     {
+        ArgumentNullException.ThrowIfNull(effect);
         _effects.Add(effect);
-        UpdateCombinedValues();
         return this;
     }
 
@@ -323,69 +451,117 @@ public sealed class CompositeBackdropEffect : BackdropEffect
     public CompositeBackdropEffect Remove(IBackdropEffect effect)
     {
         _effects.Remove(effect);
-        UpdateCombinedValues();
         return this;
+    }
+
+    private void OnEffectsCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        RefreshChildSubscriptions();
+        UpdateCombinedValues();
+    }
+
+    private void OnChildEffectChanged(object? sender, EventArgs e) => UpdateCombinedValues();
+
+    private void RefreshChildSubscriptions()
+    {
+        var current = new HashSet<BackdropEffect>();
+        for (int i = 0; i < _effects.Count; i++)
+        {
+            if (_effects[i] is BackdropEffect effect && !ReferenceEquals(effect, this))
+                current.Add(effect);
+        }
+
+        foreach (var oldEffect in _subscribedEffects)
+        {
+            if (!current.Contains(oldEffect))
+                oldEffect.EffectChanged -= OnChildEffectChanged;
+        }
+
+        foreach (var newEffect in current)
+        {
+            if (!_subscribedEffects.Contains(newEffect))
+                newEffect.EffectChanged += OnChildEffectChanged;
+        }
+
+        _subscribedEffects.Clear();
+        foreach (var effect in current)
+            _subscribedEffects.Add(effect);
     }
 
     private void UpdateCombinedValues()
     {
-        // Reset to defaults
-        BlurRadius = 0;
-        BlurSigma = 0;
-        BlurType = BackdropBlurType.Gaussian;
-        NoiseIntensity = 0;
-        Brightness = 1.0f;
-        Contrast = 1.0f;
-        Saturation = 1.0f;
-        HueRotation = 0;
-        Grayscale = 0;
-        Sepia = 0;
-        Invert = 0;
-        Opacity = 1.0f;
-        TintColor = Color.Transparent;
-        TintOpacity = 0;
-        Luminosity = 1.0f;
+        if (_isUpdatingCombinedValues)
+            return;
 
-        // Combine effects
-        foreach (var effect in _effects)
+        _isUpdatingCombinedValues = true;
+        BeginEffectUpdate();
+        try
         {
-            // For blur, use the maximum
-            if (effect.BlurRadius > BlurRadius)
+            // Reset to defaults.
+            BlurRadius = 0;
+            BlurSigma = 0;
+            BlurType = BackdropBlurType.Gaussian;
+            NoiseIntensity = 0;
+            Brightness = 1.0f;
+            Contrast = 1.0f;
+            Saturation = 1.0f;
+            HueRotation = 0;
+            Grayscale = 0;
+            Sepia = 0;
+            Invert = 0;
+            Opacity = 1.0f;
+            TintColor = Color.Transparent;
+            TintOpacity = 0;
+            Luminosity = 1.0f;
+
+            // Combine effects.
+            foreach (var effect in _effects)
             {
-                BlurRadius = effect.BlurRadius;
-                BlurSigma = effect.BlurSigma;
-                BlurType = effect.BlurType;
+                if (ReferenceEquals(effect, this))
+                    continue;
+
+                // For blur, use the maximum.
+                if (effect.BlurRadius > BlurRadius)
+                {
+                    BlurRadius = effect.BlurRadius;
+                    BlurSigma = effect.BlurSigma;
+                    BlurType = effect.BlurType;
+                }
+
+                NoiseIntensity = Math.Max(NoiseIntensity, effect.NoiseIntensity);
+
+                Brightness *= effect.Brightness;
+                Contrast *= effect.Contrast;
+                Saturation *= effect.Saturation;
+
+                HueRotation += effect.HueRotation;
+                HueRotation %= 2.0f * MathF.PI;
+
+                Grayscale = Math.Max(Grayscale, effect.Grayscale);
+                Sepia = Math.Max(Sepia, effect.Sepia);
+                Invert = Math.Max(Invert, effect.Invert);
+
+                Opacity *= effect.Opacity;
+
+                if (effect.TintOpacity > 0)
+                {
+                    TintColor = Color.FromArgb(effect.TintColorArgb);
+                    TintOpacity = effect.TintOpacity;
+                }
+
+                Luminosity *= effect.Luminosity;
             }
-
-            // For noise, use the maximum
-            NoiseIntensity = Math.Max(NoiseIntensity, effect.NoiseIntensity);
-
-            // For color adjustments, multiply
-            Brightness *= effect.Brightness;
-            Contrast *= effect.Contrast;
-            Saturation *= effect.Saturation;
-
-            // For hue rotation, add
-            HueRotation += effect.HueRotation;
-            HueRotation = HueRotation % (2.0f * MathF.PI);
-
-            // For grayscale/sepia/invert, use maximum
-            Grayscale = Math.Max(Grayscale, effect.Grayscale);
-            Sepia = Math.Max(Sepia, effect.Sepia);
-            Invert = Math.Max(Invert, effect.Invert);
-
-            // For opacity, multiply
-            Opacity *= effect.Opacity;
-
-            // For tint, use the last non-transparent one
-            if (effect.TintOpacity > 0)
+        }
+        finally
+        {
+            try
             {
-                TintColor = Color.FromArgb(effect.TintColorArgb);
-                TintOpacity = effect.TintOpacity;
+                EndEffectUpdate();
             }
-
-            // For luminosity, multiply
-            Luminosity *= effect.Luminosity;
+            finally
+            {
+                _isUpdatingCombinedValues = false;
+            }
         }
     }
 }

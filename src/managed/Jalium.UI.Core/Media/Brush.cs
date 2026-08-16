@@ -346,7 +346,8 @@ public abstract class GradientBrush : Brush
             OnFreezablePropertyChanged(e.OldValue as DependencyObject, e.NewValue as DependencyObject, GradientStopsProperty);
         }
 
-        if (ReferenceEquals(e.Property, GradientStopsProperty)
+        if (ReferenceEquals(e.Property, OpacityProperty)
+            || ReferenceEquals(e.Property, GradientStopsProperty)
             || ReferenceEquals(e.Property, SpreadMethodProperty)
             || ReferenceEquals(e.Property, MappingModeProperty)
             || ReferenceEquals(e.Property, ColorInterpolationModeProperty))

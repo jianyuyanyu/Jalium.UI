@@ -80,6 +80,79 @@ public sealed class WholeFrameRecorderTests : System.IDisposable
     }
 
     [Fact]
+    public void WholeFrameCapture_ReusesCleanVisualDrawingAsSceneGraphNode()
+    {
+        MediaRenderCacheHost.Bootstrap();
+        var visual = new CountingRenderElement();
+        visual.Measure(new Size(100, 60));
+        visual.Arrange(new Rect(0, 0, 100, 60));
+        var host = new MediaRenderCacheHost();
+
+        Drawing Capture()
+        {
+            var recorder = host.CreateFrameRecorder()!;
+            visual.Render(recorder);
+            return (Drawing)host.FinishRecord(recorder);
+        }
+
+        var first = Capture();
+        var firstNode = Assert.Single(
+            first.Commands,
+            command => command.Kind == DrawCommandKind.DrawRecordedDrawing);
+        Assert.Equal(1, visual.RenderCount);
+
+        var second = Capture();
+        var secondNode = Assert.Single(
+            second.Commands,
+            command => command.Kind == DrawCommandKind.DrawRecordedDrawing);
+
+        Assert.Equal(1, visual.RenderCount);
+        Assert.Same(firstNode.A, secondNode.A);
+
+        visual.InvalidateVisual();
+        var third = Capture();
+        var thirdNode = Assert.Single(
+            third.Commands,
+            command => command.Kind == DrawCommandKind.DrawRecordedDrawing);
+
+        Assert.Equal(2, visual.RenderCount);
+        Assert.NotSame(secondNode.A, thirdNode.A);
+    }
+
+    [Fact]
+    public void WholeFrameCapture_SimplifiedEffects_StillRecordsCurrentContentWithoutCaptureCommands()
+    {
+        MediaRenderCacheHost.Bootstrap();
+        var visual = new Border
+        {
+            Width = 80,
+            Height = 40,
+            Background = new SolidColorBrush(Color.FromArgb(255, 20, 40, 60)),
+            Effect = new Jalium.UI.Media.Effects.DropShadowEffect
+            {
+                BlurRadius = 8,
+                Opacity = 0.7,
+            },
+        };
+        visual.Measure(new Size(100, 60));
+        visual.Arrange(new Rect(0, 0, 80, 40));
+        var host = new MediaRenderCacheHost();
+
+        var recorder = host.CreateFrameRecorder(simplifyElementEffects: true);
+        visual.Render(recorder);
+        var drawing = (Drawing)host.FinishRecord(recorder);
+
+        Assert.DoesNotContain(drawing.Commands,
+            command => command.Kind is DrawCommandKind.BeginEffectCapture
+                or DrawCommandKind.EndEffectCapture
+                or DrawCommandKind.ApplyElementEffect);
+
+        var replay = new RecordingRenderSink();
+        host.Replay(drawing, replay);
+        Assert.Contains(replay.Events, entry => entry.StartsWith("DrawRoundedRectangle"));
+    }
+
+    [Fact]
     public void WholeFrameCapture_TransformOrigin_RoundTripsIdentically()
     {
         // Exercises ITransformDrawingContext.PushTransform(transform, originX, originY):
@@ -286,4 +359,19 @@ public sealed class WholeFrameRecorderTests : System.IDisposable
             "extend DrawCommandKind + the recorder/replayer, or the whole-frame (render-thread) path will silently drop them: " +
             string.Join(", ", offenders.Distinct()));
     }
+
+    private sealed class CountingRenderElement : FrameworkElement
+    {
+        public int RenderCount { get; private set; }
+
+        protected override void OnRender(DrawingContext drawingContext)
+        {
+            RenderCount++;
+            drawingContext.DrawRectangle(
+                new SolidColorBrush(Color.FromArgb(255, 12, 34, 56)),
+                null,
+                new Rect(0, 0, RenderSize.Width, RenderSize.Height));
+        }
+    }
+
 }

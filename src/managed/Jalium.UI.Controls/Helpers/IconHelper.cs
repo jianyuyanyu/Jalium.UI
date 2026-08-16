@@ -38,6 +38,65 @@ internal static partial class IconHelper
         return ExtractProcessIconPixelsWindows(exePath);
     }
 
+    /// <summary>
+    /// Returns raw <c>HICON</c> handles for the running executable, sized to the system's large
+    /// and small icon metrics, for use as a window class's <c>hIcon</c> / <c>hIconSm</c>.
+    /// Either component is <c>0</c> when the icon cannot be extracted.
+    /// </summary>
+    /// <remarks>
+    /// The returned handles are deliberately NOT destroyed by the caller: a window class owns its
+    /// icons for as long as the class is registered, and the Jalium window class lives for the
+    /// life of the process. Destroying them would leave the class pointing at freed handles.
+    ///
+    /// <para>These are what Windows draws for the window itself — the taskbar thumbnail header,
+    /// Alt-Tab and the window menu — which is a DIFFERENT source from the taskbar *button*: the
+    /// shell resolves that one from the executable independently, which is why an app can show a
+    /// correct taskbar button and a stale default window icon at the same time.</para>
+    /// </remarks>
+    internal static (nint Large, nint Small) ExtractProcessIconHandles()
+    {
+        if (!OperatingSystem.IsWindows())
+            return (0, 0);
+
+        var exePath = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(exePath))
+            return (0, 0);
+
+        return (
+            ExtractIconHandleWindows(exePath, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON)),
+            ExtractIconHandleWindows(exePath, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)));
+    }
+
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    private static nint ExtractIconHandleWindows(string exePath, int cx, int cy)
+    {
+        if (cx <= 0 || cy <= 0)
+        {
+            cx = cy = 32;
+        }
+
+        // Same preference order as ExtractProcessIconPixelsWindows, minus the shared
+        // IDI_APPLICATION fallback: leaving hIcon at 0 lets Windows apply its own default,
+        // which is exactly what a shared IDI_APPLICATION handle would have drawn anyway.
+        if (PrivateExtractIconsW(exePath, 0, cx, cy, out var hIcon, 0, 1, 0) != 0 && hIcon != 0)
+        {
+            return hIcon;
+        }
+
+        var count = ExtractIconExW(exePath, 0, out var hIconLarge, out var hIconSmall, 1);
+        if (count == 0)
+        {
+            return 0;
+        }
+
+        // Keep whichever matches the requested size better; destroy the other.
+        var wantSmall = cx <= GetSystemMetrics(SM_CXSMICON);
+        var keep = wantSmall && hIconSmall != 0 ? hIconSmall : hIconLarge;
+        var drop = keep == hIconSmall ? hIconLarge : hIconSmall;
+        if (drop != 0) DestroyIcon(drop);
+        return keep;
+    }
+
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     private static ProcessIconPixels? ExtractProcessIconPixelsWindows(string exePath)
     {
@@ -281,6 +340,15 @@ internal static partial class IconHelper
     #region Win32 P/Invoke
 
     private const nint IDI_APPLICATION = 32512;
+
+    // System icon metrics, used to size the window class's hIcon / hIconSm.
+    private const int SM_CXICON = 11;
+    private const int SM_CYICON = 12;
+    private const int SM_CXSMICON = 49;
+    private const int SM_CYSMICON = 50;
+
+    [LibraryImport("user32.dll")]
+    private static partial int GetSystemMetrics(int nIndex);
 
     [LibraryImport("shell32.dll", EntryPoint = "ExtractIconExW", StringMarshalling = StringMarshalling.Utf16)]
     private static partial uint ExtractIconExW(string lpszFile, int nIconIndex, out nint phiconLarge, out nint phiconSmall, uint nIcons);

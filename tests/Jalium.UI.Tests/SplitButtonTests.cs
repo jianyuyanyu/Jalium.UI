@@ -154,6 +154,90 @@ public class SplitButtonTests
         Assert.Equal("from-keyboard", executedParameter);
     }
 
+    /// <summary>
+    /// 模板已展开后再把 Content 换成 UIElement：默认模板里的
+    /// PrimaryButton Content="{TemplateBinding Content}" 会把同一个元素接过去，
+    /// 逻辑父必须留在 SplitButton 一侧，不能抛 "logical child already has a parent"。
+    /// </summary>
+    [Fact]
+    public void SplitButton_UIElementContentAfterTemplateApplied_ShouldKeepLogicalParentOnHost()
+    {
+        ResetApplicationState();
+        ThemeLoader.Initialize();
+        _ = new Application();
+
+        try
+        {
+            var splitButton = new SplitButton { Content = "Run" };
+
+            var host = new StackPanel { Width = 300, Height = 80 };
+            host.Children.Add(splitButton);
+            host.Measure(new Size(300, 80));
+            host.Arrange(new Rect(0, 0, 300, 80));
+
+            var content = new StackPanel { Orientation = Orientation.Horizontal };
+            content.Children.Add(new TextBlock { Text = "启动" });
+
+            splitButton.Content = content;
+
+            var primaryButton = Assert.IsType<Button>(splitButton.FindName("PrimaryButton"));
+            Assert.Same(content, splitButton.Content);
+            Assert.Same(content, primaryButton.Content);
+            Assert.Same(splitButton, content.Parent);
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
+    /// <summary>
+    /// 三态切换（启动 / 取消 / 停止）会反复替换 Content —— 每一轮都必须换干净：
+    /// 新内容跟到 PrimaryButton，旧内容与两侧都脱钩，且不残留逻辑父。
+    /// </summary>
+    [Fact]
+    public void SplitButton_UIElementContentSwappedRepeatedly_ShouldNotThrow()
+    {
+        ResetApplicationState();
+        ThemeLoader.Initialize();
+        _ = new Application();
+
+        try
+        {
+            var splitButton = new SplitButton();
+
+            var host = new StackPanel { Width = 300, Height = 80 };
+            host.Children.Add(splitButton);
+            host.Measure(new Size(300, 80));
+            host.Arrange(new Rect(0, 0, 300, 80));
+
+            var primaryButton = Assert.IsType<Button>(splitButton.FindName("PrimaryButton"));
+
+            StackPanel? previous = null;
+            foreach (var caption in new[] { "启动", "取消", "停止" })
+            {
+                var content = new StackPanel { Orientation = Orientation.Horizontal };
+                content.Children.Add(new TextBlock { Text = caption });
+
+                splitButton.Content = content;
+
+                Assert.Same(content, primaryButton.Content);
+                Assert.Same(splitButton, content.Parent);
+
+                if (previous != null)
+                {
+                    Assert.Null(previous.Parent);
+                }
+
+                previous = content;
+            }
+        }
+        finally
+        {
+            ResetApplicationState();
+        }
+    }
+
     [Fact]
     public void SplitButton_ApiSurface_ShouldMatchWinUI()
     {

@@ -26,6 +26,13 @@ public sealed class NativeBrush : IDisposable
     internal Color CachedColor { get; set; }
 
     /// <summary>
+    /// For solid brushes: the managed brush opacity captured when the native
+    /// alpha was created. Kept separately from <see cref="CachedColor"/> so
+    /// fractional opacity is not quantized to an 8-bit effective color.
+    /// </summary>
+    internal double CachedOpacity { get; set; } = 1d;
+
+    /// <summary>
     /// For ImageBrush-stroke fallbacks: the <see cref="ImageSource"/> the average
     /// color was sampled from. Lets the cache lookup detect when the underlying
     /// source has been swapped on the brush and re-sample instead of returning a

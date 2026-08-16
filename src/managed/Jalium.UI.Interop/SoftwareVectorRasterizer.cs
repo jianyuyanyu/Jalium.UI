@@ -43,7 +43,27 @@ internal static class SoftwareVectorRasterizer
     /// falls back to <see cref="Drawing.Bounds"/>, which only covers the actual
     /// geometry and will distort content that relies on viewport whitespace.
     /// </param>
-    public static byte[]? Rasterize(Drawing drawing, int width, int height, Rect? sourceBounds = null)
+    /// <param name="touchedSources">
+    /// When supplied, receives every <see cref="ImageSource"/> this rasterization read pixels from
+    /// — an <see cref="ImageDrawing"/>'s source, an <see cref="ImageBrush"/>'s source.
+    /// </param>
+    /// <remarks>
+    /// <para><paramref name="touchedSources"/> is what makes the caller's raster cache
+    /// INVALIDATABLE. The result is one flat buffer keyed on the OUTER vector source, but its
+    /// content depends on inner bitmaps that publish asynchronously: the first rasterization of a
+    /// <see cref="DrawingImage"/> wrapping a URI-backed <see cref="ImageDrawing"/> runs while that
+    /// bitmap still has no pixels, and produces a perfectly valid all-transparent buffer. A cache
+    /// that cannot map "this inner bitmap just published" back to "that outer raster is stale"
+    /// therefore serves the blank frame for the life of the window. Recording the dependency here —
+    /// where the sources are actually read — is the only place that cannot drift from the rendering
+    /// itself.</para>
+    /// </remarks>
+    public static byte[]? Rasterize(
+        Drawing drawing,
+        int width,
+        int height,
+        Rect? sourceBounds = null,
+        ICollection<ImageSource>? touchedSources = null)
     {
         if (drawing == null || width <= 0 || height <= 0)
             return null;
@@ -62,7 +82,7 @@ internal static class SoftwareVectorRasterizer
         var scaleY = height / bounds.Height;
         var m = new Matrix(scaleX, 0, 0, scaleY, -bounds.X * scaleX, -bounds.Y * scaleY);
 
-        var ctx = new SoftwareRenderContext(pixels, width, height, stride, m);
+        var ctx = new SoftwareRenderContext(pixels, width, height, stride, m, touchedSources);
         RenderDrawing(drawing, ctx);
 
         return pixels;
@@ -124,7 +144,7 @@ internal static class SoftwareVectorRasterizer
         // Fill — extract a representative color from any brush type
         if (drawing.Brush != null)
         {
-            var (fb, fg, fr, fa) = ExtractBrushColor(drawing.Brush, geoCtx.Opacity);
+            var (fb, fg, fr, fa) = ExtractBrushColor(drawing.Brush, geoCtx, flatGeometry);
             if (fa > 0)
                 FillGeometry(flatGeometry, geoCtx, fb, fg, fr, fa);
         }
@@ -132,7 +152,7 @@ internal static class SoftwareVectorRasterizer
         // Stroke
         if (drawing.Pen?.Brush != null && drawing.Pen.Thickness > 0)
         {
-            var (sb, sg, sr, sa) = ExtractBrushColor(drawing.Pen.Brush, geoCtx.Opacity);
+            var (sb, sg, sr, sa) = ExtractBrushColor(drawing.Pen.Brush, geoCtx, flatGeometry);
             if (sa > 0)
                 StrokeGeometry(flatGeometry, geoCtx, sb, sg, sr, sa, drawing.Pen.Thickness);
         }
@@ -151,20 +171,10 @@ internal static class SoftwareVectorRasterizer
         // Only raster sources expose a CPU pixel buffer the software path can sample.
         if (drawing.ImageSource is not BitmapImage bitmap) return;
 
-        var srcPixels = bitmap.RawPixelData;
-        if (srcPixels == null || srcPixels.Length < 4) return;
-
-        int srcW = bitmap.PixelWidth;
-        int srcH = bitmap.PixelHeight;
-        if (srcW <= 0 || srcH <= 0) return;
-        int srcStride = bitmap.PixelStride > 0 ? bitmap.PixelStride : srcW * 4;
-
-        // Defensive: if the declared stride can't fit the actual buffer (e.g. an
-        // injected decoder reported row padding it never allocated), fall back to a
-        // compact stride so right/bottom-edge texels are still sampled instead of
-        // being silently dropped by the per-pixel bounds guard below.
-        if ((long)srcStride * srcH > srcPixels.Length)
-            srcStride = srcW * 4;
+        // Recorded before any early return: the caller's raster cache has to learn about the
+        // dependency even on the frame where nothing could be blitted, because THAT is the frame
+        // whose blank output would otherwise be cached forever.
+        ctx.TouchedSources?.Add(bitmap);
 
         var rect = drawing.Rect;
         if (rect.IsEmpty || rect.Width <= 0 || rect.Height <= 0) return;
@@ -189,6 +199,33 @@ internal static class SoftwareVectorRasterizer
         int yStart = Math.Max(0, (int)Math.Floor(minYf));
         int yEnd = Math.Min(ctx.Height - 1, (int)Math.Ceiling(maxYf));
         if (xStart > xEnd || yStart > yEnd) return;
+
+        // Drive the decode from here as well as from the GPU choke point. This method reads the
+        // pixel buffer directly and never goes through RenderTargetDrawingContext.GetNativeBitmap,
+        // so without this line a DrawingImage / SVG <image> backed by a URI bitmap renders nothing
+        // at all on the software backend and on WARP — the fix at the GPU choke point does not
+        // reach this code path. The bounding box computed above IS device pixels (ctx maps into
+        // the raster buffer), so it is the honest size hint.
+        // Floored at 1, never 0: an all-zero request means "unbounded" to the deferred decoder and
+        // resolves to the source's natural size, which a growth-only bucket ladder can never walk
+        // back. A degenerate transform must cost a 1px bucket, not a permanently resident
+        // full-resolution one.
+        bitmap.RequestDecode(
+            Math.Clamp((int)Math.Ceiling(maxXf - minXf), 1, 16384),
+            Math.Clamp((int)Math.Ceiling(maxYf - minYf), 1, 16384),
+            cover: false);
+
+        // One consistent tuple. The old code read RawPixelData, PixelWidth, PixelHeight and
+        // PixelStride as four independent properties and then had to defend against the stride not
+        // fitting the buffer; the snapshot is validated at publication, so `Pixels.Length >=
+        // Stride * Height` and `Stride >= Width * 4` hold by construction.
+        if (!bitmap.TryGetPixelSnapshot(out var snapshot) || snapshot is null) return;
+
+        var srcPixels = snapshot.Pixels;
+        int srcW = snapshot.Width;
+        int srcH = snapshot.Height;
+        int srcStride = snapshot.Stride;
+        if (srcW <= 0 || srcH <= 0 || srcPixels.Length < 4) return;
 
         // Invert the device transform so a destination pixel maps back to drawing-local space.
         if (!ctx.Matrix.TryInvert(out var inv)) return;
@@ -280,8 +317,15 @@ internal static class SoftwareVectorRasterizer
     /// color instead of being completely invisible when the brush type is
     /// not natively supported by the software rasterizer.
     /// </summary>
-    private static (byte B, byte G, byte R, byte A) ExtractBrushColor(Brush brush, double opacity)
+    /// <param name="paintedGeometry">
+    /// The flattened geometry this brush is about to paint, in source units. Only read for an
+    /// <see cref="ImageBrush"/>, whose decode request needs an honest size hint.
+    /// </param>
+    private static (byte B, byte G, byte R, byte A) ExtractBrushColor(
+        Brush brush, in SoftwareRenderContext ctx, PathGeometry paintedGeometry)
     {
+        var opacity = ctx.Opacity;
+
         if (brush is SolidColorBrush solid)
         {
             var c = solid.Color;
@@ -305,6 +349,43 @@ internal static class SoftwareVectorRasterizer
 
         if (brush is ImageBrush imageBrush)
         {
+            if (imageBrush.ImageSource is BitmapImage bitmap)
+            {
+                ctx.TouchedSources?.Add(bitmap);
+
+                // The other half of RC2, and the one the choke-point fix cannot reach: a brush used
+                // as a vector FILL never goes near GetNativeBitmap, so before this line nothing in
+                // the process ever asked a URI-backed brush source for its pixels — it sampled an
+                // empty buffer on the first frame and on every frame after it, and fell through to
+                // the opaque-black last resort permanently. (At HEAD the decode was eager, so the
+                // average colour was always available; this leg is a regression from that, not a
+                // pre-existing gap.)
+                //
+                // The hint is the geometry's own device-space extent, floored at 1 for the same
+                // reason the ImageDrawing leg floors its own: an all-zero request means "unbounded"
+                // to the deferred decoder and resolves to the natural size, which a growth-only
+                // bucket ladder can never walk back. Over-asking is the expensive mistake here, and
+                // this is a FLAT-AVERAGE fill — the 64-sample average below cannot use more
+                // resolution than the shape it paints — so the shape's extent is both honest and
+                // generous.
+                var extent = paintedGeometry.Bounds;
+                bitmap.RequestDecode(
+                    Math.Clamp((int)Math.Ceiling(extent.Width * ctx.ScaleX), 1, 16384),
+                    Math.Clamp((int)Math.Ceiling(extent.Height * ctx.ScaleY), 1, 16384),
+                    cover: false);
+
+                if (bitmap.IsDeferredDecodePending)
+                {
+                    // Paint NOTHING this frame rather than the black silhouette below. The decode
+                    // requested above lands within a frame or two and RasterChanged then drops the
+                    // caller's cached raster, so the shape appears at its real average colour; a
+                    // black rectangle burned into that cached raster is a WRONG image, which is
+                    // worse than a shape that is briefly absent. A source that genuinely cannot
+                    // decode still ends up on the diagnostics channel through its own failure path.
+                    return (0, 0, 0, 0);
+                }
+            }
+
             var sampled = SampleImageAverage(imageBrush.ImageSource);
             if (sampled.HasValue)
             {
@@ -312,7 +393,7 @@ internal static class SoftwareVectorRasterizer
                 var a = (byte)(c.A * opacity * imageBrush.Opacity);
                 return (c.B, c.G, c.R, a);
             }
-            // No pixel data available (decode pending or vector source) —
+            // No pixel data available (a vector source, or a raster whose decode failed) —
             // fall through to the opaque-black last resort below.
         }
 
@@ -350,8 +431,15 @@ internal static class SoftwareVectorRasterizer
     /// </summary>
     private static Color? SampleImageAverage(ImageSource? source)
     {
-        if (source is BitmapImage bitmap && bitmap.RawPixelData is { Length: >= 4 } pixels)
+        // Read through the snapshot so the buffer cannot be swapped for a differently-sized one
+        // between the length check and the loop. Deliberately does not request a decode of its own:
+        // the caller does that, once, with the size hint only it can compute — the extent of the
+        // geometry the brush is about to fill.
+        if (source is BitmapImage bitmap &&
+            bitmap.TryGetPixelSnapshot(out var snapshot) &&
+            snapshot is { Pixels.Length: >= 4 })
         {
+            var pixels = snapshot.Pixels;
             const int MaxSamples = 64;
             int totalPixels = pixels.Length / 4;
             int step = Math.Max(1, totalPixels / MaxSamples);
@@ -918,13 +1006,24 @@ internal static class SoftwareVectorRasterizer
         /// the DrawingGroup tree from each group's ClipGeometry; null when unclipped.</summary>
         public readonly byte[]? ClipMask;
 
-        public SoftwareRenderContext(byte[] pixels, int width, int height, int stride, Matrix matrix)
-            : this(pixels, width, height, stride, matrix, 1.0, null)
+        /// <summary>
+        /// Collects every <see cref="ImageSource"/> read while rendering, so the caller's raster
+        /// cache knows which publications invalidate the buffer. Null when nobody is caching.
+        /// </summary>
+        /// <remarks>
+        /// A reference shared by every derived context rather than a copied value: the whole
+        /// drawing tree contributes to ONE set, which is what the cache is keyed against.
+        /// </remarks>
+        public readonly ICollection<ImageSource>? TouchedSources;
+
+        public SoftwareRenderContext(byte[] pixels, int width, int height, int stride, Matrix matrix,
+            ICollection<ImageSource>? touchedSources = null)
+            : this(pixels, width, height, stride, matrix, 1.0, null, touchedSources)
         {
         }
 
         private SoftwareRenderContext(byte[] pixels, int width, int height, int stride, Matrix matrix,
-            double opacity, byte[]? clipMask)
+            double opacity, byte[]? clipMask, ICollection<ImageSource>? touchedSources)
         {
             Pixels = pixels;
             Width = width;
@@ -933,6 +1032,7 @@ internal static class SoftwareVectorRasterizer
             Matrix = matrix;
             Opacity = opacity;
             ClipMask = clipMask;
+            TouchedSources = touchedSources;
             ScaleX = Math.Sqrt(matrix.M11 * matrix.M11 + matrix.M12 * matrix.M12);
             ScaleY = Math.Sqrt(matrix.M21 * matrix.M21 + matrix.M22 * matrix.M22);
         }
@@ -940,13 +1040,14 @@ internal static class SoftwareVectorRasterizer
         /// <summary>Composes a child transform (applied to points BEFORE the current one,
         /// matching DrawingGroup/Geometry nesting): combined = child * current (row-vector).</summary>
         public SoftwareRenderContext WithTransform(Matrix child)
-            => new(Pixels, Width, Height, Stride, Matrix.Multiply(child, Matrix), Opacity, ClipMask);
+            => new(Pixels, Width, Height, Stride, Matrix.Multiply(child, Matrix), Opacity, ClipMask,
+                TouchedSources);
 
         public SoftwareRenderContext WithOpacity(double opacity)
-            => new(Pixels, Width, Height, Stride, Matrix, opacity, ClipMask);
+            => new(Pixels, Width, Height, Stride, Matrix, opacity, ClipMask, TouchedSources);
 
         public SoftwareRenderContext WithClipMask(byte[] clipMask)
-            => new(Pixels, Width, Height, Stride, Matrix, Opacity, clipMask);
+            => new(Pixels, Width, Height, Stride, Matrix, Opacity, clipMask, TouchedSources);
 
         public (float X, float Y) TransformPoint(Point p)
         {

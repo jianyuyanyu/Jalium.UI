@@ -10,6 +10,17 @@ public readonly struct DecodedImage
     /// 初始化新的 <see cref="DecodedImage"/>。
     /// </summary>
     public DecodedImage(ReadOnlyMemory<byte> pixels, int width, int height, int stride, NativePixelFormat format)
+        : this(pixels, width, height, stride, format, bufferIsExclusive: false)
+    {
+    }
+
+    internal DecodedImage(
+        ReadOnlyMemory<byte> pixels,
+        int width,
+        int height,
+        int stride,
+        NativePixelFormat format,
+        bool bufferIsExclusive)
     {
         int requiredByteCount = PixelBufferLayout.GetRequiredByteCount(width, height, stride);
         if (pixels.Length < requiredByteCount)
@@ -24,7 +35,22 @@ public readonly struct DecodedImage
         Height = height;
         Stride = stride;
         Format = format;
+        BufferIsExclusive = bufferIsExclusive;
     }
+
+    /// <summary>
+    /// 像素缓冲是否为本次解码专属、可由消费方直接接管而无需再拷一份。
+    ///
+    /// <para>仅框架自带解码器在把原生像素搬进一个全新 <c>byte[]</c> 后置
+    /// <see langword="true"/>。第三方 <see cref="INativeImageDecoder"/> 实现走 public
+    /// 构造函数，恒为 <see langword="false"/>，保持"缓冲可能被复用/池化，消费方必须
+    /// 自行拷贝"的保守语义。</para>
+    ///
+    /// <para>存在的理由：全分辨率位图的一次多余拷贝就是一次 LOH 分配加一次全尺寸
+    /// memcpy（1910x823 BGRA 即 6 MiB），在页面切换这种同帧解码多张图的场景里直接
+    /// 决定是否触发一次阻塞 GC。</para>
+    /// </summary>
+    internal bool BufferIsExclusive { get; }
 
     /// <summary>
     /// 紧凑或带行间填充的像素数据。

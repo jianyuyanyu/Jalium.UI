@@ -12,9 +12,10 @@
 // hoisted into jalium.native.core so the Vulkan Impeller engine can share
 // the exact pixel output (and any future correctness fix lands once).
 //
-// Algorithm: 4× vertical subpixel sampling × continuous horizontal coverage.
-// See the long-form comment inline below for derivation and correctness
-// notes — moved verbatim from the D3D12 implementation.
+// Algorithm: N× vertical subpixel sampling × continuous horizontal coverage,
+// where N adapts to the path's rasterization cost (16 for anything icon- or
+// control-sized, 4 for large artwork). See the long-form comment inline below
+// for derivation and correctness notes.
 
 #include "jalium_rendering_engine.h"
 #include "jalium_triangulate.h"   // for jalium::Contour
@@ -57,10 +58,15 @@ struct RasterEdge {
 // Output rectangles are appended to outRects (the function does NOT clear
 // it first, so callers can layer multiple paths into the same buffer).
 //
-// Quality: 4× vertical × continuous horizontal gives roughly 32 unique
-// coverage levels at edge pixels, visually indistinguishable from 8-bit AA
-// on typical UI shapes. Straight horizontal/vertical edges remain perfectly
-// sharp.
+// Quality: horizontal coverage is exact (continuous span area), vertical is
+// sampled at kSub sub-scanlines. The vertical sample count is therefore the
+// quality ceiling for NEAR-HORIZONTAL edges — they can only take kSub+1
+// distinct alpha values. At the historical kSub = 4 that is five levels, which
+// is plainly visible as a staircase on small icons; kSub = 16 gives seventeen
+// and reads as smooth. Cost is linear in kSub, so it is spent only where it is
+// affordable: the sub count drops back to 4 once (rows × edges) says this path
+// is large artwork rather than an icon. Straight horizontal/vertical edges are
+// exact at any kSub.
 //
 // Correctness:
 //   • Half-open [yMin, yMax) on edges + half-open [fillFrom, fillTo) on
@@ -146,8 +152,16 @@ inline void RasterizePathToRects(
     int yEnd   = (int)std::ceil (maxY);
     if (yEnd <= yStart) return;
 
-    constexpr int   kSub     = 4;
-    constexpr float kSubStep = 1.0f / (float)kSub;
+    // Vertical sub-scanline count. The inner loop below is O(rows × kSub ×
+    // edges), so budget the extra samples by that product: everything an
+    // application actually draws as an icon, glyph or control glyph lands far
+    // under the cap and gets the high-quality 16×, while a full-page vector
+    // illustration keeps the historical 4× and the historical cost.
+    constexpr uint64_t kHighQualityWorkBudget = 200000;
+    const uint64_t rasterWork =
+        (uint64_t)(yEnd - yStart) * (uint64_t)edges.size();
+    const int   kSub     = (rasterWork <= kHighQualityWorkBudget) ? 16 : 4;
+    const float kSubStep = 1.0f / (float)kSub;
 
     std::vector<float> coverage((size_t)pxWidth, 0.0f);
     std::vector<std::pair<float, int>> crossings;

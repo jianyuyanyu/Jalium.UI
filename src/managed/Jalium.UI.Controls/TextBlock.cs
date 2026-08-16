@@ -2124,6 +2124,23 @@ public class TextBlock : FrameworkElement, IAddChild, IServiceProvider, IContent
         return cached;
     }
 
+    /// <summary>
+    /// The clip <see cref="OnRender"/> pushes around its own drawing.
+    ///
+    /// <para>
+    /// Plain <see cref="FrameworkElement.RenderSize"/>, deliberately: the line box is now measured
+    /// to contain the glyph ink (see <c>TextMeasurement.GetLineHeight</c>), so clipping to the
+    /// element's own size cannot shave descenders any more. This used to be inflated to work around
+    /// a line box that was too short — that was padding over a measurement bug, and it left every
+    /// OTHER consumer of the size (the layout slot, containers that size to this element) still
+    /// wrong. Fixing the height fixed all of them at once, so the inflation is gone.
+    /// </para>
+    ///
+    /// <para>
+    /// The clip itself stays because horizontal overflow — the rare single-word-too-long fallback —
+    /// must be cut at the edge so it reads as clipped rather than being silently swallowed.
+    /// </para>
+    /// </summary>
     private RectangleGeometry GetRenderClip()
     {
         var clipRect = new Rect(RenderSize);

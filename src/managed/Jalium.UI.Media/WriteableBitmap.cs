@@ -81,6 +81,17 @@ public sealed partial class WriteableBitmap : BitmapSource
     public uint ContentRevision => _contentRevision;
 
     /// <summary>
+    /// The generalised form of <see cref="ContentRevision"/>, so a cache can detect a replaced
+    /// raster the same way for every source type instead of special-casing this one.
+    /// </summary>
+    /// <remarks>
+    /// Widened rather than exposed as-is: the base member is <see cref="long"/> so that sources
+    /// stamping a process-wide generation can publish it without truncation. A <see cref="uint"/>
+    /// revision widens losslessly, so this stays exactly the counter callers already compare.
+    /// </remarks>
+    internal override long ContentGeneration => _contentRevision;
+
+    /// <summary>
     /// Exposes the backing byte buffer for zero-copy native upload paths.
     /// Consumers MUST NOT retain the reference across <see cref="WritePixels(Int32Rect, byte[], int, int)"/>
     /// calls — treat it as a valid view only between reads of

@@ -10,6 +10,8 @@ using WriteableBitmap = Jalium.UI.Media.Imaging.WriteableBitmap;
 
 namespace Jalium.UI.Tests;
 
+// SetDecoder is process-global; serialize with every other decoder-injecting class.
+[Collection("Application")]
 public sealed class ImagingRefreshedParityTests
 {
     [Fact]

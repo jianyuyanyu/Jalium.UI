@@ -143,6 +143,7 @@ public class ContentDialog : ContentControl
     private TaskCompletionSource<ContentDialogResult>? _showTaskSource;
     private Task? _closeTask;
     private ContentDialogPlacement _activePlacement;
+    private Size _layoutViewport;
     private readonly List<(UIElement Element, bool WasEnabled)> _disabledSiblings = new();
 
     public ContentDialog()
@@ -395,6 +396,12 @@ public class ContentDialog : ContentControl
         var overlayAvailable = new Size(
             Math.Max(0, availableSize.Width - marginWidth),
             Math.Max(0, availableSize.Height - marginHeight));
+
+        // The slot layout just handed us is the freshest viewport this element can see:
+        // the overlay host measures modal roots against the live window client size, so
+        // it is already the post-resize value. Cache it for the hooks that run outside a
+        // layout pass (OnApplyTemplate, property changes, SizeChanged).
+        _layoutViewport = overlayAvailable;
 
         // Ensure card constraints are up-to-date before the template tree is measured.
         // UpdateCardLayout sets MaxWidth/MaxHeight on PART_DialogCard; doing it here
@@ -718,7 +725,7 @@ public class ContentDialog : ContentControl
     {
         _popupHost ??= new ContentDialogOverlayHost();
         _popupHost.Child = this;
-        UpdatePopupHostSize(hostWindow);
+        UpdatePopupHostViewport(hostWindow);
         hostWindow.SizeChanged -= OnHostWindowSizeChanged;
         hostWindow.SizeChanged += OnHostWindowSizeChanged;
         Visibility = Visibility.Visible;
@@ -754,20 +761,23 @@ public class ContentDialog : ContentControl
             return;
         }
 
-        UpdatePopupHostSize(_hostWindow);
+        UpdatePopupHostViewport(_hostWindow);
     }
 
-    private void UpdatePopupHostSize(Window hostWindow)
+    private void UpdatePopupHostViewport(Window hostWindow)
     {
         if (_popupHost == null)
         {
             return;
         }
 
-        var width = hostWindow.ActualWidth > 0 ? hostWindow.ActualWidth : hostWindow.Width;
-        var height = hostWindow.ActualHeight > 0 ? hostWindow.ActualHeight : hostWindow.Height;
-        _popupHost.Width = Math.Max(0, width);
-        _popupHost.Height = Math.Max(0, height);
+        // The host must never carry an explicit Width/Height: those would win over the
+        // constraint OverlayLayer passes down and freeze the overlay at whatever size was
+        // copied in last. The modal size comes from the layout pass; FallbackViewport only
+        // covers a host that measures with an infinite constraint.
+        _popupHost.Width = double.NaN;
+        _popupHost.Height = double.NaN;
+        _popupHost.FallbackViewport = ResolveHostWindowViewport(hostWindow);
         _popupHost.InvalidateMeasure();
         _popupHost.InvalidateArrange();
         UpdateCardLayout();
@@ -1006,33 +1016,68 @@ public class ContentDialog : ContentControl
         _hostWindow.InvalidateWindow();
     }
 
+    private bool IsPopupHosted =>
+        _activePlacement != ContentDialogPlacement.InPlace &&
+        _hostWindow != null &&
+        ReferenceEquals(_popupHost?.Child, this);
+
     private Size ResolveViewportSize()
     {
-        // 模态弹层（有 _popupHost）：viewport 取"宿主窗口实际尺寸"——它在窗口 resize 时始终是最新的。
-        // 不能优先用 this.ActualWidth/Height：对话框自身的 ActualSize 在 resize 期间滞后一帧（要等下一轮
-        // Arrange 才更新），会导致"窗口放大后对话框尺寸/内容封顶不刷新"。
-        // InPlace（无 _popupHost）：viewport 取自身实际尺寸（它就嵌在某个区域里，不该用整窗）。
-        double width, height;
-        if (_popupHost != null)
+        // 模态弹层：viewport 恒等于宿主窗口客户区，取"当前"值 —— Window.Width/Height 在 WM_SIZE
+        // 里就地写入，而 ActualWidth/ActualHeight 要等下一轮 Arrange 才回写。SizeChanged 是从
+        // WM_SIZE 直接 raise 的，处理器里读 ActualWidth 拿到的是上一次布局的尺寸；模态遮罩照抄它
+        // 就会永远落后一次 resize —— 最大化后遮罩仍是还原尺寸、还原后仍是最大化尺寸，居中的卡片
+        // 跟着整块偏移。这就是"最大化 / 还原都会位移"的根因。
+        if (IsPopupHosted)
         {
-            width = _hostWindow?.ActualWidth > 0
-                ? _hostWindow.ActualWidth
-                : (_popupHost.Width > 0 ? _popupHost.Width : (_hostWindow?.Width ?? 0));
-            height = _hostWindow?.ActualHeight > 0
-                ? _hostWindow.ActualHeight
-                : (_popupHost.Height > 0 ? _popupHost.Height : (_hostWindow?.Height ?? 0));
+            var windowViewport = ResolveHostWindowViewport(_hostWindow!);
+            if (windowViewport.Width > 0 && windowViewport.Height > 0)
+            {
+                return windowViewport;
+            }
         }
-        else
+
+        // 布局最近一次分配的可用区。InPlace 模式下它才是正确的 viewport（对话框嵌在某个区域里，
+        // 不该按整窗算），且它同样早于 ActualWidth 更新。
+        if (IsUsableViewport(_layoutViewport))
         {
-            width = ActualWidth > 0
-                ? ActualWidth
-                : (_hostWindow?.ActualWidth > 0 ? _hostWindow.ActualWidth : _hostWindow?.Width ?? 0);
-            height = ActualHeight > 0
-                ? ActualHeight
-                : (_hostWindow?.ActualHeight > 0 ? _hostWindow.ActualHeight : _hostWindow?.Height ?? 0);
+            return _layoutViewport;
+        }
+
+        double width = ActualWidth > 0 ? ActualWidth : (_popupHost?.ActualWidth ?? 0);
+        double height = ActualHeight > 0 ? ActualHeight : (_popupHost?.ActualHeight ?? 0);
+        if (width <= 0 || height <= 0)
+        {
+            var fallback = _hostWindow != null ? ResolveHostWindowViewport(_hostWindow) : default;
+            if (width <= 0) width = fallback.Width;
+            if (height <= 0) height = fallback.Height;
         }
 
         return new Size(Math.Max(0, width), Math.Max(0, height));
+    }
+
+    private Size ResolveHostWindowViewport(Window hostWindow)
+    {
+        var margin = Margin;
+        var width = SelectViewportLength(hostWindow.Width, hostWindow.ActualWidth) - (margin.Left + margin.Right);
+        var height = SelectViewportLength(hostWindow.Height, hostWindow.ActualHeight) - (margin.Top + margin.Bottom);
+        return new Size(Math.Max(0, width), Math.Max(0, height));
+    }
+
+    private static double SelectViewportLength(double liveLength, double arrangedLength)
+    {
+        if (double.IsFinite(liveLength) && liveLength > 0)
+        {
+            return liveLength;
+        }
+
+        return double.IsFinite(arrangedLength) && arrangedLength > 0 ? arrangedLength : 0;
+    }
+
+    private static bool IsUsableViewport(Size viewport)
+    {
+        return double.IsFinite(viewport.Width) && viewport.Width > 0 &&
+               double.IsFinite(viewport.Height) && viewport.Height > 0;
     }
 
     private static double NormalizeExplicitLength(double value)
@@ -1333,6 +1378,14 @@ internal sealed class ContentDialogOverlayHost : FrameworkElement
 {
     private UIElement? _child;
 
+    /// <summary>
+    /// Viewport used only when this host is measured with an infinite constraint.
+    /// OverlayLayer measures modal roots against the live window client size, so the
+    /// bounded path is authoritative and never lags a resize; this is the defensive
+    /// fallback for a host that cannot supply one.
+    /// </summary>
+    public Size FallbackViewport { get; set; }
+
     public UIElement? Child
     {
         get => _child;
@@ -1381,8 +1434,8 @@ internal sealed class ContentDialogOverlayHost : FrameworkElement
 
     protected override Size MeasureOverride(Size availableSize)
     {
-        var width = !double.IsNaN(Width) ? Width : availableSize.Width;
-        var height = !double.IsNaN(Height) ? Height : availableSize.Height;
+        var width = double.IsFinite(availableSize.Width) ? availableSize.Width : FallbackViewport.Width;
+        var height = double.IsFinite(availableSize.Height) ? availableSize.Height : FallbackViewport.Height;
         var hostSize = new Size(Math.Max(0, width), Math.Max(0, height));
 
         _child?.Measure(hostSize);

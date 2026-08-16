@@ -1336,6 +1336,15 @@ JaliumResult SoftwareRenderTarget::Resize(int32_t width, int32_t height)
 
 JaliumResult SoftwareRenderTarget::BeginDraw()
 {
+    // Recover from an abandoned managed Begin/End pair before a new frame.
+    // The first entry owns the real framebuffer as it looked before the
+    // outermost capture; nested entries only own intermediate capture state.
+    if (!effectCaptureStack_.empty()) {
+        fb_ = std::move(effectCaptureStack_.front().savedFramebuffer);
+        effectCaptureStack_.clear();
+    }
+    effectCaptureReady_ = false;
+
     // Push a root DPI scale transform so all draw calls in DIPs are
     // automatically mapped to physical pixels on high-density displays.
     if (scaleX_ != 1.0f || scaleY_ != 1.0f) {
@@ -3476,15 +3485,15 @@ void SoftwareRenderTarget::BeginEffectCapture(float x, float y, float w, float h
 {
     float tx, ty;
     currentTransform_.Apply(x, y, tx, ty);
-    effectCaptureX_ = tx;
-    effectCaptureY_ = ty;
-    effectCaptureW_ = w;
-    effectCaptureH_ = h;
 
-    // Save current framebuffer state
-    savedFb_.width = fb_.width;
-    savedFb_.height = fb_.height;
-    savedFb_.pixels = fb_.pixels;
+    EffectCaptureState state;
+    state.savedFramebuffer = fb_;
+    state.x = tx;
+    state.y = ty;
+    state.width = w;
+    state.height = h;
+    effectCaptureStack_.push_back(std::move(state));
+    effectCaptureReady_ = false;
 
     // Clear the capture region so we render effect content in isolation
     int32_t ix = (int32_t)tx, iy = (int32_t)ty;
@@ -3494,27 +3503,39 @@ void SoftwareRenderTarget::BeginEffectCapture(float x, float y, float w, float h
             fb_.SetPixel(col, row, 0, 0, 0, 0);
         }
     }
-    effectCaptureActive_ = true;
 }
 
 void SoftwareRenderTarget::EndEffectCapture()
 {
-    if (!effectCaptureActive_) return;
+    if (effectCaptureStack_.empty()) {
+        effectCaptureReady_ = false;
+        return;
+    }
+
+    EffectCaptureState state = std::move(effectCaptureStack_.back());
+    effectCaptureStack_.pop_back();
 
     // Copy the rendered content from capture region into effectCaptureFb_
-    int32_t ix = (int32_t)effectCaptureX_, iy = (int32_t)effectCaptureY_;
-    int32_t iw = (int32_t)(effectCaptureW_ + 0.5f), ih = (int32_t)(effectCaptureH_ + 0.5f);
+    int32_t ix = (int32_t)state.x, iy = (int32_t)state.y;
+    int32_t iw = (int32_t)(state.width + 0.5f), ih = (int32_t)(state.height + 0.5f);
     CopyRegion(fb_, effectCaptureFb_, ix, iy, iw, ih);
 
-    // Restore the original framebuffer
-    fb_.pixels = savedFb_.pixels;
-    effectCaptureActive_ = false;
+    // Restore the framebuffer owned by this exact scope. For a nested scope
+    // that is its ancestor's in-progress capture; for the outermost scope it is
+    // the real frame. The just-ended capture remains in effectCaptureFb_ until
+    // its Apply call completes.
+    fb_ = std::move(state.savedFramebuffer);
+    lastEffectCaptureX_ = state.x;
+    lastEffectCaptureY_ = state.y;
+    lastEffectCaptureW_ = state.width;
+    lastEffectCaptureH_ = state.height;
+    effectCaptureReady_ = true;
 }
 
 void SoftwareRenderTarget::DrawBlurEffect(float x, float y, float w, float h, float radius,
     float uvOffsetX, float uvOffsetY)
 {
-    if (effectCaptureFb_.pixels.empty()) return;
+    if (!effectCaptureReady_ || effectCaptureFb_.pixels.empty()) return;
 
     // Apply blur to the captured content
     SoftwareFramebuffer blurred;
@@ -3526,10 +3547,10 @@ void SoftwareRenderTarget::DrawBlurEffect(float x, float y, float w, float h, fl
         BoxBlur(blurred.pixels, blurred.width, blurred.height, (int32_t)(radius * 0.5f + 0.5f));
     }
 
-    float tx, ty;
-    currentTransform_.Apply(x, y, tx, ty);
-    int32_t dstX = (int32_t)(tx + uvOffsetX);
-    int32_t dstY = (int32_t)(ty + uvOffsetY);
+    // The capture buffer includes effect padding. Composite its top-left at
+    // the captured origin; its content already begins uvOffset pixels inside.
+    int32_t dstX = (int32_t)lastEffectCaptureX_;
+    int32_t dstY = (int32_t)lastEffectCaptureY_;
     BlitBuffer(blurred, dstX, dstY, currentOpacity_);
 }
 
@@ -3539,7 +3560,7 @@ void SoftwareRenderTarget::DrawDropShadowEffect(float x, float y, float w, float
     float uvOffsetX, float uvOffsetY,
     float cornerTL, float cornerTR, float cornerBR, float cornerBL)
 {
-    if (effectCaptureFb_.pixels.empty()) return;
+    if (!effectCaptureReady_ || effectCaptureFb_.pixels.empty()) return;
 
     float tx, ty;
     currentTransform_.Apply(x, y, tx, ty);
@@ -3568,13 +3589,13 @@ void SoftwareRenderTarget::DrawDropShadowEffect(float x, float y, float w, float
     }
 
     // Draw shadow (offset)
-    int32_t dstX = (int32_t)(tx + offsetX + uvOffsetX);
-    int32_t dstY = (int32_t)(ty + offsetY + uvOffsetY);
+    int32_t dstX = (int32_t)(lastEffectCaptureX_ + offsetX);
+    int32_t dstY = (int32_t)(lastEffectCaptureY_ + offsetY);
     BlitBuffer(shadow, dstX, dstY, currentOpacity_);
 
     // Draw original content on top
-    int32_t origX = (int32_t)(tx + uvOffsetX);
-    int32_t origY = (int32_t)(ty + uvOffsetY);
+    int32_t origX = (int32_t)lastEffectCaptureX_;
+    int32_t origY = (int32_t)lastEffectCaptureY_;
     BlitBuffer(effectCaptureFb_, origX, origY, currentOpacity_);
 }
 
@@ -3583,11 +3604,8 @@ void SoftwareRenderTarget::DrawOuterGlowEffect(float x, float y, float w, float 
     float uvOffsetX, float uvOffsetY,
     float cornerTL, float cornerTR, float cornerBR, float cornerBL)
 {
-    // uvOffsetX/uvOffsetY are unused by the software backend: it captures the
-    // element into a single framebuffer (effectCaptureFb_) already positioned at
-    // the element origin, so there is no atlas-style UV offset to compensate for.
     (void)uvOffsetX; (void)uvOffsetY;
-    if (effectCaptureFb_.pixels.empty()) return;
+    if (!effectCaptureReady_ || effectCaptureFb_.pixels.empty()) return;
 
     float tx, ty;
     currentTransform_.Apply(x, y, tx, ty);
@@ -3620,12 +3638,13 @@ void SoftwareRenderTarget::DrawOuterGlowEffect(float x, float y, float w, float 
     BoxBlur(glow.pixels, gw, gh, expand);
 
     // Draw glow (shifted by expand)
-    int32_t dstX = (int32_t)tx - expand;
-    int32_t dstY = (int32_t)ty - expand;
+    int32_t dstX = (int32_t)lastEffectCaptureX_ - expand;
+    int32_t dstY = (int32_t)lastEffectCaptureY_ - expand;
     BlitBuffer(glow, dstX, dstY, currentOpacity_);
 
     // Draw original content on top
-    BlitBuffer(effectCaptureFb_, (int32_t)tx, (int32_t)ty, currentOpacity_);
+    BlitBuffer(effectCaptureFb_, (int32_t)lastEffectCaptureX_,
+        (int32_t)lastEffectCaptureY_, currentOpacity_);
 }
 
 void SoftwareRenderTarget::DrawInnerShadowEffect(float x, float y, float w, float h,
@@ -3633,7 +3652,7 @@ void SoftwareRenderTarget::DrawInnerShadowEffect(float x, float y, float w, floa
     float r, float g, float b, float a,
     float cornerTL, float cornerTR, float cornerBR, float cornerBL)
 {
-    if (effectCaptureFb_.pixels.empty()) return;
+    if (!effectCaptureReady_ || effectCaptureFb_.pixels.empty()) return;
 
     float tx, ty;
     currentTransform_.Apply(x, y, tx, ty);
@@ -3641,7 +3660,8 @@ void SoftwareRenderTarget::DrawInnerShadowEffect(float x, float y, float w, floa
     int32_t ih = effectCaptureFb_.height;
 
     // Draw original content first
-    BlitBuffer(effectCaptureFb_, (int32_t)tx, (int32_t)ty, currentOpacity_);
+    BlitBuffer(effectCaptureFb_, (int32_t)lastEffectCaptureX_,
+        (int32_t)lastEffectCaptureY_, currentOpacity_);
 
     // Create inverted alpha mask (shadow where content exists, weighted by distance from edge)
     SoftwareFramebuffer shadow;
@@ -3678,10 +3698,10 @@ void SoftwareRenderTarget::DrawInnerShadowEffect(float x, float y, float w, floa
 
     // Composite inner shadow on top (clipped to original alpha)
     for (int32_t row = 0; row < ih; row++) {
-        int32_t dy = (int32_t)ty + row;
+        int32_t dy = (int32_t)lastEffectCaptureY_ + row;
         if (dy < 0 || dy >= fb_.height) continue;
         for (int32_t col = 0; col < iw; col++) {
-            int32_t dx = (int32_t)tx + col;
+            int32_t dx = (int32_t)lastEffectCaptureX_ + col;
             if (dx < 0 || dx >= fb_.width) continue;
 
             size_t srcIdx = ((size_t)row * iw + col) * 4;
@@ -3699,7 +3719,7 @@ void SoftwareRenderTarget::DrawInnerShadowEffect(float x, float y, float w, floa
 void SoftwareRenderTarget::DrawColorMatrixEffect(float x, float y, float w, float h,
     const float* matrix)
 {
-    if (effectCaptureFb_.pixels.empty() || !matrix) return;
+    if (!effectCaptureReady_ || effectCaptureFb_.pixels.empty() || !matrix) return;
 
     float tx, ty;
     currentTransform_.Apply(x, y, tx, ty);
@@ -3733,13 +3753,14 @@ void SoftwareRenderTarget::DrawColorMatrixEffect(float x, float y, float w, floa
         }
     }
 
-    BlitBuffer(result, (int32_t)tx, (int32_t)ty, currentOpacity_);
+    BlitBuffer(result, (int32_t)lastEffectCaptureX_,
+        (int32_t)lastEffectCaptureY_, currentOpacity_);
 }
 
 void SoftwareRenderTarget::DrawEmbossEffect(float x, float y, float w, float h,
     float amount, float lightDirX, float lightDirY, float relief)
 {
-    if (effectCaptureFb_.pixels.empty()) return;
+    if (!effectCaptureReady_ || effectCaptureFb_.pixels.empty()) return;
 
     float tx, ty;
     currentTransform_.Apply(x, y, tx, ty);
@@ -3788,7 +3809,8 @@ void SoftwareRenderTarget::DrawEmbossEffect(float x, float y, float w, float h,
         }
     }
 
-    BlitBuffer(result, (int32_t)tx, (int32_t)ty, currentOpacity_);
+    BlitBuffer(result, (int32_t)lastEffectCaptureX_,
+        (int32_t)lastEffectCaptureY_, currentOpacity_);
 }
 
 void SoftwareRenderTarget::DrawShaderEffect(float x, float y, float w, float h,
@@ -3796,10 +3818,21 @@ void SoftwareRenderTarget::DrawShaderEffect(float x, float y, float w, float h,
     const float* constants, uint32_t constantFloatCount)
 {
     // Custom shaders cannot be executed in software — just blit the captured content as-is
-    if (effectCaptureFb_.pixels.empty()) return;
-    float tx, ty;
-    currentTransform_.Apply(x, y, tx, ty);
-    BlitBuffer(effectCaptureFb_, (int32_t)tx, (int32_t)ty, currentOpacity_);
+    if (!effectCaptureReady_ || effectCaptureFb_.pixels.empty()) return;
+    BlitBuffer(effectCaptureFb_, (int32_t)lastEffectCaptureX_,
+        (int32_t)lastEffectCaptureY_, currentOpacity_);
+}
+
+void SoftwareRenderTarget::DrawShaderEffectFromSource(float x, float y, float w, float h,
+    const char* hlslSource, const float* constants, uint32_t constantFloatCount)
+{
+    // The software backend cannot execute HLSL. Match the bytecode path and
+    // degrade to a transparent pass-through instead of losing captured content.
+    (void)x; (void)y; (void)w; (void)h;
+    (void)hlslSource; (void)constants; (void)constantFloatCount;
+    if (!effectCaptureReady_ || effectCaptureFb_.pixels.empty()) return;
+    BlitBuffer(effectCaptureFb_, (int32_t)lastEffectCaptureX_,
+        (int32_t)lastEffectCaptureY_, currentOpacity_);
 }
 
 // ============================================================================

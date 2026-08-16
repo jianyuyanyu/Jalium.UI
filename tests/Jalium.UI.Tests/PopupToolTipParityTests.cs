@@ -142,6 +142,51 @@ public sealed class PopupToolTipParityTests
     }
 
     [Fact]
+    public void ToolTipPopup_ShouldUseAutomaticOverflowPromotion()
+    {
+        var toolTip = new ToolTip
+        {
+            PlacementTarget = new Border(),
+        };
+
+        try
+        {
+            toolTip.IsOpen = true;
+
+            var field = typeof(ToolTip).GetField("_popup", BindingFlags.Instance | BindingFlags.NonPublic);
+            var popup = Assert.IsType<Popup>(field?.GetValue(toolTip));
+
+            Assert.False(popup.ShouldConstrainToRootBounds);
+            Assert.False(popup.PreferExternalWindow);
+        }
+        finally
+        {
+            toolTip.IsOpen = false;
+        }
+    }
+
+    [Fact]
+    public void PopupHostPolicy_ShouldPromoteOnlyWhenRequestedBoundsOverflow()
+    {
+        var popup = new Popup
+        {
+            ShouldConstrainToRootBounds = false,
+            PreferExternalWindow = false,
+        };
+        var popupSize = new Size(40, 20);
+        var windowSize = new Size(160, 100);
+
+        Assert.False(popup.ShouldUseExternalWindowForBounds(
+            new Point(100, 30), popupSize, windowSize, supportsExternalPopup: true));
+        Assert.True(popup.ShouldUseExternalWindowForBounds(
+            new Point(130, 30), popupSize, windowSize, supportsExternalPopup: true));
+
+        popup.ShouldConstrainToRootBounds = true;
+        Assert.False(popup.ShouldUseExternalWindowForBounds(
+            new Point(130, 30), popupSize, windowSize, supportsExternalPopup: true));
+    }
+
+    [Fact]
     public void PopupAndToolTipVirtualHooks_RaiseTheirPublicEvents()
     {
         var popup = new HookPopup();

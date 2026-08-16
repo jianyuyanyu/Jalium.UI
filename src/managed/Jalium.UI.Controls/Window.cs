@@ -373,12 +373,10 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     // in RenderFrame; a flush frame NEVER re-arms it (isFlushFrame guard), so it
     // decreases strictly to 0 — no render loop. UI-thread only (RenderFrame).
     private int _partialPresentsToFlush;
-    // During interactive resize, every WM_SIZE already requests a full frame.
-    // Debounce the alternate-buffer convergence present so the next real size
-    // frame can replace it instead of rendering the same size twice. Once input
-    // pauses, the delayed frame still converges the FLIP buffers before idle.
-    private const int LiveResizeConvergenceDelayMs = 48;
-    private long _backBufferConvergenceNotBeforeTick;
+    // Alternate-buffer convergence is queued for the very next dispatcher turn.
+    // It is never held behind a resize quiet-period: every WM_SIZE can publish the
+    // newest layout immediately, while the normal scheduled-render gate lets that
+    // newer frame supersede a now-redundant convergence replay.
     // Live swap-chain back-buffer count, refreshed from the GPU stats query in
     // CompleteEndDrawOrHandleFailure. Defaults to kDefaultSwapBufferCount (2) so the
     // first arm is correct before any stats arrive; a JALIUM_SWAPCHAIN_BUFFERS=3
@@ -1456,6 +1454,60 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         AddHandler(LostKeyboardFocusEvent, new KeyboardFocusChangedEventHandler(OnWindowKeyboardFocusChanged), handledEventsToo: true);
 
         CreateTitleBar();
+
+        EnsureImageContentInvalidationHook();
+    }
+
+    /// <summary>
+    /// Set once the process-wide image-content repaint hook has been installed.
+    /// </summary>
+    private static int s_imageContentHookInstalled;
+
+    /// <summary>
+    /// Installs the one process-wide handler that turns "a batch of images finished decoding" into
+    /// a repaint of every open window.
+    /// </summary>
+    /// <remarks>
+    /// <para>This is the leg that makes a bitmap consumer with no element-level hook — an
+    /// <c>ImageBrush</c> on a Border background, an <c>ImageDrawing</c> inside a
+    /// <c>DrawingImage</c>, a <c>Shape.Fill</c> — repaint when its deferred source finally
+    /// publishes pixels. Only <c>Image</c> subscribes to a source's load event, so before this
+    /// existed every other consumer decoded successfully and then sat there blank waiting for an
+    /// invalidation nobody was going to raise.</para>
+    /// <para>Installed once per process rather than per window, and deliberately never
+    /// unsubscribed: it holds no window reference (it re-snapshots the live window set on every
+    /// call), so windows opened after the first one are covered and closed ones simply drop out of
+    /// the snapshot. Registering per instance would either leak closed windows or need teardown
+    /// ordering that <c>Window.Close</c> does not guarantee.</para>
+    /// <para><c>ImageSource.ContentChangedBatchCompleted</c> is raised once per notifier drain,
+    /// not once per image, so a page of thirty images that all land in the same dispatcher turn
+    /// costs one full invalidation, not thirty.</para>
+    /// </remarks>
+    private static void EnsureImageContentInvalidationHook()
+    {
+        if (Interlocked.CompareExchange(ref s_imageContentHookInstalled, 1, 0) != 0)
+        {
+            return;
+        }
+
+        Jalium.UI.Media.ImageSource.ContentChangedBatchCompleted +=
+            OnImageContentChangedBatchCompleted;
+    }
+
+    private static void OnImageContentChangedBatchCompleted()
+    {
+        var windows = SnapshotOpenWindows();
+        for (var i = 0; i < windows.Length; i++)
+        {
+            var window = windows[i];
+
+            // Both calls are required and they are not redundant: RequestFullInvalidation records
+            // that the next frame must redraw every pixel, and InvalidateWindow is what actually
+            // asks the composition loop for that frame. Marking without waking leaves the newly
+            // decoded image unpainted until some unrelated event happens to schedule a render.
+            window.RequestFullInvalidation();
+            window.InvalidateWindow();
+        }
     }
 
     /// <summary>
@@ -2108,7 +2160,9 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     {
         _ = wParam;
 
-        if (!IsTitleBarVisible())
+        // While a light-dismiss popup is open the caption buttons must not light up
+        // either — the popup owns the pointer until it is dismissed.
+        if (!IsTitleBarVisible() || HasOpenLightDismissPopup())
         {
             _inputDispatcher.UpdateTitleBarButtonHover(null);
             return;
@@ -2976,6 +3030,12 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         {
             return;
         }
+
+        // A window move leaves any open popup stranded at its old screen position,
+        // so dismiss before handing the gesture to the window system. Unlike the
+        // non-client press path this does not cancel the drag: DragMove is an explicit
+        // request from the app, not an ambient click that happens to land on a popup.
+        _ = CloseAllLightDismissPopups();
 
         // Release mouse capture so the system can take over
         UIElement.ForceReleaseMouseCapture();
@@ -5398,10 +5458,11 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         // Normal D3D12 HWNDs use a DirectComposition presentation visual even
         // when the managed window is opaque. This decouples the swap-chain
         // allocation from the HWND client size, allowing 1:1 live resize without
-        // either ResizeBuffers stalls or DWM rubber-sheet scaling. The explicit
-        // render-worker experiment retains its direct HWND target because its
-        // frame-capture/replay lifecycle is not composition-aware.
-        if (RenderTarget?.Backend == RenderBackend.D3D12 && !EnableRenderThread)
+        // either ResizeBuffers stalls or DWM rubber-sheet scaling. The render
+        // worker is composition-aware: native resize, replay and DComp commit are
+        // all performed by that worker, so enabling it must not silently switch
+        // the window back to an HWND swap chain.
+        if (RenderTarget?.Backend == RenderBackend.D3D12)
         {
             return true;
         }
@@ -5594,8 +5655,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             return context.CreateRenderTarget(surface, width, height);
         }
 
-        if ((context.Backend == RenderBackend.D3D12 && !EnableRenderThread) ||
-            ShouldUseCompositionRenderTarget())
+        if (context.Backend == RenderBackend.D3D12 || ShouldUseCompositionRenderTarget())
             return context.CreateRenderTargetForComposition(Handle, width, height);
 
         return context.CreateRenderTarget(Handle, width, height);
@@ -6192,24 +6252,52 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         return (defClientRect.left, originalRect.top, defClientRect.right, defClientRect.bottom);
     }
 
-    internal static int ComputeNcCalcSizeResizeFlags(
-        (int left, int top, int right, int bottom) newWindowRect,
-        (int left, int top, int right, int bottom) oldWindowRect)
+    private static (int width, int height) GetNonClientFrameSize(nint hwnd)
     {
-        int newWidth = newWindowRect.right - newWindowRect.left;
-        int oldWidth = oldWindowRect.right - oldWindowRect.left;
-        int newHeight = newWindowRect.bottom - newWindowRect.top;
-        int oldHeight = oldWindowRect.bottom - oldWindowRect.top;
+        if (!GetWindowRect(hwnd, out RECT windowRect) ||
+            !GetClientRect(hwnd, out RECT clientRect))
+        {
+            return default;
+        }
 
-        // DirectComposition owns live-resize preservation at a 1:1 pixel scale.
-        // Returning zero or WVR_ALIGN* asks Win32 to copy the old client image
-        // as well. On a left/top drag that copied image includes DWM's extended
-        // caption surface, briefly exposing a second set of native caption
-        // buttons in the newly uncovered strip. Suppress all Win32 image copying
-        // and let the already-scheduled DComp frame redraw the changed window.
-        return newWidth != oldWidth || newHeight != oldHeight
-            ? WVR_REDRAW
-            : 0;
+        return (
+            Math.Max(
+                0,
+                (windowRect.right - windowRect.left) -
+                (clientRect.right - clientRect.left)),
+            Math.Max(
+                0,
+                (windowRect.bottom - windowRect.top) -
+                (clientRect.bottom - clientRect.top)));
+    }
+
+    internal static int ComputeWindowTrackSizeFromClientDip(
+        double clientSizeDip,
+        double dpiScale,
+        int nonClientSizePixels,
+        bool isMinimum)
+    {
+        double scaledClientSize = clientSizeDip * dpiScale;
+        double roundedClientSize = isMinimum
+            ? Math.Ceiling(scaledClientSize)
+            : Math.Floor(scaledClientSize);
+
+        return (int)Math.Clamp(
+            roundedClientSize + Math.Max(0, nonClientSizePixels),
+            0,
+            int.MaxValue);
+    }
+
+    internal static int ComputeNcCalcSizeResult(bool hasNcCalcSizeParams)
+    {
+        // With wParam == TRUE, returning zero asks USER32 to preserve the old
+        // client image at the new client's top-left. A retained/composited
+        // renderer may not publish its resized surface until the next frame,
+        // leaving newly exposed pixels uncovered in the meantime. Match WPF's
+        // WindowChrome contract: invalidate the complete client area whenever
+        // NCCALCSIZE_PARAMS is present. For wParam == FALSE, WVR_* flags are not
+        // valid and the documented result is zero.
+        return hasNcCalcSizeParams ? WVR_REDRAW : 0;
     }
 
     internal static bool TryGetDwmCaptionButtonBounds(
@@ -6397,12 +6485,25 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
 
         _wndProcDelegate = StaticWndProc;
 
+        // Window icon (taskbar thumbnail header, Alt-Tab, window menu). Left unset, both slots
+        // are 0 and Windows draws its generic default — which is what made an app with a correct
+        // <ApplicationIcon> still show a stale icon in Alt-Tab: the taskbar BUTTON is resolved
+        // from the executable by the shell, but the WINDOW icon comes from here (or WM_SETICON,
+        // which this framework does not send). Sourcing both from the running executable keeps
+        // them in agreement with <ApplicationIcon> for free.
+        //
+        // The handles are intentionally never destroyed: the class owns them for as long as it is
+        // registered, and this class lives for the life of the process.
+        var (largeIcon, smallIcon) = Controls.Helpers.IconHelper.ExtractProcessIconHandles();
+
         WNDCLASSEX wc = new()
         {
             cbSize = (uint)Marshal.SizeOf<WNDCLASSEX>(),
             style = 0x0008, // CS_DBLCLKS: receive WM_*BUTTONDBLCLK messages
             lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProcDelegate),
             hInstance = GetModuleHandle(null),
+            hIcon = largeIcon,
+            hIconSm = smallIcon,
             hCursor = LoadCursor(nint.Zero, IDC_ARROW),
             hbrBackground = nint.Zero, // No background brush - we handle all painting
             lpszClassName = WindowClassName
@@ -6513,14 +6614,23 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     double minH = window.MinHeight;
                     double maxW = window.MaxWidth;
                     double maxH = window.MaxHeight;
+                    // FrameworkElement constraints describe the client layout,
+                    // while MINMAXINFO expects the outer window track size.
+                    // Reserve the live non-client frame so layout never receives
+                    // a client area smaller than its own MinWidth/MinHeight.
+                    var nonClientFrame = GetNonClientFrameSize(hWnd);
                     if (!double.IsNaN(minW) && minW > 0)
-                        mmi.ptMinTrackSize.X = (int)(minW * dpi);
+                        mmi.ptMinTrackSize.X = ComputeWindowTrackSizeFromClientDip(
+                            minW, dpi, nonClientFrame.width, isMinimum: true);
                     if (!double.IsNaN(minH) && minH > 0)
-                        mmi.ptMinTrackSize.Y = (int)(minH * dpi);
+                        mmi.ptMinTrackSize.Y = ComputeWindowTrackSizeFromClientDip(
+                            minH, dpi, nonClientFrame.height, isMinimum: true);
                     if (!double.IsInfinity(maxW) && maxW > 0)
-                        mmi.ptMaxTrackSize.X = (int)(maxW * dpi);
+                        mmi.ptMaxTrackSize.X = ComputeWindowTrackSizeFromClientDip(
+                            maxW, dpi, nonClientFrame.width, isMinimum: false);
                     if (!double.IsInfinity(maxH) && maxH > 0)
-                        mmi.ptMaxTrackSize.Y = (int)(maxH * dpi);
+                        mmi.ptMaxTrackSize.Y = ComputeWindowTrackSizeFromClientDip(
+                            maxH, dpi, nonClientFrame.height, isMinimum: false);
                     Marshal.StructureToPtr(mmi, lParam, true);
                     return nint.Zero;
                 }
@@ -6571,17 +6681,26 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     // via WM_NCHITTEST below.
                     if (window.WindowStyle == WindowStyle.None)
                     {
-                        if (wParam == nint.Zero)
+                        bool hasNcCalcSizeParams = wParam != nint.Zero;
+                        if (hasNcCalcSizeParams)
                         {
-                            return nint.Zero;
+                            // WVR_REDRAW invalidates the HWND update region. Jalium's
+                            // retained renderer is dispatcher-driven, so explicitly
+                            // queue its matching full frame as well; the later WM_SIZE
+                            // updates layout and the DComp logical viewport before that
+                            // dispatcher operation can run.
+                            window.RequestFullInvalidation();
+                            window.InvalidateWindow();
                         }
-                        // Returning 0 with the rect unchanged tells Windows the entire
-                        // window rect is client area.
-                        return nint.Zero;
+
+                        // Leaving the proposed rect unchanged makes the entire window
+                        // client area. With NCCALCSIZE_PARAMS, never preserve/copy the
+                        // old client image into it.
+                        return ComputeNcCalcSizeResult(hasNcCalcSizeParams);
                     }
                     // For custom title bar:
                     // 1) call DefWindowProc first to keep native NC contract intact
-                    // 2) in normal state, use full original rect as client area
+                    // 2) remove only the native caption inset in normal state
                     // 3) in maximized state, clamp to monitor work area
                     if (window.TitleBarStyle == WindowTitleBarStyle.Custom)
                     {
@@ -6594,14 +6713,12 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                         // Save pre-DefWindowProc rect before NC calculations mutate it.
                         var ncParams = Marshal.PtrToStructure<NCCALCSIZE_PARAMS>(lParam);
                         var originalRect = (ncParams.rgrc0.left, ncParams.rgrc0.top, ncParams.rgrc0.right, ncParams.rgrc0.bottom);
-                        var oldWindowRect = (ncParams.rgrc1.left, ncParams.rgrc1.top, ncParams.rgrc1.right, ncParams.rgrc1.bottom);
 
                         // Let DefWindowProc compute default non-client metrics first.
-                        var defResult = DefWindowProc(hWnd, msg, wParam, lParam);
-                        if (defResult != nint.Zero)
-                        {
-                            return defResult;
-                        }
+                        // Its return flags describe the default preservation policy;
+                        // Jalium owns the final client rectangle and deliberately
+                        // replaces those flags with WVR_REDRAW below.
+                        _ = DefWindowProc(hWnd, msg, wParam, lParam);
 
                         // Re-read DefWindowProc-computed rect and only apply minimal fixups.
                         ncParams = Marshal.PtrToStructure<NCCALCSIZE_PARAMS>(lParam);
@@ -6627,9 +6744,9 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                         ncParams.rgrc0.bottom = computedRect.bottom;
 
                         Marshal.StructureToPtr(ncParams, lParam, false);
-                        return window._isSizing
-                            ? ComputeNcCalcSizeResizeFlags(originalRect, oldWindowRect)
-                            : nint.Zero;
+                        window.RequestFullInvalidation();
+                        window.InvalidateWindow();
+                        return ComputeNcCalcSizeResult(hasNcCalcSizeParams: true);
                     }
                     break;
 
@@ -6691,6 +6808,11 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     break;
 
                 case WM_NCLBUTTONDOWN:
+                    if (window.TryDismissLightDismissPopupsForNonClientPress())
+                    {
+                        return nint.Zero;
+                    }
+
                     if (window.TitleBarStyle == WindowTitleBarStyle.Custom)
                     {
                         if (window.OnNcLButtonDown(wParam, lParam))
@@ -6711,6 +6833,11 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     break;
 
                 case WM_NCLBUTTONDBLCLK:
+                    if (window.TryDismissLightDismissPopupsForNonClientPress())
+                    {
+                        return nint.Zero;
+                    }
+
                     if (window.TitleBarStyle == WindowTitleBarStyle.Custom)
                     {
                         if (window.OnNcLButtonDblClk(wParam, lParam))
@@ -6721,6 +6848,11 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     break;
 
                 case WM_NCRBUTTONDOWN:
+                    if (window.TryDismissLightDismissPopupsForNonClientPress())
+                    {
+                        return nint.Zero;
+                    }
+
                     if (window.TitleBarStyle == WindowTitleBarStyle.Custom)
                     {
                         if (window.ShouldUseWin11SnapNcRouting())
@@ -6964,7 +7096,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     var (finalPhysW, finalPhysH) = window.GetFinalPhysicalResizeSize();
                     window.TryResizeRenderTarget(finalPhysW, finalPhysH, "ExitSizeMove");
                     // 强制重画一帧 _isSizing=false 的正常帧。拖拽期间每帧画的是 _isSizing=true 的
-                    // backdrop 降级帧（折射型特效被简化/跳过），松手时 _isSizing 刚变 false，但
+                    // live-resize 降级帧（背景折射与元素离屏特效被简化/跳过），松手时 _isSizing 刚变 false，但
                     // 内容没变（无 dirty）、最后一帧已把 _fullInvalidation 清为 false、且本帧
                     // TryResizeRenderTarget 多半因尺寸已一致而 no-op（不重设 _fullInvalidation）——
                     // 若不在此显式 RequestFullInvalidation，下面 InvalidateWindow 安排的 RenderFrame 会在
@@ -7357,6 +7489,23 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         InvalidateWindow();
     }
 
+    private void AcknowledgeCommittedRenderThreadResize()
+    {
+        if (!_hasPendingResize)
+        {
+            return;
+        }
+
+        long committedVersion = Interlocked.Read(ref _rtCommittedResizeVersion);
+        if (committedVersion != _pendingResizeVersion)
+        {
+            return;
+        }
+
+        _hasPendingResize = false;
+        _pendingResizeRequiresNativeSameSize = false;
+    }
+
     private void TryResizeRenderTarget(int physicalWidth, int physicalHeight, string stage)
     {
         if (physicalWidth <= 0 || physicalHeight <= 0)
@@ -7372,6 +7521,16 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             physicalWidth,
             physicalHeight,
             stage == "ExitSizeMove");
+
+        // The render worker owns the D3D12 target for its entire lifetime. Keep
+        // WM_SIZE fully real-time (managed Width/Height and layout are already
+        // current), but hand the native logical-viewport transition to the next
+        // captured frame instead of parking the worker from the UI thread.
+        if (_rtActive || _renderThread?.IsAlive == true)
+        {
+            if (ResizeTraceEnabled) Debug.WriteLine($"[resize-trace] QUEUE-WORKER {physicalWidth}x{physicalHeight} stage={stage}");
+            return;
+        }
 
         // Defer if it is unsafe to touch the swap chain right now:
         //   • inside RenderFrame (a command list may be open), or
@@ -8526,7 +8685,6 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         // runs on restore.
         if (WindowState == WindowState.Minimized) return;
 
-        // No rate-limiting — render as fast as possible.
         RenderFrame();
     }
 
@@ -8605,7 +8763,20 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     // then replay it into the live context on the SAME thread — proves the capture
     // is pixel-identical before Increment 2 moves the replay onto a render thread,
     // which is what finally takes the ~110ms iGPU present off the message pump.
-    private static readonly bool EnableRenderThread = IsEnvironmentSwitchEnabled("JALIUM_RENDER_THREAD");
+    // D3D12 defaults to a dedicated render worker on Windows. WM_SIZE and layout
+    // remain synchronous on the UI thread, while native Resize/Replay/Present run
+    // on the worker and consume a latest-frame-wins mailbox. An explicit
+    // JALIUM_RENDER_THREAD=0 retains the inline path for diagnostics and the
+    // device-loss harness; =1 still forces the worker as before.
+    private static readonly bool EnableRenderThread = ResolveRenderThreadEnabled();
+
+    private static bool ResolveRenderThreadEnabled()
+    {
+        string? configured = Environment.GetEnvironmentVariable("JALIUM_RENDER_THREAD");
+        return configured == null
+            ? PlatformFactory.IsWindows
+            : IsEnvironmentSwitchEnabled("JALIUM_RENDER_THREAD");
+    }
 
     /// <summary>
     /// Default path: directly walk the tree into the live context. Render-thread
@@ -8615,14 +8786,14 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     /// </summary>
     private void RenderTreeOrCapture(Jalium.UI.Interop.RenderTargetDrawingContext ctx)
     {
-        if (!EnableRenderThread)
+        if (!EnableRenderThread || !_rtActive)
         {
             Render(ctx);
             return;
         }
 
         var host = Visual.RenderCacheHost;
-        var recorder = host?.CreateFrameRecorder();
+        var recorder = host?.CreateFrameRecorder(_isSizing);
         if (host == null || recorder == null)
         {
             Render(ctx);
@@ -8673,6 +8844,11 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         public RenderContext? OwnerContext;
         public int ContextGeneration;
         public int LifecycleGeneration;
+        public int PhysicalWidth;
+        public int PhysicalHeight;
+        public long ResizeVersion;
+        public bool RequireNativeSameSize;
+        public bool SimplifyEffects;
     }
 
     private Thread? _renderThread;
@@ -8684,7 +8860,10 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     private volatile bool _rtPause;
     private ManualResetEventSlim? _rtIdle;
     private volatile bool _rtActive;
-    private volatile bool _rtBusy;   // render thread is mid BeginDraw..EndDraw (back-pressure gate)
+    // Latest version whose native viewport transition completed on the worker.
+    // UI-owned pending resize fields are cleared only after observing this ack,
+    // so a later animation capture cannot overwrite and lose an unconsumed resize.
+    private long _rtCommittedResizeVersion;
     private bool _renderThreadDisabledForSchemaGap;  // latched after un-recordable content; do not resurrect the render thread on RT recreate
     // Serializes every direct native draw session that can run outside the UI
     // render lifecycle. In particular, the pre-show background frame and the
@@ -8701,7 +8880,10 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         // ShouldUseCompositionRenderTarget()'s user32 GetWindowLong P/Invoke would
         // throw DllNotFoundException there — bail BEFORE touching it.
         if (_platformWindow != null) return;
-        if (RenderTarget == null || ShouldUseCompositionRenderTarget()) return;  // DComp → inline path
+        // D3D12 DirectComposition swap chains are worker-safe. Keeping this
+        // target type preserves exact live-resize geometry while moving the
+        // expensive native replay/present off the message pump.
+        if (RenderTarget?.Backend != RenderBackend.D3D12) return;
         if (Visual.RenderCacheHost == null) return;                              // no whole-frame capture
         _renderThreadStop = false;
         _rtFrameAvailable ??= new AutoResetEvent(false);
@@ -8875,8 +9057,12 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             if (cap == null) continue;
             try { PresentCaptureOnRenderThread(cap); }
             catch (RenderPipelineException ex) { MarshalRenderRecovery(ex); }
-            catch
+            catch (Exception ex)
             {
+                if (IsEnvironmentSwitchEnabled("JALIUM_RENDER_THREAD_DIAGNOSTICS"))
+                {
+                    Console.Error.WriteLine($"[Jalium.Render] Frame replay failed: {ex}");
+                }
                 // The capture is lost and dirty was already cleared at publish
                 // time — without re-invalidation a static scene would keep the
                 // stale frame on screen until the next external invalidation.
@@ -8896,6 +9082,18 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         }
     }
 
+    private void RequeueRenderThreadCaptureUnlessSuperseded(FrameCapture cap)
+    {
+        lock (_rtChannelLock)
+        {
+            // The UI may already have published a newer layout while this frame
+            // was waiting on the GPU. Never replace that newer state with stale
+            // geometry; otherwise retry this exact capture.
+            _rtPendingFrame ??= cap;
+        }
+        _rtFrameAvailable?.Set();
+    }
+
     private void PresentCaptureOnRenderThreadCore(FrameCapture cap)
     {
         var rt = cap.Target;
@@ -8909,6 +9107,29 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         var host = Visual.RenderCacheHost;
         if (host == null) return;
 
+        // Native resize is part of the worker-owned frame transaction. Managed
+        // Width/Height and layout were already updated synchronously by WM_SIZE;
+        // this only advances the D3D12/DComp logical viewport immediately before
+        // drawing that matching layout. It never blocks the UI thread.
+        if (cap.ResizeVersion != 0 &&
+            cap.ResizeVersion > Interlocked.Read(ref _rtCommittedResizeVersion))
+        {
+            bool needsNativeResize = cap.RequireNativeSameSize ||
+                rt.Width != cap.PhysicalWidth ||
+                rt.Height != cap.PhysicalHeight;
+            if (needsNativeResize)
+            {
+                var resizeResult = rt.Resize(cap.PhysicalWidth, cap.PhysicalHeight);
+                if (resizeResult == JaliumResult.Busy)
+                {
+                    RequeueRenderThreadCaptureUnlessSuperseded(cap);
+                    return;
+                }
+            }
+
+            Interlocked.Exchange(ref _rtCommittedResizeVersion, cap.ResizeVersion);
+        }
+
         // The render thread EXCLUSIVELY owns _drawingContext on this path (the UI
         // thread no longer touches it — see RenderFrame). Create + maintain it here
         // so the brush-cache trim and Replay run on a single thread.
@@ -8918,10 +9139,11 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         var context = rt.OwnerContext;
         if (context == null || !context.IsValid) return;
         var dc = _drawingContext ??= new RenderTargetDrawingContext(rt, context);
-        // backdrop/LiquidGlass（snapshot/背景折射型 effect）在拖拽中仍降级回扁平 overlay：
-        // 其背景 snapshot 滞后于 in-flight 的 resize back buffer，真折射会采到错位的屏幕区域
-        // → 玻璃内容"跑到面板外"。glow/shadow 是 element-capture 型、不采背景，故不受此 flag 影响。
-        dc.SimplifyBackdropEffects = _isSizing;
+        // Live resize uses a flat rendering policy. Backdrop/LiquidGlass sampling
+        // would read a lagging resize buffer, while element shadows/glows would
+        // serialize every frame through the renderer-wide offscreen scratch.
+        dc.SimplifyBackdropEffects = cap.SimplifyEffects;
+        dc.SimplifyElementEffects = cap.SimplifyEffects;
         dc.DrainPendingRetainedLayers();
 
         rt.SetFullInvalidation();
@@ -8936,12 +9158,10 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             // meanwhile) and re-wake the loop — BeginDraw's internal 16 ms
             // waitable wait is the retry back-off, and it blocks only this
             // render thread, never the UI thread.
-            lock (_rtChannelLock) { _rtPendingFrame ??= cap; }
-            _rtFrameAvailable?.Set();
+            RequeueRenderThreadCaptureUnlessSuperseded(cap);
             return;
         }
 
-        _rtBusy = true;
         bool ended = false;
         try
         {
@@ -9040,7 +9260,6 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         {
             if (!ended && rt.IsDrawing) { try { rt.TryEndDraw(); } catch { } }
             dc.TrimCacheIfNeeded();   // FIX: cache trim now on the owning (render) thread
-            _rtBusy = false;
         }
     }
 
@@ -9097,21 +9316,24 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     {
         if (!IsRenderLifecycleCurrent(lifecycleGeneration, renderTarget)) return;
 
-        // Back-pressure (FIX): if the render thread is still presenting the
-        // previous frame and a capture is already queued, skip recording this tick
-        // — the expensive Render walk would only overwrite the unconsumed pending
-        // frame. Reschedule so the latest state still reaches the screen once the
-        // render thread drains. Checked before allocating a recorder.
-        if (_rtBusy)
-        {
-            lock (_rtChannelLock)
-            {
-                if (_rtPendingFrame != null) { ScheduleDeferredRender(1); return; }
-            }
-        }
+        // Snapshot the exact native viewport that belongs to this layout. Keep
+        // recording while the worker is busy: publishing overwrites the mailbox,
+        // so every render opportunity contains the newest responsive layout and
+        // never waits for a resize quiet period.
+        long captureResizeVersion = _pendingResizeVersion;
+        bool captureHasPendingResize = _hasPendingResize;
+        int capturePhysicalWidth = captureHasPendingResize
+            ? _pendingResizeWidth
+            : renderTarget.Width;
+        int capturePhysicalHeight = captureHasPendingResize
+            ? _pendingResizeHeight
+            : renderTarget.Height;
+        bool captureRequiresNativeSameSize = captureHasPendingResize &&
+            _pendingResizeRequiresNativeSameSize;
+        bool captureSimplifiesEffects = _isSizing;
 
         var host = Visual.RenderCacheHost;
-        var recorder = host?.CreateFrameRecorder();
+        var recorder = host?.CreateFrameRecorder(captureSimplifiesEffects);
         if (host == null || recorder == null)
         {
             // Host can't whole-frame capture: latch to inline for this window and
@@ -9143,6 +9365,15 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         // or externally destroy the window; never publish that stale capture to
         // the render thread after its lifecycle token has been invalidated.
         if (!IsRenderLifecycleCurrent(lifecycleGeneration, renderTarget)) return;
+        if (_pendingResizeVersion != captureResizeVersion)
+        {
+            // A re-entrant WM_SIZE superseded the layout while user rendering was
+            // being recorded. Drop only this stale capture and immediately render
+            // the already-current managed size on the next frame-clock turn.
+            RequestFullInvalidation();
+            InvalidateWindow();
+            return;
+        }
 
         // schema-gap (render-thread path): the capture hit content it can't
         // represent (windowless WebView punch, video surface, ink-layer blit, …).
@@ -9167,6 +9398,11 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             OwnerContext = renderTarget.OwnerContext,
             ContextGeneration = renderTarget.OwnerContextGeneration,
             LifecycleGeneration = lifecycleGeneration,
+            PhysicalWidth = capturePhysicalWidth,
+            PhysicalHeight = capturePhysicalHeight,
+            ResizeVersion = captureHasPendingResize ? captureResizeVersion : 0,
+            RequireNativeSameSize = captureRequiresNativeSameSize,
+            SimplifyEffects = captureSimplifiesEffects,
         };
 
         // Publish and consume dirty state as one lifecycle transaction. If
@@ -9204,7 +9440,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         // wait on the same handle — that is the v5 two-waiter trap where each
         // signal is won by one thread and the loser stalls to the 16ms timeout.
         // Render thread supersedes the pacer.
-        if (EnableRenderThread) return;
+        if (_renderThread?.IsAlive == true) return;
         if (_framePacerThread != null) return;  // already started
         var rt = RenderTarget;
         if (rt == null) return;
@@ -9296,9 +9532,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
 
         StopExternalPresentPacing();   // RT 重建路径：刷新句柄 + 重置状态
         if (_nativeWindowHidden) { Trace("skip: nativeWindowHidden"); return; }
-        // Cross-platform host (Android 等)：无 user32、无 DXGI waitable，且下面的
-        // ShouldUseCompositionRenderTarget 会 P/Invoke user32（StartRenderThreadIfSupported
-        // 规避过的同一个陷阱）。
+        // Cross-platform host (Android 等)：无 DXGI frame-latency waitable。
         if (_platformWindow != null) { Trace("skip: platformWindow"); return; }
         // 渲染线程运行中不启用：present 阻塞落在渲染线程，本就不卡 UI；且
         // waitable 必须单消费者（v5 双等待者陷阱），渲染线程路径里 native
@@ -9312,7 +9546,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         // 调度器要解决的 16ms 卡顿；接管反而给每帧加一圈线程池+dispatcher 跳。
         if (VSyncDisabledByEnv) { Trace("skip: JALIUM_DISABLE_VSYNC"); return; }
         var rt = RenderTarget;
-        if (rt == null || !rt.IsValid || ShouldUseCompositionRenderTarget()) { Trace("skip: rt/composition"); return; }
+        if (rt == null || !rt.IsValid) { Trace("skip: invalid render target"); return; }
         nint waitable = rt.GetFrameLatencyWaitable();
         if (waitable == nint.Zero) { Trace("skip: no waitable"); return; }   // 非 D3D12 / 降级阶梯 Flags=0 → 旧路径
         // legacy frame-pacer 实验（JALIUM_ENABLE_FRAME_PACER）也常驻等待同一个
@@ -9496,20 +9730,12 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         Jalium.UI.Diagnostics.HoverTrace.Gauge(Jalium.UI.Diagnostics.HoverTrace.G_WAITREG, Volatile.Read(ref _swapWaitRegistered));
         if (_swapPacingActive)
         {
-            // 拖拽 resize（modal sizing loop）期间旁路 credit 门：每个 WM_SIZE
-            // 都必须即时重画，否则新暴露的区域要等合成节拍（慢合成下 ~9fps）
-            // 才被填充，体感是"空白慢慢填、松手才正常"。直接操纵反馈优先于
-            // 限流：Present(0) 不阻塞、深桶+DXGI 队列吸收突发；期间账本只进
-            // 不出（present 的 ack 照常经回调入账并被 clamp 塌缩），无泄漏。
-            if (_isSizing)
-            {
-                if (RenderTarget?.TryBeginDraw() == true) return true;
-                if (ResizeTraceEnabled) Debug.WriteLine("[resize-trace] BEGIN-FAIL (sizing bypass)");
-                _debugHud.OnBeginFail();
-            Jalium.UI.Diagnostics.HoverTrace.Bump(Jalium.UI.Diagnostics.HoverTrace.BEGIN_FAIL);
-                ScheduleDeferredRender(GpuBusyRetryDelayMs);
-                return false;
-            }
+            // Live resize keeps applying every WM_SIZE to layout immediately,
+            // but only opens a GPU frame after DXGI reports a writable buffer.
+            // If several sizes arrive while the previous frame is in flight,
+            // their dirty/layout state stays pending and the signal callback
+            // renders the newest state. No timer debounce and no stale frame is
+            // presented; this only removes UI-thread waiting and obsolete GPU work.
             if (!TryTakeSwapCredit())
             {
                 // 先声明渲染意图再挂等待：回调只在 pending 置位时才调度
@@ -9748,29 +9974,62 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                 !IsRenderLifecycleCurrent(frameLifecycleGeneration, frameRenderTarget))
                 return;
 
-            // Perform layout before rendering (queue-based: only dirty elements).
-            // During interactive resize, DirectComposition keeps the previous
-            // frame at 1:1 pixels while this CPU work runs. UpdateLayout may also
-            // receive/reenter another WM_SIZE; flushing afterwards commits the
-            // newest deferred size rather than an already superseded one.
-            UpdateLayoutForRender();
-            if (!IsRenderLifecycleCurrent(frameLifecycleGeneration, frameRenderTarget))
+            // The worker acknowledges a native viewport transition by version.
+            // Clear UI-owned pending state only after that acknowledgement; until
+            // then every newer capture carries the resize so latest-frame mailbox
+            // replacement can never lose it.
+            AcknowledgeCommittedRenderThreadResize();
+
+            // Settle layout and the native logical viewport as one latest-size-wins
+            // transaction. A native resize/DComp call can re-enter WM_SIZE after
+            // UpdateLayout has finished, which leaves a newly-invalid tree paired
+            // with the newer render-target size. Rendering that superseded layout
+            // is the source of transient missing/reflowed columns during a fast
+            // drag. One bounded retry catches the normal re-entrant case; if the
+            // size changes yet again, skip this stale frame and let the already
+            // scheduled next tick render the newest size.
+            const int maxResizeLayoutSettlePasses = 2;
+            bool resizeLayoutSettled = false;
+            for (int settlePass = 0; settlePass < maxResizeLayoutSettlePasses; settlePass++)
+            {
+                long resizeVersionBeforeLayout = _pendingResizeVersion;
+
+                UpdateLayoutForRender();
+                if (!IsRenderLifecycleCurrent(frameLifecycleGeneration, frameRenderTarget))
+                    return;
+
+                // Inline targets commit their native resize here. A live render
+                // worker owns its target continuously, so the matching resize is
+                // embedded in FrameCapture and performed immediately before that
+                // layout is replayed — never by parking the worker from the UI.
+                if (!_rtActive)
+                {
+                    FlushPendingRenderTargetResize();
+                }
+                if (RenderTarget == null || !RenderTarget.IsValid)
+                    return;
+
+                frameRenderTarget = RenderTarget;
+                if (frameRenderTarget == null ||
+                    !IsRenderLifecycleCurrent(frameLifecycleGeneration, frameRenderTarget))
+                    return;
+
+                if (_pendingResizeVersion == resizeVersionBeforeLayout &&
+                    (_rtActive || !_hasPendingResize))
+                {
+                    resizeLayoutSettled = true;
+                    break;
+                }
+            }
+
+            if (!resizeLayoutSettled)
+            {
+                RequestFullInvalidation();
+                InvalidateWindow();
                 return;
+            }
+
             _debugHud.MarkLayout();
-
-            // Apply any resize that was deferred because it arrived mid-frame.
-            // Safe here: RenderFlag_Rendering is set (so a reentrant resize defers),
-            // layout is complete, and no draw session is open. Recovery inside
-            // the flush may recreate the render target, so refresh the per-frame
-            // target and lifecycle snapshot afterwards.
-            FlushPendingRenderTargetResize();
-            if (RenderTarget == null || !RenderTarget.IsValid)
-                return;
-
-            frameRenderTarget = RenderTarget;
-            if (frameRenderTarget == null ||
-                !IsRenderLifecycleCurrent(frameLifecycleGeneration, frameRenderTarget))
-                return;
 
             // Increment-1 architecture gate (env-gated, one-shot). Safe here: no
             // frame command list is open yet, so the probe's one-shot clear queues
@@ -9826,17 +10085,6 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                         _debugHud.OnSkipped();
                         Jalium.UI.Diagnostics.HoverTrace.Bump(Jalium.UI.Diagnostics.HoverTrace.SKIP_NODIRTY);
                         if (DebugRender) System.Diagnostics.Debug.WriteLine("[RenderFrame] SKIP: no dirty, no fullInvalidation");
-                        return;
-                    }
-                    long convergenceDelay =
-                        _backBufferConvergenceNotBeforeTick - Environment.TickCount64;
-                    if (convergenceDelay > 0)
-                    {
-                        // CompositionTarget can still tick before the debounce
-                        // timer (for example while resize input keeps the clock
-                        // awake). Do not let that tick bypass the live-resize
-                        // debounce and submit the obsolete second full frame.
-                        ScheduleDeferredRender((int)Math.Min(int.MaxValue, convergenceDelay));
                         return;
                     }
                     isFlushFrame = true;
@@ -9933,9 +10181,10 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             // the UI thread solely owns _drawingContext from here on.
             var context = ResolveRenderTargetContext(frameRenderTarget);
             _drawingContext ??= new RenderTargetDrawingContext(frameRenderTarget, context);
-            // backdrop/LiquidGlass（snapshot/背景折射型）拖拽中仍降级：snapshot 滞后于 in-flight
-            // resize buffer，真折射采到错位屏幕区域（玻璃"跑到面板外"）。glow/shadow 不受影响。
+            // Live resize uses the same flat policy on the normal render path:
+            // no stale backdrop sampling and no per-element offscreen serialization.
             _drawingContext.SimplifyBackdropEffects = _isSizing;
+            _drawingContext.SimplifyElementEffects = _isSizing;
             // Destroy retained GPU layers orphaned by idle-eviction / detach since
             // the last frame (fence-gated native release) before drawing.
             _drawingContext.DrainPendingRetainedLayers();
@@ -10632,7 +10881,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         => supportsPartialPresentation && backend == RenderBackend.D3D12;
 
     internal static int ComputeBackBufferConvergenceDelayMs(bool isSizing)
-        => isSizing ? LiveResizeConvergenceDelayMs : 1;
+        => 1;
 
     private void HandlePresentedFrameFlush(bool isFlushFrame)
     {
@@ -10641,7 +10890,6 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             !RequiresBackBufferConvergence(renderTarget.Backend, renderTarget.SupportsPartialPresentation))
         {
             _partialPresentsToFlush = 0;
-            _backBufferConvergenceNotBeforeTick = 0;
             return;
         }
 
@@ -10664,7 +10912,6 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                 // re-arms the flush chain and keeps the ring until all buffers
                 // eventually converge.
                 ClearConvergedDirtyHistory();
-                _backBufferConvergenceNotBeforeTick = 0;
             }
             return;
         }
@@ -10687,8 +10934,6 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         // above only fires in Debug) against re-introducing the stale-deepest-buffer bug in Release.
         _partialPresentsToFlush = Math.Clamp(_lastSwapBufferCount - 1, 1, DirtyHistoryCount);
         int delayMs = ComputeBackBufferConvergenceDelayMs(_isSizing);
-        _backBufferConvergenceNotBeforeTick =
-            delayMs > 1 ? Environment.TickCount64 + delayMs : 0;
         ScheduleDeferredRender(delayMs);
     }
 
@@ -11494,20 +11739,76 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             return;
         }
 
-        _ = OverlayLayer.CloseLightDismissPopups();
+        _ = CloseAllLightDismissPopups();
+    }
 
-        if (ActiveExternalPopups.Count == 0)
+    /// <summary>
+    /// Closes every light-dismiss popup this window owns, in both hosting forms:
+    /// roots living in the OverlayLayer and popups promoted to their own top-level
+    /// window. Returns true when at least one popup was dismissed.
+    /// </summary>
+    internal bool CloseAllLightDismissPopups()
+    {
+        int closed = OverlayLayer.CloseLightDismissPopups();
+
+        if (ActiveExternalPopups.Count > 0)
         {
-            return;
+            var popupsToClose = ActiveExternalPopups
+                .Where(p => !p.StaysOpen)
+                .ToList();
+            foreach (var popup in popupsToClose)
+            {
+                popup.IsOpen = false;
+            }
+
+            closed += popupsToClose.Count;
         }
 
-        var popupsToClose = ActiveExternalPopups
-            .Where(p => !p.StaysOpen)
-            .ToList();
-        foreach (var popup in popupsToClose)
+        return closed > 0;
+    }
+
+    /// <summary>
+    /// Returns true when a light-dismiss popup is open in either hosting form.
+    /// While one is, the window's own content must not react to the pointer: WPF
+    /// gives the popup a subtree mouse capture, so everything underneath stops
+    /// receiving moves. A popup promoted to its own HWND cannot capture the parent's
+    /// input that way, and the parent keeps getting its own WM_MOUSEMOVE.
+    /// </summary>
+    internal bool HasOpenLightDismissPopup()
+    {
+        if (OverlayLayer.HasLightDismissPopups)
         {
-            popup.IsOpen = false;
+            return true;
         }
+
+        for (int i = 0; i < ActiveExternalPopups.Count; i++)
+        {
+            if (!ActiveExternalPopups[i].StaysOpen)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// A non-client press — caption drag, border resize, system menu — is carried out
+    /// by DefWindowProc's own modal loop and never reaches the client-area input
+    /// dispatcher, so the light-dismiss pass that WM_LBUTTONDOWN performs has to be
+    /// repeated here. The dismissing press is consumed rather than also starting the
+    /// drag: closing the popup is the entire gesture, matching how a click outside a
+    /// popup in the client area does not additionally act on what sits underneath.
+    /// </summary>
+    private bool TryDismissLightDismissPopupsForNonClientPress()
+    {
+        if (!CloseAllLightDismissPopups())
+        {
+            return false;
+        }
+
+        _inputDispatcher.ClearTitleBarInteractionState();
+        return true;
     }
 
     private void ResetTransientInputStateOnDeactivate()

@@ -454,4 +454,74 @@ public class AnimationEngineTests
             Assert.True(DispatcherTimer.ShouldFireOnFrame(now, intervalTicks: 0, ref nextDue));
         }
     }
+
+    // ── DispatcherTimer tick gate (dedicated-timer backlog guard) ───────────
+    //
+    // The dedicated System.Threading.Timer is periodic and keeps firing on a
+    // thread-pool thread whether or not the dispatcher has drained anything.
+    // Without a gate, a starved dispatcher accumulates queued ticks that then
+    // run as a burst inside one frame — a staggered reveal collapses into a
+    // single frame and periodic work fires several times back to back.
+    // Same rule the piggyback path gets from ShouldFireOnFrame, applied here.
+
+    [Fact]
+    public void TryEnterTickGate_FirstCallerClaimsTheSlot()
+    {
+        var gate = 0;
+        Assert.True(DispatcherTimer.TryEnterTickGate(ref gate));
+        Assert.Equal(1, gate);
+    }
+
+    [Fact]
+    public void TryEnterTickGate_DropsCallbacksWhileATickIsStillInFlight()
+    {
+        var gate = 0;
+        Assert.True(DispatcherTimer.TryEnterTickGate(ref gate));
+
+        // 一次饥饿期里线程池计时器可能回调很多次；除了第一次，其余都必须被丢弃，
+        // 而不是排进 dispatcher 队列等着一起爆发。
+        for (var i = 0; i < 8; i++)
+        {
+            Assert.False(DispatcherTimer.TryEnterTickGate(ref gate));
+        }
+
+        Assert.Equal(1, gate);
+    }
+
+    [Fact]
+    public void ExitTickGate_ReopensTheSlotForExactlyOneMoreTick()
+    {
+        var gate = 0;
+        Assert.True(DispatcherTimer.TryEnterTickGate(ref gate));
+        DispatcherTimer.ExitTickGate(ref gate);
+
+        Assert.Equal(0, gate);
+        Assert.True(DispatcherTimer.TryEnterTickGate(ref gate));
+        Assert.False(DispatcherTimer.TryEnterTickGate(ref gate));
+    }
+
+    [Fact]
+    public void TickGate_StarvationYieldsFewerTicksNeverABurst()
+    {
+        // 模拟：dispatcher 被饿住期间线程池回调 10 次，之后排空一次；如此三轮。
+        // 正确行为是每轮恰好投递 1 个 tick（共 3 个），而不是 30 个。
+        var gate = 0;
+        var delivered = 0;
+
+        for (var round = 0; round < 3; round++)
+        {
+            for (var callback = 0; callback < 10; callback++)
+            {
+                if (DispatcherTimer.TryEnterTickGate(ref gate))
+                {
+                    delivered++;
+                }
+            }
+
+            // dispatcher 终于跑到这个 tick，处理完后闸门重开
+            DispatcherTimer.ExitTickGate(ref gate);
+        }
+
+        Assert.Equal(3, delivered);
+    }
 }

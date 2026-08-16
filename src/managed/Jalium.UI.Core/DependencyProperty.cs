@@ -37,6 +37,12 @@ public sealed class DependencyProperty
     /// </summary>
     private readonly ConcurrentDictionary<Type, PropertyMetadata> _metadataCache = new();
 
+    // Most render/layout loops query one dependency property repeatedly for the same
+    // concrete control type. Keep that monomorphic case out of ConcurrentDictionary;
+    // metadata is immutable after publication, so a two-field volatile cache is safe.
+    private Type? _lastMetadataType;
+    private PropertyMetadata? _lastMetadata;
+
     /// <summary>
     /// Serializes metadata-map mutations with cache lookups. A per-property lock keeps unrelated
     /// dependency properties independent and is reentrant so metadata <c>OnApply</c> callbacks can
@@ -473,6 +479,8 @@ public sealed class DependencyProperty
             // Empty the old inherited answers before publishing the slow-path
             // flag. Once readers observe the flag they can no longer return a
             // stale cache entry while OnApply is still running.
+            Volatile.Write(ref _lastMetadataType, null);
+            Volatile.Write(ref _lastMetadata, null);
             _metadataCache.Clear();
             Volatile.Write(ref _hasTypeMetadata, 1);
             _typeMetadata[forType] = typeMetadata;
@@ -484,6 +492,8 @@ public sealed class DependencyProperty
             catch
             {
                 _typeMetadata.Remove(forType);
+                Volatile.Write(ref _lastMetadataType, null);
+                Volatile.Write(ref _lastMetadata, null);
                 _metadataCache.Clear();
                 if (_typeMetadata.Count == 0)
                     Volatile.Write(ref _hasTypeMetadata, 0);
@@ -505,18 +515,27 @@ public sealed class DependencyProperty
         if (Volatile.Read(ref _hasTypeMetadata) == 0)
             return DefaultMetadata;
 
+        if (ReferenceEquals(Volatile.Read(ref _lastMetadataType), forType))
+            return Volatile.Read(ref _lastMetadata)!;
+
         // Metadata is immutable once published and overrides are exceptionally
         // rare compared with GetValue. Keep the steady-state cache hit outside
         // _metadataSync so every dependency-property read on the UI/render path
         // does not contend with unrelated threads querying the same property.
         if (_metadataCache.TryGetValue(forType, out var cached))
+        {
+            PublishLastMetadata(forType, cached);
             return cached;
+        }
 
         lock (_metadataSync)
         {
             // Another reader may have populated this miss while we waited.
             if (_metadataCache.TryGetValue(forType, out cached))
+            {
+                PublishLastMetadata(forType, cached);
                 return cached;
+            }
 
             // Walk up the type hierarchy
             var type = forType;
@@ -525,14 +544,25 @@ public sealed class DependencyProperty
                 if (_typeMetadata.TryGetValue(type, out var metadata))
                 {
                     _metadataCache[forType] = metadata;
+                    PublishLastMetadata(forType, metadata);
                     return metadata;
                 }
                 type = type.BaseType;
             }
 
             _metadataCache[forType] = DefaultMetadata;
+            PublishLastMetadata(forType, DefaultMetadata);
             return DefaultMetadata;
         }
+    }
+
+    private void PublishLastMetadata(Type forType, PropertyMetadata metadata)
+    {
+        // Publish the value first. A reader that observes the matching type is then
+        // guaranteed to observe its metadata; seeing an older type only causes a normal
+        // dictionary lookup.
+        Volatile.Write(ref _lastMetadata, metadata);
+        Volatile.Write(ref _lastMetadataType, forType);
     }
 
     /// <summary>

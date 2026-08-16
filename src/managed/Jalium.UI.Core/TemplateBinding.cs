@@ -116,10 +116,11 @@ internal sealed class TemplateBindingExpression : BindingExpressionBase
         // property cannot legally hold — null for a non-nullable value type, or an instance of an
         // incompatible type — must NOT be pinned into the ParentTemplate precedence layer. Doing so
         // would shadow the target's own default and crash on unbox at layout (e.g. (Thickness)null).
-        // TemplateBinding performs no implicit conversion, so an invalid value degrades to
+        // A string source is first offered to the XAML type-converter pipeline (see
+        // TemplateBindingValueCoercion); anything that still cannot inhabit the target degrades to
         // DependencyProperty.UnsetValue semantics: clear this layer's contribution and let the
         // property fall through to its default / lower-precedence value.
-        if (!TargetProperty.IsValidType(value))
+        if (!TemplateBindingValueCoercion.TryCoerce(value, TargetProperty, out var effectiveValue))
         {
             System.Diagnostics.Trace.WriteLine(
                 $"[Jalium.UI] TemplateBinding skip: 模板父级 {_templatedParent.GetType().Name}.{_binding.Property.Name} 的值 " +
@@ -129,7 +130,7 @@ internal sealed class TemplateBindingExpression : BindingExpressionBase
             return;
         }
 
-        Target.SetLayerValue(TargetProperty, value, DependencyObject.LayerValueSource.ParentTemplate);
+        Target.SetLayerValue(TargetProperty, effectiveValue, DependencyObject.LayerValueSource.ParentTemplate);
     }
 
     private static FrameworkElement? FindTemplatedParent(DependencyObject target)
@@ -139,6 +140,81 @@ internal sealed class TemplateBindingExpression : BindingExpressionBase
             return fe.TemplatedParent as FrameworkElement;
         }
         return null;
+    }
+}
+
+/// <summary>
+/// Shared value gate for both TemplateBinding transfer paths — the strongly-typed
+/// <see cref="TemplateBindingExpression"/> (code templates / <c>SetTemplateBinding(DP, DP)</c>) and the
+/// name-resolved <c>DeferredTemplateBindingExpression</c> (<c>{TemplateBinding}</c> in jalxaml).
+/// </summary>
+/// <remarks>
+/// <para>
+/// The source property is picked by NAME/DP on the templated parent, so its CLR type need not match the
+/// target DP's type. Markup routinely models an icon path as <c>string</c> and feeds it to a
+/// <c>Geometry</c>-typed target (<c>Data="{TemplateBinding IconGeometry}"</c>) — exactly the same string
+/// form the parser accepts when the value is written literally (<c>Data="M0,0 L10,10"</c>), which routes
+/// through <c>XamlBuilder.SetProperty</c> → <c>TypeConverterRegistry</c>.
+/// </para>
+/// <para>
+/// Before this gate existed, the TemplateBinding path skipped conversion entirely: a type mismatch was
+/// dropped with only a <see cref="System.Diagnostics.Trace"/> line, so the target silently kept its
+/// default (a Path with no geometry renders nothing — no exception, no visible diagnostic). Offering a
+/// string source to the same converter registry the parser uses closes that asymmetry. Conversion is
+/// attempted ONLY on the branch that used to be discarded, so every binding that already transferred is
+/// bit-for-bit unaffected; a value that still cannot inhabit the target keeps the previous
+/// clear-to-default behaviour.
+/// </para>
+/// </remarks>
+internal static class TemplateBindingValueCoercion
+{
+    /// <summary>
+    /// Produces a value legal for <paramref name="targetProperty"/>, converting a string source through
+    /// the registered XAML type converters when the raw value cannot inhabit the target.
+    /// </summary>
+    /// <returns>
+    /// <see langword="true"/> with <paramref name="coerced"/> set to a value the target accepts;
+    /// <see langword="false"/> when the value must be dropped (caller clears the ParentTemplate layer).
+    /// </returns>
+    internal static bool TryCoerce(object? value, DependencyProperty targetProperty, out object? coerced)
+    {
+        if (targetProperty.IsValidType(value))
+        {
+            coerced = value;
+            return true;
+        }
+
+        // Only a string is convertible here. Any other mismatch is a genuine authoring error and keeps
+        // the historical fail-closed behaviour rather than guessing at a conversion.
+        if (value is string text)
+        {
+            var converter = Jalium.UI.Style.StringValueConverter;
+            if (converter != null)
+            {
+                var underlyingType = Nullable.GetUnderlyingType(targetProperty.PropertyType)
+                    ?? targetProperty.PropertyType;
+                try
+                {
+                    // Converters signal failure two ways: null (GeometryTypeConverter) or a throw
+                    // (ThicknessConverter's FormatException). Both must degrade to "drop", never escape
+                    // into the caller — one malformed template value cannot be allowed to tear down the
+                    // whole template application.
+                    var converted = converter(text, underlyingType);
+                    if (converted != null && targetProperty.IsValidType(converted))
+                    {
+                        coerced = converted;
+                        return true;
+                    }
+                }
+                catch
+                {
+                    // fall through to the drop path
+                }
+            }
+        }
+
+        coerced = null;
+        return false;
     }
 }
 

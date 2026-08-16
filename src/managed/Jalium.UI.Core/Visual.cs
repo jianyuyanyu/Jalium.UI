@@ -822,11 +822,14 @@ public abstract class Visual : DependencyObject
         IEffect? activeEffect = null;
         IEffectDrawingContext? effectDc = null;
         float captureX = 0, captureY = 0, captureW = 0, captureH = 0;
+        bool effectCaptureOpen = false;
+        bool pushedClip = false;
 
         if (this is UIElement effectElement &&
             effectElement.Effect is IEffect eff &&
             eff.HasEffect &&
             drawingContext is IEffectDrawingContext edc &&
+            edc.IsElementEffectCaptureEnabled &&
             drawingContext is IOffsetDrawingContext offsetDc)
         {
             activeEffect = eff;
@@ -851,22 +854,24 @@ public abstract class Visual : DependencyObject
             captureH = (float)Math.Max(0.0, snappedBottom - snappedTop);
 
             effectDc.BeginEffectCapture(captureX, captureY, captureW, captureH);
+            effectCaptureOpen = true;
         }
 
-        // Push clip BEFORE OnRender so the element's own drawing is also clipped
-        // (matches WPF semantics: ClipToBounds clips the element itself + children).
-        Geometry? clipGeometry = null;
-        if (this is UIElement thisElement)
+        try
         {
-            clipGeometry = thisElement.GetLayoutClip();
-        }
+            // Push clip BEFORE OnRender so the element's own drawing is also clipped
+            // (matches WPF semantics: ClipToBounds clips the element itself + children).
+            Geometry? clipGeometry = null;
+            if (this is UIElement thisElement)
+            {
+                clipGeometry = thisElement.GetLayoutClip();
+            }
 
-        bool pushedClip = false;
-        if (clipGeometry != null && drawingContext is IClipDrawingContext clipContext)
-        {
-            clipContext.PushClip(clipGeometry);
-            pushedClip = true;
-        }
+            if (clipGeometry != null && drawingContext is IClipDrawingContext clipContext)
+            {
+                clipContext.PushClip(clipGeometry);
+                pushedClip = true;
+            }
 
         // Templated-background layer. Painted BEFORE OnRender so that a
         // self-drawing control (e.g. ChartBase, custom visualisations) whose
@@ -954,14 +959,15 @@ public abstract class Visual : DependencyObject
         // past the stroke into the BorderThickness ring.
         if (pushedClip && drawingContext is IClipDrawingContext clipContext2)
         {
-            clipContext2.Pop();
             pushedClip = false;
+            clipContext2.Pop();
         }
 
         OnPostRender(drawingContext);
 
         if (activeEffect != null && effectDc != null)
         {
+            effectCaptureOpen = false;
             effectDc.EndEffectCapture();
             var elemOffset = (drawingContext is IOffsetDrawingContext odc2) ? odc2.Offset : new Point(captureX, captureY);
             var elemSize = (this is UIElement ue) ? ue.RenderSize : new Size(captureW, captureH);
@@ -1009,6 +1015,32 @@ public abstract class Visual : DependencyObject
         _isRenderDirty = false;
         _isSubtreeDirty = false;
         _isSubtreeCompositionDirty = false;
+        }
+        finally
+        {
+            // User rendering code is allowed to throw. Never leave the shared
+            // drawing context's clip or native offscreen target open: a window can
+            // catch the exception and continue the same process/frame, in which
+            // case leaked state would clip or redirect every following visual.
+            try
+            {
+                if (pushedClip && drawingContext is IClipDrawingContext clipContext)
+                {
+                    pushedClip = false;
+                    clipContext.Pop();
+                }
+            }
+            finally
+            {
+                // Ending the native capture is more important than preserving a
+                // clip cleanup exception: it restores the actual render target.
+                if (effectCaptureOpen && effectDc != null)
+                {
+                    effectCaptureOpen = false;
+                    effectDc.EndEffectCapture();
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -1218,9 +1250,15 @@ public abstract class Visual : DependencyObject
         if (drawingContext is not IOffsetDrawingContext offsetContext)
             return false;
 
-        // Effects use the offscreen-capture machinery the layer path also uses, and
-        // non-cacheable visuals opt out of retained-mode entirely.
-        if (!child.ParticipatesInRenderCache || (child.Effect is IEffect ce && ce.HasEffect))
+        // Effects use the offscreen-capture machinery the layer path also uses.
+        // A latency-sensitive drawing context can explicitly suppress element
+        // effects (live resize); in that mode the subtree is rendered directly
+        // into the retained layer and no nested effect capture exists to conflict.
+        bool elementEffectsEnabled =
+            drawingContext is not IEffectDrawingContext effectContext ||
+            effectContext.IsElementEffectCaptureEnabled;
+        if (!child.ParticipatesInRenderCache ||
+            (elementEffectsEnabled && child.Effect is IEffect ce && ce.HasEffect))
         {
             if (child._isCompositorBoundary) Jalium.UI.Diagnostics.HoverTrace.Bump(Jalium.UI.Diagnostics.HoverTrace.CB_NOCACHE);
             ReleaseLayerIfAny(child);
@@ -1268,7 +1306,7 @@ public abstract class Visual : DependencyObject
         // guard 拒绝（offscreen capture 不能嵌套 retained capture，EndOffscreenCapture 会把
         // RT 恢复成 swap-chain 而非 layer），导致 glow/阴影/backdrop 等 effect 静默消失。
         // resize 把带动画的容器翻上 layer 路径正是触发点（独显才有 retained-layer 优化）。
-        if (SubtreeHasEffect(child))
+        if (elementEffectsEnabled && SubtreeHasEffect(child))
         {
             if (child._isCompositorBoundary) Jalium.UI.Diagnostics.HoverTrace.Bump(Jalium.UI.Diagnostics.HoverTrace.CB_EFFECT);
             ReleaseLayerIfAny(child);

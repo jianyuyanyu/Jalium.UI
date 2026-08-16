@@ -20,6 +20,16 @@ internal sealed class PopupRoot : Decorator
     /// </summary>
     internal bool IsLightDismiss { get; }
 
+    /// <summary>
+    /// Gets whether pointer input is currently captured by popup content.
+    /// </summary>
+    /// <remarks>
+    /// Scroll bars and other drag controls keep capture while the pointer moves outside
+    /// the popup bounds. That ongoing gesture must not be interpreted as light dismiss.
+    /// </remarks>
+    internal bool HasPointerCaptureWithin =>
+        IsMouseCaptureWithin || IsStylusCaptureWithin || AreAnyTouchesCapturedWithin;
+
     public PopupRoot(Popup popup, UIElement child, bool isLightDismiss)
     {
         OwnerPopup = popup;
@@ -28,7 +38,13 @@ internal sealed class PopupRoot : Decorator
 
         // PopupRoot itself should not capture focus — let child elements receive it
         Focusable = false;
-        IsHitTestVisible = true;
+
+        // Mirror the owner's hit-test policy onto the hosted surface. A tooltip popup is
+        // declared non-hit-testable precisely so it cannot steal hover from the element it
+        // describes; hard-coding true here made the overlay swallow the pointer, the owning
+        // element saw MouseLeave, the tooltip closed and immediately reopened — an endless
+        // flicker whenever the popup landed under the cursor.
+        IsHitTestVisible = popup.IsHitTestVisible;
 
         // Inherit DataContext from the Popup (not from OverlayLayer)
         DataContext = popup.DataContext;
@@ -61,6 +77,13 @@ internal sealed class PopupRoot : Decorator
     private void OnPreviewMouseDownHandler(object sender, MouseButtonEventArgs e)
     {
         OwnerPopup.SetIsMouseOver(true);
+    }
+
+    protected override Size MeasureOverride(Size constraint)
+    {
+        var desiredSize = base.MeasureOverride(constraint);
+        OwnerPopup.QueueContentSizeUpdate(this);
+        return desiredSize;
     }
 
     /// <summary>

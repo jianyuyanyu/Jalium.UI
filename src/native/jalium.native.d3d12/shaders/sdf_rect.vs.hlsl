@@ -16,11 +16,7 @@ struct Instance
     uint   gradientType;
     uint   stopCount;
     float4 gradGeom;
-    float4 stop01PosR;
-    float4 stop01AG;
-    float4 stop12BA;
-    float4 stop23GB;
-    float4 stop3Color;
+    uint4  gradientStopRef; // x=stopOffset
     float4 _pad;        // x=shapeType, y=shapeN, z=paintMode, w unused
     float4 xform0;      // m11, m12, m21, m22  (per-instance 2x3 affine)
     float4 xform1;      // dx, dy, _, _
@@ -45,13 +41,10 @@ struct VsOutput
     nointerpolation uint  gradientType : TEXCOORD4;
     nointerpolation uint  stopCount    : TEXCOORD5;
     nointerpolation float4 gradGeom    : TEXCOORD6;
-    nointerpolation float4 stop01PosR  : TEXCOORD7;
-    nointerpolation float4 stop01AG    : TEXCOORD8;
-    nointerpolation float4 stop12BA    : TEXCOORD9;
-    nointerpolation float4 stop23GB    : TEXCOORD10;
-    nointerpolation float4 stop3Color  : TEXCOORD11;
-    nointerpolation float4 shapeParams : TEXCOORD12; // x=shapeType, y=shapeN, z=shadowMode, w=paintMode
-    nointerpolation float  shadowSigma : TEXCOORD13; // gaussian sigma (screen px)
+    nointerpolation uint   stopOffset   : TEXCOORD7;
+    nointerpolation float4 shapeParams : TEXCOORD8;  // x=shapeType, y=shapeN, z=shadowMode, w=paintMode
+    nointerpolation float  shadowSigma : TEXCOORD9;  // gaussian sigma (screen px)
+    nointerpolation float  gradientOpacity : TEXCOORD10;
 };
 
 VsOutput main(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
@@ -115,14 +108,10 @@ VsOutput main(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
     else
         o.gradGeom = inst.gradGeom - float4(inst.position, inst.position);
 
-    float op = inst.opacity;
-    o.stop01PosR  = float4(inst.stop01PosR.x,       inst.stop01PosR.yzw * op);
-    o.stop01AG    = float4(inst.stop01AG.x * op,     inst.stop01AG.y,            inst.stop01AG.zw * op);
-    o.stop12BA    = float4(inst.stop12BA.xy * op,    inst.stop12BA.z,            inst.stop12BA.w * op);
-    o.stop23GB    = float4(inst.stop23GB.xy * op,    inst.stop23GB.z * op,       inst.stop23GB.w);
-    o.stop3Color  = inst.stop3Color * op;
+    o.stopOffset = inst.gradientStopRef.x;
     o.shapeParams = float4(inst._pad.xy, shadowMode, inst._pad.z);
     o.shadowSigma = shadowSigma;                      // gaussian sigma (screen px)
+    o.gradientOpacity = inst.opacity;
 
     return o;
 }

@@ -14,6 +14,8 @@ namespace Jalium.UI.Tests;
 /// <see cref="ImageDrawing"/>) and the render side (<see cref="SoftwareVectorRasterizer"/>
 /// actually blitting the decoded pixels into the SVG raster buffer).
 /// </summary>
+// SetDecoder is process-global; serialize with every other decoder-injecting class.
+[Collection("Application")]
 public class SvgEmbeddedImageTests
 {
     /// <summary>
