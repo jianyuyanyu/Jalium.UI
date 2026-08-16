@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using System.Reflection;
 using Jalium.UI.Controls;
 using Jalium.UI.Controls.Primitives;
+using Jalium.UI.Data;
 using Jalium.UI.Markup;
 
 namespace Jalium.UI.Tests;
@@ -302,6 +303,66 @@ public sealed class TemplatePartCacheStaleRegressionTests
         });
 
         AssertCachedPartReleasedOnTemplateClear(comboBox, template, "_popup");
+    }
+
+    [Fact]
+    public void ComboBox_ReplacingTemplateWhileOpen_LeavesOnlyTheReplacementPopupHosted()
+    {
+        Popup? firstPopup = null;
+        Popup? replacementPopup = null;
+
+        ControlTemplate PopupTemplate(Action<Popup> capture)
+        {
+            return TemplateWithRoot(typeof(ComboBox), () =>
+            {
+                var popup = new Popup
+                {
+                    Name = "PART_Popup",
+                    Child = new Border { Width = 180, Height = 80 },
+                    ShouldConstrainToRootBounds = true,
+                    StaysOpen = false,
+                };
+                popup.SetTemplateBinding(Popup.IsOpenProperty, ComboBox.IsDropDownOpenProperty);
+                capture(popup);
+
+                var grid = new Grid();
+                grid.Children.Add(new ToggleButton { Name = "PART_ToggleButton" });
+                grid.Children.Add(popup);
+                return grid;
+            });
+        }
+
+        var comboBox = new ComboBox
+        {
+            Width = 180,
+            Template = PopupTemplate(popup => firstPopup = popup),
+        };
+        var window = new Window
+        {
+            Width = 800,
+            Height = 600,
+            Content = comboBox,
+        };
+
+        RunLayout(window);
+        comboBox.IsDropDownOpen = true;
+        RunLayout(window);
+
+        Assert.NotNull(firstPopup);
+        Assert.True(firstPopup!.IsOpen);
+        Assert.NotNull(GetPrivateField(firstPopup, "_popupRoot"));
+        Assert.Single(window.OverlayLayer.Children.OfType<PopupRoot>());
+
+        comboBox.Template = PopupTemplate(popup => replacementPopup = popup);
+        RunLayout(window);
+
+        Assert.True(comboBox.IsDropDownOpen);
+        Assert.NotNull(replacementPopup);
+        Assert.True(replacementPopup!.IsOpen);
+        Assert.NotNull(GetPrivateField(replacementPopup, "_popupRoot"));
+        Assert.Single(window.OverlayLayer.Children.OfType<PopupRoot>());
+        Assert.False(firstPopup.IsOpen);
+        Assert.Null(GetPrivateField(firstPopup, "_popupRoot"));
     }
 
     [Fact]

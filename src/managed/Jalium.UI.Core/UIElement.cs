@@ -1158,6 +1158,12 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     // 守卫用它决定补测约束：测过用 _previousAvailableSize，从未测过时该字段还是
     // default(0,0)，必须改用本次槽尺寸。对应 WPF 的 NeverMeasured。
     private bool _neverMeasured = true;
+
+    /// <summary>
+    /// 本元素是否从未被 Measure 过。此前的一切布局产物（含容器生成）对外都不可观察：
+    /// 没有排布、没有渲染、没有上屏。构树期需要合并重复重建工作的控件用它作判据。
+    /// </summary>
+    internal bool HasNeverBeenMeasured => _neverMeasured;
     private Size _previousAvailableSize;
     private Rect _previousFinalRect;
     private IWindowHost? _cachedWindowHost;
@@ -1663,16 +1669,29 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     /// </summary>
     internal void InvalidateHostCaches()
     {
+        // screen-offset 缓存走的是**全局** epoch（见 InvalidateScreenOffsetCache 的注释：
+        // 一次 bump 就让进程内所有元素的缓存失效）。所以在下面的整棵子树递归里每个节点各
+        // bump 一次是纯浪费——n 次自增与 1 次完全等效，却要多付 n-1 次写和相应的缓存行颠簸。
+        // 整页视图替换时这条路径按 元素数 x 深度 反复走，把它提到递归外只做一次。
+        InvalidateScreenOffsetCache();
+        InvalidateHostCachesCore();
+    }
+
+    /// <summary>
+    /// <see cref="InvalidateHostCaches"/> 的递归体：只清每个元素自己的 host / layout-manager
+    /// 缓存。全局 screen-offset epoch 由外层入口统一 bump 一次，不在这里重复。
+    /// </summary>
+    private void InvalidateHostCachesCore()
+    {
         _cachedWindowHost = null;
         _cachedLayoutManager = null;
-        InvalidateScreenOffsetCache();
 
         // Recursively invalidate children's host caches too
         var count = VisualChildrenCount;
         for (int i = 0; i < count; i++)
         {
             if (GetVisualChild(i) is UIElement uiChild)
-                uiChild.InvalidateHostCaches();
+                uiChild.InvalidateHostCachesCore();
         }
     }
 
@@ -2654,6 +2673,21 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     /// Called when the BackdropEffect property changes.
     /// </summary>
     protected virtual void OnBackdropEffectChanged(IBackdropEffect? oldValue, IBackdropEffect? newValue)
+    {
+        if (oldValue is BackdropEffect oldEffect)
+        {
+            oldEffect.EffectChanged -= OnBackdropEffectPropertyChanged;
+        }
+
+        if (newValue is BackdropEffect newEffect)
+        {
+            newEffect.EffectChanged += OnBackdropEffectPropertyChanged;
+        }
+
+        InvalidateVisual();
+    }
+
+    private void OnBackdropEffectPropertyChanged(object? sender, EventArgs e)
     {
         InvalidateVisual();
     }
@@ -6697,6 +6731,31 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     {
         var visible = Visibility == Visibility.Visible &&
                       (VisualParent is not UIElement parent || parent.IsVisible);
+
+        // 值不变即整棵子树都不会变（WPF 语义）：IsVisible 是
+        // `Visibility == Visible && parent.IsVisible` 的纯函数，自上而下单调传播，
+        // 后代唯一的外部输入就是本节点的 IsVisible。所以本节点算出的值与当前值相同
+        // 时，后代的输入没变、它们自己的 Visibility 本次也没被改，结果必然不变——
+        // 继续下探纯属浪费。
+        //
+        // 值真会变的方向不满足这个条件，仍照常下探：Visibility 在 Visible 与
+        // Collapsed/Hidden 之间切换（本节点值必翻转）、以及跨 IsVisible 不同的父
+        // 重挂子树（同样翻转）。
+        //
+        // 这条短路要紧在于本方法挂在 OnVisualParentChanged 上（见 attach/detach 路径），
+        // 整页视图替换时旧树拆除 + 新树挂载会对每个节点各走一遍完整 SetValue 管线
+        // （含 bool 装箱与变更通知），而其中绝大多数节点的可见性根本没变。
+        //
+        // "从未刷过的新建节点" 不构成漏洞：短路只在算出的值等于当前值时发生，而当前值
+        // 此时就是 IsVisible 的默认值——两者相等意味着默认值已经是正确值，不刷也对。
+        // 若不相等（例如默认值与新父的可见性冲突）则不短路，照常刷完整棵子树。
+        // 声明期 Visibility=Collapsed 的节点也安全：设初值本身会触发 Visibility 的变更
+        // 回调，那里已调用本方法把该节点及其子树刷成 false。
+        if (IsVisible == visible)
+        {
+            return;
+        }
+
         SetValue(IsVisiblePropertyKey, visible);
         for (var index = 0; index < VisualChildrenCount; index++)
         {

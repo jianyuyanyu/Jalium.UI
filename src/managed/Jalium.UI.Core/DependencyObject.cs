@@ -13,20 +13,108 @@ public class DependencyObject : DispatcherObject
     [ThreadStatic]
     private static HashSet<(DependencyObject owner, DependencyProperty property)>? t_activeCoercions;
 
-    // Most dependency objects use only one value layer, while short-lived render objects often
-    // use none at all. Allocating every layer here made each Geometry/PathSegment carry eight empty
-    // dictionaries. Keep the cold layers absent until their first write.
-    private Dictionary<DependencyProperty, object?>? _localValues;
-    private Dictionary<DependencyProperty, object?>? _parentTemplateValues;
-    private Dictionary<DependencyProperty, object?>? _styleTriggerValues;
-    private Dictionary<DependencyProperty, object?>? _templateTriggerValues;
-    private Dictionary<DependencyProperty, object?>? _styleSetterValues;
-    private Dictionary<DependencyProperty, (object? value, BaseValueSource source)>? _currentValues;
+    // All non-default base-value layers share one sparse property index. A property with a
+    // single source stays inline; only genuine precedence conflicts allocate layered storage.
+    // Keeping the whole store null preserves the zero-allocation path for render primitives.
+    private DependencyValueStore? _valueStore;
     private Dictionary<DependencyProperty, BindingExpressionBase>? _bindings;
     private Dictionary<DependencyProperty, AnimatedPropertyValue>? _animatedValues;
     private Dictionary<DependencyProperty, Brush>? _mutableRenderBrushValues;
     private WeakReference<FrameworkElement>? _bindingMentor;
     private List<WeakReference<DependencyObject>>? _bindingMentees;
+
+    #region Binding reactivation epoch
+
+    // 一次模板展开（Control.ApplyTemplateCore / Page.RebuildVisualTree）会对同一批元素反复调用
+    // ReactivateBindings：
+    //   1. SetTemplatedParentRecursive 里每设一次 TemplatedParent 就调一次（首次激活，真活）；
+    //   2. AddVisualChild -> FrameworkElement.OnVisualParentChanged 对整棵可视子树再来一趟
+    //      （让 RelativeSource FindAncestor / 继承 DataContext 的绑定得以激活，也是真活）；
+    //   3. 紧接着 Control.ReactivateBindingsRecursive 又来一趟——这一趟对**已激活**的绑定只是
+    //      再跑一遍 UpdateTarget()，取到同样的源值写回同样的目标，纯属重复。
+    //
+    // 实测（Release，Button 主题模板 2 个元素 7 个 TemplateBinding，PageSwapCostBenchmarkTests
+    // .TemplateExpansion_PhaseBreakdown_IsMeasured）：第 3 趟单独就要 7.3-8.2 us / 次展开，而
+    // 三趟递归合计 21.4 us。整页替换里带模板控件是绝对主力，这笔重复不小。
+    //
+    // 这里用「展开轮次戳」把重复剪掉：一次展开开始时取一个全局唯一的 epoch，元素每次真正跑完
+    // ReactivateBindings 就把 epoch 记在自己身上；第 3 趟遇到本轮已经跑过的元素直接跳过它的
+    // 重算（**仍然继续遍历**，因为第 3 趟的价值正是去够到第 2 趟够不到的非可视子节点：
+    // Popup.Child、尚未进可视树的 Border.Child / ContentControl.Content / Panel.Children）。
+    //
+    // ★为什么这不是「延迟」：没有任何工作被推迟到 attach 之后——三趟依然全部在
+    // ApplyTemplateCore 返回之前完成，只是把其中可证明重复的那部分不再做第二遍。
+    // 框架契约「Children.Add() 返回时子树已按新 scope 重算」原样成立。
+    //
+    // epoch 用 long + Interlocked 递增，保证跨线程（多 UI 线程 / 多窗口）永不重号，
+    // 因此元素上的戳不会被另一线程的轮次误判为「本轮已算过」。
+    private static long s_bindingReactivationEpochCounter;
+
+    [ThreadStatic]
+    private static long t_currentBindingReactivationEpoch;
+
+    private long _bindingReactivationEpoch;
+
+    /// <summary>
+    /// 模板展开去重总开关，仅供基准测试把「开/关」两条路径在**同一个进程里交替测量**——
+    /// 跨进程的漂移（主题字典缓存冷热、GC 堆形态、JIT 分层）能达到 30%，远大于本优化本身的
+    /// 量级，只有同进程交替才能给出可信的对照。生产路径恒为 true。
+    /// <para>它同时管两件事：(1) 本文件的绑定重算轮次剪枝；(2) Control 三趟模板递归的环检测
+    /// 集合（没有它，Promote / ReactivateBindings 两趟会因为 Border/Panel 特例与可视子节点
+    /// 循环重叠而变成 O(2^depth)）。</para>
+    /// </summary>
+    internal static bool TemplateExpansionDedupEnabled { get; set; } = ReadTemplateExpansionDedupDefault();
+
+    /// <summary>
+    /// 默认开启；设 <c>JALIUM_TEMPLATE_EXPANSION_DEDUP=0</c> 可整进程关掉，用来在**不重新构建**
+    /// 的前提下把任意一条测试或整个测试套在「优化前/优化后」两种行为下各跑一遍做对照。
+    /// 排查「某个失败是不是本优化引入的」时这是最省事也最可靠的判据。
+    /// </summary>
+    private static bool ReadTemplateExpansionDedupDefault()
+    {
+        try
+        {
+            var value = Environment.GetEnvironmentVariable("JALIUM_TEMPLATE_EXPANSION_DEDUP");
+            return !string.Equals(value, "0", StringComparison.Ordinal);
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// 开启一次模板展开的绑定重算轮次，返回调用前的轮次值供调用方在 finally 中还原。
+    /// 嵌套展开（模板里的控件在本次展开过程中展开自己的模板）靠保存/还原来隔离：内层用自己的
+    /// 新 epoch，退出后外层的 epoch 原样恢复，外层元素身上的戳仍然有效。
+    /// </summary>
+    internal static long BeginBindingReactivationEpoch()
+    {
+        var previous = t_currentBindingReactivationEpoch;
+
+        // 关掉去重时把轮次置 0：WasBindingReactivationDoneInCurrentEpoch 恒 false，
+        // 于是第三趟照旧对每个元素重算，行为与优化前逐字一致。
+        t_currentBindingReactivationEpoch = TemplateExpansionDedupEnabled
+            ? Interlocked.Increment(ref s_bindingReactivationEpochCounter)
+            : 0L;
+        return previous;
+    }
+
+    /// <summary>还原 <see cref="BeginBindingReactivationEpoch"/> 之前的轮次。</summary>
+    internal static void EndBindingReactivationEpoch(long previous) =>
+        t_currentBindingReactivationEpoch = previous;
+
+    /// <summary>
+    /// 本元素是否已在当前展开轮次里跑过 <see cref="ReactivateBindings"/>。
+    /// 不在任何展开轮次中（epoch 为 0）时恒为 false——这样非模板路径的行为完全不变。
+    /// </summary>
+    internal bool WasBindingReactivationDoneInCurrentEpoch()
+    {
+        var epoch = t_currentBindingReactivationEpoch;
+        return epoch != 0 && _bindingReactivationEpoch == epoch;
+    }
+
+    #endregion
 
     // Source-compatibility shims for Jalium's historical public Visual tree surface. They are
     // deliberately fields (and a callable delegate field), so metadata verification sees only
@@ -164,10 +252,10 @@ public class DependencyObject : DispatcherObject
                     owner.SetLocalValueCore(dp, Value);
                     return true;
                 case ValueMutationKind.SetLocalDirect:
-                    (owner._localValues ??= new())[dp] = Value;
+                    owner.SetStoredValue(dp, DependencyValueStore.Layer.Local, Value);
                     return true;
                 case ValueMutationKind.SetCurrent:
-                    (owner._currentValues ??= new())[dp] = (Value, BaseSource);
+                    owner.SetStoredValue(dp, DependencyValueStore.Layer.Current, Value, BaseSource);
                     return true;
                 case ValueMutationKind.SetLayer:
                     owner.SetLayerValueCore(dp, Value, LayerSource);
@@ -283,7 +371,7 @@ public class DependencyObject : DispatcherObject
     public bool HasLocalValue(DependencyProperty dp)
     {
         ArgumentNullException.ThrowIfNull(dp);
-        return _localValues?.ContainsKey(dp) == true;
+        return _valueStore?.ContainsLayer(dp, DependencyValueStore.Layer.Local) == true;
     }
 
     /// <summary>
@@ -294,7 +382,11 @@ public class DependencyObject : DispatcherObject
     public object? ReadLocalValue(DependencyProperty dp)
     {
         ArgumentNullException.ThrowIfNull(dp);
-        if (_localValues?.TryGetValue(dp, out var value) == true)
+        if (_valueStore?.TryGetLayer(
+                dp,
+                DependencyValueStore.Layer.Local,
+                out var value,
+                out _) == true)
         {
             return value;
         }
@@ -638,6 +730,10 @@ public class DependencyObject : DispatcherObject
     /// </summary>
     internal void ReactivateBindings()
     {
+        // 记下本轮已重算，供模板展开的第三趟剪枝（见 Binding reactivation epoch 一节）。
+        // 无条件写入：非展开期 epoch 为 0，写 0 等于把戳清掉，下次展开不会误判为已算过。
+        _bindingReactivationEpoch = t_currentBindingReactivationEpoch;
+
         if (_bindings is { } bindings)
         {
             foreach (var expression in bindings.Values)
@@ -726,7 +822,8 @@ public class DependencyObject : DispatcherObject
     /// </summary>
     public LocalValueEnumerator GetLocalValueEnumerator()
     {
-        var entries = _localValues?
+        var entries = _valueStore?
+            .SnapshotLayer(DependencyValueStore.Layer.Local)
             .Select(static pair => new LocalValueEntry(pair.Key, pair.Value))
             .ToArray() ?? Array.Empty<LocalValueEntry>();
         return new LocalValueEnumerator(entries);
@@ -752,7 +849,7 @@ public class DependencyObject : DispatcherObject
     protected internal virtual bool ShouldSerializeProperty(DependencyProperty dp)
     {
         ArgumentNullException.ThrowIfNull(dp);
-        return _localValues?.ContainsKey(dp) == true;
+        return _valueStore?.ContainsLayer(dp, DependencyValueStore.Layer.Local) == true;
     }
 
     /// <summary>
@@ -761,19 +858,27 @@ public class DependencyObject : DispatcherObject
     /// </summary>
     internal void PromoteLocalValuesToLayer(LayerValueSource source)
     {
-        if (_localValues is not { Count: > 0 } localValues)
+        if (_valueStore is not { Count: > 0 } valueStore)
             return;
 
         var mappedSource = MapLayerValueSource(source);
-        var entries = localValues.ToArray();
+        var entries = valueStore.SnapshotLayer(DependencyValueStore.Layer.Local);
+        if (entries.Length == 0)
+            return;
 
         foreach (var (dp, localValue) in entries)
         {
             var oldValue = GetValue(dp);
 
-            localValues.Remove(dp);
-            if (_currentValues?.TryGetValue(dp, out var current) == true && current.source == mappedSource)
-                RemoveStoredValue(ref _currentValues, dp);
+            RemoveStoredValue(dp, DependencyValueStore.Layer.Local);
+            if (_valueStore?.TryGetLayer(
+                    dp,
+                    DependencyValueStore.Layer.Current,
+                    out _,
+                    out var currentSource) == true && currentSource == mappedSource)
+            {
+                RemoveStoredValue(dp, DependencyValueStore.Layer.Current);
+            }
 
             // Never promote a null local onto a non-nullable value-type layer (mirrors the
             // SetLayerValueCore backstop, which this direct-write loop bypasses): drop it so the
@@ -784,23 +889,7 @@ public class DependencyObject : DispatcherObject
                 dp.IsValidType(localValue) &&
                 dp.IsValidValue(localValue))
             {
-                switch (source)
-                {
-                    case LayerValueSource.ParentTemplate:
-                        (_parentTemplateValues ??= new())[dp] = localValue;
-                        break;
-                    case LayerValueSource.StyleTrigger:
-                        (_styleTriggerValues ??= new())[dp] = localValue;
-                        break;
-                    case LayerValueSource.TemplateTrigger:
-                        (_templateTriggerValues ??= new())[dp] = localValue;
-                        break;
-                    case LayerValueSource.StyleSetter:
-                        (_styleSetterValues ??= new())[dp] = localValue;
-                        break;
-                    default:
-                        throw new ArgumentOutOfRangeException(nameof(source), source, null);
-                }
+                SetStoredValue(dp, MapStoreLayer(source), localValue);
             }
 
             var newValue = GetValue(dp);
@@ -808,8 +897,6 @@ public class DependencyObject : DispatcherObject
                 OnPropertyChanged(new DependencyPropertyChangedEventArgs(dp, oldValue, newValue));
         }
 
-        if (localValues.Count == 0 && ReferenceEquals(_localValues, localValues))
-            _localValues = null;
     }
 
     /// <summary>
@@ -1066,20 +1153,16 @@ public class DependencyObject : DispatcherObject
             state.IsExpression,
             state.IsAnimated,
             state.IsCoerced,
-            _currentValues?.ContainsKey(dp) == true);
+            _valueStore?.ContainsLayer(dp, DependencyValueStore.Layer.Current) == true);
     }
 
     internal bool HasValueAboveInherited(DependencyProperty dp)
     {
         ArgumentNullException.ThrowIfNull(dp);
-        if (_animatedValues?.ContainsKey(dp) == true || _localValues?.ContainsKey(dp) == true)
+        if (_animatedValues?.ContainsKey(dp) == true || _valueStore?.HasAnyLayer(dp) == true)
             return true;
 
-        return _parentTemplateValues?.ContainsKey(dp) == true
-               || _styleTriggerValues?.ContainsKey(dp) == true
-               || _templateTriggerValues?.ContainsKey(dp) == true
-               || _styleSetterValues?.ContainsKey(dp) == true
-               || _currentValues?.ContainsKey(dp) == true;
+        return false;
     }
 
     internal bool TryGetLayerValue(
@@ -1088,17 +1171,8 @@ public class DependencyObject : DispatcherObject
         out object? value)
     {
         ArgumentNullException.ThrowIfNull(dp);
-        Dictionary<DependencyProperty, object?>? values = source switch
-        {
-            LayerValueSource.ParentTemplate => _parentTemplateValues,
-            LayerValueSource.StyleTrigger => _styleTriggerValues,
-            LayerValueSource.TemplateTrigger => _templateTriggerValues,
-            LayerValueSource.StyleSetter => _styleSetterValues,
-            _ => throw new ArgumentOutOfRangeException(nameof(source), source, null)
-        };
-
-        if (values != null && values.TryGetValue(dp, out value))
-            return true;
+        if (_valueStore is { } store)
+            return store.TryGetLayer(dp, MapStoreLayer(source), out value, out _);
 
         value = null;
         return false;
@@ -1183,23 +1257,10 @@ public class DependencyObject : DispatcherObject
 
     internal virtual (object? value, BaseValueSource source) GetUncoercedBaseValueInternal(DependencyProperty dp)
     {
-        if (_localValues?.TryGetValue(dp, out var local) == true)
-            return (local, BaseValueSource.Local);
-
-        if (_templateTriggerValues?.TryGetValue(dp, out var templateTrigger) == true)
-            return (templateTrigger, BaseValueSource.TemplateTrigger);
-
-        if (_styleTriggerValues?.TryGetValue(dp, out var styleTrigger) == true)
-            return (styleTrigger, BaseValueSource.StyleTrigger);
-
-        if (_parentTemplateValues?.TryGetValue(dp, out var parentTemplate) == true)
-            return (parentTemplate, BaseValueSource.ParentTemplate);
-
-        if (_styleSetterValues?.TryGetValue(dp, out var styleSetter) == true)
-            return (styleSetter, BaseValueSource.Style);
-
-        if (_currentValues?.TryGetValue(dp, out var current) == true)
-            return current;
+        // The store maintains the winning precedence contribution as layers mutate,
+        // reducing this render/layout hot path to one property-index lookup.
+        if (_valueStore?.TryGetEffective(dp, out var value, out var source) == true)
+            return (value, source);
 
         // GetEffectiveDefaultValue (not the raw metadata DefaultValue) guarantees a non-nullable
         // value-type property never resolves to null here — a DP mis-registered with a null/absent
@@ -1347,15 +1408,20 @@ public class DependencyObject : DispatcherObject
             return;
         }
 
-        if (_currentValues?.TryGetValue(dp, out var current) == true && current.source == BaseValueSource.Local)
+        if (_valueStore?.TryGetLayer(
+                dp,
+                DependencyValueStore.Layer.Current,
+                out _,
+                out var currentSource) == true && currentSource == BaseValueSource.Local)
         {
-            RemoveStoredValue(ref _currentValues, dp);
+            RemoveStoredValue(dp, DependencyValueStore.Layer.Current);
         }
 
-        (_localValues ??= new())[dp] = value;
+        SetStoredValue(dp, DependencyValueStore.Layer.Local, value);
     }
 
-    private bool ClearLocalValueCore(DependencyProperty dp) => RemoveStoredValue(ref _localValues, dp);
+    private bool ClearLocalValueCore(DependencyProperty dp) =>
+        RemoveStoredValue(dp, DependencyValueStore.Layer.Local);
 
     // A null can never be the effective value of a non-nullable value-type dependency property:
     // the generated CLR accessor unboxes it (e.g. (Thickness)GetValue(BorderThicknessProperty)) and
@@ -1383,40 +1449,41 @@ public class DependencyObject : DispatcherObject
         }
 
         var mappedSource = MapLayerValueSource(source);
-        if (_currentValues?.TryGetValue(dp, out var current) == true && current.source == mappedSource)
+        if (_valueStore?.TryGetLayer(
+                dp,
+                DependencyValueStore.Layer.Current,
+                out _,
+                out var currentSource) == true && currentSource == mappedSource)
         {
-            RemoveStoredValue(ref _currentValues, dp);
+            RemoveStoredValue(dp, DependencyValueStore.Layer.Current);
         }
 
-        switch (source)
-        {
-            case LayerValueSource.ParentTemplate:
-                (_parentTemplateValues ??= new())[dp] = value;
-                break;
-            case LayerValueSource.StyleTrigger:
-                (_styleTriggerValues ??= new())[dp] = value;
-                break;
-            case LayerValueSource.TemplateTrigger:
-                (_templateTriggerValues ??= new())[dp] = value;
-                break;
-            case LayerValueSource.StyleSetter:
-                (_styleSetterValues ??= new())[dp] = value;
-                break;
-            default:
-                throw new ArgumentOutOfRangeException(nameof(source), source, null);
-        }
+        SetStoredValue(dp, MapStoreLayer(source), value);
     }
 
     private bool ClearLayerValueCore(DependencyProperty dp, LayerValueSource source)
     {
-        return source switch
-        {
-            LayerValueSource.ParentTemplate => RemoveStoredValue(ref _parentTemplateValues, dp),
-            LayerValueSource.StyleTrigger => RemoveStoredValue(ref _styleTriggerValues, dp),
-            LayerValueSource.TemplateTrigger => RemoveStoredValue(ref _templateTriggerValues, dp),
-            LayerValueSource.StyleSetter => RemoveStoredValue(ref _styleSetterValues, dp),
-            _ => throw new ArgumentOutOfRangeException(nameof(source), source, null)
-        };
+        return RemoveStoredValue(dp, MapStoreLayer(source));
+    }
+
+    private void SetStoredValue(
+        DependencyProperty dp,
+        DependencyValueStore.Layer layer,
+        object? value,
+        BaseValueSource currentSource = BaseValueSource.Unknown)
+    {
+        (_valueStore ??= new DependencyValueStore()).SetLayer(dp, layer, value, currentSource);
+    }
+
+    private bool RemoveStoredValue(DependencyProperty dp, DependencyValueStore.Layer layer)
+    {
+        var store = _valueStore;
+        if (store is null || !store.RemoveLayer(dp, layer))
+            return false;
+
+        if (store.Count == 0 && ReferenceEquals(_valueStore, store))
+            _valueStore = null;
+        return true;
     }
 
     private static bool RemoveStoredValue<TValue>(
@@ -1432,6 +1499,15 @@ public class DependencyObject : DispatcherObject
 
         return true;
     }
+
+    private static DependencyValueStore.Layer MapStoreLayer(LayerValueSource source) => source switch
+    {
+        LayerValueSource.ParentTemplate => DependencyValueStore.Layer.ParentTemplate,
+        LayerValueSource.StyleTrigger => DependencyValueStore.Layer.StyleTrigger,
+        LayerValueSource.TemplateTrigger => DependencyValueStore.Layer.TemplateTrigger,
+        LayerValueSource.StyleSetter => DependencyValueStore.Layer.StyleSetter,
+        _ => throw new ArgumentOutOfRangeException(nameof(source), source, null),
+    };
 
     private static BaseValueSource MapLayerValueSource(LayerValueSource source) =>
         source switch
@@ -1452,32 +1528,16 @@ public class DependencyObject : DispatcherObject
     // Transform…) 的属性几乎都经 CLR 包装器 SetValue 落到 _localValues，因此 base 克隆
     // 枚举 _localValues 即与 WPF 行为一致。返回 (dp, 原始 base 值) 包含显式 null。
     internal KeyValuePair<DependencyProperty, object?>[] GetLocalValueEntriesInternal()
-        => _localValues?.ToArray() ?? Array.Empty<KeyValuePair<DependencyProperty, object?>>();
+        => _valueStore?.SnapshotLayer(DependencyValueStore.Layer.Local)
+           ?? Array.Empty<KeyValuePair<DependencyProperty, object?>>();
 
     // CloneCurrentValue / FreezeCore 需要"所有高于默认值的有效属性"集合，对应 WPF 的
     // EffectiveValues 数组（不含纯默认值）。排除纯 Inherited 值，避免把继承值烤进克隆体
     // （Freezable 极少参与属性继承），但保留 SetCurrentValue 写出的 modified-default。
     internal DependencyProperty[] GetEffectiveSetPropertiesInternal()
     {
-        var set = new HashSet<DependencyProperty>();
-        if (_localValues is not null)
-            foreach (var k in _localValues.Keys) set.Add(k);
-        if (_parentTemplateValues is not null)
-            foreach (var k in _parentTemplateValues.Keys) set.Add(k);
-        if (_styleTriggerValues is not null)
-            foreach (var k in _styleTriggerValues.Keys) set.Add(k);
-        if (_templateTriggerValues is not null)
-            foreach (var k in _templateTriggerValues.Keys) set.Add(k);
-        if (_styleSetterValues is not null)
-            foreach (var k in _styleSetterValues.Keys) set.Add(k);
-        if (_currentValues is not null)
-        {
-            foreach (var kv in _currentValues)
-            {
-                if (kv.Value.source != BaseValueSource.Inherited)
-                    set.Add(kv.Key);
-            }
-        }
+        var set = new HashSet<DependencyProperty>(
+            _valueStore?.SnapshotEffectiveProperties() ?? Array.Empty<DependencyProperty>());
         if (_animatedValues is not null)
             foreach (var k in _animatedValues.Keys) set.Add(k);
         var result = new DependencyProperty[set.Count];

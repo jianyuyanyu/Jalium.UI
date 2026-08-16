@@ -467,7 +467,24 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
     /// <summary>
     /// Sets the templated parent. This is called internally when applying templates.
     /// </summary>
-    internal void SetTemplatedParent(FrameworkElement? parent)
+    internal void SetTemplatedParent(FrameworkElement? parent) =>
+        SetTemplatedParent(parent, reactivateBindings: true);
+
+    /// <summary>
+    /// Sets the templated parent. This is called internally when applying templates.
+    /// </summary>
+    /// <param name="parent">The element that owns the template this element belongs to.</param>
+    /// <param name="reactivateBindings">
+    /// 是否顺带重算本元素的绑定。
+    /// <para>只有当调用方能保证「本次调用返回后、控制权交还给应用代码之前，必定还会有一趟覆盖
+    /// 本元素的绑定重算」时才可传 false。目前唯一这样的调用方是模板展开
+    /// （<c>Control.ApplyTemplateCore</c> / <c>Page.RebuildVisualTree</c>）：它在设完
+    /// TemplatedParent 之后**立刻** <c>AddVisualChild(templateRoot)</c>，由
+    /// <see cref="OnVisualParentChanged"/> 对整棵可视子树重算一遍；够不到的非可视子节点
+    /// （Popup.Child 等）再由随后的 <c>Control.ReactivateBindingsRecursive</c> 兜住。
+    /// 于是同一批元素从「重算三遍」降到「重算一遍」，而三趟依然全部在模板展开返回前完成。</para>
+    /// </summary>
+    internal void SetTemplatedParent(FrameworkElement? parent, bool reactivateBindings)
     {
         var oldParent = _templatedParent;
         _templatedParent = parent;
@@ -480,7 +497,7 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
 
         // Reactivate bindings now that TemplatedParent is set.
         // This allows deferred template bindings (TemplateBinding) to resolve.
-        if (parent != null)
+        if (parent != null && reactivateBindings)
         {
             ReactivateBindings();
         }
@@ -852,6 +869,18 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
     /// 用于资源快照 / 诊断等场景，避免对每个元素都生成空字典污染查找。
     /// </summary>
     internal bool HasResources => _resources != null && _resources.Count > 0;
+
+    /// <summary>
+    /// 本地 Resources 字典；未实例化时返回 <see langword="null"/>。
+    ///
+    /// <para>框架内部的资源查找必须走这里，不得走 <see cref="Resources"/>。
+    /// 那个 getter 带懒构造副作用（new 字典 + 订阅 Changed + 注册诊断 owner），
+    /// 于是「沿祖先链探测有无本地资源」这种纯只读遍历会给**每个经过的元素**都
+    /// 实体化一个空字典——把 O(1) 的探测变成 O(祖先数) 的分配，并让后续查找
+    /// 每级多探一个恒空的字典。整页视图替换时这一项按元素数线性放大。</para>
+    /// </summary>
+    internal ResourceDictionary? ResourcesOrNull => _resources;
+
 
     /// <summary>
     /// Gets or sets the locally-defined resource dictionary.
@@ -1316,16 +1345,12 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
         var previousVisualBounds = _visualBounds;
         _visualBounds = new Rect(x, y, renderSize.Width, renderSize.Height);
 
-        // A layout pass that changed this element's position OR size makes any
-        // retained-mode drawing cache (Visual._cachedDrawing) stale: OnRender was
-        // recorded against the OLD bounds (or was empty when the element had not
-        // been arranged yet — the classic "text is blank until you hover" bug,
-        // where the first OnRender ran pre-layout, produced an empty command list,
-        // and RenderDirect kept replaying it because nothing flipped _isRenderDirty).
-        // Invalidate render so the cache re-records against the new bounds on the
-        // next render pass. This does NOT snap layout to the pixel grid — bounds
-        // stay continuous float for smooth animation; we only mark the cache dirty.
-        // Stable layouts don't change bounds, so the cache still replays for them.
+        // OnRender records in element-local coordinates. A size change can alter
+        // those commands (and covers the first 0x0 -> arranged pass that once left
+        // text blank), so it invalidates the retained drawing. A position-only
+        // change does not: the parent applies the current child offset while
+        // replaying/compositing. Treating WrapPanel reflow as content damage made
+        // every moved card discard both its drawing and GPU layer each resize tick.
         if (_visualBounds != previousVisualBounds)
         {
             // ArrangeOverride runs before this element's final parent-space bounds are
@@ -1340,7 +1365,11 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
             {
                 InvalidateScreenOffsetCache();
             }
-            SetRenderDirty();
+            if (_visualBounds.Width != previousVisualBounds.Width ||
+                _visualBounds.Height != previousVisualBounds.Height)
+            {
+                SetRenderDirty();
+            }
         }
 
         // Update _renderSize BEFORE firing SizeChanged so that handlers
@@ -1722,6 +1751,9 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
         // after being added to the visual tree
         if (VisualParent != null)
         {
+            // 在 Consume 之前记下 marker：它内部会清除标记，而下面的 scope 重算需要知道
+            // 「这是一次虚拟化回收重挂」以便保持完整刷新语义。
+            var hadVirtualizationRecycleMarker = _virtualizationRecycleParent != null;
             var isSameScopeVirtualizationReattach = ConsumeVirtualizationReattachFastPath();
 
             // Re-evaluate implicit styles for this entire subtree.
@@ -1732,25 +1764,31 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
             // yet. When the subtree is later connected to the full tree, we must
             // re-evaluate so that closer-scope user-defined implicit styles take
             // precedence over theme styles.
+            //
+            // ★ 这三趟必须在 attach 返回前完成，不能推迟到 Measure：框架的既定契约是
+            // 「Children.Add() 返回时子树已按新 scope 重算」，且该契约有回归测试钉死
+            // （DynamicResourceLayeredTests.InlineDynamicResource_OnDetachedElement_
+            // ResolvesWhenAttachedToAncestorWithResource、ChartTests.LineChart_SeriesBinding_
+            // ResolvesWhenDetachedSubtreeIsAttached 等），对应真实 bug「内联
+            // {DynamicResource} 在游离元素上解析为 null 后永不恢复 → 图标画不出来」。
+            // 那些用例里的宿主自身也是游离的，所以「等接入 host 再算」同样不满足契约。
+            //
+            // 代价是 attach 期的子树重算为 O(n x depth)（源生成器 bottom-up 构树，深度 d
+            // 的节点被 d 个祖先各重扫一遍）。实测见 PageSwapCostBenchmarkTests：元素数固定
+            // 800、深度 4→40，一次换页 23.74ms→194.24ms。根治方向是让源生成器改为 top-down
+            // 构树（先挂父再填子，届时子树为空，每次 attach 天然 O(1)，与 WPF/Avalonia 一致），
+            // 而不是削弱这里的语义。
+            // 与之配套的还有内联 DynamicResource 的重解析，两者走同一条查找路径，因此合并到
+            // 一趟 DFS 里（RescopeSubtreeAfterAttach），并带上「祖先链无资源即可剪掉已重算过的
+            // 子树」的等价判据——见该方法上方的推导。合并本身也把两次全子树遍历省成一次。
+            //
+            // 内联 DynamicResource 为什么必须在 attach 时重解析：<Path Stroke="{DynamicResource
+            // ...}"> 这类写法只在构造时解析一次，若当时 key 不可达（Application.Current 或带
+            // 该 key 的祖先尚未接入）就会解析成 null，而 Shape.Stroke/Fill 默认就是 null，
+            // 于是图形什么都不画且永不自愈。这与 WPF 在树变化时重新求值资源引用一致。
             if (!isSameScopeVirtualizationReattach)
             {
-                ReEvaluateImplicitStylesRecursive(this);
-            }
-
-            // Re-resolve dynamic resources for this entire subtree, for the SAME reason the
-            // implicit-style pass above runs: attaching to a visual parent widens the
-            // resource-lookup scope to include ancestor / application resources that were
-            // unreachable while the subtree was detached. A {DynamicResource} written inline
-            // as element content (e.g. <Path Stroke="{DynamicResource ...}">) is resolved
-            // only once, at construction time. If it resolved to null then — because
-            // Application.Current / its resources were not yet reachable at that instant —
-            // it would otherwise stay null forever (Shape.Stroke/Fill default to null, so
-            // the shape simply draws nothing), since nothing re-resolves inline dynamic
-            // resources on attach. This mirrors WPF, which re-evaluates resource references
-            // when the tree changes.
-            if (!isSameScopeVirtualizationReattach)
-            {
-                RefreshDynamicResourcesRecursive(this);
+                RescopeSubtreeAfterAttach(hadVirtualizationRecycleMarker);
             }
 
             // Recursively reactivate bindings on this element and ALL descendants,
@@ -2069,12 +2107,71 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
     /// Looks up the implicit style for this element by walking up the type
     /// hierarchy and searching resources.
     /// </summary>
+    // 隐式样式查找的「无作用域」缓存。
+    //
+    // 动机（实测）：整页构建时样式/资源解析占 parenting 成本的 57%（约 4.6 µs/元素）。
+    // 每个元素要做 3-4 次 TryFindResource（DefaultStyleKey + 类型继承链），而
+    // ResourceLookup 的 memo 以**元素身份**为 key —— 于是一页里几百个 TextBlock 会把同一个
+    // 查找各做一遍，缓存完全帮不上忙。
+    //
+    // 等价判据（与 attach 期剪枝同源）：元素的祖先链上没有任何本地资源时，查找必然一路落到
+    // 全局 ApplicationResourceLookup，结果只取决于 key 与资源内容，**与元素身份无关**。
+    // 这种情况下整页同类元素可以共享一次查找结果。
+    //
+    // 失效用 ResourceDictionary.ContentGeneration（只在资源内容真变时递增），线程隔离用
+    // [ThreadStatic]，与框架既有的两个缓存同构。
+    [ThreadStatic]
+    private static Dictionary<object, object?>? t_scopelessResourceCache;
+    [ThreadStatic]
+    private static int t_scopelessResourceGeneration;
+
+    private const int MaxScopelessResourceCacheEntries = 4096;
+
+    /// <summary>
+    /// 隐式样式解析专用的资源查找：祖先链无本地资源时走进程内共享缓存，否则退回按元素查找。
+    /// </summary>
+    private object? LookupResourceForImplicitStyle(object key, bool scopeless)
+    {
+        if (!scopeless)
+        {
+            return TryFindResource(key);
+        }
+
+        var generation = ResourceDictionary.ContentGeneration;
+        var cache = t_scopelessResourceCache;
+        if (cache is null)
+        {
+            cache = t_scopelessResourceCache = new Dictionary<object, object?>();
+            t_scopelessResourceGeneration = generation;
+        }
+        else if (t_scopelessResourceGeneration != generation)
+        {
+            cache.Clear();
+            t_scopelessResourceGeneration = generation;
+        }
+        else if (cache.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
+        var result = TryFindResource(key);
+        if (cache.Count < MaxScopelessResourceCacheEntries)
+        {
+            cache[key] = result;
+        }
+
+        return result;
+    }
+
     private Style? LookupImplicitStyle()
     {
+        // 一次 O(depth) 的字段读，换掉下面 3-4 次完整查找里各自的祖先链遍历与字典操作。
+        var scopeless = !HasResourceBearingAncestor();
+
         var defaultStyleKey = DefaultStyleKey;
         if (defaultStyleKey != null)
         {
-            var keyedStyle = TryFindResource(defaultStyleKey) as Style;
+            var keyedStyle = LookupResourceForImplicitStyle(defaultStyleKey, scopeless) as Style;
             if (keyedStyle != null && IsStyleApplicable(keyedStyle))
             {
                 return keyedStyle;
@@ -2089,7 +2186,7 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
         var currentType = GetType();
         while (currentType != null && currentType != typeof(FrameworkElement))
         {
-            var style = TryFindResource(currentType) as Style;
+            var style = LookupResourceForImplicitStyle(currentType, scopeless) as Style;
             if (style != null && IsStyleApplicable(style))
                 return style;
             currentType = currentType.BaseType;
@@ -2115,6 +2212,159 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
             if (child != null)
             {
                 ReEvaluateImplicitStylesRecursive(child);
+            }
+        }
+    }
+
+    // ── attach 期 scope 重算的剪枝 ─────────────────────────────────────────
+    //
+    // 隐式样式与内联 DynamicResource 走的是同一条查找路径（FindResourceCore 沿
+    // FrameworkParent 链逐级探 Resources / Style.Resources，走完落到全局的
+    // ApplicationResourceLookup）。由此可得一条**精确**的等价判据：
+    //
+    //   若某元素的整条祖先链上没有任何本地资源，它这两项的解析结果只取决于全局
+    //   Application 资源——与它挂在树的哪个位置无关。
+    //
+    // 于是当一次 attach 没有引入任何带资源的祖先时，子树里「已经在同一份资源内容下、
+    // 且同样没有资源祖先的情况下重算过」的节点，结果不可能改变，可以整棵剪掉。
+    //
+    // 这消除了 bottom-up 构树的 O(n x depth)：深度 d 的节点原本被 d 个祖先的 attach
+    // 各重扫一遍，现在从第二次起即被剪枝，总成本回到 O(n)。而祖先带资源时（框架契约
+    // 用例正是这个形状：host.Resources["X"]=... 之后 host.Children.Add(child)）判据为
+    // 真，照常做完整的全子树重算，语义分毫不变。
+    //
+    // 两个记录缺一不可：
+    //   _resourceScopeStamp —— 上次重算时的资源**内容**版本（ResourceDictionary.
+    //     ContentGeneration；不能用 ResourceLookup.CacheGeneration，那个被逻辑父变更
+    //     污染得几乎每步都变）。资源内容一变就必须重算。
+    //   _rescopedWithResourceAncestor —— 上次重算时链上**是否**有资源祖先。用于处理
+    //     scope **变窄**：元素原本在带资源的祖先下解析出了近作用域样式，被移到没有资源
+    //     祖先的位置时结果应当回退，此时不能剪枝。
+    private int _resourceScopeStamp = -1;
+    private bool _rescopedWithResourceAncestor;
+
+    /// <summary>
+    /// 本元素的祖先链上是否存在任何本地资源（含 Style.Resources）。
+    /// </summary>
+    private bool HasResourceBearingAncestor()
+    {
+        var redirect = ResourceLookup.AncestorRedirectLookup;
+        var depth = 0;
+        var current = NextResourceScopeAncestor(this, redirect);
+
+        while (current != null && depth++ < 2048)
+        {
+            if (current.HasResources)
+            {
+                return true;
+            }
+
+            if (current.Style?.ResourcesOrNull is { Count: > 0 })
+            {
+                return true;
+            }
+
+            current = NextResourceScopeAncestor(current, redirect);
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 按 <see cref="ResourceLookup.FindResourceCore"/> 的同一套规则取下一级资源作用域祖先：
+    /// 先给控件层一次机会把查找重定向到非可视祖先（例如 PopupRoot 回落到 Popup 的 owner），
+    /// 否则走 <see cref="FrameworkParent"/>。
+    ///
+    /// <para>必须与查找路径逐跳一致——判据一旦和真实查找走不同的链，剪枝就会漏掉真正改变了
+    /// 解析结果的祖先。注意 <see cref="ResourceLookup.AncestorRedirectLookup"/> 在 Application
+    /// 初始化时就被无条件赋值，所以「非 null 即放弃剪枝」等于永不剪枝，必须真的调用它。</para>
+    /// </summary>
+    private static FrameworkElement? NextResourceScopeAncestor(
+        FrameworkElement current,
+        Func<FrameworkElement, FrameworkElement?>? redirect)
+    {
+        FrameworkElement? next = null;
+        if (redirect != null)
+        {
+            next = redirect(current);
+            if (ReferenceEquals(next, current))
+            {
+                next = null;
+            }
+        }
+
+        return next ?? current.FrameworkParent;
+    }
+
+    /// <summary>
+    /// attach 后重算本子树的隐式样式与内联 DynamicResource，带上述剪枝。
+    /// </summary>
+    private void RescopeSubtreeAfterAttach(bool forceFullRescope)
+    {
+        // forceFullRescope：容器刚从虚拟化回收池里出来（带过 recycle marker）但没能走成
+        // 同 scope 快路径。这条路径的既定契约是「回退到完整递归刷新」，有测试钉死
+        // （VirtualizationRecycleResourceScopeTests.DifferentPanelReattach_
+        // FallsBackToFullRecursiveRefresh）。剪枝只作用于普通构树路径——那才是
+        // bottom-up 构建页面时 O(n x depth) 的来源。
+        var chainHasResources = forceFullRescope || HasResourceBearingAncestor();
+
+        RescopeSubtreeRecursive(
+            this,
+            chainHasResources,
+            ResourceDictionary.ContentGeneration,
+            ResourceLookup.AncestorRedirectLookup);
+    }
+
+    private static void RescopeSubtreeRecursive(
+        Visual visual,
+        bool chainHasResources,
+        int stamp,
+        Func<FrameworkElement, FrameworkElement?>? redirect)
+    {
+        if (visual is FrameworkElement fe)
+        {
+            // 子树内部若有节点的资源作用域被重定向到树外（PopupRoot → Popup owner），
+            // 「按树结构累加祖先资源」这个判据对它不成立——它的 scope 不由这棵子树决定。
+            // 保守地当作有资源祖先，对它及其后代退回全量重算。
+            if (redirect != null && !chainHasResources)
+            {
+                var redirected = redirect(fe);
+                if (redirected is not null &&
+                    !ReferenceEquals(redirected, fe) &&
+                    !ReferenceEquals(redirected, fe.FrameworkParent))
+                {
+                    chainHasResources = true;
+                }
+            }
+
+            // 剪枝：本次没有引入带资源的祖先，且该节点已在同样「无资源祖先 + 同一份资源
+            // 内容」的条件下重算过 —— 它与整棵子树的解析结果都不会变。
+            // （子树内部的资源分布没变，所以后代的判据同样成立，可以安全整棵跳过。）
+            if (!chainHasResources &&
+                !fe._rescopedWithResourceAncestor &&
+                fe._resourceScopeStamp == stamp)
+            {
+                return;
+            }
+
+            fe.ReEvaluateImplicitStyle();
+            DynamicResourceBindingOperations.RefreshElement(fe);
+
+            fe._resourceScopeStamp = stamp;
+            fe._rescopedWithResourceAncestor = chainHasResources;
+
+            // 往下传递时把本节点自己的资源计入：对后代而言它也是祖先。
+            chainHasResources = chainHasResources
+                || fe.HasResources
+                || fe.Style?.ResourcesOrNull is { Count: > 0 };
+        }
+
+        for (int i = 0; i < visual.InternalVisualChildrenCount; i++)
+        {
+            var child = visual.InternalGetVisualChild(i);
+            if (child != null)
+            {
+                RescopeSubtreeRecursive(child, chainHasResources, stamp, redirect);
             }
         }
     }
@@ -2438,6 +2688,15 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
         {
             if (element._logicalParent != null && !ReferenceEquals(element._logicalParent, this))
             {
+                // 模板内的元素通过 TemplateBinding 接过宿主的内容时（SplitButton 默认模板里
+                // PrimaryButton Content="{TemplateBinding Content}" 就是这种形状），内容的逻辑父
+                // 必须留在宿主一侧：模板内元素只负责视觉承载，这与 WPF 的 ContentPresenter 语义一致。
+                // 此处静默让位——既不夺父也不抛，否则宿主 Content 一旦是 UIElement 就必崩。
+                if (IsInsideTemplateOf(element._logicalParent))
+                {
+                    return;
+                }
+
                 throw new InvalidOperationException(
                     $"The logical child already has a parent (child: {element.GetType().Name}, current parent: {element._logicalParent.GetType().Name}, attempted parent: {GetType().Name}).");
             }
@@ -2455,6 +2714,29 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
         {
             ResourceLookup.InvalidateResourceCache();
         }
+    }
+
+    /// <summary>
+    /// 本元素是否位于 <paramref name="host"/> 的模板内（沿 TemplatedParent 链上溯，
+    /// 覆盖模板套模板的多层嵌套）。用于识别「模板内元素接过宿主内容」这一合法形状。
+    /// </summary>
+    private bool IsInsideTemplateOf(FrameworkElement host)
+    {
+        // 模板嵌套层数有限；上限只是防御性护栏，避免异常的自引用链把这里挂死。
+        const int MaxTemplateDepth = 64;
+
+        var scope = _templatedParent;
+        for (var depth = 0; scope != null && depth < MaxTemplateDepth; depth++)
+        {
+            if (ReferenceEquals(scope, host))
+            {
+                return true;
+            }
+
+            scope = scope._templatedParent;
+        }
+
+        return false;
     }
 
     protected internal void RemoveLogicalChild(object? child)

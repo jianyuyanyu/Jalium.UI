@@ -24,6 +24,7 @@ public sealed class DispatcherTimer
     private object? _tag;
     private bool _useCompositionTarget; // True when piggybacking on frame timer
     private long _nextDueTimestamp;     // Stopwatch ticks; piggyback throttle deadline
+    private int _tickPending;           // 0/1 gate: at most one queued tick may be in flight
 
     /// <summary>
     /// Occurs when the timer interval has elapsed.
@@ -237,6 +238,10 @@ public sealed class DispatcherTimer
 
         _timer.Dispose();
         _timer = null;
+
+        // Reopen the gate so a restarted timer is not blocked by a tick that was
+        // still queued (or still running) when the timer was stopped.
+        ExitTickGate(ref _tickPending);
     }
 
     /// <summary>
@@ -289,11 +294,41 @@ public sealed class DispatcherTimer
             {
                 // Already on the dispatcher thread
                 RaiseTick();
+                return;
             }
-            else
+
+            // At most one tick may be in flight. The backing System.Threading.Timer is
+            // periodic and keeps firing on a thread-pool thread whether or not the UI
+            // thread has processed anything; queueing every callback lets a starved
+            // dispatcher (startup, a long layout pass, a blocking operation) accumulate
+            // a backlog that then drains as a burst of ticks inside a single frame.
+            //
+            // That burst is observable, not theoretical: a staggered reveal driven by a
+            // 55ms timer collapses into one frame, and periodic work (caret blink,
+            // debounce, polling) fires several times back to back the moment the thread
+            // frees up. WPF's DispatcherTimer never does this — it re-arms around the
+            // dispatcher actually processing the tick, so a starved dispatcher yields
+            // FEWER ticks rather than a catch-up burst.
+            //
+            // The piggyback path already guards this (see ShouldFireOnFrame, which re-arms
+            // from "now" instead of the previous due time). This is the same rule for the
+            // dedicated-timer path: drop callbacks that arrive while a tick is still
+            // queued or still running, and let the next one be scheduled from a clean state.
+            if (!TryEnterTickGate(ref _tickPending))
             {
-                // Marshal to the dispatcher thread
-                _dispatcher.BeginInvoke(RaiseTick);
+                return;
+            }
+
+            try
+            {
+                _dispatcher.BeginInvoke(RaiseQueuedTick);
+            }
+            catch
+            {
+                // Never leave the gate latched shut when the tick could not be queued,
+                // otherwise the timer goes permanently silent after one failed dispatch.
+                ExitTickGate(ref _tickPending);
+                throw;
             }
         }
         catch
@@ -301,6 +336,37 @@ public sealed class DispatcherTimer
             // Ignore exceptions if the dispatcher is shutting down
         }
     }
+
+    /// <summary>
+    /// Runs a queued tick and reopens the gate only after the handler returns, so a
+    /// long-running handler cannot have further ticks pile up behind it either.
+    /// </summary>
+    private void RaiseQueuedTick()
+    {
+        try
+        {
+            RaiseTick();
+        }
+        finally
+        {
+            ExitTickGate(ref _tickPending);
+        }
+    }
+
+    /// <summary>
+    /// Claims the single in-flight tick slot. Returns <see langword="false"/> when a tick
+    /// is already queued or running, in which case this timer callback must be dropped
+    /// rather than queued behind it — dropping keeps the cadence, queueing creates a burst.
+    /// </summary>
+    internal static bool TryEnterTickGate(ref int tickPending)
+        => Interlocked.CompareExchange(ref tickPending, 1, 0) == 0;
+
+    /// <summary>
+    /// Releases the in-flight tick slot. Must run even when the tick handler threw,
+    /// otherwise the timer goes permanently silent.
+    /// </summary>
+    internal static void ExitTickGate(ref int tickPending)
+        => Volatile.Write(ref tickPending, 0);
 
     private void RaiseTick()
     {

@@ -509,7 +509,10 @@ public sealed class MultiBindingExpression : BindingExpressionBase
         if (_multiBinding.Mode != BindingMode.Default)
             return _multiBinding.Mode;
 
-        return BindingMode.OneWay;
+        var metadata = TargetProperty.GetMetadata(Target.GetType());
+        return metadata is FrameworkPropertyMetadata { BindsTwoWayByDefault: true }
+            ? BindingMode.TwoWay
+            : BindingMode.OneWay;
     }
 
     // A target can have at most one binding expression for a given dependency property. Keying shadow

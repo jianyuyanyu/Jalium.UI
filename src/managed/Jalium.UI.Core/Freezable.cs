@@ -432,11 +432,7 @@ public class FreezableCollection<T> : Media.Animation.Animatable, IList, IList<T
 
         foreach (var item in collection)
         {
-            if (item is null)
-            {
-                throw new ArgumentException("The collection cannot contain null items.");
-            }
-
+            EnsureValidItem(item);
             OnFreezablePropertyChanged(null, item);
             _items.Add(item);
         }
@@ -773,12 +769,24 @@ public class FreezableCollection<T> : Media.Animation.Animatable, IList, IList<T
         }
     }
 
-    private static void EnsureValidItem(T item)
+    private void EnsureValidItem(T item)
     {
         if (item is null)
         {
             throw new ArgumentException("The collection cannot contain null items.");
         }
+
+        ValidateItem(item);
+    }
+
+    /// <summary>
+    /// Validates an item before it is connected to this collection.
+    /// Derived collections can reject invalid object graphs before change-notification
+    /// subscriptions are installed.
+    /// </summary>
+    /// <param name="item">The non-null item being inserted or assigned.</param>
+    protected virtual void ValidateItem(T item)
+    {
     }
 
     private static T Cast(object? value)

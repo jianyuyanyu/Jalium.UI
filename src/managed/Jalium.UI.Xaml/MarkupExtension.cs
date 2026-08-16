@@ -940,11 +940,13 @@ internal sealed class DeferredTemplateBindingExpression : BindingExpressionBase
         // incompatible type — must NOT be pinned into the ParentTemplate precedence layer. Doing so
         // would shadow the target's own default and crash on unbox at layout (e.g. (Thickness)null).
         // The source property here is resolved by NAME against the templated parent's type, so a
-        // type mismatch (or a null reference-typed source bound onto a value-type target) is entirely
-        // possible. TemplateBinding performs no implicit conversion, so an invalid value degrades to
+        // type mismatch is entirely possible and, for a string source, usually intentional
+        // (Data="{TemplateBinding IconGeometry}" where the control models the path as a string).
+        // TemplateBindingValueCoercion therefore offers a string to the same TypeConverter pipeline the
+        // parser uses for a literal attribute; anything it cannot convert degrades to
         // DependencyProperty.UnsetValue semantics: clear this layer's contribution and let the
         // property fall through to its default / lower-precedence value.
-        if (!TargetProperty.IsValidType(value))
+        if (!TemplateBindingValueCoercion.TryCoerce(value, TargetProperty, out var effectiveValue))
         {
             System.Diagnostics.Trace.WriteLine(
                 $"[Jalium.UI] TemplateBinding skip: 模板父级 {_templatedParent.GetType().Name}.{_binding.PropertyName} 的值 " +
@@ -954,7 +956,7 @@ internal sealed class DeferredTemplateBindingExpression : BindingExpressionBase
             return;
         }
 
-        Target.SetLayerValue(TargetProperty, value, DependencyObject.LayerValueSource.ParentTemplate);
+        Target.SetLayerValue(TargetProperty, effectiveValue, DependencyObject.LayerValueSource.ParentTemplate);
     }
 
     private static FrameworkElement? FindTemplatedParent(DependencyObject target)

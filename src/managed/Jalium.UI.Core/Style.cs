@@ -56,6 +56,16 @@ public class Style : DispatcherObject, Jalium.UI.Markup.INameScope, IQueryAmbien
     public bool IsSealed => _isSealed;
 
     /// <summary>
+    /// Style 局部资源字典；未实例化时返回 <see langword="null"/>（不触发懒构造）。
+    ///
+    /// <para>比 <see cref="FrameworkElement.ResourcesOrNull"/> 更要紧：Style 实例
+    /// 是**跨元素共享**的（theme style 尤其如此），经由 <see cref="Resources"/>
+    /// getter 懒构造出的空字典会挂在共享对象上，一次污染影响所有用该 style 的元素。
+    /// 框架内部只读探测一律走本属性。</para>
+    /// </summary>
+    internal ResourceDictionary? ResourcesOrNull => _resources;
+
+    /// <summary>
     /// Gets or sets resources scoped to this style.
     /// </summary>
     [Ambient]
@@ -582,7 +592,19 @@ public class Setter : SetterBase, ISupportInitialize
             resolvedProperty = ResolveDependencyPropertyByName(PropertyName, target.GetType());
         }
         if (resolvedProperty == null)
+        {
+            // A setter whose property never resolves is a markup bug, and swallowing it here
+            // is how it stays invisible: the style applies "successfully", the element just
+            // silently misses one property. Real case: `Property="TextOptions.TextHintingMode"`
+            // parsed fine, resolved to null, and did nothing — several rounds of debugging went
+            // into the wrong place because the setter looked like it was in effect.
+            //
+            // Report once per (property token, target type) so a setter on a long list keeps the
+            // log to one line instead of one per element, then keep going: dropping one setter is
+            // survivable, and throwing here would run during layout for every element.
+            ReportUnresolvedSetter(PropertyName, target.GetType());
             return;
+        }
 
         // Resolve the actual property on the target type
         // This handles the case where the property was resolved against the Style's TargetType
@@ -823,6 +845,31 @@ public class Setter : SetterBase, ISupportInitialize
     {
         // AOT-safe lookup via the DependencyProperty registry.
         return DependencyProperty.FromName(targetType, propertyName);
+    }
+
+    // Deduplicates the unresolved-setter diagnostic. Keyed by (property token, target type) so a
+    // style applied to hundreds of elements reports once, not once per element.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string, Type), byte>
+        s_reportedUnresolvedSetters = new();
+
+    private static void ReportUnresolvedSetter(string? propertyName, Type targetType)
+    {
+        if (string.IsNullOrEmpty(propertyName))
+            return;
+        if (!s_reportedUnresolvedSetters.TryAdd((propertyName, targetType), 0))
+            return;
+
+        var hint = propertyName.Contains('.')
+            ? " (attached property — is its owner type reachable from the JALXAML namespace? " +
+              "framework owners need an [assembly: XmlnsDefinition] entry for their CLR namespace)"
+            : string.Empty;
+
+        var message =
+            $"[Jalium.UI] Setter.Property '{propertyName}' did not resolve on '{targetType.Name}'; " +
+            $"the setter was skipped{hint}.";
+
+        System.Diagnostics.Debug.WriteLine(message);
+        Console.Error.WriteLine(message);
     }
 
     private FrameworkElement? GetTarget(FrameworkElement element)

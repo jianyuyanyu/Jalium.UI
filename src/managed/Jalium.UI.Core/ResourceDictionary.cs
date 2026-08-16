@@ -140,6 +140,13 @@ public class ResourceDictionary : IDictionary, ISupportInitialize, Jalium.UI.Mar
                 return;
 
             s_currentThemeKey = value;
+
+            // 主题键决定 TryGetValue 走哪本 ThemeDictionaries，切换即改变查找结果，
+            // 所以合并子树查找缓存必须在这里失效。这与下面「不在此处 RefreshAll」的策略
+            // 不冲突：失效只是丢弃缓存，不触发任何重新求值或树遍历。
+            // （回归测试：MergedLookupCacheInvariantTests.ThemeKeySwitch_Invalidates_CachedThemeLookup）
+            InvalidateMergedLookupCaches();
+
             // Note: RefreshAll() is NOT called here to avoid double-refresh.
             // Callers (e.g. ThemeManager.ForceThemeRefresh) are responsible for
             // triggering a single consolidated refresh after all dictionary
@@ -409,6 +416,57 @@ public class ResourceDictionary : IDictionary, ISupportInitialize, Jalium.UI.Mar
     public bool TryGetValue(object key, out object? value)
         => TryGetValue(key, out value, out _);
 
+    // ── 合并子树查找缓存 ──────────────────────────────────────────────────
+    //
+    // 缓存「本地 miss 之后穿透 theme + merged 子树」的查找结果，**含 negative 结果**。
+    //
+    // 动机：隐式样式查找（LookupImplicitStyle 沿类型继承链逐层 TryFindResource）绝大多数
+    // 是全 miss，而 miss 恰恰是最贵的路径——要走遍整棵 merged/theme 字典树，每层一次递归
+    // 调用加一次 thread-static HashSet Add/Remove。主题字典规模是几十个（Themes/
+    // Generic.jalxaml 有 30 处 Source=，Themes/Controls 下 27 个字典），于是单次冷查找就要
+    // 几十到上百次字典操作；整页视图替换时这条路径按 元素数 x 类型继承链长度 反复走，成为
+    // 换页帧里 UI 线程的主要开销之一。Grid/StackPanel/Border 这类没有 theme style 的类型
+    // 每次都是穿透式全 miss，negative 缓存正是为它们准备的。
+    //
+    // ★ 为什么必须用独立于 s_globalCacheGeneration 的版本号：那个版本号还会被**逻辑父变更**
+    // bump（FrameworkElement.AddLogicalChild / RemoveLogicalChild），而逻辑父变化根本不改变
+    // 任何字典的 key→value 映射。构树时每挂一个逻辑子就清一次全局缓存——那正是本缓存要
+    // 消除的开销，复用同一版本号会让它在构树期间被反复清空、命中率归零。本版本号只在真正
+    // 能改变查找结果的写操作上 bump（见 InvalidateMergedLookupCaches 的调用点）。
+    //
+    // 线程安全：与 ResourceLookup 的 per-element memo 同构，走 [ThreadStatic]，既不引入锁
+    // 也不存在跨线程撕裂。
+    private static int s_contentGeneration;
+
+    [ThreadStatic]
+    private static Dictionary<(int Dictionary, object Key), MergedLookupResult>? t_mergedLookupCache;
+    [ThreadStatic]
+    private static int t_mergedLookupGeneration;
+
+    private const int MaxMergedLookupCacheEntries = 8192;
+
+    private readonly record struct MergedLookupResult(
+        bool Found,
+        object? Value,
+        ResourceDictionary? Source);
+
+    /// <summary>
+    /// 让所有合并子树查找缓存失效。必须在任何可能改变查找结果的写操作上调用：条目增删改、
+    /// MergedDictionaries / ThemeDictionaries 结构变化、<see cref="CurrentThemeKey"/> 切换。
+    /// </summary>
+    private static void InvalidateMergedLookupCaches()
+        => Interlocked.Increment(ref s_contentGeneration);
+
+    /// <summary>
+    /// 资源**内容**版本号：只在真正能改变查找结果的写操作上递增（条目增删改、
+    /// MergedDictionaries / ThemeDictionaries 结构变化、<see cref="CurrentThemeKey"/> 切换）。
+    ///
+    /// <para>与 <see cref="ResourceLookup.CacheGeneration"/> 的区别很关键：那个还会被逻辑父
+    /// 变更（AddLogicalChild / RemoveLogicalChild）递增，构树期间几乎每步都在变，无法用来判断
+    /// 「资源内容是否还是原来那份」。需要后者语义的调用方必须用本属性。</para>
+    /// </summary>
+    internal static int ContentGeneration => Volatile.Read(ref s_contentGeneration);
+
     /// <summary>
     /// Tries to resolve a resource and also returns the dictionary that supplied the value.
     /// The source dictionary is used by the WPF-compatible static-resource diagnostics path.
@@ -425,6 +483,64 @@ public class ResourceDictionary : IDictionary, ISupportInitialize, Jalium.UI.Mar
             return true;
         }
 
+        // 只有顶层查找（当前线程的循环检测链为空）才读写缓存。
+        //
+        // ★ 这个限制是正确性要求，不是保守：嵌套查找的结果是「上下文相关」的——环检测会在
+        // `chain.Add(this)` 失败时把结果截断成 false，而那个 false 只对「祖先链上已经有本
+        // 字典」这个上下文成立。举例：A merged [B, C]、B merged A、C 里有 key。查 A 时会
+        // 探到 B，B 再探 A 被环检测截断，于是 B 这一层返回 false——但 B 作为独立查询的真实
+        // 结果是 true（B → A → C）。把那个 false 缓存下来就会污染后续对 B 的独立查询。
+        // 顶层查找不存在截断，结果是完整的，可以安全缓存；而顶层恰好就是热路径
+        // （FindResourceCore 走完祖先链后落到 ApplicationResourceLookup → 根字典），
+        // 一次命中即省掉整棵字典树的穿透，收益不因这个限制而减少。
+        var isTopLevelLookup = t_lookupChain is null || t_lookupChain.Count == 0;
+        (int, object) cacheKey = default;
+        Dictionary<(int Dictionary, object Key), MergedLookupResult>? cache = null;
+
+        if (isTopLevelLookup)
+        {
+            var generation = Volatile.Read(ref s_contentGeneration);
+            cache = t_mergedLookupCache;
+            if (cache is null)
+            {
+                cache = t_mergedLookupCache = new Dictionary<(int, object), MergedLookupResult>();
+                t_mergedLookupGeneration = generation;
+            }
+            else if (t_mergedLookupGeneration != generation)
+            {
+                cache.Clear();
+                t_mergedLookupGeneration = generation;
+            }
+
+            cacheKey = (RuntimeHelpers.GetHashCode(this), key);
+            if (cache.TryGetValue(cacheKey, out var cached))
+            {
+                value = cached.Value;
+                sourceDictionary = cached.Source;
+                return cached.Found;
+            }
+        }
+
+        var found = TryGetFromMergedSubtree(key, out value, out sourceDictionary);
+
+        // 条目上限防无界增长（同 ResourceLookup memo 的做法）。超限后不再写入，退化成原来的
+        // 穿透查找，只影响性能不影响正确性。
+        if (cache is not null && cache.Count < MaxMergedLookupCacheEntries)
+        {
+            cache[cacheKey] = new MergedLookupResult(found, value, sourceDictionary);
+        }
+
+        return found;
+    }
+
+    /// <summary>
+    /// 穿透 theme + merged 子树的原始查找（无缓存）。带 thread-static 环检测。
+    /// </summary>
+    private bool TryGetFromMergedSubtree(
+        object key,
+        out object? value,
+        out ResourceDictionary? sourceDictionary)
+    {
         var chain = t_lookupChain ??= new HashSet<ResourceDictionary>(ReferenceEqualityComparer.Instance);
         if (!chain.Add(this))
         {
@@ -590,6 +706,13 @@ public class ResourceDictionary : IDictionary, ISupportInitialize, Jalium.UI.Mar
             // Realizing deferred content is a cache operation, not a resource mutation, so it
             // intentionally does not raise Changed or invalidate the resource lookup cache.
             _innerDictionary[key] = resolvedValue;
+
+            // 但合并子树查找缓存必须失效：本字典若作为别人的 merged 子字典，刚才那个尚未
+            // 实体化的值可能已经被上层缓存下来了。失效只是丢弃缓存条目，不触发任何重新求值
+            // 或树遍历，因此不会造成上面那条注释要避免的 refresh 风暴。
+            // （默认 OnGettingValue 不改写 value，本分支进不来；这里是为覆盖了该钩子的
+            //   派生字典守住不变式。）
+            InvalidateMergedLookupCaches();
         }
 
         return resolvedValue;
@@ -624,6 +747,10 @@ public class ResourceDictionary : IDictionary, ISupportInitialize, Jalium.UI.Mar
     {
         if (_notificationDeferralDepth > 0)
         {
+            // 延迟的是**通知**，不是缓存失效——条目此刻已经改了，查找结果立即随之改变。
+            // 若等到 EndNotificationDeferral 才失效，deferral 期间的查找会把旧值缓存下来
+            // 并被后续命中，成为难查的 stale 读。
+            InvalidateMergedLookupCaches();
             _notificationPending = true;
             if (!_pendingAllChanged)
             {
@@ -641,6 +768,8 @@ public class ResourceDictionary : IDictionary, ISupportInitialize, Jalium.UI.Mar
     {
         if (_notificationDeferralDepth > 0)
         {
+            // 同上：结构已变，缓存必须立即失效，不能跟着通知一起延迟。
+            InvalidateMergedLookupCaches();
             _notificationPending = true;
             _pendingAllChanged = true; // merged dict replacement — all keys may have changed
             return;
@@ -651,6 +780,7 @@ public class ResourceDictionary : IDictionary, ISupportInitialize, Jalium.UI.Mar
 
     private void RaiseChanged(ResourcesChangedEventArgs args)
     {
+        InvalidateMergedLookupCaches();
         ResourceLookup.InvalidateResourceCache();
         Changed?.Invoke(this, EventArgs.Empty);
         ChangedWithKeys?.Invoke(this, args);
@@ -1106,12 +1236,19 @@ public static class ResourceLookup
         int depthGuard = 0;
         while (current != null && depthGuard++ < 2048)
         {
-            if (current.Resources != null && current.Resources.TryGetValue(resourceKey, out var value))
+            // 只读探测必须走 ResourcesOrNull / Style.ResourcesOrNull：public Resources
+            // getter 带懒构造副作用，用它做 `!= null` 判断的话该判断恒为真，且判断本身
+            // 就给这一级祖先分配了一个空字典（外加 Changed 订阅与诊断 owner 注册）。
+            // 旧写法还额外把 getter 调了两次。Style 侧更严重——Style 实例跨元素共享，
+            // 空字典会挂到 theme style 上，污染所有使用该 style 的元素。
+            var localResources = current.ResourcesOrNull;
+            if (localResources != null && localResources.TryGetValue(resourceKey, out var value))
             {
                 return ResolveDynamicResourceValue(element, value, resourceChain);
             }
 
-            if (current.Style?.Resources.TryGetValue(resourceKey, out var styleValue) == true)
+            var styleResources = current.Style?.ResourcesOrNull;
+            if (styleResources != null && styleResources.TryGetValue(resourceKey, out var styleValue))
             {
                 return ResolveDynamicResourceValue(element, styleValue, resourceChain);
             }
@@ -1155,7 +1292,11 @@ public static class ResourceLookup
         int depthGuard = 0;
         while (current != null && depthGuard++ < 2048)
         {
-            if (current.Resources.TryGetValue(resourceKey, out var value, out sourceDictionary))
+            // 同 FindResourceCore：只读探测走非分配读法。这里原本连 null 判断都没有，
+            // 直接 current.Resources 触发懒构造，是祖先链上每级一个空字典。
+            var localResources = current.ResourcesOrNull;
+            if (localResources != null &&
+                localResources.TryGetValue(resourceKey, out var value, out sourceDictionary))
             {
                 if (value is IDynamicResourceReference dynamicReference)
                 {
@@ -1169,7 +1310,7 @@ public static class ResourceLookup
                 return value;
             }
 
-            var styleResources = current.Style?.Resources;
+            var styleResources = current.Style?.ResourcesOrNull;
             if (styleResources is not null &&
                 styleResources.TryGetValue(
                     resourceKey,

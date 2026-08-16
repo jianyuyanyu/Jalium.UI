@@ -99,6 +99,8 @@ internal static class LiteralValueConverter
                 return TryConvertGridLength(value);
             case "global::Jalium.UI.Media.Color":
                 return TryConvertColor(value);
+            case "global::Jalium.UI.Media.Effects.ColorMatrix":
+                return TryConvertColorMatrix(value);
             case "global::Jalium.UI.FontWeight":
                 return TryConvertNamedStaticMember(value, "global::Jalium.UI.FontWeights");
             case "global::Jalium.UI.FontStyle":
@@ -209,6 +211,42 @@ internal static class LiteralValueConverter
         }
 
         return null;
+    }
+
+    private static string? TryConvertColorMatrix(string value)
+    {
+        var trimmed = value.Trim();
+        if (string.Equals(trimmed, "Identity", StringComparison.OrdinalIgnoreCase))
+        {
+            return "global::Jalium.UI.Media.Effects.ColorMatrix.Identity";
+        }
+
+        var parts = trimmed.Split(
+            new[] { ',', ';', ' ', '\t', '\r', '\n' },
+            StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 20)
+            return null;
+
+        var values = new string[20];
+        for (var i = 0; i < parts.Length; i++)
+        {
+            if (!float.TryParse(parts[i].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) ||
+                float.IsNaN(parsed) ||
+                float.IsInfinity(parsed))
+            {
+                return null;
+            }
+
+            values[i] = parsed.ToString("R", CultureInfo.InvariantCulture) + "f";
+        }
+
+        return
+            "new global::Jalium.UI.Media.Effects.ColorMatrix { " +
+            $"M11 = {values[0]}, M12 = {values[1]}, M13 = {values[2]}, M14 = {values[3]}, M15 = {values[4]}, " +
+            $"M21 = {values[5]}, M22 = {values[6]}, M23 = {values[7]}, M24 = {values[8]}, M25 = {values[9]}, " +
+            $"M31 = {values[10]}, M32 = {values[11]}, M33 = {values[12]}, M34 = {values[13]}, M35 = {values[14]}, " +
+            $"M41 = {values[15]}, M42 = {values[16]}, M43 = {values[17]}, M44 = {values[18]}, M45 = {values[19]} " +
+            "}";
     }
 
     private static string? TryParseHexColor(string trimmed)

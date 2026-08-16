@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.ComponentModel;
@@ -2648,7 +2650,7 @@ public partial class XamlReader
 
                 if (targetType != null)
                 {
-                    var dp = XamlParserContext.ResolveDependencyProperty(stringValue, targetType);
+                    var dp = XamlParserContext.ResolveDependencyProperty(stringValue, targetType, context);
                     if (dp != null)
                     {
                         property.SetValue(instance, dp);
@@ -4202,8 +4204,11 @@ internal sealed class XamlParserContext : IAmbientResourceProvider
                 return true;
             }
 
+            // 只读探测走 ResourcesOrNull：public Resources getter 带懒构造副作用，
+            // 会给 parent stack 上每个没有本地资源的元素都实体化一个空字典。
             if (parent is FrameworkElement fe &&
-                fe.Resources.TryGetValue(key, out value, out sourceDictionary))
+                fe.ResourcesOrNull is { } feResources &&
+                feResources.TryGetValue(key, out value, out sourceDictionary))
             {
                 return true;
             }
@@ -4335,7 +4340,25 @@ internal sealed class XamlParserContext : IAmbientResourceProvider
     /// <summary>
     /// Resolves a DependencyProperty by name from a target type.
     /// </summary>
-    public static DependencyProperty? ResolveDependencyProperty(string propertyName, Type? targetType)
+    /// <summary>
+    /// Resolves a <c>Setter.Property</c> / <c>Trigger.Property</c> token to a
+    /// <see cref="DependencyProperty"/>. Accepts the plain form (<c>Background</c>, looked up
+    /// on <paramref name="targetType"/>) and the attached form (<c>TextOptions.TextHintingMode</c>,
+    /// looked up on the named owner type).
+    /// </summary>
+    /// <param name="context">
+    /// Supplies the full type-resolution chain for the attached form. Without it the owner type
+    /// can only be found in <see cref="XamlTypeRegistry"/> — a hand-maintained list — so any
+    /// framework owner missing from it silently failed to resolve, and
+    /// <c>Setter.Apply</c> then skipped the setter without a word (see the null-check there).
+    /// That is how <c>&lt;Setter Property="TextOptions.TextHintingMode" ...&gt;</c> could look
+    /// correct, parse without error, and do nothing at all. Passing the context lets the owner
+    /// resolve through XmlnsDefinition mappings like every other type reference in markup.
+    /// </param>
+    public static DependencyProperty? ResolveDependencyProperty(
+        string propertyName,
+        Type? targetType,
+        XamlParserContext? context = null)
     {
         if (string.IsNullOrEmpty(propertyName) || targetType == null)
             return null;
@@ -4354,7 +4377,13 @@ internal sealed class XamlParserContext : IAmbientResourceProvider
             var ownerSimpleName = ownerSimpleNameSeparator >= 0
                 ? ownerToken.Substring(ownerSimpleNameSeparator + 1)
                 : ownerToken;
-            var ownerType = XamlTypeRegistry.GetType(ownerToken) ?? XamlTypeRegistry.GetType(ownerSimpleName);
+            var ownerType = XamlTypeRegistry.GetType(ownerToken)
+                ?? XamlTypeRegistry.GetType(ownerSimpleName)
+                // Same chain element attributes use (XmlnsDefinition mappings et al), so an
+                // owner reachable as `<X Owner.Prop="..."/>` is equally reachable as
+                // `<Setter Property="Owner.Prop" .../>`. Without this the two forms disagree.
+                ?? context?.ResolveType(JalxamlNamespaces.Presentation, ownerSimpleName);
+
             return ownerType == null
                 ? null
                 : DependencyProperty.FromName(ownerType, normalizedName.Substring(separator + 1));
@@ -4438,24 +4467,27 @@ internal sealed class XamlParserContext : IAmbientResourceProvider
             if (type != null) return type;
         }
 
-        // 2) Look up assembly-level XmlnsDefinition mappings. The registry is populated by
-        //    scanning XmlnsDefinitionAttribute on every loaded assembly, so user assemblies
-        //    can opt into a shared XML namespace simply by declaring the attribute.
-        var mappings = XmlnsDefinitionRegistry.GetMappings(namespaceUri);
-        if (!mappings.IsDefaultOrEmpty)
-        {
-            foreach (var mapping in mappings)
-            {
-                var type = ResolveTypeInNamespace(mapping.ClrNamespace, typeName, mapping.Assembly);
-                if (type != null) return type;
-            }
-        }
-
-        // 3) Fall back to the AOT-friendly static type registry by simple name. This catches
-        //    the bootstrap window before XmlnsDefinition scanning has seen the framework
-        //    assemblies, and also handles the empty default namespace (xmlns="") case.
+        // 2) The AOT-friendly static type registry, by simple name. This used to sit *after*
+        //    the XmlnsDefinition walk below — but ResolveTypeInNamespace consulted the registry
+        //    as its own first step, so every mapping iteration re-ran this exact lookup and the
+        //    first one already decided the outcome. Hoisting it is behaviour-preserving and
+        //    removes N redundant dictionary probes per resolution.
         var registryType = XamlTypeRegistry.GetType(typeName);
         if (registryType != null) return registryType;
+
+        // 3) XmlnsDefinition mappings, through a per-namespace simple-name index.
+        //
+        //    This was a linear walk: for each (CLR namespace, assembly) mapping registered for
+        //    the xmlns, probe that namespace for the type. Cost scaled with the number of
+        //    mappings — and it is paid on every *miss*, which is the common case while a
+        //    document resolves markup extensions and literals. The framework now declares ~34
+        //    mappings, so a miss meant ~34 probes.
+        //
+        //    The index flattens all of that to one dictionary lookup, built once per xmlns and
+        //    reused for the process. Cost is now independent of how many namespaces the
+        //    framework exposes, so adding an XmlnsDefinition entry is free at runtime.
+        var indexed = LookupXmlnsIndexedType(namespaceUri, typeName);
+        if (indexed != null) return indexed;
 
         // 4) Scan the framework CLR namespaces by convention. This covers third-party assemblies
         //    that ship types in these namespaces without declaring XmlnsDefinitionAttribute.
@@ -4467,6 +4499,118 @@ internal sealed class XamlParserContext : IAmbientResourceProvider
 
         // 5) Markup extension convention: "Foo" resolves to "FooExtension".
         return XamlTypeRegistry.GetType(typeName + "Extension");
+    }
+
+    // ── XmlnsDefinition simple-name index ───────────────────────────────────────────────
+    // Per xmlns: "simple type name" -> Type, covering every CLR namespace mapped to that
+    // xmlns. Replaces the per-mapping linear probe in ResolveTypeUncached with one lookup.
+    //
+    // Precedence is preserved exactly: XmlnsDefinitionRegistry hands back mappings in
+    // registration order and "earlier wins on a name clash", so the build walks mappings in
+    // that order and the first writer of a name keeps it.
+    //
+    // Staleness: assemblies can load later and add mappings (the registry subscribes to
+    // AppDomain.AssemblyLoad). The built index is cached alongside the exact mapping snapshot
+    // it came from; a changed snapshot rebuilds. ImmutableArray equality is a reference
+    // comparison of the backing array, so the check is O(1).
+    private readonly record struct XmlnsIndexEntry(
+        ImmutableArray<XmlnsDefinitionRegistry.Mapping> Mappings,
+        Dictionary<string, Type> Index);
+
+    private static readonly ConcurrentDictionary<string, XmlnsIndexEntry> s_xmlnsIndex =
+        new(StringComparer.Ordinal);
+
+    private static Type? LookupXmlnsIndexedType(string namespaceUri, string typeName)
+    {
+        var mappings = XmlnsDefinitionRegistry.GetMappings(namespaceUri);
+        if (mappings.IsDefaultOrEmpty)
+            return null;
+
+        if (!s_xmlnsIndex.TryGetValue(namespaceUri, out var entry) ||
+            !entry.Mappings.Equals(mappings))
+        {
+            entry = new XmlnsIndexEntry(mappings, BuildXmlnsIndex(mappings));
+            s_xmlnsIndex[namespaceUri] = entry;
+        }
+
+        if (!entry.Index.TryGetValue(typeName, out var type))
+            return null;
+
+        // Parity with the old ResolveTypeInNamespace hit path: promote into the simple-name
+        // registry so later namespace-agnostic lookups short-circuit at step 2.
+        XamlTypeRegistry.RegisterType(typeName, type);
+        return type;
+    }
+
+    [UnconditionalSuppressMessage("Trimming", "IL2026:RequiresUnreferencedCode",
+        Justification = "Enumerates types of assemblies that opted into a XAML namespace via XmlnsDefinitionAttribute — the same types the previous Assembly.GetType(fullName) probe could return, just discovered in one pass instead of one probe per (namespace, name). The RUC contract for reflective XAML type resolution is already declared at the XamlReader.Load/Parse boundary; under trimming this enumeration simply sees whatever survived, and the AOT-safe XamlTypeRegistry (consulted first) is what preserves framework types.")]
+    [UnconditionalSuppressMessage("Trimming", "IL2070:UnrecognizedReflectionPattern",
+        Justification = "Same contract as above: assembly type enumeration for XAML name resolution, gated by the public RUC boundary.")]
+    private static Dictionary<string, Type> BuildXmlnsIndex(
+        ImmutableArray<XmlnsDefinitionRegistry.Mapping> mappings)
+    {
+        // CLR namespace -> precedence rank (lower wins). Mapping order is precedence order.
+        var rank = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var i = 0; i < mappings.Length; i++)
+        {
+            rank.TryAdd(mappings[i].ClrNamespace, i);
+        }
+
+        // Walk each distinct assembly once rather than once per mapping — the framework points
+        // ~34 mappings at a single merged assembly, so per-mapping enumeration would re-read
+        // the same type table 34 times.
+        var assemblies = new HashSet<Assembly>();
+        foreach (var mapping in mappings)
+        {
+            assemblies.Add(mapping.Assembly);
+        }
+
+        var index = new Dictionary<string, Type>(StringComparer.Ordinal);
+        var chosen = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        foreach (var assembly in assemblies)
+        {
+            foreach (var type in SafeGetTypes(assembly))
+            {
+                // Nested types are addressed as "Ns.Outer+Inner"; the old Assembly.GetType
+                // probe could never reach one by simple name, so indexing them would invent
+                // resolutions that did not previously exist.
+                if (type is null || type.IsNested)
+                    continue;
+
+                var ns = type.Namespace;
+                if (ns is null || !rank.TryGetValue(ns, out var r))
+                    continue;
+
+                if (!chosen.TryGetValue(type.Name, out var existing) || r < existing)
+                {
+                    chosen[type.Name] = r;
+                    index[type.Name] = type;
+                }
+            }
+        }
+
+        return index;
+    }
+
+    private static IEnumerable<Type?> SafeGetTypes(Assembly assembly)
+    {
+        if (assembly.IsDynamic)
+            return Array.Empty<Type?>();
+
+        try
+        {
+            return assembly.GetTypes();
+        }
+        catch (ReflectionTypeLoadException ex)
+        {
+            // A partially loadable assembly still contributes the types that did load.
+            return ex.Types;
+        }
+        catch
+        {
+            return Array.Empty<Type?>();
+        }
     }
 
     private Type? ResolveClrNamespaceType(string namespaceUri, string typeName)
@@ -4836,6 +4980,43 @@ public static class XamlTypeRegistry
         Register<RectangleGeometry>(types);
         Register<EllipseGeometry>(types);
         Register<PathGeometry>(types);
+
+        // Element effects. Keep these explicit instead of relying on runtime
+        // namespace reflection so restrictive/AOT XAML can construct every
+        // built-in effect, not only BlurEffect and DropShadowEffect.
+        Register<Jalium.UI.Media.Effects.BlurEffect>(types);
+        Register<Jalium.UI.Media.Effects.ElementBlurEffect>(types);
+        Register<Jalium.UI.Media.Effects.DropShadowEffect>(types);
+        Register<Jalium.UI.Media.Effects.OuterGlowEffect>(types);
+        Register<Jalium.UI.Media.Effects.InnerShadowEffect>(types);
+        Register<Jalium.UI.Media.Effects.EmbossEffect>(types);
+        Register<Jalium.UI.Media.Effects.ColorMatrixEffect>(types);
+        Register<Jalium.UI.Media.Effects.ColorMatrix>(types);
+        Register<Jalium.UI.Media.Effects.EffectGroup>(types);
+        Register<Jalium.UI.Media.Effects.EffectCollection>(types);
+        Register<Jalium.UI.Media.Effects.PixelShader>(types);
+
+        // Legacy bitmap-effect object elements remain parseable for WPF XAML
+        // compatibility even though UIElement.Effect is the preferred API.
+#pragma warning disable CS0618
+        Register<Jalium.UI.Media.Effects.BlurBitmapEffect>(types);
+        Register<Jalium.UI.Media.Effects.DropShadowBitmapEffect>(types);
+        Register<Jalium.UI.Media.Effects.BevelBitmapEffect>(types);
+        Register<Jalium.UI.Media.Effects.EmbossBitmapEffect>(types);
+        Register<Jalium.UI.Media.Effects.OuterGlowBitmapEffect>(types);
+        Register<Jalium.UI.Media.Effects.BitmapEffectGroup>(types);
+        Register<Jalium.UI.Media.Effects.BitmapEffectCollection>(types);
+        Register<Jalium.UI.Media.Effects.BitmapEffectInput>(types);
+#pragma warning restore CS0618
+
+        // Backdrop effects share a separate rendering pipeline but are XAML
+        // object elements as well, including CompositeBackdropEffect children.
+        Register<BackdropBlurEffect>(types);
+        Register<AcrylicEffect>(types);
+        Register<MicaEffect>(types);
+        Register<FrostedGlassEffect>(types);
+        Register<ColorAdjustmentEffect>(types);
+        Register<CompositeBackdropEffect>(types);
     }
 
     private static void RegisterShapeTypes(Dictionary<string, Type> types)
