@@ -420,6 +420,55 @@ typedef struct JaliumSurfaceDescriptor {
 } JaliumSurfaceDescriptor;
 
 // ============================================================================
+// Backdrop Material
+// ============================================================================
+
+/// Blur kernel family for an in-app backdrop material.
+typedef enum JaliumBackdropBlurType {
+    JALIUM_BACKDROP_BLUR_GAUSSIAN = 0,  ///< Separable Gaussian, sigma = blurSigma (or blurRadius / 3).
+    JALIUM_BACKDROP_BLUR_BOX = 1,       ///< Box-equivalent Gaussian (sigma = blurRadius / sqrt(3)).
+    JALIUM_BACKDROP_BLUR_FROSTED = 2    ///< Gaussian plus per-pixel sample jitter (frosted-glass grain).
+} JaliumBackdropBlurType;
+
+/// Full parameter set of an in-app backdrop material (blur + colour pipeline +
+/// tint + grain + rounding). Replaces the string-based backdrop-filter entry
+/// points, which could only carry blur/tint/noise/saturation/luminosity.
+///
+/// Colour pipeline order, shared by every backend (CSS backdrop-filter
+/// semantics: the filters act on the backdrop, the tint composites on top):
+///   blur -> brightness -> contrast -> saturation -> hueRotation -> grayscale
+///        -> sepia -> invert -> tint -> luminosity -> noise.
+/// All lengths are DIPs; backends convert to physical pixels themselves.
+typedef struct JaliumBackdropMaterialDesc {
+    uint32_t structSize;        ///< sizeof(JaliumBackdropMaterialDesc); versioning guard.
+    uint32_t blurType;          ///< JaliumBackdropBlurType.
+    float x;                    ///< Panel rect in DIPs.
+    float y;
+    float width;
+    float height;
+    float blurRadius;           ///< Kernel extent in DIPs (radius ~= 3 sigma convention).
+    float blurSigma;            ///< Gaussian sigma in DIPs; 0 = blurRadius / 3.
+    float noiseIntensity;       ///< Full-range grain mixed at this amplitude (0 = none, Acrylic ~0.02-0.05).
+    float tintR;                ///< Tint colour (0..1, straight).
+    float tintG;
+    float tintB;
+    float tintA;                ///< Effective tint opacity (0..1, already folded with the colour alpha).
+    float saturation;           ///< 1 = unchanged.
+    float luminosity;           ///< Multiplier applied after the tint (1 = unchanged).
+    float brightness;           ///< 1 = unchanged.
+    float contrast;             ///< 1 = unchanged.
+    float hueRotation;          ///< Radians.
+    float grayscale;            ///< 0..1.
+    float sepia;                ///< 0..1.
+    float invert;               ///< 0..1.
+    float opacity;              ///< Overall effect opacity (0 = backdrop untouched, 1 = full).
+    float cornerRadiusTL;       ///< Per-corner rounding in DIPs (already normalised to the rect).
+    float cornerRadiusTR;
+    float cornerRadiusBR;
+    float cornerRadiusBL;
+} JaliumBackdropMaterialDesc;
+
+// ============================================================================
 // Function Pointers
 // ============================================================================
 

@@ -106,7 +106,11 @@ internal sealed class WindowInputDispatcher
         // no hover, no cursor change, no move events for the window's own content until
         // the popup is dismissed. Overlay-hosted popups already block pass-through in
         // OverlayLayer.HitTestCore, and an active capture still outranks all of this.
-        if (Mouse.Captured == null && HasBlockingExternalPopup())
+        // 例外：指针落在覆盖层的某个弹窗里（典型是从外飞弹窗里级联出来、又落回主窗口覆盖层的
+        // 子弹窗）——它是弹窗链的一部分，不是「弹窗底下的窗口内容」，悬停照常。
+        if (Mouse.Captured == null
+            && HasBlockingExternalPopup()
+            && _host.OverlayLayer.FindPopupRootAt(position) == null)
         {
             UpdateTitleBarButtonHover(null);
             ClearContentMouseOver(timestamp);
@@ -204,18 +208,19 @@ internal sealed class WindowInputDispatcher
             Mouse.SetCursor(overrideCursor);
             _host.SetPlatformCursor((int)overrideCursor.CursorType);
         }
-        else if ((capturedThumb ?? hitElement) is FrameworkElement fe)
+        else
         {
-            if (!fe.IsEnabled)
-            {
-                Mouse.SetCursor(Jalium.UI.Input.Cursors.Arrow);
-                _host.SetPlatformCursor((int)Jalium.UI.Input.Cursors.Arrow.CursorType);
-            }
-            else if (FrameworkElement.ResolveEffectiveCursor(fe) is { } cursor)
-            {
-                Mouse.SetCursor(cursor);
-                _host.SetPlatformCursor((int)cursor.CursorType);
-            }
+            // 没有任何祖先设过 Cursor 时 ResolveEffectiveCursor 返回 null —— 这时必须**显式落回箭头**，
+            // 不能什么都不做：什么都不做的话，上一个元素设过的光标会一直留在屏幕上（鼠标从一个
+            // Cursor="Hand" 的按钮移到没设光标的空白区，光标仍是手型，直到碰到下一个设了光标的元素）。
+            // WPF 的契约是「无人指定即箭头」，框架里另外两条路径（Window.ResolveCursor 的注释、
+            // Mouse.UpdateCursor 的 `cursor ?? Cursors.Arrow`）也都是这么兜的，唯独这里漏了。
+            var target2 = capturedThumb ?? hitElement;
+            var cursor = target2 is FrameworkElement fe && fe.IsEnabled
+                ? FrameworkElement.ResolveEffectiveCursor(fe) ?? Jalium.UI.Input.Cursors.Arrow
+                : Jalium.UI.Input.Cursors.Arrow;
+            Mouse.SetCursor(cursor);
+            _host.SetPlatformCursor((int)cursor.CursorType);
         }
     }
 
@@ -268,26 +273,37 @@ internal sealed class WindowInputDispatcher
             ? HitTopLevelMenuItemBehindOverlay(position)
             : null;
 
-        // Check light dismiss via OverlayLayer — clicks outside popups close them
-        if (topLevelMenuItemBehindOverlay == null && _host.OverlayLayer.TryHandleLightDismiss(position))
-        {
-            _suppressMouseUpButton = button;
-            return;
-        }
+        // 按下点落在覆盖层的哪个弹窗里（没有则 null）。下面两段 light dismiss 都要用它：
+        // 落在弹窗里的按下不是「点到外面」，既不关它的祖先、也不吞掉点击。
+        var hitOverlayRoot = _host.OverlayLayer.FindPopupRootAt(position);
 
-        // Light dismiss for external popup windows (rendered outside the parent window)
+        // Check light dismiss via OverlayLayer — clicks outside popups close them
+        bool dismissed = topLevelMenuItemBehindOverlay == null
+            && _host.OverlayLayer.TryHandleLightDismiss(position);
+
+        // Light dismiss for external popup windows (rendered outside the parent window).
+        // 与覆盖层那一段同一次按下里一起判：点在所有弹窗之外时两种宿主形态一起关（和非客户区按下、
+        // 窗口失活走的 CloseAllLightDismissPopups 一致），不再是先关覆盖层、外飞的留到下一次点击。
         if (_host.ActiveExternalPopups.Count > 0)
         {
+            // 链感知：按下落在覆盖层的某个弹窗里时（典型是外飞菜单里级联出来、又落回主窗口覆盖层的
+            // 子菜单/下拉），它的祖先外飞弹窗不算「被点到外面」——保持打开，点击照常派发给弹窗内容；
+            // 只有与按下点无关的外飞弹窗才关。否则父菜单被关、点击被吞、子菜单却留着还能继续点。
             var popupsToClose = _host.ActiveExternalPopups
-                .Where(p => !p.StaysOpen && !p.HasPointerCaptureWithin)
+                .Where(p => !p.StaysOpen
+                            && !p.HasPointerCaptureWithin
+                            && (hitOverlayRoot == null || !p.IsAncestorOfPopupRoot(hitOverlayRoot)))
                 .ToList();
             foreach (var popup in popupsToClose)
                 popup.IsOpen = false;
-            if (popupsToClose.Count > 0)
-            {
-                _suppressMouseUpButton = button;
-                return;
-            }
+            if (popupsToClose.Count > 0 && hitOverlayRoot == null)
+                dismissed = true;
+        }
+
+        if (dismissed)
+        {
+            _suppressMouseUpButton = button;
+            return;
         }
 
         // Handle title bar button press (for custom title bar)
@@ -488,7 +504,17 @@ internal sealed class WindowInputDispatcher
         }
 
         if (button == MouseButton.Left)
+        {
             ClearMousePressedChain();
+
+            // 不变式：左键抬起后若没有任何托管元素持有捕获，窗口就不该还扣着 Win32 捕获。
+            // 托管捕获可能被 WM_CAPTURECHANGED 清成 null（那条路径按契约不碰原生捕获），
+            // 此后 ReleaseMouseCapture 的 `_mouseCaptured == this` 判断也不再成立，
+            // 原生捕获就成了没人认领的孤儿 —— 系统随即停发 WM_SETCURSOR、也不再做标题栏命中，
+            // 用户看到的是「光标卡在上一个形状」和「窗口拖不动」。
+            if (Mouse.Captured == null)
+                _host.Self.ReleaseNativeCaptureIfOwned();
+        }
     }
 
     /// <summary>Handles mouse wheel.</summary>
@@ -743,9 +769,22 @@ internal sealed class WindowInputDispatcher
     //  Window Lifecycle (affecting input state)
     // ══════════════════════════════════════════════════════════════
 
-    /// <summary>Native mouse/pointer capture was lost.</summary>
-    public void HandleNativeCaptureChanged()
+    /// <summary>
+    /// WM_CAPTURECHANGED：<paramref name="newCaptureWindow"/> 是**即将拿到**捕获的那个窗口。
+    ///
+    /// <para>
+    /// 它等于本窗口时说明捕获压根没易主 —— 同一个窗口内换捕获元素（按钮按下先 CaptureMouse，
+    /// 祖先随后接管拖拽再 CaptureMouse）会再调一次 <c>SetCapture(自己)</c>，Win32 会**同步**回一条
+    /// WM_CAPTURECHANGED。此时若照常清掉托管捕获，接管者刚拿到的捕获就在 <see cref="UIElement.CaptureMouse"/>
+    /// 返回前被清成 null（调用方毫无察觉，返回值仍是 true），之后的鼠标事件不再路由给它 ——
+    /// 表现就是「拖拽刚起步就断、元素不跟手」。
+    /// </para>
+    /// </summary>
+    public void HandleNativeCaptureChanged(nint newCaptureWindow, nint selfWindow)
     {
+        if (newCaptureWindow != nint.Zero && newCaptureWindow == selfWindow)
+            return;
+
         UIElement.OnNativeCaptureChanged();
         ClearMousePressedChain();
     }

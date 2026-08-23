@@ -11,6 +11,7 @@ internal static partial class GalleryWindow
         Card("TextBlock", BuildTextBlockDemo()),
         Card("Label", new Label { Content = "Account name" }),
         Card("Markdown", BuildMarkdownDemo(), width: 360),
+        Card("Markdown (restyled)", BuildStyledMarkdownDemo(), width: 360),
         Card("FontIcon", BuildFontIconRow()),
         Card("SymbolIcon", BuildSymbolIconRow()),
         Card("PathIcon", BuildPathIconRow()));
@@ -45,6 +46,72 @@ internal static partial class GalleryWindow
             "- Third item\n",
         Width = 320
     };
+
+    // 同样的 Markdown 源，外观全部从控件外部改：块级走 Style + 默认模板，
+    // 行内走 MarkdownInlineStyle，一行 OnRender 都不用碰。
+    private static UIElement BuildStyledMarkdownDemo()
+    {
+        var accent = new SolidColorBrush(Color.FromRgb(0x7C, 0x3A, 0xED));
+
+        var headingStyle = new Style(typeof(MarkdownHeadingPresenter))
+        {
+            Setters =
+            {
+                new Setter(Control.ForegroundProperty, accent),
+                new Setter(MarkdownHeadingPresenter.HasSeparatorProperty, false),
+                new Setter(FrameworkElement.MarginProperty, new Thickness(0, 0, 0, 8)),
+            }
+        };
+
+        var quoteStyle = new Style(typeof(MarkdownQuotePresenter))
+        {
+            Setters =
+            {
+                new Setter(Control.BackgroundProperty, null),
+                new Setter(Control.BorderBrushProperty, new SolidColorBrush(Color.FromRgb(0xF5, 0x9E, 0x0B))),
+                new Setter(Control.BorderThicknessProperty, new Thickness(3, 0, 0, 0)),
+                new Setter(Control.PaddingProperty, new Thickness(10, 4, 0, 0)),
+                new Setter(Control.CornerRadiusProperty, new CornerRadius(0)),
+            }
+        };
+
+        var listItemStyle = new Style(typeof(MarkdownListItemPresenter))
+        {
+            Setters =
+            {
+                new Setter(MarkdownListItemPresenter.BulletGlyphProperty, "→"),
+                new Setter(MarkdownListItemPresenter.MarkerForegroundProperty, accent),
+                new Setter(MarkdownListItemPresenter.MarkerWidthProperty, 20.0),
+            }
+        };
+
+        return new Markdown
+        {
+            Text =
+                "### Restyled\n" +
+                "Headings, quotes, bullets and `inline code` all restyled from outside.\n\n" +
+                "> A quote with its own rule.\n\n" +
+                "- First item\n" +
+                "- Second item\n",
+            HeadingStyle = headingStyle,
+            QuoteStyle = quoteStyle,
+            ListItemStyle = listItemStyle,
+            InlineCodeForeground = accent,
+            InlineCodeBackground = new SolidColorBrush(Color.FromArgb(0x28, 0x7C, 0x3A, 0xED)),
+            InlineCodeStyle = new MarkdownInlineStyle
+            {
+                CornerRadius = new CornerRadius(9),
+                Padding = new Thickness(7, 2, 7, 2),
+                FontSizeRatio = 0.92,
+            },
+            LinkStyle = new MarkdownInlineStyle
+            {
+                Decorations = MarkdownTextDecorations.None,
+                FontWeight = FontWeights.SemiBold,
+            },
+            Width = 320
+        };
+    }
 
     private static UIElement BuildFontIconRow()
     {

@@ -27,6 +27,21 @@ internal static class RazorLightweightCodeBlockInterpreter
     /// Expands a code block by interpreting C# code and emitting XML markup.
     /// This is a drop-in replacement for the Roslyn-based <c>ExecuteScript</c>.
     /// </summary>
+    public static string Expand(
+        List<RazorCodeBlockPreprocessor.CodeSegment> segments,
+        Func<string, object?>? externalResolver)
+    {
+        var merged = new StringBuilder();
+        foreach (var seg in segments)
+            merged.Append(seg.Text);
+
+        var output = new StringBuilder();
+        var scope = new InterpreterScope(externalResolver);
+        InjectBuiltins(scope, output);
+        InterpretMixedCode(merged.ToString(), output, scope);
+        return output.ToString();
+    }
+
     public static string Expand(List<RazorCodeBlockPreprocessor.CodeSegment> segments)
     {
         // Merge all segments back into a single code string where markup

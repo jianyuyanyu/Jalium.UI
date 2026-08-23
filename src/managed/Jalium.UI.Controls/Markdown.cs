@@ -29,8 +29,26 @@ public sealed class MarkdownLinkClickedEventArgs : EventArgs
 }
 
 /// <summary>
-/// Displays Markdown content using a native parser and renderer.
+/// 用原生解析器与渲染器显示 Markdown 内容。
 /// </summary>
+/// <remarks>
+/// <para>
+/// 每个 Markdown 块都渲染成一个带默认 <c>ControlTemplate</c> 的
+/// <see cref="MarkdownBlockPresenter"/> 派生控件（标题、段落、引用、代码块、列表、
+/// 列表项、表格、单元格、分隔线、图表）。外观有三层定制入口：
+/// </para>
+/// <list type="number">
+/// <item>隐式样式：<c>&lt;Style TargetType="MarkdownHeadingPresenter"&gt;</c> 等，作用于整个应用；</item>
+/// <item>容器样式属性：<see cref="HeadingStyle"/>、<see cref="ParagraphStyle"/> 等，
+/// 只作用于这一个 <see cref="Markdown"/> 实例，语义与 <c>ItemsControl.ItemContainerStyle</c> 一致；
+/// <see cref="BlockContainerStyleSelector"/> 可按块动态选择；</item>
+/// <item>行内文本：<see cref="BoldStyle"/>、<see cref="ItalicStyle"/>、
+/// <see cref="InlineCodeStyle"/>、<see cref="LinkStyle"/> 描述形态，
+/// <see cref="LinkForeground"/>、<see cref="InlineCodeForeground"/>、
+/// <see cref="InlineCodeBackground"/> 描述主题色；这些属性都可继承，
+/// 因此也能在单个块的样式里覆盖。</item>
+/// </list>
+/// </remarks>
 [Jalium.UI.Markup.ContentProperty(nameof(Text))]
 public class Markdown : Control
 {
@@ -47,12 +65,16 @@ public class Markdown : Control
         "mailto"
     };
 
-    private static readonly SolidColorBrush s_defaultSelectionBrush = new(Color.FromArgb(90, 51, 153, 255));
-
     private Border? _container;
     private ScrollViewer? _scrollViewer;
     private StackPanel? _contentHost;
     private IReadOnlyList<MarkdownBlock> _blocks = Array.Empty<MarkdownBlock>();
+
+    // 增量追加状态：上次解析过的源文本、它规范化后的行，以及每个顶层块的起始行号。
+    // 三者一起让「末尾追加」只需要重新解析并重建尾部，见 TryAppendText。
+    private string _parsedText = string.Empty;
+    private string[] _lines = Array.Empty<string>();
+    private readonly List<int> _blockLineStarts = new();
 
     private readonly List<MarkdownSegment> _segments = new();
     private int _selectionAnchor;
@@ -77,6 +99,8 @@ public class Markdown : Control
         public int Length { get; set; }
     }
 
+    #region Content dependency properties
+
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Content)]
     public static readonly DependencyProperty TextProperty =
         DependencyProperty.Register(nameof(Text), typeof(string), typeof(Markdown),
@@ -92,60 +116,115 @@ public class Markdown : Control
         DependencyProperty.Register(nameof(OpenLinksExternally), typeof(bool), typeof(Markdown),
             new PropertyMetadata(true));
 
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
-    public static readonly DependencyProperty LinkForegroundProperty =
-        DependencyProperty.Register(nameof(LinkForeground), typeof(Brush), typeof(Markdown),
-            new PropertyMetadata(null, OnMarkdownVisualChanged));
-
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
-    public static readonly DependencyProperty CodeBackgroundProperty =
-        DependencyProperty.Register(nameof(CodeBackground), typeof(Brush), typeof(Markdown),
-            new PropertyMetadata(null, OnMarkdownVisualChanged));
-
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
-    public static readonly DependencyProperty CodeLineNumberForegroundProperty =
-        DependencyProperty.Register(nameof(CodeLineNumberForeground), typeof(Brush), typeof(Markdown),
-            new PropertyMetadata(null, OnMarkdownVisualChanged));
-
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
-    public static readonly DependencyProperty CodeGutterBackgroundProperty =
-        DependencyProperty.Register(nameof(CodeGutterBackground), typeof(Brush), typeof(Markdown),
-            new PropertyMetadata(null, OnMarkdownVisualChanged));
-
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
-    public static readonly DependencyProperty QuoteBackgroundProperty =
-        DependencyProperty.Register(nameof(QuoteBackground), typeof(Brush), typeof(Markdown),
-            new PropertyMetadata(null, OnMarkdownVisualChanged));
-
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
-    public static readonly DependencyProperty QuoteBorderBrushProperty =
-        DependencyProperty.Register(nameof(QuoteBorderBrush), typeof(Brush), typeof(Markdown),
-            new PropertyMetadata(null, OnMarkdownVisualChanged));
-
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
-    public static readonly DependencyProperty HeadingSeparatorBrushProperty =
-        DependencyProperty.Register(nameof(HeadingSeparatorBrush), typeof(Brush), typeof(Markdown),
-            new PropertyMetadata(null, OnMarkdownVisualChanged));
-
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
-    public static readonly DependencyProperty TableBorderBrushProperty =
-        DependencyProperty.Register(nameof(TableBorderBrush), typeof(Brush), typeof(Markdown),
-            new PropertyMetadata(null, OnMarkdownVisualChanged));
-
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Input)]
-    public static readonly DependencyProperty TableHeaderBackgroundProperty =
-        DependencyProperty.Register(nameof(TableHeaderBackground), typeof(Brush), typeof(Markdown),
-            new PropertyMetadata(null, OnMarkdownVisualChanged));
-
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Behavior)]
     public static readonly DependencyProperty IsTextSelectionEnabledProperty =
         DependencyProperty.Register(nameof(IsTextSelectionEnabled), typeof(bool), typeof(Markdown),
             new PropertyMetadata(true, OnSelectionEnabledChanged));
 
+    #endregion
+
+    #region Block container style hooks
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty HeadingStyleProperty =
+        DependencyProperty.Register(nameof(HeadingStyle), typeof(Style), typeof(Markdown),
+            new PropertyMetadata(null, OnContainerStyleChanged));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty ParagraphStyleProperty =
+        DependencyProperty.Register(nameof(ParagraphStyle), typeof(Style), typeof(Markdown),
+            new PropertyMetadata(null, OnContainerStyleChanged));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty QuoteStyleProperty =
+        DependencyProperty.Register(nameof(QuoteStyle), typeof(Style), typeof(Markdown),
+            new PropertyMetadata(null, OnContainerStyleChanged));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty CodeBlockStyleProperty =
+        DependencyProperty.Register(nameof(CodeBlockStyle), typeof(Style), typeof(Markdown),
+            new PropertyMetadata(null, OnContainerStyleChanged));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty RuleStyleProperty =
+        DependencyProperty.Register(nameof(RuleStyle), typeof(Style), typeof(Markdown),
+            new PropertyMetadata(null, OnContainerStyleChanged));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty ListStyleProperty =
+        DependencyProperty.Register(nameof(ListStyle), typeof(Style), typeof(Markdown),
+            new PropertyMetadata(null, OnContainerStyleChanged));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty ListItemStyleProperty =
+        DependencyProperty.Register(nameof(ListItemStyle), typeof(Style), typeof(Markdown),
+            new PropertyMetadata(null, OnContainerStyleChanged));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty TableStyleProperty =
+        DependencyProperty.Register(nameof(TableStyle), typeof(Style), typeof(Markdown),
+            new PropertyMetadata(null, OnContainerStyleChanged));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty TableCellStyleProperty =
+        DependencyProperty.Register(nameof(TableCellStyle), typeof(Style), typeof(Markdown),
+            new PropertyMetadata(null, OnContainerStyleChanged));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty DiagramStyleProperty =
+        DependencyProperty.Register(nameof(DiagramStyle), typeof(Style), typeof(Markdown),
+            new PropertyMetadata(null, OnContainerStyleChanged));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty BlockContainerStyleSelectorProperty =
+        DependencyProperty.Register(nameof(BlockContainerStyleSelector), typeof(StyleSelector), typeof(Markdown),
+            new PropertyMetadata(null, OnContainerStyleChanged));
+
+    #endregion
+
+    #region Inline text style hooks (shared with MarkdownTextPresenter, inherited down the tree)
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Typography)]
+    public static readonly DependencyProperty LineHeightRatioProperty =
+        MarkdownTextPresenter.LineHeightRatioProperty.AddOwner(typeof(Markdown));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Typography)]
+    public static readonly DependencyProperty MonospaceFontFamilyProperty =
+        MarkdownTextPresenter.MonospaceFontFamilyProperty.AddOwner(typeof(Markdown));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty LinkForegroundProperty =
+        MarkdownTextPresenter.LinkForegroundProperty.AddOwner(typeof(Markdown));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty InlineCodeForegroundProperty =
+        MarkdownTextPresenter.InlineCodeForegroundProperty.AddOwner(typeof(Markdown));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty InlineCodeBackgroundProperty =
+        MarkdownTextPresenter.InlineCodeBackgroundProperty.AddOwner(typeof(Markdown));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Typography)]
+    public static readonly DependencyProperty BoldStyleProperty =
+        MarkdownTextPresenter.BoldStyleProperty.AddOwner(typeof(Markdown));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Typography)]
+    public static readonly DependencyProperty ItalicStyleProperty =
+        MarkdownTextPresenter.ItalicStyleProperty.AddOwner(typeof(Markdown));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Typography)]
+    public static readonly DependencyProperty InlineCodeStyleProperty =
+        MarkdownTextPresenter.InlineCodeStyleProperty.AddOwner(typeof(Markdown));
+
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Typography)]
+    public static readonly DependencyProperty LinkStyleProperty =
+        MarkdownTextPresenter.LinkStyleProperty.AddOwner(typeof(Markdown));
+
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
     public static readonly DependencyProperty SelectionBrushProperty =
-        DependencyProperty.Register(nameof(SelectionBrush), typeof(Brush), typeof(Markdown),
-            new PropertyMetadata(null, OnMarkdownVisualChanged));
+        MarkdownTextPresenter.SelectionBrushProperty.AddOwner(typeof(Markdown));
+
+    #endregion
 
     public Markdown()
     {
@@ -204,96 +283,6 @@ public class Markdown : Control
     }
 
     /// <summary>
-    /// Gets or sets the brush used for links.
-    /// </summary>
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
-    public Brush? LinkForeground
-    {
-        get => (Brush?)GetValue(LinkForegroundProperty);
-        set => SetValue(LinkForegroundProperty, value);
-    }
-
-    /// <summary>
-    /// Gets or sets the brush used behind inline and fenced code.
-    /// </summary>
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
-    public Brush? CodeBackground
-    {
-        get => (Brush?)GetValue(CodeBackgroundProperty);
-        set => SetValue(CodeBackgroundProperty, value);
-    }
-
-    /// <summary>
-    /// Gets or sets the brush used for code block line numbers.
-    /// </summary>
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
-    public Brush? CodeLineNumberForeground
-    {
-        get => (Brush?)GetValue(CodeLineNumberForegroundProperty);
-        set => SetValue(CodeLineNumberForegroundProperty, value);
-    }
-
-    /// <summary>
-    /// Gets or sets the brush used behind the code block gutter.
-    /// </summary>
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
-    public Brush? CodeGutterBackground
-    {
-        get => (Brush?)GetValue(CodeGutterBackgroundProperty);
-        set => SetValue(CodeGutterBackgroundProperty, value);
-    }
-
-    /// <summary>
-    /// Gets or sets the brush used behind block quotes.
-    /// </summary>
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
-    public Brush? QuoteBackground
-    {
-        get => (Brush?)GetValue(QuoteBackgroundProperty);
-        set => SetValue(QuoteBackgroundProperty, value);
-    }
-
-    /// <summary>
-    /// Gets or sets the left border brush used for block quotes.
-    /// </summary>
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
-    public Brush? QuoteBorderBrush
-    {
-        get => (Brush?)GetValue(QuoteBorderBrushProperty);
-        set => SetValue(QuoteBorderBrushProperty, value);
-    }
-
-    /// <summary>
-    /// Gets or sets the brush used for heading underline separators.
-    /// </summary>
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
-    public Brush? HeadingSeparatorBrush
-    {
-        get => (Brush?)GetValue(HeadingSeparatorBrushProperty);
-        set => SetValue(HeadingSeparatorBrushProperty, value);
-    }
-
-    /// <summary>
-    /// Gets or sets the border brush used by Markdown tables.
-    /// </summary>
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
-    public Brush? TableBorderBrush
-    {
-        get => (Brush?)GetValue(TableBorderBrushProperty);
-        set => SetValue(TableBorderBrushProperty, value);
-    }
-
-    /// <summary>
-    /// Gets or sets the background brush used by Markdown table headers.
-    /// </summary>
-    [DevToolsPropertyCategory(DevToolsPropertyCategory.Input)]
-    public Brush? TableHeaderBackground
-    {
-        get => (Brush?)GetValue(TableHeaderBackgroundProperty);
-        set => SetValue(TableHeaderBackgroundProperty, value);
-    }
-
-    /// <summary>
     /// Gets or sets whether the rendered content can be selected with the mouse and copied.
     /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Behavior)]
@@ -301,6 +290,157 @@ public class Markdown : Control
     {
         get => (bool)GetValue(IsTextSelectionEnabledProperty)!;
         set => SetValue(IsTextSelectionEnabledProperty, value);
+    }
+
+    #region Block container style accessors
+
+    /// <summary>应用到每个标题容器（<see cref="MarkdownHeadingPresenter"/>）的样式。</summary>
+    public Style? HeadingStyle
+    {
+        get => (Style?)GetValue(HeadingStyleProperty);
+        set => SetValue(HeadingStyleProperty, value);
+    }
+
+    /// <summary>应用到每个段落容器（<see cref="MarkdownParagraphPresenter"/>）的样式。</summary>
+    public Style? ParagraphStyle
+    {
+        get => (Style?)GetValue(ParagraphStyleProperty);
+        set => SetValue(ParagraphStyleProperty, value);
+    }
+
+    /// <summary>应用到每个块引用容器（<see cref="MarkdownQuotePresenter"/>）的样式。</summary>
+    public Style? QuoteStyle
+    {
+        get => (Style?)GetValue(QuoteStyleProperty);
+        set => SetValue(QuoteStyleProperty, value);
+    }
+
+    /// <summary>应用到每个代码块容器（<see cref="MarkdownCodePresenter"/>）的样式。</summary>
+    public Style? CodeBlockStyle
+    {
+        get => (Style?)GetValue(CodeBlockStyleProperty);
+        set => SetValue(CodeBlockStyleProperty, value);
+    }
+
+    /// <summary>应用到每条分隔线容器（<see cref="MarkdownRulePresenter"/>）的样式。</summary>
+    public Style? RuleStyle
+    {
+        get => (Style?)GetValue(RuleStyleProperty);
+        set => SetValue(RuleStyleProperty, value);
+    }
+
+    /// <summary>应用到每个列表容器（<see cref="MarkdownListPresenter"/>）的样式。</summary>
+    public Style? ListStyle
+    {
+        get => (Style?)GetValue(ListStyleProperty);
+        set => SetValue(ListStyleProperty, value);
+    }
+
+    /// <summary>应用到每个列表项容器（<see cref="MarkdownListItemPresenter"/>）的样式。</summary>
+    public Style? ListItemStyle
+    {
+        get => (Style?)GetValue(ListItemStyleProperty);
+        set => SetValue(ListItemStyleProperty, value);
+    }
+
+    /// <summary>应用到每个表格容器（<see cref="MarkdownTablePresenter"/>）的样式。</summary>
+    public Style? TableStyle
+    {
+        get => (Style?)GetValue(TableStyleProperty);
+        set => SetValue(TableStyleProperty, value);
+    }
+
+    /// <summary>应用到每个表格单元格容器（<see cref="MarkdownTableCellPresenter"/>）的样式。</summary>
+    public Style? TableCellStyle
+    {
+        get => (Style?)GetValue(TableCellStyleProperty);
+        set => SetValue(TableCellStyleProperty, value);
+    }
+
+    /// <summary>应用到每个图表容器（<see cref="MarkdownDiagramPresenter"/>）的样式。</summary>
+    public Style? DiagramStyle
+    {
+        get => (Style?)GetValue(DiagramStyleProperty);
+        set => SetValue(DiagramStyleProperty, value);
+    }
+
+    /// <summary>
+    /// 按块动态选择容器样式。选择器返回非 <see langword="null"/> 时优先于上面的固定样式属性；
+    /// 传入的 <c>item</c> 与 <c>container</c> 都是待应用样式的
+    /// <see cref="MarkdownBlockPresenter"/>，可从 <see cref="MarkdownBlockPresenter.BlockKind"/>
+    /// 或具体类型（如 <see cref="MarkdownHeadingPresenter.Level"/>）分派。
+    /// </summary>
+    public StyleSelector? BlockContainerStyleSelector
+    {
+        get => (StyleSelector?)GetValue(BlockContainerStyleSelectorProperty);
+        set => SetValue(BlockContainerStyleSelectorProperty, value);
+    }
+
+    #endregion
+
+    #region Inline text style accessors
+
+    /// <summary>行内文本行高相对字号的倍数。</summary>
+    public double LineHeightRatio
+    {
+        get => (double)GetValue(LineHeightRatioProperty)!;
+        set => SetValue(LineHeightRatioProperty, value);
+    }
+
+    /// <summary>行内代码与代码块使用的等宽字体族。</summary>
+    public FontFamily? MonospaceFontFamily
+    {
+        get => (FontFamily?)GetValue(MonospaceFontFamilyProperty);
+        set => SetValue(MonospaceFontFamilyProperty, value);
+    }
+
+    /// <summary>链接文本的前景画刷。</summary>
+    public Brush? LinkForeground
+    {
+        get => (Brush?)GetValue(LinkForegroundProperty);
+        set => SetValue(LinkForegroundProperty, value);
+    }
+
+    /// <summary>行内代码的前景画刷。</summary>
+    public Brush? InlineCodeForeground
+    {
+        get => (Brush?)GetValue(InlineCodeForegroundProperty);
+        set => SetValue(InlineCodeForegroundProperty, value);
+    }
+
+    /// <summary>行内代码的背景画刷。</summary>
+    public Brush? InlineCodeBackground
+    {
+        get => (Brush?)GetValue(InlineCodeBackgroundProperty);
+        set => SetValue(InlineCodeBackgroundProperty, value);
+    }
+
+    /// <summary>粗体片段的行内样式。</summary>
+    public MarkdownInlineStyle? BoldStyle
+    {
+        get => (MarkdownInlineStyle?)GetValue(BoldStyleProperty);
+        set => SetValue(BoldStyleProperty, value);
+    }
+
+    /// <summary>斜体片段的行内样式。</summary>
+    public MarkdownInlineStyle? ItalicStyle
+    {
+        get => (MarkdownInlineStyle?)GetValue(ItalicStyleProperty);
+        set => SetValue(ItalicStyleProperty, value);
+    }
+
+    /// <summary>行内代码片段的行内样式。</summary>
+    public MarkdownInlineStyle? InlineCodeStyle
+    {
+        get => (MarkdownInlineStyle?)GetValue(InlineCodeStyleProperty);
+        set => SetValue(InlineCodeStyleProperty, value);
+    }
+
+    /// <summary>链接片段的行内样式。</summary>
+    public MarkdownInlineStyle? LinkStyle
+    {
+        get => (MarkdownInlineStyle?)GetValue(LinkStyleProperty);
+        set => SetValue(LinkStyleProperty, value);
     }
 
     /// <summary>
@@ -313,12 +453,22 @@ public class Markdown : Control
         set => SetValue(SelectionBrushProperty, value);
     }
 
+    #endregion
+
     /// <summary>
     /// Occurs when a rendered Markdown link is clicked.
     /// </summary>
     public event EventHandler<MarkdownLinkClickedEventArgs>? LinkClicked;
 
     internal IReadOnlyList<MarkdownBlock> DebugBlocks => _blocks;
+
+    /// <summary>诊断计数器：建过几个顶层块元素。流式追加时它应该几乎不涨。</summary>
+    internal static long DebugBlockElementsCreated;
+
+    /// <summary>诊断计数器：走了几次全量重建可视树。</summary>
+    internal static long DebugFullRebuilds;
+
+    internal StackPanel? DebugContentHost => _contentHost;
 
     public override void OnApplyTemplate()
     {
@@ -356,24 +506,16 @@ public class Markdown : Control
         RebuildVisualTree();
     }
 
+    /// <inheritdoc />
     protected override void OnPropertyChanged(DependencyPropertyChangedEventArgs e)
     {
         base.OnPropertyChanged(e);
 
-        if (e.Property == ForegroundProperty ||
-            e.Property == FontFamilyProperty ||
-            e.Property == FontSizeProperty ||
-            e.Property == LinkForegroundProperty ||
-            e.Property == CodeBackgroundProperty ||
-            e.Property == CodeLineNumberForegroundProperty ||
-            e.Property == CodeGutterBackgroundProperty ||
-            e.Property == QuoteBackgroundProperty ||
-            e.Property == QuoteBorderBrushProperty ||
-            e.Property == HeadingSeparatorBrushProperty ||
-            e.Property == TableBorderBrushProperty ||
-            e.Property == TableHeaderBackgroundProperty)
+        // 可继承的排版属性（字体、前景、各类行内样式）改了不需要重建可视树，
+        // 但要把已缓存排版的叶子呈现器叫醒——继承是按需向上取值的，它们收不到回调。
+        if (MarkdownInheritedFormatting.AffectsInlineFormatting(e.Property))
         {
-            RebuildVisualTree();
+            MarkdownInheritedFormatting.InvalidateSubtree(_contentHost);
         }
     }
 
@@ -384,22 +526,223 @@ public class Markdown : Control
             return;
         }
 
+        if (e.Property == TextProperty && markdown.TryAppendText(e.NewValue as string))
+        {
+            return;
+        }
+
         markdown.ParseMarkdown();
         markdown.RebuildVisualTree();
     }
 
-    private static void OnMarkdownVisualChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    private static void OnContainerStyleChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
-        if (d is Markdown markdown)
-        {
-            markdown.RebuildVisualTree();
-        }
+        // 容器样式换了要重新套用；行内样式与颜色是可继承属性，会自己流到呈现器上，不必重建。
+        (d as Markdown)?.RebuildVisualTree();
     }
 
     private void ParseMarkdown()
     {
-        _blocks = MarkdownParser.Parse(Text, BaseUri);
+        _parsedText = Text ?? string.Empty;
+        _blockLineStarts.Clear();
+
+        if (string.IsNullOrWhiteSpace(_parsedText))
+        {
+            _lines = Array.Empty<string>();
+            _blocks = Array.Empty<MarkdownBlock>();
+            return;
+        }
+
+        _lines = MarkdownParser.Normalize(_parsedText).Split('\n');
+        _blocks = MarkdownParser.ParseLines(_lines, BaseUri, _blockLineStarts);
     }
+
+    #region Incremental append (streaming)
+
+    /// <summary>
+    /// 流式输出的快路径：<see cref="Text"/> 只在末尾变长时，避开「全量重解析 + 整棵可视树重建」。
+    /// </summary>
+    /// <remarks>
+    /// 逐字追加走慢路径的代价是 O(文本长度 × 追加次数)：每次赋值都要重新解析全文、清空
+    /// <c>_contentHost.Children</c> 重建每一个块的呈现器，顺带把它们的排版缓存全部丢弃。
+    /// 快路径把三件事都收敛到「只碰尾部」：
+    /// <list type="number">
+    ///   <item>只规范化并切分新追加的那一段文本，接到行缓冲末尾；</item>
+    ///   <item>只从倒数第二个顶层块的起始行重新解析（顶层块无跨块状态，见
+    ///         <see cref="MarkdownParser.ParseLines"/>）；</item>
+    ///   <item>可视树按块结构比对，未变的块连元素带排版缓存一起留用，变了的块优先原地换内容
+    ///         而不是重建元素——这样 <see cref="MarkdownTextPresenter"/> 才有机会只重排最后一行。</item>
+    /// </list>
+    /// 返回 <see langword="false"/> 表示这次变化不是纯追加（或状态不足以复用），交回慢路径。
+    /// </remarks>
+    private bool TryAppendText(string? newValue)
+    {
+        var newText = newValue ?? string.Empty;
+
+        if (_contentHost == null ||
+            _parsedText.Length == 0 ||
+            _blockLineStarts.Count == 0 ||
+            newText.Length <= _parsedText.Length ||
+            !newText.StartsWith(_parsedText, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        // 旧文本以 \r 收尾时，追加的 \n 会与它合并成一个换行——规范化就不再是逐段可拼接的了。
+        if (_parsedText[^1] == '\r')
+        {
+            return false;
+        }
+
+        if (_contentHost.Children.Count != _blocks.Count)
+        {
+            return false;
+        }
+
+        AppendLines(MarkdownParser.Normalize(newText.AsSpan(_parsedText.Length).ToString()));
+        _parsedText = newText;
+
+        // 只有最后一个顶层块会被追加的内容延长，这里保守地从倒数第二个块起重解析：多解析一个块几乎不要钱，
+        // 而块结构比对会把没真正变化的块挡在可视树更新之外。
+        var stableBlockCount = Math.Max(0, _blockLineStarts.Count - 2);
+        var fromLine = _blockLineStarts[stableBlockCount];
+
+        var tailLines = new string[_lines.Length - fromLine];
+        Array.Copy(_lines, fromLine, tailLines, 0, tailLines.Length);
+
+        var tailStarts = new List<int>();
+        var tailBlocks = MarkdownParser.ParseLines(tailLines, BaseUri, tailStarts);
+
+        var merged = new List<MarkdownBlock>(stableBlockCount + tailBlocks.Count);
+        for (var index = 0; index < stableBlockCount; index++)
+        {
+            merged.Add(_blocks[index]);
+        }
+        merged.AddRange(tailBlocks);
+
+        _blockLineStarts.RemoveRange(stableBlockCount, _blockLineStarts.Count - stableBlockCount);
+        foreach (var start in tailStarts)
+        {
+            _blockLineStarts.Add(start + fromLine);
+        }
+
+        var previousBlocks = _blocks;
+        _blocks = merged;
+        SyncVisualTree(previousBlocks, stableBlockCount);
+        return true;
+    }
+
+    /// <summary>把一段已规范化的新文本接到行缓冲末尾——第一段续在原末行上，其余各自成行。</summary>
+    private void AppendLines(string normalizedDelta)
+    {
+        var parts = normalizedDelta.Split('\n');
+        if (_lines.Length == 0)
+        {
+            _lines = parts;
+            return;
+        }
+
+        var previousCount = _lines.Length;
+        if (parts.Length > 1)
+        {
+            Array.Resize(ref _lines, previousCount + parts.Length - 1);
+        }
+
+        _lines[previousCount - 1] += parts[0];
+        for (var index = 1; index < parts.Length; index++)
+        {
+            _lines[previousCount + index - 1] = parts[index];
+        }
+    }
+
+    /// <summary>
+    /// 把可视树对齐到新的块列表：前 <paramref name="stableBlockCount"/> 个块保证没动，从那之后按结构比对，
+    /// 第一个真正变化的块起才动元素。
+    /// </summary>
+    private void SyncVisualTree(IReadOnlyList<MarkdownBlock> previousBlocks, int stableBlockCount)
+    {
+        if (_contentHost == null)
+        {
+            RebuildVisualTree();
+            return;
+        }
+
+        var comparable = Math.Min(previousBlocks.Count, _blocks.Count);
+        var firstChanged = stableBlockCount;
+        while (firstChanged < comparable &&
+               MarkdownParser.StructuralEquals(previousBlocks[firstChanged], _blocks[firstChanged]))
+        {
+            firstChanged++;
+        }
+
+        if (firstChanged >= _blocks.Count && previousBlocks.Count == _blocks.Count)
+        {
+            return;
+        }
+
+        for (var index = firstChanged; index < _blocks.Count; index++)
+        {
+            if (index >= previousBlocks.Count)
+            {
+                _contentHost.Children.Add(CreateBlockElement(_blocks[index], isNested: false));
+                continue;
+            }
+
+            if (TryUpdateBlockInPlace(_contentHost.Children[index], previousBlocks[index], _blocks[index]))
+            {
+                continue;
+            }
+
+            _contentHost.Children[index] = CreateBlockElement(_blocks[index], isNested: false);
+        }
+
+        for (var index = previousBlocks.Count - 1; index >= _blocks.Count; index--)
+        {
+            _contentHost.Children.RemoveAt(index);
+        }
+
+        _selectionGlobalStart = 0;
+        _selectionGlobalEnd = 0;
+        _isSelecting = false;
+        RecollectSelectablesFrom(firstChanged);
+    }
+
+    /// <summary>
+    /// 同类型的块只换内容，不换元素——留住呈现器就是留住它的排版缓存，
+    /// 正在变长的那个段落因此只需重排最后一行。
+    /// </summary>
+    private bool TryUpdateBlockInPlace(UIElement element, MarkdownBlock previous, MarkdownBlock current)
+    {
+        switch (previous, current)
+        {
+            case (MarkdownParagraphBlock, MarkdownParagraphBlock paragraph)
+                when element is MarkdownParagraphPresenter { Content: MarkdownTextPresenter text }:
+                text.Spans = FlattenInlines(paragraph.Inlines);
+                return true;
+
+            case (MarkdownHeadingBlock previousHeading, MarkdownHeadingBlock heading)
+                when previousHeading.Level == heading.Level &&
+                     element is MarkdownHeadingPresenter { Content: MarkdownTextPresenter text }:
+                text.Spans = FlattenInlines(heading.Inlines);
+                return true;
+
+            case (MarkdownCodeBlock previousCode, MarkdownCodeBlock code)
+                when element is MarkdownCodePresenter presenter &&
+                     string.Equals(previousCode.Language, code.Language, StringComparison.Ordinal) &&
+                     !IsMermaidLanguage(code.Language):
+                presenter.Code = code.Text;
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    private static bool IsMermaidLanguage(string? language) =>
+        !string.IsNullOrEmpty(language) &&
+        string.Equals(language.Trim(), "mermaid", StringComparison.OrdinalIgnoreCase);
+
+    #endregion
 
     private void RebuildVisualTree()
     {
@@ -408,10 +751,11 @@ public class Markdown : Control
             return;
         }
 
+        System.Threading.Interlocked.Increment(ref DebugFullRebuilds);
         _contentHost.Children.Clear();
         foreach (var block in _blocks)
         {
-            _contentHost.Children.Add(CreateBlockElement(block, inListItem: false));
+            _contentHost.Children.Add(CreateBlockElement(block, isNested: false));
         }
 
         _selectionGlobalStart = 0;
@@ -420,253 +764,148 @@ public class Markdown : Control
         CollectSelectables();
     }
 
-    private UIElement CreateBlockElement(MarkdownBlock block, bool inListItem)
+    #region Block container construction
+
+    private UIElement CreateBlockElement(MarkdownBlock block, bool isNested)
     {
-        return block switch
+        if (!isNested)
         {
-            MarkdownHeadingBlock heading => CreateHeadingElement(heading),
-            MarkdownParagraphBlock paragraph => CreateParagraphElement(paragraph, inListItem),
-            MarkdownListBlock list => CreateListElement(list),
-            MarkdownQuoteBlock quote => CreateQuoteElement(quote),
-            MarkdownCodeBlock code => CreateCodeBlockElement(code),
-            MarkdownRuleBlock => new Border
-            {
-                Height = 1,
-                MinHeight = 1,
-                MaxHeight = 1,
-                Background = ResolveBrush(TableBorderBrush, "ControlBorder", new SolidColorBrush(Color.FromRgb(200, 200, 200))),
-                Margin = new Thickness(0, 4, 0, 16)
-            },
-            MarkdownTableBlock table => CreateTableElement(table),
-            _ => new TextBlock { Text = string.Empty }
-        };
-    }
-
-    private UIElement CreateHeadingElement(MarkdownHeadingBlock heading)
-    {
-        var scale = heading.Level switch
-        {
-            1 => 2.0,
-            2 => 1.65,
-            3 => 1.4,
-            4 => 1.2,
-            5 => 1.05,
-            _ => 1.0
-        };
-
-        var renderer = CreateTextRenderer(heading.Inlines);
-        renderer.TextFontSize = FontSize * scale;
-        renderer.DefaultFontWeight = FontWeights.Bold;
-        renderer.LineHeightMultiplier = heading.Level <= 2 ? 1.0 : 1.3;
-
-        if (heading.Level is not (1 or 2))
-        {
-            renderer.Margin = new Thickness(0, heading.Level == 1 ? 0 : 4, 0, 12);
-            return renderer;
+            System.Threading.Interlocked.Increment(ref DebugBlockElementsCreated);
         }
 
-        renderer.Margin = new Thickness(0, heading.Level == 1 ? 0 : 4, 0, 2);
-
-        var host = new StackPanel
+        return block switch
         {
-            Orientation = Orientation.Vertical
-        };
-        host.Children.Add(renderer);
-        host.Children.Add(new Border
-        {
-            Height = 1,
-            MinHeight = 1,
-            MaxHeight = 1,
-            Background = ResolveBrush(HeadingSeparatorBrush, "TextSecondary", new SolidColorBrush(Color.FromRgb(160, 160, 160))),
-            Margin = new Thickness(0, 0, 0, 0)
-        });
-        return new Border
-        {
-            Margin = new Thickness(0, 0, 0, 12),
-            Child = host
+            MarkdownHeadingBlock heading => CreateHeadingPresenter(heading, isNested),
+            MarkdownParagraphBlock paragraph => CreateParagraphPresenter(paragraph, isNested),
+            MarkdownListBlock list => CreateListPresenter(list, isNested),
+            MarkdownQuoteBlock quote => CreateQuotePresenter(quote, isNested),
+            MarkdownCodeBlock code => CreateCodePresenter(code, isNested),
+            MarkdownRuleBlock => CreateRulePresenter(isNested),
+            MarkdownTableBlock table => CreateTablePresenter(table, isNested),
+            _ => CreateEmptyParagraphPresenter(isNested),
         };
     }
 
-    private UIElement CreateParagraphElement(MarkdownParagraphBlock paragraph, bool inListItem)
+    private MarkdownHeadingPresenter CreateHeadingPresenter(MarkdownHeadingBlock heading, bool isNested)
     {
-        var renderer = CreateTextRenderer(paragraph.Inlines);
-        renderer.Margin = new Thickness(0, 0, 0, inListItem ? 6 : 12);
-        return renderer;
+        var presenter = new MarkdownHeadingPresenter
+        {
+            Level = Math.Clamp(heading.Level, 1, 6),
+            IsNested = isNested,
+            Content = CreateTextPresenter(heading.Inlines),
+        };
+        ApplyContainerStyle(presenter, HeadingStyle);
+        return presenter;
     }
 
-    private UIElement CreateListElement(MarkdownListBlock list)
+    private MarkdownParagraphPresenter CreateParagraphPresenter(MarkdownParagraphBlock paragraph, bool isNested)
     {
-        var host = new StackPanel
+        var presenter = new MarkdownParagraphPresenter
         {
-            Orientation = Orientation.Vertical,
-            Margin = new Thickness(0, 0, 0, 12)
+            IsNested = isNested,
+            Content = CreateTextPresenter(paragraph.Inlines),
         };
+        ApplyContainerStyle(presenter, ParagraphStyle);
+        return presenter;
+    }
+
+    private MarkdownParagraphPresenter CreateEmptyParagraphPresenter(bool isNested)
+    {
+        var presenter = new MarkdownParagraphPresenter { IsNested = isNested };
+        ApplyContainerStyle(presenter, ParagraphStyle);
+        return presenter;
+    }
+
+    private MarkdownQuotePresenter CreateQuotePresenter(MarkdownQuoteBlock quote, bool isNested)
+    {
+        var presenter = new MarkdownQuotePresenter
+        {
+            IsNested = isNested,
+            Content = CreateBlockHost(quote.Blocks, isNested: false),
+        };
+        ApplyContainerStyle(presenter, QuoteStyle);
+        return presenter;
+    }
+
+    private MarkdownRulePresenter CreateRulePresenter(bool isNested)
+    {
+        var presenter = new MarkdownRulePresenter { IsNested = isNested };
+        ApplyContainerStyle(presenter, RuleStyle);
+        return presenter;
+    }
+
+    private MarkdownBlockPresenter CreateCodePresenter(MarkdownCodeBlock code, bool isNested)
+    {
+        if (!string.IsNullOrEmpty(code.Language) &&
+            string.Equals(code.Language.Trim(), "mermaid", StringComparison.OrdinalIgnoreCase) &&
+            TryCreateDiagram(code.Text) is { } diagram)
+        {
+            var diagramPresenter = new MarkdownDiagramPresenter
+            {
+                IsNested = isNested,
+                Content = diagram,
+            };
+            ApplyContainerStyle(diagramPresenter, DiagramStyle);
+            return diagramPresenter;
+        }
+
+        var presenter = new MarkdownCodePresenter
+        {
+            Code = code.Text,
+            CodeLanguage = code.Language,
+            IsNested = isNested,
+        };
+        ApplyContainerStyle(presenter, CodeBlockStyle);
+        return presenter;
+    }
+
+    private static Jalium.UI.Controls.Charts.MermaidDiagram? TryCreateDiagram(string source)
+    {
+        var diagram = new Jalium.UI.Controls.Charts.MermaidDiagram { Source = source };
+        return diagram.DiagramKind == Jalium.UI.Controls.Charts.MermaidDiagramKind.Unknown ? null : diagram;
+    }
+
+    private MarkdownListPresenter CreateListPresenter(MarkdownListBlock list, bool isNested)
+    {
+        var itemHost = new StackPanel { Orientation = Orientation.Vertical };
 
         for (var index = 0; index < list.Items.Count; index++)
         {
             var item = list.Items[index];
-            var row = new Grid
+            var itemPresenter = new MarkdownListItemPresenter
             {
-                Margin = new Thickness(0, 0, 0, index == list.Items.Count - 1 ? 0 : 6)
+                IsNested = true,
+                IsLastItem = index == list.Items.Count - 1,
+                MarkerKind = item.TaskState is not null
+                    ? MarkdownListMarkerKind.Task
+                    : (list.Ordered ? MarkdownListMarkerKind.Number : MarkdownListMarkerKind.Bullet),
+                ItemNumber = list.StartIndex + index,
+                IsChecked = item.TaskState is true,
+                Content = CreateBlockHost(item.Blocks, isNested: true),
             };
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Star });
-
-            var marker = CreateListMarker(list, item, index);
-            Grid.SetColumn(marker, 0);
-            row.Children.Add(marker);
-
-            var contentHost = new StackPanel
-            {
-                Orientation = Orientation.Vertical
-            };
-            foreach (var childBlock in item.Blocks)
-            {
-                contentHost.Children.Add(CreateBlockElement(childBlock, inListItem: true));
-            }
-
-            Grid.SetColumn(contentHost, 1);
-            row.Children.Add(contentHost);
-            host.Children.Add(row);
+            ApplyContainerStyle(itemPresenter, ListItemStyle);
+            itemHost.Children.Add(itemPresenter);
         }
 
-        return host;
+        var presenter = new MarkdownListPresenter
+        {
+            IsOrdered = list.Ordered,
+            StartIndex = list.StartIndex,
+            IsNested = isNested,
+            Content = itemHost,
+        };
+        ApplyContainerStyle(presenter, ListStyle);
+        return presenter;
     }
 
-    private UIElement CreateListMarker(MarkdownListBlock list, MarkdownListItemBlock item, int index)
-    {
-        var markerBrush = ResolveBrush(Foreground, "TextSecondary", new SolidColorBrush(Color.FromRgb(128, 128, 128)));
-        var markerMargin = new Thickness(0, 2, 10, 0);
-
-        if (item.TaskState is bool taskState)
-        {
-            return new TextBlock
-            {
-                Text = taskState ? "[x]" : "[ ]",
-                Foreground = markerBrush,
-                Margin = markerMargin,
-                MinWidth = 28
-            };
-        }
-
-        if (list.Ordered)
-        {
-            return new TextBlock
-            {
-                Text = $"{list.StartIndex + index}.",
-                Foreground = markerBrush,
-                Margin = markerMargin,
-                MinWidth = 28
-            };
-        }
-
-        return new Border
-        {
-            Width = 28,
-            Height = Math.Max(16, FontSize * 1.5),
-            Margin = markerMargin,
-            Child = new Border
-            {
-                Width = 6,
-                Height = 6,
-                Background = markerBrush,
-                CornerRadius = new CornerRadius(3),
-                HorizontalAlignment = HorizontalAlignment.Center,
-                VerticalAlignment = VerticalAlignment.Center
-            }
-        };
-    }
-
-    private UIElement CreateQuoteElement(MarkdownQuoteBlock quote)
-    {
-        var content = new StackPanel
-        {
-            Orientation = Orientation.Vertical
-        };
-
-        foreach (var block in quote.Blocks)
-        {
-            content.Children.Add(CreateBlockElement(block, inListItem: false));
-        }
-
-        return new Border
-        {
-            Background = ResolveBrush(QuoteBackground, "ControlBackground", new SolidColorBrush(Color.FromRgb(245, 245, 245))),
-            BorderBrush = ResolveBrush(QuoteBorderBrush, "HyperlinkForeground", new SolidColorBrush(Color.FromRgb(0, 102, 204))),
-            BorderThickness = new Thickness(4, 0, 0, 0),
-            CornerRadius = new CornerRadius(6),
-            Padding = new Thickness(12, 10, 10, 6),
-            Margin = new Thickness(0, 0, 0, 12),
-            Child = content
-        };
-    }
-
-    private UIElement CreateCodeBlockElement(MarkdownCodeBlock code)
-    {
-        if (!string.IsNullOrEmpty(code.Language) &&
-            string.Equals(code.Language.Trim(), "mermaid", StringComparison.OrdinalIgnoreCase))
-        {
-            var diagram = TryCreateMermaidElement(code.Text);
-            if (diagram != null)
-            {
-                return diagram;
-            }
-            // Fall back to the syntax-highlighted source view when the diagram cannot be parsed.
-        }
-
-        var codeView = new MarkdownCodeBlockView
-        {
-            Text = code.Text,
-            Language = code.Language,
-            CodeFontFamily = ResolveMonoFontFamily(),
-            CodeFontSize = FontSize,
-            ForegroundBrush = Foreground,
-            LineNumberForegroundBrush = ResolveBrush(CodeLineNumberForeground, "TextSecondary", new SolidColorBrush(Color.FromRgb(128, 128, 128))),
-            GutterBackgroundBrush = ResolveBrush(CodeGutterBackground, "ControlBackground", new SolidColorBrush(Color.FromRgb(32, 32, 32)))
-        };
-
-        return new Border
-        {
-            Background = ResolveBrush(CodeBackground, "ControlBackground", new SolidColorBrush(Color.FromRgb(245, 245, 245))),
-            CornerRadius = new CornerRadius(8),
-            Margin = new Thickness(0, 0, 0, 12),
-            Child = codeView
-        };
-    }
-
-    private UIElement? TryCreateMermaidElement(string source)
-    {
-        var diagram = new Jalium.UI.Controls.Charts.MermaidDiagram { Source = source };
-        if (diagram.DiagramKind == Jalium.UI.Controls.Charts.MermaidDiagramKind.Unknown)
-        {
-            return null;
-        }
-
-        // Diagrams render dark strokes on light fills (the classic mermaid look), so host them on
-        // a light surface card to stay readable regardless of the surrounding app theme.
-        return new Border
-        {
-            Background = new SolidColorBrush(Color.FromRgb(0xFA, 0xFB, 0xFE)),
-            BorderBrush = ResolveBrush(TableBorderBrush, "ControlBorder", new SolidColorBrush(Color.FromRgb(220, 220, 224))),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(12),
-            Margin = new Thickness(0, 0, 0, 12),
-            Child = diagram
-        };
-    }
-
-    private UIElement CreateTableElement(MarkdownTableBlock table)
+    private MarkdownTablePresenter CreateTablePresenter(MarkdownTableBlock table, bool isNested)
     {
         var rowCount = table.HeaderRows.Count + table.Rows.Count;
         var columnCount = Math.Max(
             table.HeaderRows.Count == 0 ? 0 : table.HeaderRows.Max(static row => row.Cells.Count),
             table.Rows.Count == 0 ? 0 : table.Rows.Max(static row => row.Cells.Count));
 
-        var grid = new Grid
-        {
-            Margin = new Thickness(0, 0, 0, 12)
-        };
+        var grid = new Grid();
 
         for (var column = 0; column < columnCount; column++)
         {
@@ -689,27 +928,30 @@ public class Markdown : Control
             AddTableRow(grid, bodyRow, currentRow++, isHeader: false);
         }
 
-        return grid;
+        var presenter = new MarkdownTablePresenter
+        {
+            RowCount = rowCount,
+            ColumnCount = columnCount,
+            IsNested = isNested,
+            Content = grid,
+        };
+        ApplyContainerStyle(presenter, TableStyle);
+        return presenter;
     }
 
     private void AddTableRow(Grid grid, MarkdownTableRow row, int rowIndex, bool isHeader)
     {
         for (var columnIndex = 0; columnIndex < row.Cells.Count; columnIndex++)
         {
-            var renderer = CreateTextRenderer(row.Cells[columnIndex]);
-            renderer.DefaultFontWeight = isHeader ? FontWeights.Bold : FontWeights.Normal;
-            renderer.Margin = new Thickness(0);
-
-            var cell = new Border
+            var cell = new MarkdownTableCellPresenter
             {
-                Background = isHeader
-                    ? ResolveBrush(TableHeaderBackground, "ControlBackground", new SolidColorBrush(Color.FromRgb(245, 245, 245)))
-                    : null,
-                BorderBrush = ResolveBrush(TableBorderBrush, "ControlBorder", new SolidColorBrush(Color.FromRgb(200, 200, 200))),
-                BorderThickness = new Thickness(1),
-                Padding = new Thickness(8, 6, 8, 6),
-                Child = renderer
+                IsHeaderCell = isHeader,
+                RowIndex = rowIndex,
+                ColumnIndex = columnIndex,
+                IsNested = true,
+                Content = CreateTextPresenter(row.Cells[columnIndex]),
             };
+            ApplyContainerStyle(cell, TableCellStyle);
 
             Grid.SetRow(cell, rowIndex);
             Grid.SetColumn(cell, columnIndex);
@@ -717,27 +959,38 @@ public class Markdown : Control
         }
     }
 
-    private MarkdownTextRenderer CreateTextRenderer(IReadOnlyList<MarkdownInline> inlines)
+    private StackPanel CreateBlockHost(IReadOnlyList<MarkdownBlock> blocks, bool isNested)
     {
-        var renderer = new MarkdownTextRenderer
+        var host = new StackPanel { Orientation = Orientation.Vertical };
+        foreach (var block in blocks)
+        {
+            host.Children.Add(CreateBlockElement(block, isNested));
+        }
+        return host;
+    }
+
+    private void ApplyContainerStyle(MarkdownBlockPresenter presenter, Style? fallbackStyle)
+    {
+        var style = BlockContainerStyleSelector?.SelectStyle(presenter, presenter) ?? fallbackStyle;
+        if (style != null)
+        {
+            presenter.Style = style;
+        }
+    }
+
+    private MarkdownTextPresenter CreateTextPresenter(IReadOnlyList<MarkdownInline> inlines)
+    {
+        // 字体、字号、字重、前景以及全部行内样式都靠依赖属性继承流下来，
+        // 所以块级样式改什么，这里的文字就跟着变，不需要在这里再解析一次。
+        var presenter = new MarkdownTextPresenter
         {
             Spans = FlattenInlines(inlines),
-            TextFontFamily = ResolveBodyFontFamily(),
-            MonoFontFamily = ResolveMonoFontFamily(),
-            TextFontSize = FontSize,
-            DefaultFontWeight = FontWeights.Normal,
-            DefaultFontStyle = FontStyles.Normal,
-            ForegroundBrush = Foreground,
-            LinkForegroundBrush = ResolveBrush(LinkForeground, "HyperlinkForeground", new SolidColorBrush(Color.FromRgb(0, 102, 204))),
-            CodeBackgroundBrush = ResolveBrush(CodeBackground, "ControlBackground", new SolidColorBrush(Color.FromRgb(245, 245, 245))),
-            Wrap = true,
-            PreserveWhitespace = false,
-            LineHeightMultiplier = 1.5
         };
-
-        renderer.LinkClicked += OnInlineLinkClicked;
-        return renderer;
+        presenter.LinkClicked += OnInlineLinkClicked;
+        return presenter;
     }
+
+    #endregion
 
     private void OnInlineLinkClicked(object? sender, MarkdownLinkClickedEventArgs e)
     {
@@ -799,32 +1052,6 @@ public class Markdown : Control
                     break;
             }
         }
-    }
-
-    private Brush ResolveBrush(Brush? preferred, object resourceKey, Brush fallback)
-    {
-        return preferred ?? TryFindResource(resourceKey) as Brush ?? fallback;
-    }
-
-    private string ResolveBodyFontFamily()
-    {
-        if (!string.IsNullOrWhiteSpace(FontFamily?.Source))
-            return FontFamily.Source;
-
-        return ResolveFontFamilyResource("BodyFontFamily", FrameworkElement.DefaultFontFamilyName);
-    }
-
-    private string ResolveMonoFontFamily() =>
-        ResolveFontFamilyResource("MonoFontFamily", "Cascadia Code");
-
-    private string ResolveFontFamilyResource(object resourceKey, string fallback)
-    {
-        return TryFindResource(resourceKey) switch
-        {
-            FontFamily family when !string.IsNullOrWhiteSpace(family.Source) => family.Source,
-            string source when !string.IsNullOrWhiteSpace(source) => source,
-            _ => fallback,
-        };
     }
 
     #region Content extraction (translation / programmatic copy)
@@ -944,27 +1171,50 @@ public class Markdown : Control
         }
     }
 
-    private void CollectSelectables()
+    private void CollectSelectables() => RecollectSelectablesFrom(0);
+
+    /// <summary>
+    /// 从第 <paramref name="fromBlockIndex"/> 个块起重新收集可选中片段，之前的原样留用。
+    /// </summary>
+    /// <remarks>
+    /// 收集是按块序深度优先做的，所以 <c>_segments</c> 的 <c>BlockIndex</c> 天然非递减，
+    /// 砍掉尾巴再续收就等价于全量重收。追加一次就全树递归一遍的话，块一多它自己就成了新的瓶颈。
+    /// </remarks>
+    private void RecollectSelectablesFrom(int fromBlockIndex)
     {
-        _segments.Clear();
         if (_contentHost == null)
         {
+            _segments.Clear();
             return;
         }
 
-        var selectionBrush = ResolveBrush(SelectionBrush, "AccentBrush", s_defaultSelectionBrush);
-        var count = Math.Min(_contentHost.Children.Count, _blocks.Count);
-        for (var i = 0; i < count; i++)
+        if (fromBlockIndex <= 0)
         {
-            CollectSelectablesFrom(_contentHost.Children[i], i, selectionBrush);
+            _segments.Clear();
+        }
+        else
+        {
+            var keep = 0;
+            while (keep < _segments.Count && _segments[keep].BlockIndex < fromBlockIndex)
+            {
+                keep++;
+            }
+
+            _segments.RemoveRange(keep, _segments.Count - keep);
+        }
+
+        var count = Math.Min(_contentHost.Children.Count, _blocks.Count);
+        for (var i = Math.Max(0, fromBlockIndex); i < count; i++)
+        {
+            CollectSelectablesFrom(_contentHost.Children[i], i);
         }
     }
 
-    private void CollectSelectablesFrom(DependencyObject node, int blockIndex, Brush selectionBrush)
+    private void CollectSelectablesFrom(DependencyObject node, int blockIndex)
     {
+        // 选区画刷是可继承属性，会自己从 Markdown 流到叶子呈现器，这里只负责收集顺序。
         if (node is IMarkdownSelectable selectable && node is UIElement element)
         {
-            selectable.SelectionBrush = selectionBrush;
             _segments.Add(new MarkdownSegment(selectable, element, blockIndex));
         }
 
@@ -974,7 +1224,7 @@ public class Markdown : Control
             var child = VisualTreeHelper.GetChild(node, i);
             if (child != null)
             {
-                CollectSelectablesFrom(child, blockIndex, selectionBrush);
+                CollectSelectablesFrom(child, blockIndex);
             }
         }
     }

@@ -1,6 +1,5 @@
 using Jalium.UI.Input;
 using Jalium.UI.Controls.Primitives;
-using Jalium.UI.Controls.Themes;
 using Jalium.UI.Media;
 
 using static Jalium.UI.Input.Cursors;
@@ -18,12 +17,6 @@ public class GridSplitter : Thumb
     {
         return new Jalium.UI.Automation.Peers.GridSplitterAutomationPeer(this);
     }
-
-    #region Static Brushes
-
-    private static readonly SolidColorBrush s_draggingBrush = new(ThemeColors.Accent);
-
-    #endregion
 
     #region Dependency Properties
 
@@ -192,7 +185,6 @@ public class GridSplitter : Thumb
 
     private void OnDragCompletedHandler(object sender, DragCompletedEventArgs e)
     {
-        ClearValue(BackgroundProperty);
         _cumulativeDragDelta = 0;
     }
 
@@ -257,7 +249,6 @@ public class GridSplitter : Thumb
 
         StartResize();
         ApplyResize(delta);
-        ClearValue(BackgroundProperty);
         _cumulativeDragDelta = 0;
     }
 
@@ -265,10 +256,13 @@ public class GridSplitter : Thumb
 
     #region Drag Operations
 
+    // The drag visual belongs to the control template (IsDragging trigger), never to the
+    // Background property: writing Background here lands on the local value layer, and the
+    // matching ClearValue on drag completion wipes whatever Background the caller set in
+    // markup or code, leaving the splitter stuck on the theme default after the first drag.
     private void StartResize()
     {
         _cumulativeDragDelta = 0;
-        Background = s_draggingBrush;
         _effectiveResizeDirection = GetEffectiveResizeDirection();
 
         // Store original dimensions

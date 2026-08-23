@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <string>
@@ -687,6 +688,38 @@ public:
                            cornerRadiusTL, cornerRadiusTR, cornerRadiusBR, cornerRadiusBL);
     }
 
+    /// Draws an in-app backdrop material with the full parameter set
+    /// (JaliumBackdropMaterialDesc: blur kernel family + sigma, the colour
+    /// pipeline brightness/contrast/saturation/hue/grayscale/sepia/invert, tint
+    /// with alpha, grain, overall opacity and per-corner rounding). This is the
+    /// primary backdrop entry point; DrawBackdropFilter/Ex are the legacy
+    /// string-based subset.
+    ///
+    /// Non-pure with a forwarding default: a backend that has not implemented
+    /// the material path inherits this default, which keeps the subset the
+    /// extended path already understands (blur radius, tint colour + opacity,
+    /// noise, saturation, luminosity, corners) and drops the rest — so an
+    /// un-upgraded backend renders the same blur + tint it rendered before.
+    virtual void DrawBackdropMaterial(const JaliumBackdropMaterialDesc& desc)
+    {
+        char tint[8];
+        const auto channel = [](float v) -> int {
+            const float clamped = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            return static_cast<int>(clamped * 255.0f + 0.5f);
+        };
+        std::snprintf(tint, sizeof(tint), "#%02X%02X%02X",
+                      channel(desc.tintR), channel(desc.tintG), channel(desc.tintB));
+        DrawBackdropFilterEx(desc.x, desc.y, desc.width, desc.height,
+                             "", "", tint,
+                             desc.tintA,
+                             desc.blurRadius,
+                             desc.noiseIntensity,
+                             desc.saturation,
+                             desc.luminosity,
+                             desc.cornerRadiusTL, desc.cornerRadiusTR,
+                             desc.cornerRadiusBR, desc.cornerRadiusBL);
+    }
+
     /// Draws a glowing border highlight effect for DevTools element inspection.
     /// Creates an animated glowing line that follows the element border with:
     /// - Gradient trail (thick in middle, thin at ends)
@@ -1261,9 +1294,16 @@ public:
     /// 2=Animated (hinting suppressed — smoother subpixel animation).
     void SetTextHintingMode(int32_t mode) noexcept { text_hinting_mode_ = mode; }
 
+    /// Sets per-format sub-pixel glyph positioning. Off (default) snaps every
+    /// glyph pen to a whole physical pixel; on keeps 1/8-pixel phases measured
+    /// from the final screen position so a run can slide or scale without
+    /// per-glyph stepping. See jalium_text_format_set_subpixel_positioning.
+    void SetSubpixelPositioning(bool enabled) noexcept { subpixel_positioning_ = enabled; }
+
     int32_t GetTextRenderingMode() const noexcept { return text_rendering_mode_; }
     int32_t GetTextFormattingMode() const noexcept { return text_formatting_mode_; }
     int32_t GetTextHintingMode() const noexcept { return text_hinting_mode_; }
+    bool GetSubpixelPositioning() const noexcept { return subpixel_positioning_; }
 
     /// Resolves the per-format TextRenderingMode against the process-wide
     /// fallback chain and returns a concrete JALIUM_TEXT_AA_* value (never
@@ -1286,6 +1326,7 @@ protected:
     int32_t text_rendering_mode_  = 0;  // JALIUM_TEXT_AA_AUTO
     int32_t text_formatting_mode_ = 0;  // Ideal
     int32_t text_hinting_mode_    = 0;  // Auto
+    bool    subpixel_positioning_ = false;  // snapped pens (WPF Display parity)
 };
 
 /// Abstract base class for bitmaps.

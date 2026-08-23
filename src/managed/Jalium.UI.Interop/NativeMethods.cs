@@ -975,6 +975,16 @@ internal static partial class NativeMethods
         float cornerRadiusBL);
 
     /// <summary>
+    /// Draws an in-app backdrop material with the full parameter set
+    /// (<see cref="BackdropMaterialDesc"/>: blur kernel + sigma, colour pipeline,
+    /// tint with alpha, grain, opacity, per-corner rounding). Backends without
+    /// the material path fall back to the blur/tint/noise/saturation/luminosity
+    /// subset in native.
+    /// </summary>
+    [LibraryImport(CoreLib, EntryPoint = "jalium_draw_backdrop_material")]
+    internal static unsafe partial void DrawBackdropMaterial(nint renderTarget, BackdropMaterialDesc* desc);
+
+    /// <summary>
     /// Draws a glowing border highlight effect for DevTools.
     /// </summary>
     [LibraryImport(CoreLib, EntryPoint = "jalium_draw_glowing_border_highlight")]
@@ -1338,6 +1348,16 @@ internal static partial class NativeMethods
     /// </summary>
     [LibraryImport(CoreLib, EntryPoint = "jalium_text_format_set_text_hinting_mode")]
     internal static partial void TextFormatSetTextHintingMode(nint textFormat, int mode);
+
+    /// <summary>
+    /// Sets per-format sub-pixel glyph positioning. Off (default) snaps every
+    /// glyph pen to a whole physical pixel; on keeps 1/8-pixel phases measured
+    /// from the final screen position, so a run can slide or scale without
+    /// each glyph stepping a whole pixel at its own instant. Managed DrawText
+    /// enables it for text rendered under a live scale transform.
+    /// </summary>
+    [LibraryImport(CoreLib, EntryPoint = "jalium_text_format_set_subpixel_positioning")]
+    internal static partial void TextFormatSetSubpixelPositioning(nint textFormat, int enabled);
 
     /// <summary>
     /// Hit-tests a point against a text layout.

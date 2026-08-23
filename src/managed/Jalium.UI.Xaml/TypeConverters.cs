@@ -6,6 +6,7 @@ using Jalium.UI.Media;
 using Jalium.UI.Media.Effects;
 using AnimationDuration = Jalium.UI.Duration;
 using MediaPointCollection = Jalium.UI.Media.PointCollection;
+using MediaDoubleCollection = Jalium.UI.Media.DoubleCollection;
 
 namespace Jalium.UI.Markup;
 
@@ -546,6 +547,22 @@ internal sealed class PointCollectionConverter : TypeConverter
 }
 
 /// <summary>
+/// Converts strings such as "10, 30, 60" or "5 3" to <see cref="MediaDoubleCollection"/>.
+/// The type already carries a <c>[TypeConverter]</c> attribute, but
+/// <see cref="TypeConverterRegistry.ConvertValue"/> only consults its own table, so without
+/// this entry every DoubleCollection attribute in markup (Slider.Ticks, TickBar.Ticks,
+/// Shape.StrokeDashArray) converted to null and was dropped without a diagnostic.
+/// </summary>
+internal sealed class DoubleCollectionValueConverter : TypeConverter
+{
+    public override object? ConvertFrom(object? value)
+    {
+        if (value is not string str) return null;
+        return MediaDoubleCollection.Parse(str);
+    }
+}
+
+/// <summary>
 /// Converts strings to <see cref="Point"/> values. Accepts the standard XAML
 /// "x,y" format (whitespace and comma both serve as separators) and the
 /// space-separated "x y" form. Without this converter, properties like
@@ -670,6 +687,7 @@ public static class TypeConverterRegistry
         [typeof(Type)] = new TypeTypeConverter(),
         [typeof(IconElement)] = new IconElementConverter(),
         [typeof(MediaPointCollection)] = new PointCollectionConverter(),
+        [typeof(MediaDoubleCollection)] = new DoubleCollectionValueConverter(),
         [typeof(Point)] = new PointConverter(),
         [typeof(Vector)] = new VectorConverter(),
         [typeof(Size)] = new SizeConverter(),

@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <share.h>
 #include <limits>
 #include <vector>
 #pragma comment(lib, "d3dcompiler.lib")
@@ -2351,12 +2353,53 @@ void D3D12DirectRenderer::AddSdfRect(const SdfRectInstance& inst)
     rectInstances_.push_back(adjusted);
 }
 
+// ── JALIUM_TEXT_TRACE ─────────────────────────────────────────────────────
+// One line per DrawText, dumping the transform state that decides whether the
+// run stays on the CRISP point-sampled path (integer-snapped quad + grid-fit
+// atlas bitmap) or drops to the SMOOTH bilinear path. Diagnoses "some panel's
+// text is soft while the rest of the window is pixel-exact": the smooth path
+// leaves posY fractional, so horizontal strokes straddle two pixel rows.
+// One env lookup per process; cheap no-op when off. Mirrors JALIUM_BLUR_TRACE.
+namespace {
+bool TextTraceEnabled() {
+    static int state = -1;
+    if (state < 0) {
+        char buf[8];
+        DWORD n = GetEnvironmentVariableA("JALIUM_TEXT_TRACE", buf, sizeof(buf));
+        state = (n > 0 && buf[0] != '0') ? 1 : 0;
+    }
+    return state == 1;
+}
+
+FILE* TextTraceFile() {
+    static FILE* f = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        char dir[MAX_PATH] = {};
+        DWORD n = GetEnvironmentVariableA("TEMP", dir, sizeof(dir));
+        char path[MAX_PATH + 32];
+        if (n > 0 && n < sizeof(dir)) {
+            _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\jalium_text_trace.txt", dir);
+        } else {
+            _snprintf_s(path, sizeof(path), _TRUNCATE, "jalium_text_trace.txt");
+        }
+        // _fsopen with _SH_DENYWR, not fopen_s: fopen_s opens DENY_READWRITE,
+        // so the log could not be inspected while the app is still running —
+        // which is exactly when a rendering symptom is on screen.
+        f = _fsopen(path, "w", _SH_DENYWR);
+    }
+    return f;
+}
+}  // namespace
+
 void D3D12DirectRenderer::AddText(IDWriteTextLayout* layout, float x, float y,
                                    float r, float g, float b, float a,
                                    uint64_t layoutKey,
                                    int32_t aaMode,
                                    int32_t hintingMode,
-                                   const EngineBrushData* gradientBrush)
+                                   const EngineBrushData* gradientBrush,
+                                   bool subpixelPositioning)
 {
     if (!glyphAtlas_ || !layout) return;
 
@@ -2407,12 +2450,18 @@ void D3D12DirectRenderer::AddText(IDWriteTextLayout* layout, float x, float y,
 
     // Collect glyph instances and text decorations
     std::vector<D3D12GlyphAtlas::TextDecorationRect> decorations;
+    // Sub-pixel positioning keeps the crisp POINT path (the quad snap below
+    // still runs); GenerateGlyphs just measures each glyph's 1/8-px phase from
+    // the final screen pen (tx folded in) so the snap lands it within 1/8 px
+    // of its true place instead of a whole pixel — no per-glyph stepping when
+    // the run's layout scales or slides sub-pixel.
     uint32_t count = glyphAtlas_->GenerateGlyphs(layout, tx, ty, r, g, b, effectiveA,
                                                   textInstances_, &decorations,
                                                   layoutKey,
                                                   aaMode, hintingMode,
                                                   scaleX, scaleY,
-                                                  crispAxisAligned);
+                                                  crispAxisAligned,
+                                                  subpixelPositioning);
     if (count > 0) {
         glyphAtlasUsedThisFrame_ = true;
     }
@@ -2451,6 +2500,36 @@ void D3D12DirectRenderer::AddText(IDWriteTextLayout* layout, float x, float y,
             if (crispAxisAligned) {
                 g.posX = std::round(g.posX * dpi) * invDpi;
                 g.posY = std::round(g.posY * dpi) * invDpi;
+            }
+        }
+    }
+
+    // Diagnostic only — see TextTraceEnabled() above. Capped so a long session
+    // cannot fill the disk; the first frames are what matters.
+    if (TextTraceEnabled()) {
+        // Every SMOOTH-path run is logged (that is the symptom being chased);
+        // CRISP runs are sampled 1-in-500 so the file still proves the normal
+        // path is alive without drowning the interesting lines. Startup alone
+        // emits ~800 runs/frame, so an unfiltered log never survives to the
+        // frame where the panel under investigation is finally populated.
+        static uint32_t seen = 0;
+        static uint32_t lines = 0;
+        const bool interesting = !crispAxisAligned || (++seen % 500u == 0u);
+        if (interesting && lines < 20000u) {
+            if (FILE* tf = TextTraceFile()) {
+                const float qy = (count > 0) ? textInstances_[startIdx].posY : 0.0f;
+                const float qh = (count > 0) ? textInstances_[startIdx].sizeY : 0.0f;
+                fprintf(tf,
+                        "n=%u key=%llu tx=%.4f ty=%.4f m=[%.6f %.6f %.6f %.6f %.4f %.4f] "
+                        "sx=%.6f sy=%.6f axisAligned=%d scaled=%d crisp=%d smooth=%d "
+                        "hint=%d aa=%d subpx=%d dpi=%.4f glyphs=%u q0y=%.4f q0h=%.4f\n",
+                        ++lines, (unsigned long long)layoutKey, tx, ty,
+                        t.m11, t.m12, t.m21, t.m22, t.dx, t.dy,
+                        scaleX, scaleY, axisAligned ? 1 : 0, scaled ? 1 : 0,
+                        crispAxisAligned ? 1 : 0, crispAxisAligned ? 0 : 1,
+                        hintingMode, aaMode, subpixelPositioning ? 1 : 0,
+                        dpiScale_, count, qy, qh);
+                fflush(tf);
             }
         }
     }
@@ -4176,7 +4255,7 @@ bool D3D12DirectRenderer::CreateBlurResources()
     }
 
     // --- Root signature for blur compute ---
-    // [0] Root 32-bit constants (4 x uint32 = BlurConstants)
+    // [0] Root 32-bit constants (16 x uint32 = BlurConstants)
     // [1] Descriptor table: SRV t0
     // [2] Descriptor table: UAV u0
     D3D12_DESCRIPTOR_RANGE srvRange = {};
@@ -4209,9 +4288,22 @@ bool D3D12DirectRenderer::CreateBlurResources()
     params[2].DescriptorTable.pDescriptorRanges = &uavRange;
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+    // s0: linear clamp sampler for the horizontal pass's source remap
+    // (backdrop region crop + downsample straight out of the snapshot). The
+    // historical Load path never touches it.
+    D3D12_STATIC_SAMPLER_DESC srcSampler = {};
+    srcSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    srcSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    srcSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    srcSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    srcSampler.ShaderRegister = 0;
+    srcSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
     D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
     rootSigDesc.NumParameters = 3;
     rootSigDesc.pParameters = params;
+    rootSigDesc.NumStaticSamplers = 1;
+    rootSigDesc.pStaticSamplers = &srcSampler;
     rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
     ComPtr<ID3DBlob> signature, error;
@@ -5143,27 +5235,23 @@ void D3D12DirectRenderer::DrawSnapshotBlurred(float x, float y, float w, float h
 // noise + luminosity + per-corner rounding) sampling the framebuffer snapshot.
 // ============================================================================
 
-void D3D12DirectRenderer::DrawSnapshotBackdrop(float x, float y, float w, float h,
-                                               float blurRadius,
-                                               float tintR, float tintG, float tintB, float tintOpacity,
-                                               float noiseIntensity, float saturation, float luminosity,
-                                               float cornerTL, float cornerTR, float cornerBR, float cornerBL)
+void D3D12DirectRenderer::DrawSnapshotBackdrop(const JaliumBackdropMaterialDesc& m)
 {
-    if (!inFrame_ || w <= 0 || h <= 0) return;
+    if (!inFrame_ || m.width <= 0 || m.height <= 0) return;
 
-    // Single-pass Vulkan-parity route: honours noise/saturation/luminosity.
-    if (TryDrawSnapshotBackdropQuad(x, y, w, h, blurRadius,
-                                    tintR, tintG, tintB, tintOpacity,
-                                    noiseIntensity, saturation, luminosity,
-                                    cornerTL, cornerTR, cornerBR, cornerBL)) {
+    // Material route: compute Gaussian region blur + the full colour pipeline
+    // (brightness/contrast/saturation/hue/grayscale/sepia/invert), tint with
+    // alpha, grain, frost jitter, opacity and anti-aliased per-corner rounding.
+    if (TryDrawSnapshotBackdropQuad(m)) {
         return;
     }
 
     // Fallback (backdrop PSO unavailable): the legacy blit + BlurRegion + tint
-    // sequence. noise/saturation/luminosity are not applied here, but the
+    // sequence. The colour pipeline / grain are not applied here, but the
     // backdrop still shows blurred + tinted content instead of vanishing.
-    DrawSnapshotBlurred(x, y, w, h, blurRadius, tintR, tintG, tintB, tintOpacity,
-                        cornerTL, cornerTR, cornerBR, cornerBL);
+    DrawSnapshotBlurred(m.x, m.y, m.width, m.height, m.blurRadius,
+                        m.tintR, m.tintG, m.tintB, m.tintA,
+                        m.cornerRadiusTL, m.cornerRadiusTR, m.cornerRadiusBR, m.cornerRadiusBL);
 }
 
 // ============================================================================
@@ -6664,17 +6752,210 @@ bool D3D12DirectRenderer::TryDrawDesktopBackdropQuad(float x, float y, float w, 
     return true;
 }
 
-// TryDrawSnapshotBackdropQuad — in-app backdrop via the snapshot-backdrop PS.
-// Structurally mirrors TryDrawDesktopBackdropQuad but samples the framebuffer
-// snapshot (full back buffer) and draws a sub-region of it back, so it uploads
-// a UV-remap (uvOffset + quadUv*uvScale) plus the per-corner rounded-rect and
-// the luminosity multiplier that the desktop path does not need.
-bool D3D12DirectRenderer::TryDrawSnapshotBackdropQuad(float x, float y, float w, float h,
-    float blurRadius,
-    float tintR, float tintG, float tintB, float tintOpacity,
-    float noiseIntensity, float saturation, float luminosity,
-    float cornerTL, float cornerTR, float cornerBR, float cornerBL)
+// ============================================================================
+// BlurSnapshotRegion — separable Gaussian compute blur of the panel's region
+// of the snapshot into blurTempA_ (crop + downsample straight out of the
+// snapshot, no intermediate copy).
+// ============================================================================
+
+bool D3D12DirectRenderer::BlurSnapshotRegion(const JaliumBackdropMaterialDesc& m,
+                                             BackdropBlurRegion& out)
 {
+    if (!inFrame_ || !blurResourcesReady_ || !snapshotValid_ || !snapshotTexture_ ||
+        snapshotW_ == 0 || snapshotH_ == 0 || viewportWidth_ == 0 || viewportHeight_ == 0) {
+        return false;
+    }
+
+    // DIP -> physical. The old single-pass route fed DIPs to a physical-texel
+    // kernel, so 150% DPI lost a third of every radius before the 8-texel clamp
+    // took the rest.
+    const float physRadius = std::clamp(m.blurRadius * dpiScale_, 0.0f, 512.0f);
+    if (physRadius < 0.5f) {
+        return false;   // nothing to blur: the caller resamples the snapshot directly
+    }
+
+    // Downsample tier from the physical radius (same thresholds as the Vulkan
+    // backend): the kernel then runs over 1/4 or 1/16 of the pixels and large
+    // radii stay inside the 64-texel compute kernel.
+    const uint32_t ds = physRadius >= 32.0f ? 4u : (physRadius >= 12.0f ? 2u : 1u);
+
+    // Source region = panel + kernel apron, clamped to the captured viewport
+    // (CaptureSnapshot copies exactly viewportWidth_ x viewportHeight_ into the
+    // top-left of the grow-only allocation).
+    const float capW = (float)(std::min)(snapshotW_, viewportWidth_);
+    const float capH = (float)(std::min)(snapshotH_, viewportHeight_);
+    const float apron = std::ceil(physRadius) + 1.0f;
+    const float rx0 = std::clamp(std::floor(m.x * dpiScale_ - apron), 0.0f, capW);
+    const float ry0 = std::clamp(std::floor(m.y * dpiScale_ - apron), 0.0f, capH);
+    const float rx1 = std::clamp(std::ceil((m.x + m.width) * dpiScale_ + apron), 0.0f, capW);
+    const float ry1 = std::clamp(std::ceil((m.y + m.height) * dpiScale_ + apron), 0.0f, capH);
+    if (rx1 - rx0 < 1.0f || ry1 - ry0 < 1.0f) {
+        return false;
+    }
+
+    const uint32_t outW = (uint32_t)std::ceil((rx1 - rx0) / (float)ds);
+    const uint32_t outH = (uint32_t)std::ceil((ry1 - ry0) / (float)ds);
+    if (outW == 0 || outH == 0) {
+        return false;
+    }
+
+    // Per-pass kernel in scratch texels. Box arrives as the box-equivalent
+    // Gaussian (sigma = extent / sqrt(3)) so every backend renders the same
+    // softness from one kernel; an explicit material sigma is honoured;
+    // otherwise the shader's radius / 3 convention applies (sigma = 0).
+    const float kernelRadius = (std::min)(physRadius / (float)ds, 64.0f);
+    float sigma = 0.0f;
+    if (m.blurType == JALIUM_BACKDROP_BLUR_BOX) {
+        sigma = kernelRadius / 1.7320508f;
+    } else if (m.blurSigma > 0.0f) {
+        sigma = (std::min)(m.blurSigma * dpiScale_ / (float)ds, 64.0f);
+    }
+
+    if (!FlushGraphicsForCompute()) return false;  // device lost — frame will abort
+
+    // Scratch at full snapshot size: every region fits, so a frame with several
+    // backdrops never asks the grow-only temps to regrow mid-frame (which the
+    // #921 guard in EnsureBlurTemps refuses once they have been bound).
+    if (!EnsureBlurTemps(snapshotW_, snapshotH_)) {
+        return false;
+    }
+    if (blurTempW_ < outW || blurTempH_ < outH) {
+        return false;
+    }
+    blurTempsUsedThisFrame_ = true;
+
+    auto* cl = commandList_.Get();
+    const DXGI_FORMAT fmt = swapChainFormat_;
+
+    // Per-call descriptors from the frame ring (the fixed tail slots that
+    // BlurRegion uses always hold blurTempA_/B_; this pass binds the snapshot
+    // as the compute source, so it must not rewrite those shared slots).
+    const UINT frameSrvBase = currentFrame_ * frameSrvRegionSize_;
+    const UINT frameSrvEnd = frameSrvBase + frameSrvRegionSize_;
+    UINT slot = srvAllocOffset_;
+    if (slot < frameSrvBase || slot + 4 > frameSrvEnd) {
+        slot = frameSrvBase;
+    }
+    srvAllocOffset_ = slot + 4;
+
+    auto srvCpuBase = srvHeap_->GetCPUDescriptorHandleForHeapStart();
+    auto srvGpuBase = srvHeap_->GetGPUDescriptorHandleForHeapStart();
+    auto cpuAt = [&](UINT index) {
+        auto h = srvCpuBase;
+        h.ptr += (slot + index) * srvDescriptorSize_;
+        return h;
+    };
+    auto gpuAt = [&](UINT index) {
+        auto h = srvGpuBase;
+        h.ptr += (slot + index) * srvDescriptorSize_;
+        return h;
+    };
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Format = fmt;
+    srvDesc.Texture2D.MipLevels = 1;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uavDesc.Format = fmt;
+
+    device_->CreateShaderResourceView(snapshotTexture_.Get(), &srvDesc, cpuAt(0));   // H in
+    device_->CreateUnorderedAccessView(blurTempB_.Get(), nullptr, &uavDesc, cpuAt(1)); // H out
+    device_->CreateShaderResourceView(blurTempB_.Get(), &srvDesc, cpuAt(2));         // V in
+    device_->CreateUnorderedAccessView(blurTempA_.Get(), nullptr, &uavDesc, cpuAt(3)); // V out
+
+    // --- Horizontal pass: snapshot (cropped + downsampled) -> blurTempB_ ---
+    {
+        D3D12_RESOURCE_BARRIER barriers[2];
+        barriers[0] = MakeTransitionBarrier(snapshotTexture_.Get(),
+            snapshotState_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barriers[1] = MakeTransitionBarrier(blurTempB_.Get(),
+            blurTempBState_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cl->ResourceBarrier(2, barriers);
+        snapshotState_ = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        blurTempBState_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+
+    cl->SetComputeRootSignature(blurRootSignature_.Get());
+    ID3D12DescriptorHeap* heaps[] = { srvHeap_.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    cl->SetPipelineState(blurPSO_.Get());
+
+    BlurConstants hConstants;
+    hConstants.direction = 0;
+    hConstants.radius = kernelRadius;
+    hConstants.texWidth = outW;
+    hConstants.texHeight = outH;
+    hConstants.srcMode = 1;
+    hConstants.srcOffsetX = rx0;
+    hConstants.srcOffsetY = ry0;
+    hConstants.srcScale = (float)ds;
+    hConstants.sigma = sigma;
+    hConstants.srcClampW = capW;
+    hConstants.srcClampH = capH;
+    hConstants.invSrcAllocW = 1.0f / (float)snapshotW_;
+    hConstants.invSrcAllocH = 1.0f / (float)snapshotH_;
+    cl->SetComputeRoot32BitConstants(0, sizeof(BlurConstants) / 4, &hConstants, 0);
+    cl->SetComputeRootDescriptorTable(1, gpuAt(0));
+    cl->SetComputeRootDescriptorTable(2, gpuAt(1));
+    cl->Dispatch((outW + 255) / 256, outH, 1);
+
+    // --- Vertical pass: blurTempB_ -> blurTempA_ ---
+    {
+        D3D12_RESOURCE_BARRIER barriers[2];
+        barriers[0] = MakeTransitionBarrier(blurTempB_.Get(),
+            blurTempBState_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barriers[1] = MakeTransitionBarrier(blurTempA_.Get(),
+            blurTempAState_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cl->ResourceBarrier(2, barriers);
+        blurTempBState_ = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        blurTempAState_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+
+    BlurConstants vConstants;
+    vConstants.direction = 1;
+    vConstants.radius = kernelRadius;
+    vConstants.texWidth = outW;
+    vConstants.texHeight = outH;
+    vConstants.sigma = sigma;
+    cl->SetComputeRoot32BitConstants(0, sizeof(BlurConstants) / 4, &vConstants, 0);
+    cl->SetComputeRootDescriptorTable(1, gpuAt(2));
+    cl->SetComputeRootDescriptorTable(2, gpuAt(3));
+    cl->Dispatch((outH + 255) / 256, outW, 1);
+
+    // --- Hand blurTempA_ to the pixel shader; park the rest ---
+    {
+        D3D12_RESOURCE_BARRIER barriers[3];
+        barriers[0] = MakeTransitionBarrier(blurTempA_.Get(),
+            blurTempAState_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        barriers[1] = MakeTransitionBarrier(blurTempB_.Get(),
+            blurTempBState_, D3D12_RESOURCE_STATE_COMMON);
+        barriers[2] = MakeTransitionBarrier(snapshotTexture_.Get(),
+            snapshotState_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        cl->ResourceBarrier(3, barriers);
+        blurTempAState_ = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        blurTempBState_ = D3D12_RESOURCE_STATE_COMMON;
+        snapshotState_ = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+
+    out.srcX = rx0;
+    out.srcY = ry0;
+    out.downsample = ds;
+    out.outW = outW;
+    out.outH = outH;
+    return true;
+}
+
+// TryDrawSnapshotBackdropQuad — in-app backdrop material via the
+// snapshot-backdrop PS. Structurally mirrors TryDrawDesktopBackdropQuad but
+// samples a pre-blurred region of the framebuffer snapshot (BlurSnapshotRegion)
+// and draws the panel's sub-rect of it back, so it uploads a UV remap
+// (uvOffset + quadUv*uvScale), the per-corner rounded rect and the full
+// material colour pipeline the desktop path does not need.
+bool D3D12DirectRenderer::TryDrawSnapshotBackdropQuad(const JaliumBackdropMaterialDesc& m)
+{
+    const float x = m.x, y = m.y, w = m.width, h = m.height;
     if (!inFrame_ || !snapshotValid_ || !snapshotTexture_ || w <= 0 || h <= 0 ||
         snapshotW_ == 0 || snapshotH_ == 0) {
         return false;
@@ -6688,24 +6969,60 @@ bool D3D12DirectRenderer::TryDrawSnapshotBackdropQuad(float x, float y, float w,
 
     if (!FlushGraphicsForCompute()) return true;  // device lost — frame will abort
 
+    // Compute-blur the panel's region first. When that route is unavailable
+    // (blur resources missing, scratch unable to grow mid-frame) the quad
+    // samples the raw snapshot with the PS's small residual box blur instead:
+    // degraded, but the backdrop never vanishes.
+    BackdropBlurRegion region;
+    const bool preBlurred = BlurSnapshotRegion(m, region);
+    const float physRadius = (std::max)(0.0f, m.blurRadius * dpiScale_);
+
     auto* cl = commandList_.Get();
-    // CaptureSnapshot leaves the snapshot in PIXEL_SHADER_RESOURCE; guard anyway.
-    if (snapshotState_ != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
-        auto barrier = MakeTransitionBarrier(snapshotTexture_.Get(),
-            snapshotState_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        cl->ResourceBarrier(1, &barrier);
-        snapshotState_ = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+    ID3D12Resource* source = nullptr;
+    float texelStepX, texelStepY, uvOffX, uvOffY, uvScaleX, uvScaleY;
+    float residualRadius = 0.0f;
+    float frostScale = 1.0f;   // source texels per snapshot pixel
+    if (preBlurred) {
+        source = blurTempA_.Get();   // left in PIXEL_SHADER_RESOURCE by BlurSnapshotRegion
+        const float ds = (float)region.downsample;
+        const float sx = (x * dpiScale_ - region.srcX) / ds;
+        const float sy = (y * dpiScale_ - region.srcY) / ds;
+        const float sw = w * dpiScale_ / ds;
+        const float sh = h * dpiScale_ / ds;
+        texelStepX = 1.0f / (float)blurTempW_;
+        texelStepY = 1.0f / (float)blurTempH_;
+        uvOffX = sx * texelStepX;
+        uvOffY = sy * texelStepY;
+        uvScaleX = sw * texelStepX;
+        uvScaleY = sh * texelStepY;
+        frostScale = 1.0f / ds;
+    } else {
+        source = snapshotTexture_.Get();
+        // CaptureSnapshot leaves the snapshot in PIXEL_SHADER_RESOURCE; guard anyway.
+        if (snapshotState_ != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+            auto barrier = MakeTransitionBarrier(snapshotTexture_.Get(),
+                snapshotState_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            cl->ResourceBarrier(1, &barrier);
+            snapshotState_ = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        }
+        // Quad-local uv [0,1] over the DIP rect -> snapshot texel uv. The
+        // snapshot is captured at physical-pixel size, so scale DIPs by the
+        // DPI scale before dividing by the snapshot dimensions.
+        texelStepX = 1.0f / (float)snapshotW_;
+        texelStepY = 1.0f / (float)snapshotH_;
+        uvOffX = x * dpiScale_ * texelStepX;
+        uvOffY = y * dpiScale_ * texelStepY;
+        uvScaleX = w * dpiScale_ * texelStepX;
+        uvScaleY = h * dpiScale_ * texelStepY;
+        residualRadius = (std::min)(physRadius, 8.0f);
     }
 
-    // UV remap: quad-local uv [0,1] over the DIP rect (x,y,w,h) -> snapshot texel
-    // uv. The snapshot is captured at physical-pixel size, so scale DIPs by the
-    // DPI scale before dividing by the snapshot dimensions.
-    const float invSnapW = dpiScale_ / (float)snapshotW_;
-    const float invSnapH = dpiScale_ / (float)snapshotH_;
-    const float uvOffX = x * invSnapW;
-    const float uvOffY = y * invSnapH;
-    const float uvScaleX = w * invSnapW;
-    const float uvScaleY = h * invSnapH;
+    // Frosted kernel: per-pixel sample jitter in source texels, a fraction of
+    // the radius so it reads as grain rather than displacement.
+    const float frostJitter = (m.blurType == JALIUM_BACKDROP_BLUR_FROSTED && physRadius > 0.0f)
+        ? std::clamp(physRadius * 0.12f, 1.0f, 4.0f) * frostScale
+        : 0.0f;
 
     // The snapshot always uses surface-space coordinates above. The destination
     // is different when this immediate pass is nested inside an effect/layer
@@ -6744,19 +7061,24 @@ bool D3D12DirectRenderer::TryDrawSnapshotBackdropQuad(float x, float y, float w,
     const float clipB = (targetY + targetH) * dpiScale_;
 
     // ---- b0 constants (must match SnapshotBackdropConstants in the PS) ----
-    float constants[24] = {
-        // blurInfo: radius (source texels), texelStepX, texelStepY, unused.
-        blurRadius, 1.0f / (float)snapshotW_, 1.0f / (float)snapshotH_, 0.0f,
-        // tintColor.
-        tintR, tintG, tintB, tintOpacity,
+    float constants[32] = {
+        // blurInfo: residual radius (source texels, 0 on the compute route), texelStep.xy, unused.
+        residualRadius, texelStepX, texelStepY, 0.0f,
+        // tintColor: rgb + effective opacity.
+        m.tintR, m.tintG, m.tintB, m.tintA,
         // extraInfo: saturation, noiseIntensity, luminosity, unused.
-        saturation, noiseIntensity, luminosity, 0.0f,
+        m.saturation, m.noiseIntensity, m.luminosity, 0.0f,
         // uvRemap: offset.xy, scale.zw.
         uvOffX, uvOffY, uvScaleX, uvScaleY,
         // clipRect (physical px): left, top, right, bottom.
         clipL, clipT, clipR, clipB,
         // clipRadii (physical px): TL, TR, BR, BL.
-        cornerTL * dpiScale_, cornerTR * dpiScale_, cornerBR * dpiScale_, cornerBL * dpiScale_,
+        m.cornerRadiusTL * dpiScale_, m.cornerRadiusTR * dpiScale_,
+        m.cornerRadiusBR * dpiScale_, m.cornerRadiusBL * dpiScale_,
+        // materialInfo0: brightness, contrast, hueRotation, opacity.
+        m.brightness, m.contrast, m.hueRotation, m.opacity,
+        // materialInfo1: grayscale, sepia, invert, frost jitter (source texels).
+        m.grayscale, m.sepia, m.invert, frostJitter,
     };
 
     auto& fr = frames_[currentFrame_];
@@ -6774,7 +7096,7 @@ bool D3D12DirectRenderer::TryDrawSnapshotBackdropQuad(float x, float y, float w,
     uploadBufferOffset_ = cbOffset + cbSize;
     D3D12_GPU_VIRTUAL_ADDRESS cbGpuAddr = fr.instanceUploadBuffer->GetGPUVirtualAddress() + cbOffset;
 
-    // ---- SRVs (t0 = snapshot; t1 unused, points at the same texture) ----
+    // ---- SRVs (t0 = blurred region or snapshot; t1 unused, same texture) ----
     UINT frameSrvBase = currentFrame_ * frameSrvRegionSize_;
     UINT frameSrvEnd = frameSrvBase + frameSrvRegionSize_;
     UINT srvOffset = srvAllocOffset_;
@@ -6791,11 +7113,11 @@ bool D3D12DirectRenderer::TryDrawSnapshotBackdropQuad(float x, float y, float w,
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.Format = swapChainFormat_;
     srvDesc.Texture2D.MipLevels = 1;
-    device_->CreateShaderResourceView(snapshotTexture_.Get(), &srvDesc, srvCpu);
+    device_->CreateShaderResourceView(source, &srvDesc, srvCpu);
 
     auto srvCpu2 = srvCpu;
     srvCpu2.ptr += srvDescriptorSize_;
-    device_->CreateShaderResourceView(snapshotTexture_.Get(), &srvDesc, srvCpu2);
+    device_->CreateShaderResourceView(source, &srvDesc, srvCpu2);
 
     cl->SetGraphicsRootSignature(rootSignature_.Get());
     ID3D12DescriptorHeap* heaps[] = { srvHeap_.Get() };

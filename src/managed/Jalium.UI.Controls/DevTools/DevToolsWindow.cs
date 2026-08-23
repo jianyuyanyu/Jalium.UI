@@ -24,6 +24,9 @@ using static Jalium.UI.Interop.Win32.Win32GdiMethods;
 using static Jalium.UI.Interop.Win32.Win32Methods;
 using Jalium.UI.Automation;
 using WriteableBitmap = Jalium.UI.Media.Imaging.WriteableBitmap;
+using BitmapFrame = Jalium.UI.Media.Imaging.BitmapFrame;
+using BitmapSource = Jalium.UI.Media.Imaging.BitmapSource;
+using PngBitmapEncoder = Jalium.UI.Media.Imaging.PngBitmapEncoder;
 
 namespace Jalium.UI.Controls.DevTools;
 
@@ -9312,126 +9315,11 @@ public partial class DevToolsWindow : Window
 
     private static void WritePngFromBgra(string path, byte[] bgra, int width, int height)
     {
-        // Jalium's PngBitmapEncoder does not yet emit bytes, so we write a minimal PNG
-        // (signature + IHDR + single IDAT + IEND) here. Pixels arrive as BGRA; PNG wants RGBA.
+        var source = BitmapSource.Create(
+            width, height, 96, 96, PixelFormat.Bgra32, null, bgra, checked(width * 4));
+        var encoder = new PngBitmapEncoder { Frames = { BitmapFrame.Create(source) } };
         using var fs = File.Create(path);
-        Span<byte> sig = stackalloc byte[8] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
-        fs.Write(sig);
-
-        // IHDR
-        Span<byte> ihdr = stackalloc byte[13];
-        WriteUInt32BE(ihdr, 0, (uint)width);
-        WriteUInt32BE(ihdr, 4, (uint)height);
-        ihdr[8] = 8;  // bit depth
-        ihdr[9] = 6;  // color type RGBA
-        ihdr[10] = 0; // compression
-        ihdr[11] = 0; // filter
-        ihdr[12] = 0; // interlace
-        WritePngChunk(fs, "IHDR", ihdr);
-
-        // IDAT — raw filter=0 per scanline, then zlib (adler32 + deflate)
-        int rowBytes = width * 4;
-        byte[] rawWithFilters = new byte[(rowBytes + 1) * height];
-        for (int y = 0; y < height; y++)
-        {
-            int srcOffset = y * rowBytes;
-            int dstOffset = y * (rowBytes + 1);
-            rawWithFilters[dstOffset] = 0;
-            for (int x = 0; x < width; x++)
-            {
-                int srcPx = srcOffset + x * 4;
-                int dstPx = dstOffset + 1 + x * 4;
-                // BGRA → RGBA, un-premultiply not needed: source is either BGRA from GetDIBits (already straight)
-                // or Pbgra32 which we treat as straight BGRA for a screenshot visualisation.
-                rawWithFilters[dstPx + 0] = bgra[srcPx + 2];
-                rawWithFilters[dstPx + 1] = bgra[srcPx + 1];
-                rawWithFilters[dstPx + 2] = bgra[srcPx + 0];
-                rawWithFilters[dstPx + 3] = bgra[srcPx + 3];
-            }
-        }
-
-        using var zlibStream = new MemoryStream();
-        WriteZlib(zlibStream, rawWithFilters);
-        WritePngChunk(fs, "IDAT", zlibStream.ToArray());
-
-        WritePngChunk(fs, "IEND", ReadOnlySpan<byte>.Empty);
-    }
-
-    private static void WriteZlib(Stream output, byte[] raw)
-    {
-        output.WriteByte(0x78);
-        output.WriteByte(0x9C);
-        using (var deflate = new System.IO.Compression.DeflateStream(output, System.IO.Compression.CompressionLevel.Optimal, leaveOpen: true))
-        {
-            deflate.Write(raw, 0, raw.Length);
-        }
-        uint adler = Adler32(raw);
-        Span<byte> a = stackalloc byte[4];
-        WriteUInt32BE(a, 0, adler);
-        output.Write(a);
-    }
-
-    private static uint Adler32(byte[] data)
-    {
-        const uint mod = 65521;
-        uint a = 1, b = 0;
-        foreach (var d in data)
-        {
-            a = (a + d) % mod;
-            b = (b + a) % mod;
-        }
-        return (b << 16) | a;
-    }
-
-    private static void WritePngChunk(Stream s, string type, ReadOnlySpan<byte> data)
-    {
-        Span<byte> len = stackalloc byte[4];
-        WriteUInt32BE(len, 0, (uint)data.Length);
-        s.Write(len);
-
-        Span<byte> typeBytes = stackalloc byte[4];
-        for (int i = 0; i < 4; i++) typeBytes[i] = (byte)type[i];
-        s.Write(typeBytes);
-
-        s.Write(data);
-
-        uint crc = Crc32(typeBytes, data);
-        Span<byte> crcSpan = stackalloc byte[4];
-        WriteUInt32BE(crcSpan, 0, crc);
-        s.Write(crcSpan);
-    }
-
-    private static readonly uint[] s_crcTable = CreateCrcTable();
-
-    private static uint[] CreateCrcTable()
-    {
-        uint[] table = new uint[256];
-        for (uint n = 0; n < 256; n++)
-        {
-            uint c = n;
-            for (int k = 0; k < 8; k++)
-                c = (c & 1) != 0 ? 0xEDB88320 ^ (c >> 1) : c >> 1;
-            table[n] = c;
-        }
-        return table;
-    }
-
-    private static uint Crc32(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
-    {
-        uint c = 0xFFFFFFFF;
-        for (int i = 0; i < a.Length; i++)
-            c = s_crcTable[(c ^ a[i]) & 0xFF] ^ (c >> 8);
-        for (int i = 0; i < b.Length; i++)
-            c = s_crcTable[(c ^ b[i]) & 0xFF] ^ (c >> 8);
-        return c ^ 0xFFFFFFFF;
-    }
-
-    private static void WriteUInt32BE(Span<byte> buffer, int offset, uint value)
-    {
-        buffer[offset + 0] = (byte)((value >> 24) & 0xFF);
-        buffer[offset + 1] = (byte)((value >> 16) & 0xFF);
-        buffer[offset + 2] = (byte)((value >> 8) & 0xFF);
-        buffer[offset + 3] = (byte)(value & 0xFF);
+        encoder.Save(fs);
     }
 
     #endregion

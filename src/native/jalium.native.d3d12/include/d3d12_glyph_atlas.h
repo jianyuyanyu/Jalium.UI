@@ -188,7 +188,19 @@ public:
         // snap the post-scaled quad and sample it with the POINT PSO for pixel-
         // exact stems. Rotated/skewed text leaves this false and keeps the
         // continuous pen + bilinear PSO so it animates without per-glyph jitter.
-        bool crispAxisAligned = false);
+        bool crispAxisAligned = false,
+        // Sub-pixel positioning (TextFormat::GetSubpixelPositioning): keep the
+        // 1/8-pixel phases for EVERY run (grid-fitted sizes included) and
+        // measure them from the final screen position — the run origin's own
+        // fraction is folded into the pen before the phase is taken, so the
+        // emitted quad + the caller's whole-pixel snap land each glyph within
+        // 1/8 px of its true place. Without it a run that slides or scales
+        // sub-pixel has every glyph cross its own pixel boundary at a
+        // different instant (the "characters tremble" artifact under a live
+        // ScaleTransform). Ignored for deformed (non-unit scale-bucket) runs,
+        // which keep their single-phase policy. Origin-dependent: the
+        // instance memo is keyed by the origin phase as well.
+        bool subpixelPositioning = false);
 
     /// Uploads any pending glyph data to the GPU atlas texture.
     /// Must be called before rendering text in a frame. Returns true only when
@@ -270,6 +282,34 @@ public:
     }
 
 private:
+    /// Rasterization policy the font's `gasp` table asks for at a given ppem,
+    /// as reported by IDWriteFontFace3::GetRecommendedRenderingMode.
+    struct GaspPolicy {
+        DWRITE_RENDERING_MODE1 mode = DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC;
+        DWRITE_GRID_FIT_MODE   gridFit = DWRITE_GRID_FIT_MODE_DEFAULT;
+        /// The recommendation is one CreateGlyphRunAnalysis cannot serve
+        /// (OUTLINE / ALIASED / DEFAULT) — use the GDI bitmap render target.
+        bool useGdiFallback = false;
+        /// True when the mode grid-fits outlines onto the pixel grid, i.e. the
+        /// font asked for hinting at this size. Those sizes render a visibly
+        /// different bitmap per sub-pixel phase, so GenerateGlyphs pins phase 0
+        /// there and trades sub-pixel positioning for shape consistency.
+        bool gridAligned = false;
+    };
+
+    /// Memoised GetRecommendedRenderingMode. Both the per-run path
+    /// (GenerateGlyphs) and the per-cache-miss path (RasterizeGlyph) resolve
+    /// through here so they can never disagree about how a glyph is rasterized.
+    GaspPolicy ResolveGaspPolicy(IDWriteFontFace* fontFace,
+                                 uint16_t ppem,
+                                 const DWRITE_MATRIX* transform,
+                                 uint8_t hintingMode);
+
+    /// Keyed by (face, ppem, aspect bucket, hinting mode). Entries are pure
+    /// functions of the font file, so they survive atlas resets; Reset() clears
+    /// them anyway since a face pointer may be recycled by then.
+    std::unordered_map<uint64_t, GaspPolicy> gaspPolicyCache_;
+
     bool RasterizeGlyph(const GlyphKey& key, GlyphEntry& entry);
     bool AllocateAtlasRect(uint16_t w, uint16_t h, uint16_t& outX, uint16_t& outY);
     bool EnsureUploadBuffer();
@@ -343,7 +383,9 @@ private:
                                     int32_t aaMode,
                                     int32_t hintingMode,
                                     float scaleX, float scaleY,
-                                    bool crispAxisAligned) noexcept;
+                                    bool crispAxisAligned,
+                                    uint8_t originPhaseX = 0,
+                                    bool subpixelPositioning = false) noexcept;
 
     // Simple row-based atlas packer
     uint16_t packX_ = 0;

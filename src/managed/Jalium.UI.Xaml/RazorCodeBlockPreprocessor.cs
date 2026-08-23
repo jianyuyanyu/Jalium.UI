@@ -864,7 +864,7 @@ internal static class RazorCodeBlockPreprocessor
         Justification = "RazorLightweightCodeBlockInterpreter.Expand is the opt-in Razor code-block interpreter whose RequiresUnreferencedCode message documents that it 'dispatches to the lightweight expression evaluator, which reflects on user types' and that Trim/AOT-safe usage requires applications to register typed accessors via RazorExpressionRegistry. That consumer prerequisite is the documented preservation responsibility, and the reflective evaluation only runs from the runtime jalxaml reader (JalxamlReader) entry point, which carries the RequiresUnreferencedCode contract for runtime XAML parsing.")]
     [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage("AOT", "IL3050:RequiresDynamicCode",
         Justification = "RazorLightweightCodeBlockInterpreter.Expand's RequiresDynamicCode message notes it 'may construct generic types/methods at runtime via the expression evaluator'. Razor runtime expression evaluation is an opt-in feature reached only through the runtime jalxaml reader (JalxamlReader); applications publishing under AOT must register typed accessors so no generic construction is needed, which is the documented consumer responsibility for this site rather than a defect of it.")]
-    internal static string ExpandCodeBlock(string code)
+    internal static string ExpandCodeBlock(string code, Func<string, object?>? dataResolver = null)
     {
         if (string.IsNullOrWhiteSpace(code))
             return string.Empty;
@@ -874,7 +874,12 @@ internal static class RazorCodeBlockPreprocessor
         if (!hasMarkup)
             return "@{" + code + "}";
 
-        return RazorLightweightCodeBlockInterpreter.Expand(segments);
+        // With a resolver the loop can read the component and its DataContext, so
+        // "@foreach (var x in Items)" finally iterates something. Without one — a bare
+        // XamlReader.Parse, with no component to read from — the old empty scope stands.
+        return dataResolver is null
+            ? RazorLightweightCodeBlockInterpreter.Expand(segments)
+            : RazorLightweightCodeBlockInterpreter.Expand(segments, dataResolver);
     }
 
     /// <summary>

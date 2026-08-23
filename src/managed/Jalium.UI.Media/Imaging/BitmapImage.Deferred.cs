@@ -761,6 +761,52 @@ public sealed partial class BitmapImage
     }
 
     /// <summary>
+    /// Decodes a deferred (URI-backed) source now, ahead of its first draw, sized for a slot of
+    /// <paramref name="pixelWidth"/> × <paramref name="pixelHeight"/> device pixels. The returned
+    /// task completes once pixels for that size are published — that is, once a draw of this
+    /// source can no longer miss.
+    /// </summary>
+    /// <remarks>
+    /// <para>The deferred pipeline otherwise starts a decode the first time something DRAWS the
+    /// source, and that first draw paints nothing until a worker publishes. That is the right
+    /// trade for a page of images — nothing decodes that is never shown — and the wrong one for a
+    /// sprite animation, a carousel's next slide or a hover state, where the source about to be
+    /// shown is known in advance and a blank first frame is a visible flicker. This is the "I know
+    /// it is coming" hook. It runs the same scheduler, the same display-bucket ladder and the same
+    /// reclaim/restore path as a draw-driven decode, so an application never has to reach for the
+    /// eager <see cref="FromBytes"/> path — a synchronous, full-resolution decode on the calling
+    /// thread that also disables display-bucket downsampling for the life of the source — just to
+    /// get ahead of the renderer.</para>
+    /// <para>Idempotent and cheap to repeat. A source whose published bucket already covers the
+    /// request — including a non-deferred source, which always has its pixels — returns a
+    /// completed task without touching the scheduler. A request larger than the published bucket
+    /// schedules an upgrade; the pixels already published stay drawable until the upgrade lands.
+    /// After the idle reclaimer has dropped the pixels, calling this again is what restores them
+    /// before the next draw.</para>
+    /// <para><paramref name="pixelWidth"/> / <paramref name="pixelHeight"/> are DEVICE pixels —
+    /// multiply the layout size by the DPI scale. Zero on both axes means the natural size, which
+    /// pins the full-resolution raster resident for the life of the source; pass the real slot
+    /// size whenever it is known. A request on one axis only constrains that axis.
+    /// <paramref name="cover"/> mirrors <c>Stretch.UniformToFill</c>: the bucket is sized to cover
+    /// the slot rather than to fit inside it.</para>
+    /// <para>The task faults with the decoder's exception when the source cannot be decoded (the
+    /// failure is also reported through <c>Image.ImageFailed</c> and
+    /// <see cref="Jalium.UI.Diagnostics.ImageDiagnostics"/>), and is cancelled when the source is
+    /// reassigned before the decode lands. It completes on a decode worker, not on the UI thread;
+    /// marshal back before touching elements.</para>
+    /// </remarks>
+    /// <param name="pixelWidth">Target slot width in device pixels, or 0 for unconstrained.</param>
+    /// <param name="pixelHeight">Target slot height in device pixels, or 0 for unconstrained.</param>
+    /// <param name="cover">Whether the slot must be covered (<c>Stretch.UniformToFill</c>) rather than fitted.</param>
+    /// <exception cref="ArgumentOutOfRangeException">A size is negative.</exception>
+    public Task PreloadAsync(int pixelWidth, int pixelHeight, bool cover = false)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(pixelWidth);
+        ArgumentOutOfRangeException.ThrowIfNegative(pixelHeight);
+        return RequestDecodeAsync(pixelWidth, pixelHeight, cover);
+    }
+
+    /// <summary>
     /// Requests pixels sized for a realized <see cref="Jalium.UI.Controls.Image"/>.
     /// The request is idempotent and upgrades an in-flight decode when a later layout
     /// needs a larger bucket.

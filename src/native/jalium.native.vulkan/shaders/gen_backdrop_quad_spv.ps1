@@ -1,7 +1,8 @@
-# Compiles backdrop_quad.frag.hlsl to SPIR-V (DXC) and SURGICALLY replaces
-# ONLY the kBackdropQuadFragmentShaderSpv array inside
-# ../include/vulkan_embedded_shaders.h (splice pattern of gen_solid_rect_spv.ps1;
-# the vertex shader is untouched here, so its array is left byte-identical).
+# Compiles backdrop_quad.{frag,vert}.hlsl to SPIR-V (DXC) and SURGICALLY
+# replaces ONLY the kBackdropQuadFragmentShaderSpv / kBackdropQuadVertexShaderSpv
+# arrays inside ../include/vulkan_embedded_shaders.h (splice pattern of
+# gen_solid_rect_spv.ps1). Both stages share one push-constant block (the
+# pipeline layout range spans VS+FS), so they are always regenerated together.
 
 param(
     [string]$ShaderSrcDir = $PSScriptRoot,
@@ -55,7 +56,9 @@ function Splice-Array([string]$text, [string]$sym, [string]$body) {
 }
 
 $fs = Compile-Spv (Join-Path $ShaderSrcDir 'backdrop_quad.frag.hlsl') 'ps_6_0'
+$vs = Compile-Spv (Join-Path $ShaderSrcDir 'backdrop_quad.vert.hlsl') 'vs_6_0'
 $fsBody = Format-ArrayBody $fs
+$vsBody = Format-ArrayBody $vs
 
 $origBytes = [System.IO.File]::ReadAllBytes($HeaderPath)
 $hadBom = ($origBytes.Length -ge 3 -and $origBytes[0] -eq 0xEF -and $origBytes[1] -eq 0xBB -and $origBytes[2] -eq 0xBF)
@@ -63,9 +66,10 @@ $text = [System.IO.File]::ReadAllText($HeaderPath)
 $usesCrlf = $text.Contains("`r`n")
 
 $text = Splice-Array $text 'kBackdropQuadFragmentShaderSpv' $fsBody
+$text = Splice-Array $text 'kBackdropQuadVertexShaderSpv'   $vsBody
 
 $text = $text -replace "`r`n", "`n"
 if ($usesCrlf) { $text = $text -replace "`n", "`r`n" }
 $enc = New-Object System.Text.UTF8Encoding($hadBom)
 [System.IO.File]::WriteAllText($HeaderPath, $text, $enc)
-Write-Host ("Spliced kBackdropQuad frag SPIR-V into {0}  (frag={1}B)" -f $HeaderPath, $fs.Length)
+Write-Host ("Spliced kBackdropQuad frag+vert SPIR-V into {0}  (frag={1}B vert={2}B)" -f $HeaderPath, $fs.Length, $vs.Length)

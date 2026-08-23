@@ -6,6 +6,7 @@
 #include "font_face.h"
 #include "jalium_text_options.h"
 
+#include <atomic>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -55,6 +56,10 @@ JaliumTextFormat::JaliumTextFormat(
     , fontStyle_(fontStyle)
 {
     fontId_ = ComputeFontId(fontFamily, fontWeight, fontStyle);
+    {
+        static std::atomic<uint64_t> s_nextInstanceId { 1 };
+        instanceId_ = s_nextInstanceId.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // Create the self-hosted font face (owns the font-file bytes via RAII).
     if (engine_ && engine_->GetFontProvider())
@@ -88,14 +93,32 @@ JaliumTextFormat::JaliumTextFormat(
 
 JaliumTextFormat::~JaliumTextFormat() = default;   // unique_ptr<FontFace> owns the faces
 
-void JaliumTextFormat::SetAlignment(int32_t alignment) { alignment_ = alignment; }
-void JaliumTextFormat::SetParagraphAlignment(int32_t alignment) { paragraphAlignment_ = alignment; }
-void JaliumTextFormat::SetTrimming(int32_t trimming) { trimming_ = trimming; }
-void JaliumTextFormat::SetWordWrapping(int32_t wrapping) { wrapping_ = wrapping; }
-void JaliumTextFormat::SetMaxLines(uint32_t maxLines) { maxLines_ = maxLines; }
+void JaliumTextFormat::SetAlignment(int32_t alignment)
+{
+    if (alignment_ != alignment) { alignment_ = alignment; ++styleGeneration_; }
+}
+void JaliumTextFormat::SetParagraphAlignment(int32_t alignment)
+{
+    if (paragraphAlignment_ != alignment) { paragraphAlignment_ = alignment; ++styleGeneration_; }
+}
+void JaliumTextFormat::SetTrimming(int32_t trimming)
+{
+    if (trimming_ != trimming) { trimming_ = trimming; ++styleGeneration_; }
+}
+void JaliumTextFormat::SetWordWrapping(int32_t wrapping)
+{
+    if (wrapping_ != wrapping) { wrapping_ = wrapping; ++styleGeneration_; }
+}
+void JaliumTextFormat::SetMaxLines(uint32_t maxLines)
+{
+    if (maxLines_ != maxLines) { maxLines_ = maxLines; ++styleGeneration_; }
+}
 
 void JaliumTextFormat::SetLineSpacing(int32_t method, float spacing, float baseline)
 {
+    if (lineSpacingMethod_ != method || lineSpacing_ != spacing || lineSpacingBaseline_ != baseline) {
+        ++styleGeneration_;
+    }
     lineSpacingMethod_ = method;
     lineSpacing_ = spacing;
     lineSpacingBaseline_ = baseline;
@@ -909,6 +932,16 @@ void JaliumTextFormat::GenerateGlyphQuads(
     if (lineSpacingMethod_ != 0 && lineSpacing_ > 0)
         effectiveLineHeight = lineSpacing_;
 
+    // The atlas auto-resets when its packer runs out of room (see
+    // GlyphAtlas::GetOrInsert). A reset in the MIDDLE of this run would leave
+    // the quads emitted before it pointing at overwritten pixels, so emit the
+    // whole run against one atlas generation: if the generation changed while
+    // emitting, discard this run's quads and emit again (the atlas is now
+    // nearly empty, so the second pass fits).
+    const size_t baseQuadCount = outQuads.size();
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+    const uint64_t atlasGenerationAtStart = atlas->GetGeneration();
     for (size_t lineIdx = 0; lineIdx < layout.lines.size(); lineIdx++)
     {
         const auto& line = layout.lines[lineIdx];
@@ -982,6 +1015,10 @@ void JaliumTextFormat::GenerateGlyphQuads(
 
             penX += glyph.advanceX;
         }
+    }
+    if (atlas->GetGeneration() == atlasGenerationAtStart)
+        break;
+    outQuads.resize(baseQuadCount);
     }
 
 }

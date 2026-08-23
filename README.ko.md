@@ -36,7 +36,7 @@ WPF에서 영감을 받은 API, Razor 확장을 갖춘 JALXAML, Windows·Linux·
 
 - ClearType 서브픽셀 텍스트 렌더링을 갖춘 GPU 네이티브 렌더링 파이프라인
 - 익숙한 프로그래밍 모델 (`DependencyObject`, `UIElement`, 패널, 템플릿, 리소스)
-- Razor 구문 확장을 갖춘 JALXAML 마크업 (`@Path`, `@(expr)`, `@{ ... }`, `@if`/`@for`/`@foreach`, `@section`/`@RenderSection`)
+- Razor 구문 확장을 갖춘 JALXAML 마크업 (`@Path`, `@(expr)`, `@{ ... }`, `@if`/`@virtualize`/`@foreach`, `@section`/`@RenderSection`)
 - 풍부한 컨트롤 라이브러리: Charts, Ribbon, Docking, InkCanvas, WebView, Terminal, MediaElement, MapView, PropertyGrid, WindowsFormsHost를 포함한 100개 이상의 컨트롤
 - 개발자 경험: JALXAML 핫 리로드(라이브 비주얼 트리 패칭)와 함께 선택적으로 활성화하는(opt-in) 내장 DevTools 인스펙터 및 디버그 HUD
 - NuGet을 통한 빌드 타임 도구 (`Jalium.UI.Build`, `Jalium.UI.Xaml.SourceGenerator`)
@@ -235,41 +235,62 @@ WPF에서 영감을 받은 API, Razor 확장을 갖춘 JALXAML, Windows·Linux·
 
 JALXAML은 기존 `{Binding ...}` 위에 문법적 편의(syntactic sugar)로 Razor 스타일 구문을 추가로 지원합니다:
 
-- `@Path`
-- `@(expr)`
-- `@{ ... }`
-- `@*...*@` 주석
-- 혼합 텍스트 템플릿 (문자열/객체 대상용)
-- `@if(expr){<Element />}` 블록 지시문 (전체 `else if` / `else` 체인 포함)
-- 문(statement) / 제어 흐름 지시문: `@for`, `@foreach`, `@while`, `@switch`,
-  `@using`, `@lock` (파싱 시점에 확장됨)
+- `@Path`, `@(expr)`, `@{ ... }`, `@*...*@` 주석
+- `$.Path`(요소 자신의 속성)와 `#.Path`(DataContext 전용)
+- 혼합 텍스트 템플릿(문자열/객체 대상)
+- `@if(expr){<Element />}` 블록 지시문(완전한 `else if` / `else` 체인 지원)
+- `@virtualize` — 데이터 바인딩된 가상화 루프
+- 문 / 제어 흐름 지시문: `@for`, `@foreach`, `@while`, `@switch`,
+  `@using`, `@lock` (로드 시 한 번만 확장)
 - 템플릿 콘텐츠를 위한 `@section`/`@RenderSection`
 - 이스케이프: `@@` 및 `\@`
 
-바인딩 소스 해석은 `DataContext`를 먼저, 그다음 코드비하인드 폴백 순으로 진행됩니다.
+바인딩 소스 해석 순서는 `DataContext`가 먼저이고, 그다음 코드 비하인드로 폴백합니다.
 
 업데이트 동작:
 
-- 관찰 가능 소스 (`INotifyPropertyChanged` / 종속성 속성): 실시간 업데이트.
-- 관찰 불가능 CLR 소스: 로드 시 일회성 평가.
+- 관찰 가능한 소스(`INotifyPropertyChanged` / 종속성 속성): 실시간 업데이트.
+- 관찰 불가능한 CLR 소스: 로드 시 한 번 평가.
 
-### 컴파일 타임 로어링
+### 목록
 
-JALXAML 소스 생성기는 핫 경로(hot path)에서 런타임 파싱 비용이 없도록 다음을
-빌드 타임에 로어링합니다:
+커질 수 있는 목록에는 `@virtualize`를 사용하세요. 데이터 바인딩된 가상화 목록으로 낮춰지며,
+요소 수가 데이터가 아니라 뷰포트를 따르고, 컨테이너가 재활용되며,
+`INotifyCollectionChanged`를 추적합니다.
+
+```xml
+<ScrollViewer>
+  @virtualize(var row in Rows)
+  {
+    <Border Padding="8"><TextBlock Text="@row.Name" /></Border>
+  }
+</ScrollViewer>
+```
+
+본문은 항목 템플릿이 되므로 단일 요소여야 하며, 스크롤 축에 경계가 필요합니다
+(`ScrollViewer` 바로 아래에 두거나 `Height`/`MaxHeight`를 명시).
+숫자 형식(`@virtualize(var i = 0; i < Count; i++)`)도 지원됩니다.
+
+`@foreach`와 `@for`는 여전히 정적으로 확장됩니다: 항목마다 실제 요소 하나, 재활용 없음,
+로드 시 한 번 평가. 짧고 고정된 목록에 적합하며, 데이터 기반이라면 `@virtualize`를 사용하세요.
+
+### 컴파일 타임 로어링(lowering)
+
+JALXAML 소스 생성기는 다음을 빌드 시점에 낮춰 핫 경로에서 런타임 파싱 비용을 없앱니다:
 
 - `@if` / `@else if` / `@else` 체인.
 - `@section` / `@RenderSection`.
-- 값 표현식 (`@Path`, `@(expr)`).
-- `SetCompiledBinding`을 통한 `{Binding ...}` (SG의 `SplitParameters`는
-  런타임 파서와 한 줄 한 줄(line-for-line) 일관성을 유지합니다).
-- 사용자 정의 xmlns 요소 타입 — `.jalxaml`이 `XmlnsDefinition`을 통해 노출된
-  컨트롤 라이브러리를 사용할 때, SG는 런타임 리플렉션으로 폴백하는 대신
-  컴파일 타임에 CLR 타입을 해석합니다 (트리밍 / AOT에 도움이 됨).
+- `@virtualize`.
+- 값 표현식(`@Path`, `@(expr)`, `$.`, `#.`).
+- `SetCompiledBinding`을 통한 `{Binding ...}`(소스 생성기의 `SplitParameters`는
+  런타임 파서와 한 줄 단위로 일치시킵니다).
+- 사용자 지정 xmlns 요소 타입 — `.jalxaml`이 `XmlnsDefinition`으로 노출된 컨트롤 라이브러리를
+  사용할 때, 소스 생성기는 런타임 리플렉션 대신 컴파일 시점에 CLR 타입을 해석합니다
+  (트리밍 / AOT에 유리).
 
-`Setter.Value`는 의도적으로 로어링되지 않습니다.
+`Setter.Value`는 의도적으로 낮추지 않습니다.
 
-구문 세부 사항 및 규칙은 [`docs/razor-syntax.md`](docs/razor-syntax.md)를 참조하세요.
+구문 세부 사항과 규칙은 [`docs/razor-syntax.md`](https://github.com/VeryJokerJal/Jalium.UI/blob/master/docs/razor-syntax.md)를 참조하세요.
 
 ## 설치
 

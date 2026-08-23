@@ -36,8 +36,18 @@ internal static class RazorCodeBlockExpander
         foreach (var block in merged)
         {
             sb.Append(xaml, lastEnd, block.Start - lastEnd);
-            var expanded = ExpandCodeBlock(block.Code);
-            sb.Append(expanded);
+            try
+            {
+                sb.Append(ExpandCodeBlock(block.Code));
+            }
+            catch (RazorDeferToRuntimeException)
+            {
+                // The block reads something only the running app has. Leave it exactly as written
+                // so the runtime reader can expand it against the live component, instead of
+                // failing the build over a name that was never meant to resolve here.
+                sb.Append(xaml, block.Start, block.End - block.Start);
+            }
+
             lastEnd = block.End;
         }
 
@@ -580,6 +590,23 @@ internal static class RazorCodeBlockExpander
 
     #region Expand code block
 
+    /// <summary>
+    /// Raised when a code block only failed to compile because it names something that does not
+    /// exist at build time. Signals "leave this for the runtime", not "the build is broken".
+    /// </summary>
+    private sealed class RazorDeferToRuntimeException : Exception
+    {
+    }
+
+    /// <summary>True for the diagnostics that mean "this name is not in scope here".</summary>
+    private static bool IsUnresolvedName(string id) => id switch
+    {
+        "CS0103" => true, // The name 'X' does not exist in the current context
+        "CS1061" => true, // 'T' does not contain a definition for 'X'
+        "CS0246" => true, // The type or namespace name 'X' could not be found
+        _ => false,
+    };
+
     private static string ExpandCodeBlock(string code)
     {
         if (string.IsNullOrWhiteSpace(code))
@@ -1027,9 +1054,21 @@ internal static class RazorCodeBlockExpander
 
         if (!emitResult.Success)
         {
-            var errors = emitResult.Diagnostics
+            var failures = emitResult.Diagnostics
                 .Where(static d => d.Severity == DiagnosticSeverity.Error)
-                .Select(static d => d.ToString());
+                .ToList();
+
+            // This script is compiled against System, System.Linq, System.Collections.Generic and
+            // System.Text and nothing else — no view, no view model. So an unknown name is not a
+            // mistake in the markup; it is a block that wants data, and data only exists at run
+            // time. Anything else (a real syntax error, a bad cast) still fails the build, because
+            // deferring those would trade a clear error for a mystery later.
+            if (failures.Count > 0 && failures.TrueForAll(static d => IsUnresolvedName(d.Id)))
+            {
+                throw new RazorDeferToRuntimeException();
+            }
+
+            var errors = failures.Select(static d => d.ToString());
             throw new InvalidOperationException(
                 $"Razor code block compilation failed:\n{string.Join("\n", errors)}\n\nGenerated source:\n{compilationUnit.ToFullString()}");
         }

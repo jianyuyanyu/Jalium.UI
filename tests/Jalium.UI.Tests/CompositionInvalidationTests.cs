@@ -1,4 +1,4 @@
-using System.Reflection;
+﻿using System.Reflection;
 using Jalium.UI.Media;
 
 namespace Jalium.UI.Tests;
@@ -26,6 +26,27 @@ public class CompositionInvalidationTests
 
     private static void ClearIsRenderDirty(Visual v) =>
         IsRenderDirtyField.SetValue(v, false);
+
+    private static FieldInfo? s_layerContentDirtyField;
+    private static FieldInfo LayerContentDirtyField =>
+        s_layerContentDirtyField ??= typeof(Visual).GetField("_layerContentDirty",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException("Visual._layerContentDirty field not found");
+
+    private static bool GetLayerContentDirty(Visual v) =>
+        (bool)LayerContentDirtyField.GetValue(v)!;
+
+    private static void ClearLayerContentDirty(Visual v) =>
+        LayerContentDirtyField.SetValue(v, false);
+
+    private static FieldInfo? s_subtreeCompositionDirtyField;
+    private static FieldInfo SubtreeCompositionDirtyField =>
+        s_subtreeCompositionDirtyField ??= typeof(Visual).GetField("_isSubtreeCompositionDirty",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException("Visual._isSubtreeCompositionDirty field not found");
+
+    private static void SetSubtreeCompositionDirty(Visual v) =>
+        SubtreeCompositionDirtyField.SetValue(v, true);
 
     [Fact]
     public void InvalidateComposition_DoesNotFlipRenderDirty()
@@ -82,19 +103,29 @@ public class CompositionInvalidationTests
             "RenderTransform is a composition-only property — changing it must not invalidate the cache.");
     }
 
+    /// <summary>
+    /// The retained-layer quad path only places a pure translate (or opacity) correctly, so
+    /// ANY scale != 1 must fall back to inline rendering — upscaling because the cached texture
+    /// would be resampled blurry, downscaling because the composite lands it at the wrong
+    /// offset (the scale is composed about the wrong fixed point; symptom measured in the XAML
+    /// designer: preview content correct at 100%, shifted down-right at 50%, up-left at 200%).
+    /// Mirror-only transforms (|scale| == 1) keep the fast path: they resample nothing.
+    /// </summary>
     [Theory]
     [InlineData(1.0, 1.0, false)]
-    [InlineData(0.5, 0.75, false)]
     [InlineData(-1.0, 1.0, false)]
+    [InlineData(1.0, -1.0, false)]
+    [InlineData(0.5, 0.75, true)]
+    [InlineData(0.99, 1.0, true)]
     [InlineData(2.1666666667, 2.1666666667, true)]
     [InlineData(1.0, 1.01, true)]
     [InlineData(-2.0, 1.0, true)]
-    public void RetainedLayerEligibility_RejectsTextureUpscaling(
+    public void RetainedLayerEligibility_RejectsAnyTextureRescaling(
         double scaleX, double scaleY, bool expected)
     {
         var transform = new ScaleTransform(scaleX, scaleY);
 
-        Assert.Equal(expected, Visual.TransformWouldUpscaleRetainedLayer(transform));
+        Assert.Equal(expected, Visual.TransformWouldRescaleRetainedLayer(transform));
     }
 
     [Fact]
@@ -192,8 +223,101 @@ public class CompositionInvalidationTests
         Assert.True(meta.AffectsRender);
     }
 
+    // ── A descendant's composition change must invalidate every ancestor's retained layer ──
+    //
+    // A retained GPU layer bakes its whole subtree — every descendant's Opacity /
+    // RenderTransform included — into ONE texture, then composites that texture applying
+    // only the LAYER OWNER's own live opacity/transform. So a DESCENDANT's composition
+    // change makes the cached texture stale. The composite gate reads content flags only,
+    // hence the layer-content flag has to be raised on the ancestors by the composition
+    // walk itself. Symptom when it is not: a list row (generated item containers are
+    // compositor boundaries) whose layer happened to be realized on the frame its fade-in
+    // sat at Opacity 0 stayed invisible for good — laid out, IsVisible, Opacity back at 1,
+    // simply never re-realized.
+
+    [Fact]
+    public void DescendantOpacityChange_MarksEveryAncestorLayerContentDirty()
+    {
+        var root = new TestVisualContainer();
+        var mid = new TestVisualContainer();
+        var leaf = new TestVisualElement();
+        root.Add(mid);
+        mid.Add(leaf);
+        ClearLayerContentDirty(root);
+        ClearLayerContentDirty(mid);
+        ClearLayerContentDirty(leaf);
+
+        leaf.Opacity = 0.5;
+
+        Assert.True(GetLayerContentDirty(mid),
+            "The immediate ancestor bakes the leaf's opacity into its layer texture — it must re-realize.");
+        Assert.True(GetLayerContentDirty(root),
+            "Every caching ancestor bakes the leaf, not just the immediate parent.");
+        Assert.False(GetLayerContentDirty(leaf),
+            "The animated element's OWN opacity is applied live at composite time — marking it " +
+            "content-dirty would re-record the very subtree the composited-animation fast path exists to skip.");
+    }
+
+    [Fact]
+    public void DescendantOpacityChange_MarksAncestors_EvenWhenItsOwnCompositionFlagIsStale()
+    {
+        // An element inside a composited layer is never walked by the renderer, so its
+        // dirty flags are never cleared. The flag-propagation short-circuit must therefore
+        // not gate the layer invalidation: this is exactly the frame-2-onward case of a
+        // running fade inside a cached row.
+        var root = new TestVisualContainer();
+        var mid = new TestVisualContainer();
+        var leaf = new TestVisualElement();
+        root.Add(mid);
+        mid.Add(leaf);
+        SetSubtreeCompositionDirty(leaf);
+        SetSubtreeCompositionDirty(mid);
+        SetSubtreeCompositionDirty(root);
+        ClearLayerContentDirty(root);
+        ClearLayerContentDirty(mid);
+        ClearLayerContentDirty(leaf);
+
+        leaf.Opacity = 0.25;
+
+        Assert.True(GetLayerContentDirty(mid),
+            "A stale composition flag on the animating element must not stop the layer invalidation.");
+        Assert.True(GetLayerContentDirty(root),
+            "…nor may a stale flag on an intermediate ancestor.");
+    }
+
+    [Fact]
+    public void DescendantRenderTransformChange_MarksAncestorLayerContentDirty()
+    {
+        var root = new TestVisualContainer();
+        var leaf = new TestVisualElement();
+        root.Add(leaf);
+        ClearLayerContentDirty(root);
+        ClearLayerContentDirty(leaf);
+
+        leaf.RenderTransform = new ScaleTransform(0.9, 0.9);
+
+        Assert.True(GetLayerContentDirty(root),
+            "RenderTransform is baked into an ancestor's layer texture exactly like Opacity.");
+    }
+
     private sealed class TestVisualElement : FrameworkElement
     {
+    }
+
+    /// <summary>Minimal visual container: parents children so the dirty walk has a chain to climb.</summary>
+    private sealed class TestVisualContainer : FrameworkElement
+    {
+        private readonly List<Visual> _children = new();
+
+        public void Add(Visual child)
+        {
+            _children.Add(child);
+            AddVisualChild(child);
+        }
+
+        protected override int VisualChildrenCount => _children.Count;
+
+        protected override Visual GetVisualChild(int index) => _children[index];
     }
 
     /// <summary>

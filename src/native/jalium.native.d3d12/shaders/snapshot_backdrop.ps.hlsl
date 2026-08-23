@@ -1,41 +1,48 @@
-// D3D12 in-app backdrop-filter shader (BlurEffect / AcrylicEffect / MicaEffect).
+// D3D12 in-app backdrop-material shader (BackdropBlurEffect / AcrylicEffect /
+// MicaEffect / FrostedGlassEffect / ColorAdjustmentEffect).
 //
 // This is the in-app sibling of desktop_backdrop.ps.hlsl. Where the desktop
 // path samples a GDI desktop capture that fills the whole quad, this path
-// samples the framebuffer SNAPSHOT (the full back buffer copied by
-// CaptureSnapshot) and draws a SUB-REGION of it back, so it needs a UV remap
-// (uvOffset + quadUv * uvScale) to address the sub-rect of the snapshot the
-// backdrop occupies. It also carries per-corner rounding (in-app backdrops sit
-// under rounded Borders; the desktop path always used square corners) and a
-// luminosity multiplier (Mica raises perceived brightness a few percent).
+// samples a SUB-REGION of the framebuffer snapshot and draws it back, so it
+// needs a UV remap (uvOffset + quadUv * uvScale) to address the sub-rect the
+// backdrop occupies.
 //
-// Colour math is field-for-field the Vulkan reference (backdrop_quad.frag.hlsl,
-// mirrored in desktop_backdrop.ps.hlsl):
-//   * <=8-tap box blur of one source texel each (fxc rejects gradient Sample in
-//     a dynamic loop, so SampleLevel(...,0); the snapshot has a single mip so
-//     the result is identical),
-//   * tint lerp:        color = lerp(blurred, tint.rgb, tint.a),
-//   * saturation lerp:  towards Rec.601 luma,
-//   * luminosity:       color *= luminosity (NEW vs the desktop shader),
-//   * screen-space hash noise: (frac(sin(dot(pos, k))*c) - 0.5) * intensity*0.04.
+// Blur: the heavy lifting is done BEFORE this pass. BlurSnapshotRegion runs
+// the separable Gaussian compute shader (gaussian_blur.cs.hlsl: DPI-scaled
+// radius, 1x/2x/4x downsample, linear-light, sigma from the material) over the
+// region of the snapshot under the panel and t0 is that pre-blurred scratch
+// texture; blurInfo.x is then 0 and the quad is a plain resample. Only when
+// the compute route is unavailable (blur resources not created, scratch could
+// not grow mid-frame) does t0 fall back to the raw snapshot with the small
+// <=8-tap box below as a degraded-but-visible blur.
 //
-// Output is premultiplied for the shared ONE / INV_SRC_ALPHA custom-effect PSO,
-// and the per-corner rounded-rect SDF multiplies coverage into the alpha so the
-// backdrop is masked to the element's rounded silhouette (the ancestor AABB
-// clip is applied on the CPU side via RSSetScissorRects, matching the desktop
-// path and the rest of the D3D12 rounded-clip approximation).
+// Colour pipeline: the SAME order on every backend (Vulkan
+// backdrop_quad.frag.hlsl, the software backend). CSS backdrop-filter
+// semantics: the filters act on the backdrop, the tint composites on top:
+//   blur -> brightness -> contrast -> saturation -> hueRotation -> grayscale
+//        -> sepia -> invert -> tint -> luminosity -> noise
+// Noise is full-range hash grain mixed at noiseIntensity (integer hash, no
+// frac(sin()) banding). The Frosted kernel adds a per-pixel sample jitter of
+// materialInfo1.w texels before the resample for frost grain.
+//
+// Output is premultiplied for the shared ONE / INV_SRC_ALPHA custom-effect PSO;
+// the per-corner rounded-rect SDF multiplies anti-aliased coverage into the
+// alpha and materialInfo0.w (effect opacity) scales the whole result (the
+// ancestor AABB clip is applied CPU-side via RSSetScissorRects).
 
 Texture2D sourceTexture : register(t0);
 SamplerState sourceSampler : register(s0);
 
 cbuffer SnapshotBackdropConstants : register(b0)
 {
-    float4 blurInfo;    // x=blur radius (source texels; clamped to <=8 taps) y=texelStepX z=texelStepY w=unused
-    float4 tintColor;   // rgb = tint color, a = tint opacity
-    float4 extraInfo;   // x=saturation (1=unchanged) y=noiseIntensity z=luminosity (1=unchanged) w=unused
-    float4 uvRemap;     // xy = uv offset into the snapshot, zw = uv scale over the quad
-    float4 clipRect;    // (left, top, right, bottom) in PHYSICAL pixels (SV_Position space)
-    float4 clipRadii;   // per-corner radii in physical pixels: (TL, TR, BR, BL)
+    float4 blurInfo;       // x=residual blur radius (source texels, <=8, 0 on the compute route) y=texelStepX z=texelStepY w=unused
+    float4 tintColor;      // rgb = tint colour, a = effective tint opacity
+    float4 extraInfo;      // x=saturation y=noiseIntensity z=luminosity w=unused
+    float4 uvRemap;        // xy = uv offset into the source, zw = uv scale over the quad
+    float4 clipRect;       // (left, top, right, bottom) in PHYSICAL pixels (SV_Position space)
+    float4 clipRadii;      // per-corner radii in physical pixels: (TL, TR, BR, BL)
+    float4 materialInfo0;  // x=brightness y=contrast z=hueRotation (radians) w=opacity
+    float4 materialInfo1;  // x=grayscale y=sepia z=invert w=frost jitter (source texels)
 };
 
 struct PsInput
@@ -44,74 +51,144 @@ struct PsInput
     float2 uv : TEXCOORD0;
 };
 
-// Per-corner rounded-rect SDF (iquilezles), identical convention to
-// rounded_clip.hlsli: <= 0 inside, > 0 outside. Coordinates are physical pixels.
+// Per-corner rounded-rect SDF (iquilezles), <= 0 inside, > 0 outside. Physical
+// pixels so the anti-aliasing ramp is exactly one device pixel wide.
 float BackdropRoundedSdf(float2 p)
 {
     float2 center   = (clipRect.xy + clipRect.zw) * 0.5;
     float2 halfSize = max((clipRect.zw - clipRect.xy) * 0.5, float2(0.0001, 0.0001));
     float2 q        = p - center;
     float  minDim   = min(halfSize.x, halfSize.y);
-
-    // clipRadii = (TL, TR, BR, BL); pick by quadrant.
-    float radius = (q.x > 0.0)
-        ? ((q.y > 0.0) ? clipRadii.z : clipRadii.y)
-        : ((q.y > 0.0) ? clipRadii.w : clipRadii.x);
+    float radius = (q.x > 0.0) ? ((q.y > 0.0) ? clipRadii.z : clipRadii.y)
+                               : ((q.y > 0.0) ? clipRadii.w : clipRadii.x);
     radius = clamp(radius, 0.0, minDim);
-
     float2 d = abs(q) - halfSize + radius;
     return min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - radius;
 }
 
+// lowbias32 integer hash on the device pixel: stable per pixel, no visible
+// lattice, identical in the Vulkan backdrop shader so the grain matches.
+uint HashPixel(uint2 p, uint salt)
+{
+    uint n = p.x * 1597334677u ^ p.y * 3812015801u ^ salt * 2654435761u;
+    n ^= n >> 16;
+    n *= 0x7feb352du;
+    n ^= n >> 15;
+    n *= 0x846ca68bu;
+    n ^= n >> 16;
+    return n;
+}
+
+float Hash01(uint2 p, uint salt)
+{
+    return (float)HashPixel(p, salt) * (1.0f / 4294967295.0f);
+}
+
+float3 ApplyColorPipeline(float3 color)
+{
+    // brightness
+    color *= max(materialInfo0.x, 0.0f);
+
+    // contrast (pivot at mid grey)
+    color = (color - 0.5f) * max(materialInfo0.y, 0.0f) + 0.5f;
+
+    // saturation towards Rec.601 luma
+    const float saturation = max(extraInfo.x, 0.0f);
+    float luma = dot(color, float3(0.299f, 0.587f, 0.114f));
+    color = lerp(float3(luma, luma, luma), color, saturation);
+
+    // hue rotation (YIQ chroma rotation)
+    const float hue = materialInfo0.z;
+    if (abs(hue) > 0.0001f) {
+        const float yv = dot(color, float3(0.299f, 0.587f, 0.114f));
+        const float iv = dot(color, float3(0.596f, -0.274f, -0.322f));
+        const float qv = dot(color, float3(0.211f, -0.523f, 0.312f));
+        const float c = cos(hue);
+        const float s = sin(hue);
+        const float i2 = iv * c - qv * s;
+        const float q2 = iv * s + qv * c;
+        color = float3(yv + 0.956f * i2 + 0.621f * q2,
+                       yv - 0.272f * i2 - 0.647f * q2,
+                       yv - 1.106f * i2 + 1.703f * q2);
+    }
+
+    // grayscale
+    luma = dot(color, float3(0.299f, 0.587f, 0.114f));
+    color = lerp(color, float3(luma, luma, luma), saturate(materialInfo1.x));
+
+    // sepia
+    const float3 sepia = float3(
+        dot(color, float3(0.393f, 0.769f, 0.189f)),
+        dot(color, float3(0.349f, 0.686f, 0.168f)),
+        dot(color, float3(0.272f, 0.534f, 0.131f)));
+    color = lerp(color, sepia, saturate(materialInfo1.y));
+
+    // invert
+    color = lerp(color, 1.0f - color, saturate(materialInfo1.z));
+
+    // tint composites on top of the filtered backdrop
+    color = lerp(color, tintColor.rgb, saturate(tintColor.a));
+
+    // luminosity
+    color *= max(extraInfo.z, 0.0f);
+    return color;
+}
+
 float4 main(PsInput input) : SV_Target
 {
-    // Quad-local uv [0,1] -> snapshot sub-rect uv.
-    const float2 srcUv = uvRemap.xy + input.uv * uvRemap.zw;
-
+    const uint2 pixel = (uint2)input.position.xy;
     const float2 texelStep = float2(blurInfo.y, blurInfo.z);
+
+    float2 srcUv = uvRemap.xy + input.uv * uvRemap.zw;
+
+    // Frosted kernel: jitter the resample position per pixel so the smooth
+    // Gaussian picks up a fine frost grain that tracks the content beneath.
+    const float frost = max(materialInfo1.w, 0.0f);
+    if (frost > 0.0f) {
+        const float2 jitter = float2(Hash01(pixel, 11u), Hash01(pixel, 29u)) - 0.5f;
+        srcUv += jitter * frost * texelStep;
+    }
+
+    // Degraded route only (blurInfo.x == 0 on the compute route): small box
+    // blur straight on the snapshot. fxc rejects gradient Sample in a dynamic
+    // loop, so SampleLevel(..., 0); the sources have a single mip.
     const float radius = clamp(blurInfo.x, 0.0f, 8.0f);
     const int blurRadius = min(8, max(0, (int)round(radius)));
 
     float4 blurred = 0.0f;
-    int count = 0;
-    [loop]
-    for (int dy = -blurRadius; dy <= blurRadius; ++dy) {
+    if (blurRadius > 0) {
+        int count = 0;
         [loop]
-        for (int dx = -blurRadius; dx <= blurRadius; ++dx) {
-            blurred += sourceTexture.SampleLevel(sourceSampler, srcUv + float2(dx, dy) * texelStep, 0);
-            ++count;
+        for (int dy = -blurRadius; dy <= blurRadius; ++dy) {
+            [loop]
+            for (int dx = -blurRadius; dx <= blurRadius; ++dx) {
+                blurred += sourceTexture.SampleLevel(sourceSampler, srcUv + float2(dx, dy) * texelStep, 0);
+                ++count;
+            }
         }
+        blurred /= (float)count;
+    } else {
+        blurred = sourceTexture.SampleLevel(sourceSampler, srcUv, 0);
     }
-    blurred = count > 0 ? blurred / count : sourceTexture.SampleLevel(sourceSampler, srcUv, 0);
 
-    // Tint lerp.
-    float3 color = lerp(blurred.rgb, tintColor.rgb, tintColor.a);
+    float3 color = ApplyColorPipeline(blurred.rgb);
 
-    // Saturation lerp about Rec.601 luma.
-    const float saturation = max(0.0f, extraInfo.x);
-    const float luminance = dot(color, float3(0.299, 0.587, 0.114));
-    color = lerp(float3(luminance, luminance, luminance), color, saturation);
+    // grain
+    const float noiseIntensity = max(extraInfo.y, 0.0f);
+    if (noiseIntensity > 0.0f) {
+        color += (Hash01(pixel, 3u) - 0.5f) * noiseIntensity;
+    }
 
-    // Luminosity (Mica raises perceived brightness a few percent).
-    const float luminosity = max(0.0f, extraInfo.z);
-    color *= luminosity;
+    color = saturate(color);
 
-    // Screen-space hash noise.
-    const float noiseIntensity = max(0.0f, extraInfo.y);
-    const float noise = frac(sin(dot(input.position.xy, float2(12.9898, 78.233))) * 43758.5453);
-    color += (noise - 0.5) * noiseIntensity * 0.04;
+    // Opaque windows give blurred.a == 1; the floor keeps a faint panel visible
+    // over a fully transparent (per-pixel alpha) window background.
+    const float baseA = max(blurred.a, 0.08f + tintColor.a * 0.25f);
 
-    color = max(color, 0.0f);
+    const float sdf = BackdropRoundedSdf(input.position.xy);
+    const float aa = max(fwidth(sdf), 0.0001f);
+    const float cornerCov = 1.0f - smoothstep(-aa * 0.5f, aa * 0.5f, sdf);
 
-    // The snapshot backdrop is opaque content, so drive alpha the same way the
-    // desktop path does (a floor plus a tint-weighted term) and fold the
-    // per-corner rounded-rect coverage into it so corners fade smoothly.
-    float baseA = max(blurred.a, 0.08f + tintColor.a * 0.25f);
-
-    float sdf = BackdropRoundedSdf(input.position.xy);
-    float aa = max(fwidth(sdf), 0.0001);
-    float cornerCov = 1.0 - smoothstep(-aa * 0.5, aa * 0.5, sdf);
-
-    const float outA = baseA * cornerCov;
+    const float outA = baseA * cornerCov * saturate(materialInfo0.w);
     return float4(color * outA, outA);   // premultiplied out
 }

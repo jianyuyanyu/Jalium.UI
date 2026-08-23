@@ -190,12 +190,20 @@ public class DependencyObject : DispatcherObject
         }
     }
 
+    /// <summary>
+    /// 非 local 值层。优先级由 <see cref="DependencyValueStore"/> 定义，
+    /// 高 → 低为：ParentTemplateTrigger &gt; ParentTemplate &gt; StyleTrigger
+    /// &gt; TemplateTrigger &gt; StyleSetter。
+    /// </summary>
     internal enum LayerValueSource
     {
         ParentTemplate,
         StyleTrigger,
+        /// <summary>模板对**被模板化控件自身**下的 trigger（无 TargetName）。低于 StyleTrigger。</summary>
         TemplateTrigger,
-        StyleSetter
+        StyleSetter,
+        /// <summary>模板对**自己生成的具名部件**下的 trigger（TargetName）。仅次于 local。</summary>
+        ParentTemplateTrigger
     }
 
     private enum ValueMutationKind : byte
@@ -504,10 +512,16 @@ public class DependencyObject : DispatcherObject
                     allowAutoTransition);
                 return;
             case BaseValueSource.TemplateTrigger:
-            case BaseValueSource.ParentTemplateTrigger:
                 MutateValue(
                     dp,
                     ValueMutation.ForSetLayer(value, LayerValueSource.TemplateTrigger),
+                    notifyBinding: false,
+                    allowAutoTransition);
+                return;
+            case BaseValueSource.ParentTemplateTrigger:
+                MutateValue(
+                    dp,
+                    ValueMutation.ForSetLayer(value, LayerValueSource.ParentTemplateTrigger),
                     notifyBinding: false,
                     allowAutoTransition);
                 return;
@@ -1506,6 +1520,7 @@ public class DependencyObject : DispatcherObject
         LayerValueSource.StyleTrigger => DependencyValueStore.Layer.StyleTrigger,
         LayerValueSource.TemplateTrigger => DependencyValueStore.Layer.TemplateTrigger,
         LayerValueSource.StyleSetter => DependencyValueStore.Layer.StyleSetter,
+        LayerValueSource.ParentTemplateTrigger => DependencyValueStore.Layer.ParentTemplateTrigger,
         _ => throw new ArgumentOutOfRangeException(nameof(source), source, null),
     };
 
@@ -1516,6 +1531,7 @@ public class DependencyObject : DispatcherObject
             LayerValueSource.StyleTrigger => BaseValueSource.StyleTrigger,
             LayerValueSource.TemplateTrigger => BaseValueSource.TemplateTrigger,
             LayerValueSource.StyleSetter => BaseValueSource.Style,
+            LayerValueSource.ParentTemplateTrigger => BaseValueSource.ParentTemplateTrigger,
             _ => BaseValueSource.Unknown
         };
 

@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #ifndef M_PI
@@ -47,6 +48,91 @@ namespace jalium {
 enum class ImpellerCap  : int32_t { Butt = 0, Square = 1, Round = 2 };
 enum class ImpellerJoin : int32_t { Miter = 0, Bevel = 1, Round = 2 };
 
+namespace stroke_detail {
+
+// Arc fans are built once as a flat {hub, a0, a1, …, aN} point list, then
+// either triangulated into a vertex/index mesh (GPU binary raster) or pushed
+// whole as one convex contour (analytic scanline raster). Keeping the angle
+// math in one place is what stops the two output modes from drifting apart.
+
+inline void BuildRoundCapArc(
+    std::vector<float>& outXY,
+    float cx, float cy, float nx, float ny,
+    float halfWidth, bool isStart)
+{
+    constexpr uint32_t kSegments = 8;
+    constexpr float kPi = (float)M_PI;
+
+    float angle0 = std::atan2(ny, nx);
+    float startAngle = isStart ? (angle0 + kPi * 0.5f) : (angle0 - kPi * 0.5f);
+    float sweep = isStart ? kPi : -kPi;
+
+    outXY.clear();
+    outXY.push_back(cx);
+    outXY.push_back(cy);
+    for (uint32_t i = 0; i <= kSegments; ++i) {
+        float t = (float)i / (float)kSegments;
+        float angle = startAngle + sweep * t;
+        outXY.push_back(cx + halfWidth * std::cos(angle));
+        outXY.push_back(cy + halfWidth * std::sin(angle));
+    }
+}
+
+// Returns false when the corner is degenerate (normals collinear) and no
+// join geometry should be emitted at all.
+inline bool BuildRoundJoinArc(
+    std::vector<float>& outXY,
+    float cx, float cy,
+    float n0x, float n0y, float n1x, float n1y,
+    float halfWidth)
+{
+    float cr = n0x * n1y - n0y * n1x;
+    if (std::abs(cr) < 1e-5f) return false; // nearly collinear normals
+
+    float sign = (cr > 0.0f) ? -1.0f : 1.0f;
+    float a0x = n0x * sign, a0y = n0y * sign;
+    float a1x = n1x * sign, a1y = n1y * sign;
+
+    float angle0 = std::atan2(a0y, a0x);
+    float angle1 = std::atan2(a1y, a1x);
+    float diff = angle1 - angle0;
+    while (diff >  (float)M_PI) diff -= 2.0f * (float)M_PI;
+    while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
+
+    uint32_t segments = std::max(2u,
+        (uint32_t)std::ceil(std::abs(diff) / (float)M_PI * 8.0f));
+
+    outXY.clear();
+    outXY.push_back(cx);
+    outXY.push_back(cy);
+    for (uint32_t i = 0; i <= segments; ++i) {
+        float t = (float)i / (float)segments;
+        float angle = angle0 + diff * t;
+        outXY.push_back(cx + halfWidth * std::cos(angle));
+        outXY.push_back(cy + halfWidth * std::sin(angle));
+    }
+    return true;
+}
+
+// Fan {hub, a0 … aN} -> triangle list.
+template <typename TVertex>
+inline void FanToMesh(
+    std::vector<TVertex>& verts, std::vector<uint32_t>& indices,
+    const std::vector<float>& xy, float r, float g, float b, float a)
+{
+    const uint32_t n = (uint32_t)(xy.size() / 2);
+    if (n < 3) return;
+    uint32_t base = (uint32_t)verts.size();
+    for (uint32_t i = 0; i < n; ++i) verts.push_back({ xy[i * 2], xy[i * 2 + 1], r, g, b, a });
+    for (uint32_t i = 0; i + 2 < n; ++i) {
+        indices.push_back(base);
+        indices.push_back(base + 1 + i);
+        indices.push_back(base + 2 + i);
+    }
+}
+
+} // namespace stroke_detail
+
 // ---------------------------------------------------------------------------
 // GenerateRoundCap — hemicircle fan centred on the cap point. isStart flips
 // the sweep direction so the cap sits on the correct side of the line.
@@ -62,30 +148,9 @@ inline void GenerateRoundCap(
     float r, float g, float b, float a,
     bool isStart)
 {
-    constexpr uint32_t kSegments = 8;
-    constexpr float kPi = (float)M_PI;
-
-    float angle0 = std::atan2(ny, nx);
-    float startAngle = isStart ? (angle0 + kPi * 0.5f) : (angle0 - kPi * 0.5f);
-    float sweep = isStart ? kPi : -kPi;
-
-    uint32_t base = (uint32_t)verts.size();
-    verts.push_back({ cx, cy, r, g, b, a }); // hub
-
-    for (uint32_t i = 0; i <= kSegments; ++i) {
-        float t = (float)i / (float)kSegments;
-        float angle = startAngle + sweep * t;
-        verts.push_back({
-            cx + halfWidth * std::cos(angle),
-            cy + halfWidth * std::sin(angle),
-            r, g, b, a });
-    }
-
-    for (uint32_t i = 0; i < kSegments; ++i) {
-        indices.push_back(base);
-        indices.push_back(base + 1 + i);
-        indices.push_back(base + 2 + i);
-    }
+    std::vector<float> xy;
+    stroke_detail::BuildRoundCapArc(xy, cx, cy, nx, ny, halfWidth, isStart);
+    stroke_detail::FanToMesh<TVertex>(verts, indices, xy, r, g, b, a);
 }
 
 // ---------------------------------------------------------------------------
@@ -106,37 +171,9 @@ inline void GenerateRoundJoin(
     float halfWidth,
     float r, float g, float b, float a)
 {
-    float cr = n0x * n1y - n0y * n1x;
-    if (std::abs(cr) < 1e-5f) return; // nearly collinear normals — no corner
-
-    float sign = (cr > 0.0f) ? -1.0f : 1.0f;
-    float a0x = n0x * sign, a0y = n0y * sign;
-    float a1x = n1x * sign, a1y = n1y * sign;
-
-    float angle0 = std::atan2(a0y, a0x);
-    float angle1 = std::atan2(a1y, a1x);
-    float diff = angle1 - angle0;
-    while (diff >  (float)M_PI) diff -= 2.0f * (float)M_PI;
-    while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
-
-    uint32_t segments = std::max(2u,
-        (uint32_t)std::ceil(std::abs(diff) / (float)M_PI * 8.0f));
-
-    uint32_t base = (uint32_t)verts.size();
-    verts.push_back({ cx, cy, r, g, b, a });
-    for (uint32_t i = 0; i <= segments; ++i) {
-        float t = (float)i / (float)segments;
-        float angle = angle0 + diff * t;
-        verts.push_back({
-            cx + halfWidth * std::cos(angle),
-            cy + halfWidth * std::sin(angle),
-            r, g, b, a });
-    }
-    for (uint32_t i = 0; i < segments; ++i) {
-        indices.push_back(base);
-        indices.push_back(base + 1 + i);
-        indices.push_back(base + 2 + i);
-    }
+    std::vector<float> xy;
+    if (!stroke_detail::BuildRoundJoinArc(xy, cx, cy, n0x, n0y, n1x, n1y, halfWidth)) return;
+    stroke_detail::FanToMesh<TVertex>(verts, indices, xy, r, g, b, a);
 }
 
 // ---------------------------------------------------------------------------
@@ -156,10 +193,17 @@ inline void GenerateRoundJoin(
 // would emit a 2-px-wide feather skirt → strokes look ~2× too thick.
 //
 // When collectContours is non-null the function does NOT touch outVerts /
-// outIndices and instead packs each emitted triangle as a 3-vertex Contour.
-// Used by callers that want to feed the stroke geometry through an analytic-
-// AA path (every triangle is winding-normalized to CCW so that NonZero fill
-// gives the correct union, see comment in the implementation).
+// outIndices and instead emits ONE convex contour per stroke primitive —
+// a quad per segment, a fan per round join/cap, a tri/quad per miter or
+// bevel join — each winding-normalized to CCW so a NonZero fill of the set
+// is exactly the stroke's union. Used by callers that feed the geometry to
+// the analytic-AA scanline rasterizer.
+//
+// This used to emit one 3-vertex contour PER TRIANGLE, which handed the
+// rasterizer ~3× the edges it needed (every quad carried its shared diagonal
+// twice) and one heap allocation per triangle — ~400 of them for a 24 px
+// lucide glyph. Emitting whole primitives is the same covered region with
+// far less to rasterize.
 // ---------------------------------------------------------------------------
 
 template <typename TVertex>
@@ -191,32 +235,89 @@ inline bool ExpandStrokePath(
     float b = brushB * brushA;
     float a = brushA;
 
+    const bool collect = (collectContours != nullptr);
+
     // Sub-pixel hairline alpha fade — only when going through the direct
     // (binary GPU) rasterization path. The analytic AA path takes the true
     // halfWidth so per-pixel coverage handles hairlines naturally.
-    if (!collectContours && halfWidth < halfPxInSrc && halfWidth > 0.0f) {
+    if (!collect && halfWidth < halfPxInSrc && halfWidth > 0.0f) {
         float fade = halfWidth / halfPxInSrc;
         r *= fade; g *= fade; b *= fade; a *= fade;
         halfWidth = halfPxInSrc;
     }
 
-    // Local geometry vectors — used either to fill outVerts/outIndices
-    // directly (collectContours == null) or as a scratch buffer that
-    // we then chop into per-triangle contours below.
-    std::vector<TVertex> localVerts;
-    std::vector<uint32_t> localIndices;
-    auto& verts = collectContours ? localVerts : outVerts;
-    auto& indices = collectContours ? localIndices : outIndices;
+    std::vector<TVertex>& verts = outVerts;
+    std::vector<uint32_t>& indices = outIndices;
+
+    // Scratch for arc fans and for assembling one primitive's points before
+    // it is handed to pushContourCCW.
+    std::vector<float> arcXY;
+    float quadXY[8];
+
+    // Push one convex primitive as a CCW contour. The rasterizer unions the
+    // set under NonZero, so every primitive must wind the same way; the
+    // shoelace sign tells us whether to reverse.
+    auto pushContourCCW = [&](const float* xy, uint32_t n) {
+        if (n < 3) return;
+        double sa = 0.0;
+        for (uint32_t i = 0; i < n; ++i) {
+            uint32_t j = (i + 1 < n) ? (i + 1) : 0u;
+            sa += (double)xy[i * 2] * (double)xy[j * 2 + 1]
+                - (double)xy[j * 2] * (double)xy[i * 2 + 1];
+        }
+        if (std::abs(sa) < 1e-7) return;   // degenerate — contributes no area
+        // Built in place: constructing a temporary Contour and moving it in
+        // costs an extra vector move per primitive, and there are hundreds
+        // of primitives per frame.
+        collectContours->emplace_back();
+        std::vector<float>& pts = collectContours->back().points;
+        pts.resize((size_t)n * 2);
+        float* dst = pts.data();
+        if (sa > 0.0) {
+            std::memcpy(dst, xy, (size_t)n * 2 * sizeof(float));
+        } else {
+            for (uint32_t i = 0; i < n; ++i) {
+                dst[i * 2]     = xy[(n - 1 - i) * 2];
+                dst[i * 2 + 1] = xy[(n - 1 - i) * 2 + 1];
+            }
+        }
+    };
 
     auto getX = [&](uint32_t i) { return flatPoints[i * 2]; };
     auto getY = [&](uint32_t i) { return flatPoints[i * 2 + 1]; };
 
+    // A closed contour can arrive here two ways: already geometrically closed
+    // (last point == first point, which is what the flattener produces from an
+    // explicit ClosePath command) or as an open polyline plus closed=true, in
+    // which case the wrap-around edge from the last point back to the first is
+    // IMPLIED and must be stroked like any other segment. Emitting only the
+    // closing join (what this function used to do) drew the corner but not the
+    // edge, so every closed outline whose command stream lacked ClosePath came
+    // out with one whole side missing — e.g. the warehouse icon rendering with
+    // no right wall, the file icon with no bottom edge.
+    const bool wrapSegment = closed && pointCount >= 3 &&
+        (std::abs(getX(pointCount - 1) - getX(0)) > 1e-6f ||
+         std::abs(getY(pointCount - 1) - getY(0)) > 1e-6f);
+    // Segment i runs from point i to point nextIndex(i); the wrap segment is
+    // the extra one at index pointCount-1 (last → first).
+    const uint32_t segCount = wrapSegment ? pointCount : (pointCount - 1);
+    auto nextIndex = [&](uint32_t i) -> uint32_t {
+        const uint32_t n = i + 1;
+        return (n < pointCount) ? n : 0u;
+    };
+
+    // One contour per segment plus one per join/cap; reserving up front keeps
+    // the outer vector from reallocating (and move-constructing every Contour
+    // it already holds) a dozen times per stroke.
+    if (collect) collectContours->reserve(collectContours->size() + (size_t)segCount * 2 + 4);
+
     struct Segment { float nx, ny; };
     std::vector<Segment> segNormals;
-    segNormals.reserve(pointCount - 1);
-    for (uint32_t i = 0; i + 1 < pointCount; ++i) {
-        float dx = getX(i + 1) - getX(i);
-        float dy = getY(i + 1) - getY(i);
+    segNormals.reserve(segCount);
+    for (uint32_t i = 0; i < segCount; ++i) {
+        const uint32_t j = nextIndex(i);
+        float dx = getX(j) - getX(i);
+        float dy = getY(j) - getY(i);
         float len = std::sqrt(dx * dx + dy * dy);
         if (len < 1e-6f) { segNormals.push_back({0, 0}); continue; }
         segNormals.push_back({ -dy / len, dx / len });
@@ -224,9 +325,14 @@ inline bool ExpandStrokePath(
 
     // ---- Per-segment quads (+ optional outer-skirt vertex feather AA) ----
     //
-    // Two emit modes:
+    // Three emit modes:
     //
-    // collectContours == nullptr (D3D12 binary mesh → GPU triangle raster):
+    // collect (analytic scanline raster):
+    //   one 4-point contour, the exact stroke quad. Per-pixel coverage comes
+    //   from the rasterizer, so emitting a feather skirt here would just be
+    //   union'd in by NonZero filling and fatten the stroke by 1 px.
+    //
+    // !collect (D3D12 / Vulkan binary mesh → GPU triangle raster):
     //   8 verts / 6 triangles per segment with an outer feather skirt at
     //   alpha=0. GPU's barycentric interpolation of vertex alpha gives a
     //   1-px coverage gradient on each long edge — same visual quality as
@@ -234,43 +340,32 @@ inline bool ExpandStrokePath(
     //   RasterizePathToRects). Skia / Flutter Impeller use this extended-
     //   quad pattern for stroke AA when MSAA isn't available.
     //
-    // collectContours != nullptr (Vulkan stroke → analytic scanline raster):
-    //   4 verts / 2 triangles, exact pixel-space stroke quad. The Vulkan
-    //   path collects these triangles into a per-stroke contour set and
-    //   feeds them to RasterizePathToRects, which produces per-pixel
-    //   coverage from the exact geometry — emitting an additional feather
-    //   skirt here would just be union'd in by NonZero filling, fattening
-    //   the stroke by 1 px.
-    // Symmetric ±0.5-px feather centred on the geometric stroke edge.
+    // Symmetric ±0.5-px feather centred on the geometric stroke edge:
     //   inner alpha=a half-width = halfWidth - 0.5px (clamped ≥ 0)
     //   outer alpha=0 half-width = halfWidth + 0.5px
     // Net effect: total geometric width = strokeWidth + 1 px; the GPU's
     // bilinear interpolation across that 1-px feather gives 50% coverage
     // at the geometric edge, so the on-screen visual width matches the
-    // requested strokeWidth. The previous code skipped the inward inset
-    // and only extruded outward by +1 px → strokes rendered ~2 px wider
-    // than asked, which is what made every line look "too thick".
+    // requested strokeWidth.
     //
     // When halfWidth ≤ 0.5px (after the hairline clamp above the stroke
     // is exactly 0.5px wide), innerHalf collapses to 0 and the inner
     // verts on both sides degenerate to the centreline. The two feather
     // strips meet at that centreline and still produce a 1-px-wide
     // soft line — correct hairline behaviour.
-    const bool emitFeather = (collectContours == nullptr);
-    for (uint32_t i = 0; i + 1 < pointCount; ++i) {
+    for (uint32_t i = 0; i < segCount; ++i) {
+        const uint32_t j = nextIndex(i);
         float nx = segNormals[i].nx * halfWidth;
         float ny = segNormals[i].ny * halfWidth;
         float x0 = getX(i), y0 = getY(i);
-        float x1 = getX(i + 1), y1 = getY(i + 1);
+        float x1 = getX(j), y1 = getY(j);
 
-        if (!emitFeather) {
-            uint32_t base = (uint32_t)verts.size();
-            verts.push_back({ x0 + nx, y0 + ny, r, g, b, a });
-            verts.push_back({ x0 - nx, y0 - ny, r, g, b, a });
-            verts.push_back({ x1 + nx, y1 + ny, r, g, b, a });
-            verts.push_back({ x1 - nx, y1 - ny, r, g, b, a });
-            indices.push_back(base);     indices.push_back(base + 1); indices.push_back(base + 2);
-            indices.push_back(base + 1); indices.push_back(base + 3); indices.push_back(base + 2);
+        if (collect) {
+            quadXY[0] = x0 + nx; quadXY[1] = y0 + ny;
+            quadXY[2] = x0 - nx; quadXY[3] = y0 - ny;
+            quadXY[4] = x1 - nx; quadXY[5] = y1 - ny;
+            quadXY[6] = x1 + nx; quadXY[7] = y1 + ny;
+            pushContourCCW(quadXY, 4);
             continue;
         }
 
@@ -310,20 +405,27 @@ inline bool ExpandStrokePath(
     // ---- Joins between adjacent segments ----
     auto emitJoin = [&](float n0x, float n0y, float n1x, float n1y, float cx, float cy) {
         if (join == ImpellerJoin::Round) {
-            GenerateRoundJoin<TVertex>(verts, indices, cx, cy,
-                n0x, n0y, n1x, n1y, halfWidth, r, g, b, a);
+            if (!stroke_detail::BuildRoundJoinArc(arcXY, cx, cy, n0x, n0y, n1x, n1y, halfWidth)) return;
+            if (collect) pushContourCCW(arcXY.data(), (uint32_t)(arcXY.size() / 2));
+            else         stroke_detail::FanToMesh<TVertex>(verts, indices, arcXY, r, g, b, a);
             return;
         }
         if (join == ImpellerJoin::Bevel) {
+            // Two wedges, one per side of the corner.
+            float t0[6] = { cx, cy, cx + n0x * halfWidth, cy + n0y * halfWidth,
+                                    cx + n1x * halfWidth, cy + n1y * halfWidth };
+            float t1[6] = { cx, cy, cx - n0x * halfWidth, cy - n0y * halfWidth,
+                                    cx - n1x * halfWidth, cy - n1y * halfWidth };
+            if (collect) { pushContourCCW(t0, 3); pushContourCCW(t1, 3); return; }
             uint32_t base = (uint32_t)verts.size();
-            verts.push_back({ cx, cy, r, g, b, a });
-            verts.push_back({ cx + n0x * halfWidth, cy + n0y * halfWidth, r, g, b, a });
-            verts.push_back({ cx + n1x * halfWidth, cy + n1y * halfWidth, r, g, b, a });
+            verts.push_back({ t0[0], t0[1], r, g, b, a });
+            verts.push_back({ t0[2], t0[3], r, g, b, a });
+            verts.push_back({ t0[4], t0[5], r, g, b, a });
             indices.push_back(base); indices.push_back(base + 1); indices.push_back(base + 2);
             base = (uint32_t)verts.size();
-            verts.push_back({ cx, cy, r, g, b, a });
-            verts.push_back({ cx - n0x * halfWidth, cy - n0y * halfWidth, r, g, b, a });
-            verts.push_back({ cx - n1x * halfWidth, cy - n1y * halfWidth, r, g, b, a });
+            verts.push_back({ t1[0], t1[1], r, g, b, a });
+            verts.push_back({ t1[2], t1[3], r, g, b, a });
+            verts.push_back({ t1[4], t1[5], r, g, b, a });
             indices.push_back(base); indices.push_back(base + 1); indices.push_back(base + 2);
             return;
         }
@@ -335,30 +437,58 @@ inline bool ExpandStrokePath(
         float cr = n0x * n1y - n0y * n1x;
         float dir = cr > 0 ? -1.0f : 1.0f;
 
-        // Bevel base triangle — always present.
-        uint32_t base = (uint32_t)verts.size();
-        verts.push_back({ cx, cy, r, g, b, a });
-        verts.push_back({ cx + n0x * halfWidth * dir, cy + n0y * halfWidth * dir, r, g, b, a });
-        verts.push_back({ cx + n1x * halfWidth * dir, cy + n1y * halfWidth * dir, r, g, b, a });
-        indices.push_back(base); indices.push_back(base + 1); indices.push_back(base + 2);
+        float p0x = cx + n0x * halfWidth * dir, p0y = cy + n0y * halfWidth * dir;
+        float p1x = cx + n1x * halfWidth * dir, p1y = cy + n1y * halfWidth * dir;
 
         // Miter extension (only when within limit).
+        bool haveMiter = false;
+        float mtx = 0.0f, mty = 0.0f;
         if (alignment > 1e-6f) {
             float mx = (n0x + n1x) * 0.5f * halfWidth / alignment;
             float my = (n0y + n1y) * 0.5f * halfWidth / alignment;
-            float miterDist2 = mx * mx + my * my;
-            float miterLimitDist2 = miterLimit * miterLimit;
-            if (miterDist2 <= miterLimitDist2) {
-                uint32_t mbase = (uint32_t)verts.size();
-                verts.push_back({ cx + mx * dir, cy + my * dir, r, g, b, a });
-                indices.push_back(base);
-                indices.push_back(base + 2);
-                indices.push_back(mbase);
+            if (mx * mx + my * my <= miterLimit * miterLimit) {
+                haveMiter = true;
+                mtx = cx + mx * dir; mty = cy + my * dir;
             }
+        }
+
+        if (collect) {
+            // Deliberately mirrors the mesh decomposition triangle-for-
+            // triangle rather than merging into one polygon: the bevel
+            // triangle and the miter triangle are (corner, p0, p1) and
+            // (corner, p1, tip), and the quad through those four points in
+            // that order is a self-intersecting bowtie whose signed area is
+            // zero — merging would silently delete every miter join. (The
+            // pair also does not tile the full miter kite; that asymmetry
+            // predates this change and is preserved here so the analytic and
+            // mesh routes keep rendering the same shape.)
+            float t0[6] = { cx, cy, p0x, p0y, p1x, p1y };
+            pushContourCCW(t0, 3);
+            if (haveMiter) {
+                float t1[6] = { cx, cy, p1x, p1y, mtx, mty };
+                pushContourCCW(t1, 3);
+            }
+            return;
+        }
+
+        uint32_t base = (uint32_t)verts.size();
+        verts.push_back({ cx, cy, r, g, b, a });
+        verts.push_back({ p0x, p0y, r, g, b, a });
+        verts.push_back({ p1x, p1y, r, g, b, a });
+        indices.push_back(base); indices.push_back(base + 1); indices.push_back(base + 2);
+        if (haveMiter) {
+            uint32_t mbase = (uint32_t)verts.size();
+            verts.push_back({ mtx, mty, r, g, b, a });
+            indices.push_back(base);
+            indices.push_back(base + 2);
+            indices.push_back(mbase);
         }
     };
 
-    for (uint32_t i = 1; i + 1 < pointCount; ++i) {
+    // Vertex i is the junction of segment i-1 (arriving) and segment i
+    // (leaving). With a wrap segment present this also covers the last input
+    // vertex, whose leaving edge is the wrap.
+    for (uint32_t i = 1; i < segCount; ++i) {
         emitJoin(segNormals[i - 1].nx, segNormals[i - 1].ny,
                  segNormals[i].nx, segNormals[i].ny,
                  getX(i), getY(i));
@@ -375,69 +505,65 @@ inline bool ExpandStrokePath(
 
     // ---- Caps (open contours only) ----
     if (!closed && pointCount >= 2) {
+        // Square caps: the two stroke-edge points plus the same pair displaced
+        // by the extrusion vector. The start and end caps build that vector
+        // differently in the mesh code below, so it is passed in rather than
+        // derived here — deriving it cost a sign flip that pushed the start
+        // cap back along the line instead of past its end.
+        auto emitSquareCapQuad = [&](float cx, float cy, float nx, float ny,
+                                     float ex, float ey) {
+            quadXY[0] = cx + nx * halfWidth + ex; quadXY[1] = cy + ny * halfWidth + ey;
+            quadXY[2] = cx - nx * halfWidth + ex; quadXY[3] = cy - ny * halfWidth + ey;
+            quadXY[4] = cx - nx * halfWidth;      quadXY[5] = cy - ny * halfWidth;
+            quadXY[6] = cx + nx * halfWidth;      quadXY[7] = cy + ny * halfWidth;
+            pushContourCCW(quadXY, 4);
+        };
+
         // Start cap.
         float nx = segNormals[0].nx, ny = segNormals[0].ny;
         float cx = getX(0), cy = getY(0);
         if (cap == ImpellerCap::Round) {
-            GenerateRoundCap<TVertex>(verts, indices, cx, cy, nx, ny,
-                halfWidth, r, g, b, a, true);
+            stroke_detail::BuildRoundCapArc(arcXY, cx, cy, nx, ny, halfWidth, true);
+            if (collect) pushContourCCW(arcXY.data(), (uint32_t)(arcXY.size() / 2));
+            else         stroke_detail::FanToMesh<TVertex>(verts, indices, arcXY, r, g, b, a);
         } else if (cap == ImpellerCap::Square) {
             float dx = -segNormals[0].ny, dy = segNormals[0].nx;
-            uint32_t base = (uint32_t)verts.size();
-            verts.push_back({ cx + nx * halfWidth - dx * halfWidth, cy + ny * halfWidth - dy * halfWidth, r, g, b, a });
-            verts.push_back({ cx - nx * halfWidth - dx * halfWidth, cy - ny * halfWidth - dy * halfWidth, r, g, b, a });
-            verts.push_back({ cx + nx * halfWidth, cy + ny * halfWidth, r, g, b, a });
-            verts.push_back({ cx - nx * halfWidth, cy - ny * halfWidth, r, g, b, a });
-            indices.push_back(base);     indices.push_back(base + 1); indices.push_back(base + 2);
-            indices.push_back(base + 1); indices.push_back(base + 3); indices.push_back(base + 2);
+            if (collect) {
+                emitSquareCapQuad(cx, cy, nx, ny, -dx * halfWidth, -dy * halfWidth);
+            } else {
+                uint32_t base = (uint32_t)verts.size();
+                verts.push_back({ cx + nx * halfWidth - dx * halfWidth, cy + ny * halfWidth - dy * halfWidth, r, g, b, a });
+                verts.push_back({ cx - nx * halfWidth - dx * halfWidth, cy - ny * halfWidth - dy * halfWidth, r, g, b, a });
+                verts.push_back({ cx + nx * halfWidth, cy + ny * halfWidth, r, g, b, a });
+                verts.push_back({ cx - nx * halfWidth, cy - ny * halfWidth, r, g, b, a });
+                indices.push_back(base);     indices.push_back(base + 1); indices.push_back(base + 2);
+                indices.push_back(base + 1); indices.push_back(base + 3); indices.push_back(base + 2);
+            }
         }
         // End cap.
         uint32_t lastSeg = (uint32_t)segNormals.size() - 1;
         nx = segNormals[lastSeg].nx; ny = segNormals[lastSeg].ny;
         cx = getX(pointCount - 1); cy = getY(pointCount - 1);
         if (cap == ImpellerCap::Round) {
-            GenerateRoundCap<TVertex>(verts, indices, cx, cy, nx, ny,
-                halfWidth, r, g, b, a, false);
+            stroke_detail::BuildRoundCapArc(arcXY, cx, cy, nx, ny, halfWidth, false);
+            if (collect) pushContourCCW(arcXY.data(), (uint32_t)(arcXY.size() / 2));
+            else         stroke_detail::FanToMesh<TVertex>(verts, indices, arcXY, r, g, b, a);
         } else if (cap == ImpellerCap::Square) {
             float dx = segNormals[lastSeg].ny, dy = -segNormals[lastSeg].nx;
-            uint32_t base = (uint32_t)verts.size();
-            verts.push_back({ cx + nx * halfWidth, cy + ny * halfWidth, r, g, b, a });
-            verts.push_back({ cx - nx * halfWidth, cy - ny * halfWidth, r, g, b, a });
-            verts.push_back({ cx + nx * halfWidth + dx * halfWidth, cy + ny * halfWidth + dy * halfWidth, r, g, b, a });
-            verts.push_back({ cx - nx * halfWidth + dx * halfWidth, cy - ny * halfWidth + dy * halfWidth, r, g, b, a });
-            indices.push_back(base);     indices.push_back(base + 1); indices.push_back(base + 2);
-            indices.push_back(base + 1); indices.push_back(base + 3); indices.push_back(base + 2);
-        }
-    }
-
-    if (verts.empty() || indices.empty()) return true;
-
-    // Convert the triangle mesh to per-triangle contours (winding-normalized
-    // to CCW) so the analytic-AA NonZero rasterizer sees stroke = union.
-    if (collectContours) {
-        for (size_t ti = 0; ti + 2 < indices.size(); ti += 3) {
-            uint32_t i0 = indices[ti];
-            uint32_t i1 = indices[ti + 1];
-            uint32_t i2 = indices[ti + 2];
-            if (i0 >= verts.size() || i1 >= verts.size() || i2 >= verts.size()) continue;
-            float ax = verts[i0].x, ay = verts[i0].y;
-            float bx = verts[i1].x, by = verts[i1].y;
-            float cx = verts[i2].x, cy = verts[i2].y;
-            float sa = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-            if (std::abs(sa) < 1e-7f) continue;
-            Contour tri;
-            tri.points.reserve(6);
-            tri.points.push_back(ax); tri.points.push_back(ay);
-            if (sa > 0.0f) {
-                tri.points.push_back(bx); tri.points.push_back(by);
-                tri.points.push_back(cx); tri.points.push_back(cy);
+            if (collect) {
+                emitSquareCapQuad(cx, cy, nx, ny, dx * halfWidth, dy * halfWidth);
             } else {
-                tri.points.push_back(cx); tri.points.push_back(cy);
-                tri.points.push_back(bx); tri.points.push_back(by);
+                uint32_t base = (uint32_t)verts.size();
+                verts.push_back({ cx + nx * halfWidth, cy + ny * halfWidth, r, g, b, a });
+                verts.push_back({ cx - nx * halfWidth, cy - ny * halfWidth, r, g, b, a });
+                verts.push_back({ cx + nx * halfWidth + dx * halfWidth, cy + ny * halfWidth + dy * halfWidth, r, g, b, a });
+                verts.push_back({ cx - nx * halfWidth + dx * halfWidth, cy - ny * halfWidth + dy * halfWidth, r, g, b, a });
+                indices.push_back(base);     indices.push_back(base + 1); indices.push_back(base + 2);
+                indices.push_back(base + 1); indices.push_back(base + 3); indices.push_back(base + 2);
             }
-            collectContours->push_back(std::move(tri));
         }
     }
+
     return true;
 }
 

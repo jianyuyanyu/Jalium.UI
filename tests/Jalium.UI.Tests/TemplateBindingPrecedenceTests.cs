@@ -46,7 +46,9 @@ public class TemplateBindingPrecedenceTests
 
         var textBlock = Assert.IsType<TextBlock>(control.GetVisualChild(0));
         Assert.Equal("Triggered", textBlock.Text);
-        Assert.Equal(BaseValueSource.TemplateTrigger, DependencyPropertyHelper.GetValueSource(textBlock, TextBlock.TextProperty).BaseValueSource);
+        // TargetName 指向模板内具名部件的 trigger 是 WPF 的 ParentTemplateTrigger 级
+        // （模板对自己生成物的支配），优先级仅次于 local。
+        Assert.Equal(BaseValueSource.ParentTemplateTrigger, DependencyPropertyHelper.GetValueSource(textBlock, TextBlock.TextProperty).BaseValueSource);
 
         control.Tag = "Off";
         Assert.Equal("Base", textBlock.Text);

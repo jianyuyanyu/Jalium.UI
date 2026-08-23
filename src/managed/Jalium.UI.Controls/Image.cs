@@ -40,16 +40,37 @@ public class Image : FrameworkElement, IUriContext
 
     /// <inheritdoc />
     /// <remarks>
-    /// Forwards to the assigned <see cref="Source"/> when it implements
+    /// <para>Forwards to the assigned <see cref="Source"/> when it implements
     /// <see cref="IReclaimableResource"/> (true for the built-in
     /// <see cref="BitmapImage"/>). For a <see cref="BitmapImage"/> source this
     /// drops the decoded BGRA8 pixel buffer and asks every active GPU bitmap
     /// cache to release its <c>NativeBitmap</c> upload, so both CPU and GPU
-    /// memory shrink while the image is off-screen.
+    /// memory shrink while the image is off-screen.</para>
+    /// <para>Unless somebody else is still drawing that source. The reclaimer's idle test is per
+    /// ELEMENT, but the resource being freed belongs to a SHARED <see cref="ImageSource"/>: one
+    /// bitmap routinely backs several elements at once, and non-element consumers (an image brush,
+    /// an image drawing) hold no element the reclaimer can even see. Forwarding unconditionally
+    /// therefore let an element that had been off-screen for the idle window free the pixels of an
+    /// image another element was painting on that very frame — which reads to the user as the live
+    /// image blanking for the length of one re-decode and coming back, repeatedly, for as long as
+    /// anything keeps producing frames. It is self-sustaining, too: the reclaim clears the
+    /// published decode state, so the live consumer's next draw re-requests a full decode, which
+    /// republishes, which the next scan reclaims again.</para>
+    /// <para>The test is a comparison, not a timeout, so it needs no knowledge of the reclaimer's
+    /// idle window: this element has been idle since <see cref="Visual.LastRenderedTickMs"/>, so a
+    /// source drawn AFTER that instant was drawn by somebody else and must be left alone. A source
+    /// only this element draws stamps the two together on its last frame, the comparison is false,
+    /// and reclamation proceeds exactly as before.</para>
     /// </remarks>
     public void ReclaimIdleResources()
     {
-        (Source as IReclaimableResource)?.ReclaimIdleResources();
+        if (Source is not { } source)
+            return;
+
+        if (source.LastDrawnTickMs > LastRenderedTickMs)
+            return;
+
+        (source as IReclaimableResource)?.ReclaimIdleResources();
     }
 
     private Uri? _baseUri;

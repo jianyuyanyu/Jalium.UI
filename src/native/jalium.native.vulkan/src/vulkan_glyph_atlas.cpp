@@ -374,6 +374,173 @@ VulkanGlyphAtlas::VulkanGlyphAtlas(IDWriteFactory* dwriteFactory)
 
 VulkanGlyphAtlas::~VulkanGlyphAtlas() = default;
 
+// ============================================================================
+// gasp-table rasterization policy
+// ============================================================================
+//
+// DirectWrite exposes two families of antialiasing for outline glyphs:
+//
+//   * NATURAL / GDI_*        — the outline is grid-fit VERTICALLY, so
+//                              horizontal strokes and the baseline land on
+//                              whole pixel rows and read as solid ink.
+//   * NATURAL_SYMMETRIC      — symmetric antialiasing in both axes; strokes
+//                              are free to straddle two rows at 50 % each.
+//
+// Which one is right is a per-font, per-ppem decision that lives in the font's
+// `gasp` table, and GetRecommendedRenderingMode is the API that reads it.
+// Symmetric rendering only becomes the better choice once a stroke is thick
+// enough to span more than one pixel — which is why the gasp table for the
+// stock UI fonts asks for NATURAL below roughly 20 ppem and only switches to
+// NATURAL_SYMMETRIC above it.
+//
+// Mirrors D3D12GlyphAtlas::ResolveGaspPolicy; the two must stay identical or
+// the same text renders differently per backend.
+VulkanGlyphAtlas::GaspPolicy VulkanGlyphAtlas::ResolveGaspPolicy(
+    IDWriteFontFace* fontFace,
+    uint16_t ppem,
+    const DWRITE_MATRIX* transform,
+    uint8_t hintingMode)
+{
+    // Symmetric antialiasing only becomes the better trade once a stroke spans
+    // more than one pixel; below this em size it just costs stroke contrast.
+    // 20 is where the stock UI fonts' own gasp tables switch over, so fonts
+    // that already behave see no change at all.
+    static constexpr uint16_t kSymmetricDowngradeMaxPpem = 20;
+
+    GaspPolicy policy;
+    if (!fontFace) {
+        policy.useGdiFallback = true;
+        return policy;
+    }
+
+    // The transform only ever carries the X:Y aspect ratio here (scaleY is
+    // folded into ppem), so a single bucket byte identifies it for the key.
+    uint8_t aspectBucket = 0;
+    if (transform) {
+        long q = std::lround(transform->m11 * 32.0f);
+        aspectBucket = (uint8_t)std::clamp(q, 1L, 255L);
+    }
+    const uint64_t cacheKey =
+        (uint64_t)(uintptr_t)fontFace ^
+        (((uint64_t)ppem << 1) | ((uint64_t)hintingMode << 18) |
+         ((uint64_t)aspectBucket << 22)) * 0x9E3779B97F4A7C15ull;
+
+    if (auto it = gaspPolicyCache_.find(cacheKey); it != gaspPolicyCache_.end()) {
+        return it->second;
+    }
+
+    Microsoft::WRL::ComPtr<IDWriteFontFace3> fontFace3;
+    if (FAILED(fontFace->QueryInterface(IID_PPV_ARGS(&fontFace3))) || !fontFace3) {
+        // Pre-Win10 face: keep the historical behaviour (symmetric + whatever
+        // grid fit the caller pinned) rather than guessing.
+        policy.mode = DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC;
+        policy.gridFit = DWRITE_GRID_FIT_MODE_DEFAULT;
+        gaspPolicyCache_.emplace(cacheKey, policy);
+        return policy;
+    }
+
+    DWRITE_RENDERING_MODE1 recMode = DWRITE_RENDERING_MODE1_DEFAULT;
+    DWRITE_GRID_FIT_MODE recGridFit = DWRITE_GRID_FIT_MODE_DEFAULT;
+    HRESULT hr = fontFace3->GetRecommendedRenderingMode(
+        (float)ppem,
+        96.0f, 96.0f,                         // pixelsPerDip = 1.0 (ppem is final)
+        transform,
+        FALSE,                                // not sideways
+        DWRITE_OUTLINE_THRESHOLD_ANTIALIASED,
+        DWRITE_MEASURING_MODE_NATURAL,
+        renderingParams_.Get(),
+        &recMode,
+        &recGridFit);
+
+    if (FAILED(hr)) {
+        policy.mode = DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC;
+        policy.gridFit = DWRITE_GRID_FIT_MODE_DEFAULT;
+        gaspPolicyCache_.emplace(cacheKey, policy);
+        return policy;
+    }
+
+    switch (recMode) {
+        // CreateGlyphRunAnalysis cannot consume these — the GDI bitmap render
+        // target path owns them.
+        case DWRITE_RENDERING_MODE1_OUTLINE:
+        case DWRITE_RENDERING_MODE1_ALIASED:
+        case DWRITE_RENDERING_MODE1_DEFAULT:
+            policy.useGdiFallback = true;
+            break;
+
+        // GDI-compatible modes rasterize against GDI's integer-advance metrics.
+        // Our layout is measured with DWRITE_MEASURING_MODE_NATURAL, so feeding
+        // a GDI mode into CreateGlyphRunAnalysis would pair hinted-to-integer
+        // ink with fractional natural advances and scatter the glyphs. Take the
+        // vertical grid fitting they were recommended FOR — that is the part
+        // that matters at these sizes — via plain NATURAL, which is the
+        // natural-metrics member of the same family.
+        case DWRITE_RENDERING_MODE1_GDI_CLASSIC:
+        case DWRITE_RENDERING_MODE1_GDI_NATURAL:
+            policy.mode = DWRITE_RENDERING_MODE1_NATURAL;
+            policy.gridFit = recGridFit;
+            policy.gridAligned = true;
+            break;
+
+        case DWRITE_RENDERING_MODE1_NATURAL:
+            policy.mode = recMode;
+            policy.gridFit = recGridFit;
+            policy.gridAligned = true;
+            break;
+
+        // NATURAL_SYMMETRIC and NATURAL_SYMMETRIC_DOWNSAMPLED.
+        //
+        // Symmetric antialiasing spreads a stroke's coverage across the pixel
+        // grid in BOTH axes. That is the right trade once a stroke is thicker
+        // than a pixel, but at UI sizes it costs contrast for nothing here:
+        // measured on Microsoft YaHei UI at 12 ppem, symmetric and NATURAL
+        // produce the SAME ink box (12x11 at bearing (0,-10)) yet every
+        // horizontal stroke peaks at 191/255 under symmetric versus a solid
+        // 255 under NATURAL. The glyph lands on the right rows either way and
+        // simply never reaches full ink, which reads as "small text is grey /
+        // out of focus".
+        //
+        // This is not a hypothetical: the recommendation is per-font, and the
+        // families a modern Windows UI actually defaults to are exactly the
+        // ones that ask for symmetric all the way down. Measured against
+        // GetRecommendedRenderingMode at 11/12/13/14 ppem:
+        //
+        //     Microsoft YaHei UI, Segoe UI, Consolas  -> NATURAL
+        //     Segoe UI Variable Display / Text        -> NATURAL_SYMMETRIC
+        //     Cascadia Code                           -> NATURAL_SYMMETRIC
+        //
+        // So a window mixing a Segoe UI Variable label with a YaHei UI one
+        // renders the first soft and the second crisp, at the same size, with
+        // no way to tell from the markup — the original "why is only THIS list
+        // blurry" report.
+        //
+        // Nothing downstream compensates: the quad is snapped to whole physical
+        // pixels and sampled with a POINT sampler precisely so the atlas bitmap
+        // reaches the screen untouched, so whatever contrast the rasterizer
+        // gives up is gone for good.
+        //
+        // Below the size where symmetric starts paying for itself, take NATURAL
+        // instead and keep the recommended grid-fit mode. A font that
+        // explicitly asks for grid fitting to be OFF is left alone: there
+        // symmetric is the honest choice and NATURAL would only fight it.
+        default:
+            if (ppem < kSymmetricDowngradeMaxPpem &&
+                recGridFit != DWRITE_GRID_FIT_MODE_DISABLED) {
+                policy.mode = DWRITE_RENDERING_MODE1_NATURAL;
+                policy.gridFit = recGridFit;
+                policy.gridAligned = true;
+            } else {
+                policy.mode = recMode;
+                policy.gridFit = recGridFit;
+                policy.gridAligned = false;
+            }
+            break;
+    }
+
+    gaspPolicyCache_.emplace(cacheKey, policy);
+    return policy;
+}
+
 void VulkanGlyphAtlas::Reset()
 {
     // Every cached glyph slot is about to be invalidated — bump the
@@ -382,6 +549,10 @@ void VulkanGlyphAtlas::Reset()
     ++atlasGeneration_;
     jalium::text_stats::AddAtlasReset();
     cache_.clear();
+    // cache_ is what keeps the IDWriteFontFace objects behind the raw pointers
+    // in both key sets alive, so the gasp memo has to be dropped with it —
+    // otherwise a recycled face address could serve another font's policy.
+    gaspPolicyCache_.clear();
     std::fill(atlasBitmap_.begin(), atlasBitmap_.end(), (uint8_t)0);
     packX_ = 0;
     packY_ = 0;
@@ -429,21 +600,52 @@ bool VulkanGlyphAtlas::Initialize()
     dwriteFactory_->QueryInterface(IID_PPV_ARGS(&dwriteFactory4_));
 
     // Create custom rendering params for ClearType sub-pixel rendering.
-    // clearTypeLevel = 1.0 enables full ClearType; RGBA atlas stores per-channel coverage.
+    //
+    // CRITICAL: renderingMode and gridFitMode must stay DEFAULT here.
+    // GetRecommendedRenderingMode short-circuits and returns whatever mode a
+    // params object names, so pinning NATURAL_SYMMETRIC/ENABLED (as this used
+    // to) silently bypassed the font's gasp table for EVERY size. Measured on
+    // Microsoft YaHei UI: at 9-20 ppem the gasp table asks for NATURAL, which
+    // grid-fits horizontal strokes onto whole pixel rows; NATURAL_SYMMETRIC
+    // antialiases vertically instead, so at the 12 px default UI size every
+    // CJK stroke landed as two rows of half-grey — the "small text is blurry"
+    // report. Only at >= 24 ppem does the gasp table itself switch to
+    // NATURAL_SYMMETRIC, which is exactly why large text looked fine.
+    // Kept byte-for-byte in sync with D3D12GlyphAtlas::Initialize.
+    Microsoft::WRL::ComPtr<IDWriteRenderingParams> systemParams;
+    dwriteFactory_->CreateRenderingParams(&systemParams);
+
     if (dwriteFactory3_) {
+        float gamma = systemParams ? systemParams->GetGamma() : 1.8f;
+        float enhancedContrast = systemParams ? systemParams->GetEnhancedContrast() : 0.5f;
+        float clearTypeLevel = systemParams ? systemParams->GetClearTypeLevel() : 1.0f;
+        DWRITE_PIXEL_GEOMETRY pixelGeometry = systemParams
+            ? systemParams->GetPixelGeometry()
+            : DWRITE_PIXEL_GEOMETRY_RGB;
+        float grayscaleEnhancedContrast = 1.0f;
+        if (systemParams) {
+            Microsoft::WRL::ComPtr<IDWriteRenderingParams3> sys3;
+            if (SUCCEEDED(systemParams.As(&sys3)) && sys3) {
+                grayscaleEnhancedContrast = sys3->GetGrayscaleEnhancedContrast();
+            }
+        }
+
         Microsoft::WRL::ComPtr<IDWriteRenderingParams3> params3;
         dwriteFactory3_->CreateCustomRenderingParams(
-            1.0f,              // gamma
-            0.5f,              // enhancedContrast — slight boost for ClearType sharpness
-            0.0f,              // grayscaleEnhancedContrast
-            1.0f,              // clearTypeLevel = 1.0 enables full ClearType sub-pixel rendering
-            DWRITE_PIXEL_GEOMETRY_RGB,
-            DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
-            DWRITE_GRID_FIT_MODE_ENABLED,
+            gamma,
+            enhancedContrast,
+            grayscaleEnhancedContrast,
+            clearTypeLevel,
+            pixelGeometry,
+            DWRITE_RENDERING_MODE1_DEFAULT,     // let the gasp table decide
+            DWRITE_GRID_FIT_MODE_DEFAULT,       // ditto
             &params3);
         if (params3) {
             params3->QueryInterface(IID_PPV_ARGS(&renderingParams_));
         }
+    }
+    if (!renderingParams_) {
+        renderingParams_ = systemParams;
     }
     if (!renderingParams_) {
         if (FAILED(dwriteFactory_->CreateRenderingParams(&renderingParams_)))
@@ -759,37 +961,20 @@ bool VulkanGlyphAtlas::RasterizeGlyph(const GlyphKey& key, GlyphEntry& entry)
             useGdiFallback = true;
         }
 
-        Microsoft::WRL::ComPtr<IDWriteFontFace3> fontFace3;
-        if (!useGdiFallback &&
-            SUCCEEDED(key.fontFace->QueryInterface(IID_PPV_ARGS(&fontFace3))) && fontFace3) {
-            DWRITE_RENDERING_MODE1 recMode = DWRITE_RENDERING_MODE1_DEFAULT;
-            DWRITE_GRID_FIT_MODE recGridFit = DWRITE_GRID_FIT_MODE_DEFAULT;
-            HRESULT recHr = fontFace3->GetRecommendedRenderingMode(
-                (float)key.fontSize,
-                96.0f, 96.0f,                         // pixelsPerDip = 1.0
-                hasGlyphXform ? &glyphXform : nullptr,
-                FALSE,                                // not sideways
-                DWRITE_OUTLINE_THRESHOLD_ANTIALIASED,
-                DWRITE_MEASURING_MODE_NATURAL,
-                renderingParams_.Get(),
-                &recMode,
-                &recGridFit);
-            if (SUCCEEDED(recHr)) {
-                // CreateGlyphRunAnalysis cannot consume DEFAULT, ALIASED, or
-                // OUTLINE — those have to be drawn through the GDI path.
-                if (recMode == DWRITE_RENDERING_MODE1_OUTLINE ||
-                    recMode == DWRITE_RENDERING_MODE1_ALIASED ||
-                    recMode == DWRITE_RENDERING_MODE1_DEFAULT) {
-                    useGdiFallback = true;
-                } else {
-                    renderingMode = recMode;
-                    // Only adopt the recommended grid-fit policy when the
-                    // caller didn't pin an explicit Fixed / Animated mode —
-                    // otherwise WPF's TextOptions.TextHintingMode override
-                    // would silently lose to the font's gasp-table hint.
-                    if (hint == 0) {
-                        gridFitMode = recGridFit;
-                    }
+        if (!useGdiFallback) {
+            const GaspPolicy policy = ResolveGaspPolicy(
+                key.fontFace, key.fontSize,
+                hasGlyphXform ? &glyphXform : nullptr, hint);
+            if (policy.useGdiFallback) {
+                useGdiFallback = true;
+            } else {
+                renderingMode = policy.mode;
+                // Only adopt the recommended grid-fit policy when the
+                // caller didn't pin an explicit Fixed / Animated mode —
+                // otherwise WPF's TextOptions.TextHintingMode override
+                // would silently lose to the font's gasp-table hint.
+                if (hint == 0) {
+                    gridFitMode = policy.gridFit;
                 }
             }
         }
@@ -1415,7 +1600,9 @@ uint64_t VulkanGlyphAtlas::HashInstanceKey(uint64_t layoutKey,
                                            int32_t aaMode,
                                            int32_t hintingMode,
                                            float scaleX, float scaleY,
-                                           bool crispAxisAligned) noexcept
+                                           bool crispAxisAligned,
+                                           uint8_t originPhaseX,
+                                           bool subpixelPositioning) noexcept
 {
     uint64_t h = 0xCBF29CE484222325ull;  // FNV-1a 64-bit
     auto mix = [&h](const void* p, size_t n) {
@@ -1446,6 +1633,13 @@ uint64_t VulkanGlyphAtlas::HashInstanceKey(uint64_t layoutKey,
     // across every screen position it visits within the cache lifetime.
     mix(&aaMode, sizeof(aaMode));
     mix(&hintingMode, sizeof(hintingMode));
+    // Sub-pixel positioning folds the origin's 1/8-px phase into every pen
+    // before flooring, so the cached layout-local positions (and the phase
+    // bitmaps they reference) are only valid for runs whose origin shares that
+    // phase. Keying on the phase keeps the memo origin-independent in spirit —
+    // at most 8 variants per shaped run — while the snapped path stays at one.
+    const uint8_t posByte = subpixelPositioning ? (uint8_t)(0x10 | (originPhaseX & 0x7)) : (uint8_t)0;
+    mix(&posByte, sizeof(posByte));
     return h;
 }
 
@@ -1460,7 +1654,8 @@ uint32_t VulkanGlyphAtlas::GenerateGlyphs(
     int32_t hintingMode,
     float scaleX,
     float scaleY,
-    bool crispAxisAligned)
+    bool crispAxisAligned,
+    bool subpixelPositioning)
 {
     if (!layout || !initialized_) return 0;
 
@@ -1481,6 +1676,25 @@ uint32_t VulkanGlyphAtlas::GenerateGlyphs(
     const uint8_t scaleYQ = quantScale(scaleY);
     const float   sxR = scaleXQ / (float)kGlyphScaleQuant;   // dequantized raster scale (matches the key)
     const float   syR = scaleYQ / (float)kGlyphScaleQuant;
+    const bool    deformed = (scaleXQ != (uint8_t)kGlyphScaleQuant ||
+                              scaleYQ != (uint8_t)kGlyphScaleQuant);
+
+    // Sub-pixel positioning: phases are measured from the FINAL screen pen,
+    // i.e. origin + layout-local pen. On Vulkan the caller hands us the
+    // ALREADY-TRANSFORMED origin in PHYSICAL pixels (RenderText passes tx/ty;
+    // dpiScale_ only scales the layout-local pen), so its fraction is taken
+    // as-is and quantized to the same 1/8 buckets the glyph phases use.
+    // Deformed runs keep their single-phase policy (a moving deform would
+    // otherwise flood the atlas — see the EXCEPTION note in the glyph loop),
+    // so the mode is only honoured at unit scale buckets.
+    const bool subpixelRun = subpixelPositioning && !deformed;
+    uint8_t originPhaseX = 0;
+    float originPhaseOffset = 0.0f;   // physical px, == originPhaseX / 8
+    if (subpixelRun) {
+        const float originFrac = originX - std::floor(originX);
+        originPhaseX = (uint8_t)std::clamp((int)(originFrac * 8.0f), 0, 7);
+        originPhaseOffset = originPhaseX / 8.0f;
+    }
 
     // Detect a runtime process-wide ClearType↔Grayscale swap. SyncAntialiasMode()
     // bumps needsReset_ when it spots a mode change so cached glyph pixels
@@ -1593,7 +1807,8 @@ uint32_t VulkanGlyphAtlas::GenerateGlyphs(
     if (layoutKey != 0) {
         const uint64_t ck = HashInstanceKey(layoutKey, dpiScale_,
                                             effectiveAaMode, effectiveHintingMode,
-                                            sxR, syR, crispAxisAligned);
+                                            sxR, syR, crispAxisAligned,
+                                            originPhaseX, subpixelRun);
         auto mit = instMap_.find(ck);
         if (mit != instMap_.end()) {
             if (mit->second->run.gen == atlasGeneration_) {
@@ -1664,8 +1879,47 @@ uint32_t VulkanGlyphAtlas::GenerateGlyphs(
         float invDpi = 1.0f / dpiScale_;
         float invRasterX = 1.0f / rasterScaleX;
         float invRasterY = 1.0f / rasterScaleY;
-        const bool deformed = (scaleXQ != (uint8_t)kGlyphScaleQuant ||
-                               scaleYQ != (uint8_t)kGlyphScaleQuant);
+
+        // Sub-pixel positioning policy for this run, resolved once from the
+        // font's gasp table (the same call RasterizeGlyph makes per cache miss,
+        // memoised).
+        //
+        // Grid-fit sizes rasterize the outline against the pixel grid, so the
+        // SAME character comes out with measurably different ink depending on
+        // which of the 8 phases it lands in — measured on Microsoft YaHei UI at
+        // 12 ppem, one Latin glyph spans 4 px in some phases and 5 px in others,
+        // with average coverage varying by ~25 %. In running text that reads as
+        // "some characters are bigger/bolder than others". Pinning phase 0 makes
+        // every instance of a character byte-identical, which is the same trade
+        // GDI and WPF's Display mode make at these sizes: shape consistency
+        // bought with up to a pixel of positional error. That is the
+        // Display-mode (pen-snapped) policy. It is NOT a free trade: the
+        // layout's advances are natural (fractional), so snapping each pen
+        // independently lets two neighbouring gaps round in opposite
+        // directions — a 14px bold "Desktop" rendered as "Desk to p". Ideal
+        // mode (the managed default) therefore asks for sub-pixel positioning
+        // (subpixelRun below) and keeps the phases even at grid-fit sizes.
+        // Above the grid-fit range symmetric antialiasing renders phases
+        // consistently, so there the phases stay in every mode.
+        const DWRITE_MATRIX runGlyphXform {
+            scaleXQ / (float)std::max<uint8_t>(scaleYQ, 1), 0.0f, 0.0f, 1.0f, 0.0f, 0.0f
+        };
+        const GaspPolicy runPolicy = ResolveGaspPolicy(
+            run.fontFace.Get(), fontSize,
+            (scaleXQ != scaleYQ) ? &runGlyphXform : nullptr,
+            static_cast<uint8_t>(effectiveHintingMode));
+        // Animated hinting (2) explicitly asks for grid fitting to be off so
+        // text slides smoothly; honour that by keeping the sub-pixel phases.
+        // Sub-pixel positioning (Ideal-mode text, and any text under a live
+        // scale on the managed side) asks for the same thing for a different
+        // reason: the pens are fractional — static text because the advances
+        // are natural metrics, zooming text because they move continuously —
+        // and a grid-fitted run pinned to phase 0 would place each glyph up to
+        // half a pixel off, each in its own direction. Phases bound the
+        // placement error to 1/8 px per glyph, which is what keeps the
+        // spacing visually constant.
+        const bool useSubpixelPhases =
+            subpixelRun || (effectiveHintingMode == 2) || !runPolicy.gridAligned;
 
         for (uint32_t i = 0; i < run.glyphIndices.size(); i++) {
             // Apply DirectWrite glyph offsets (kerning adjustments, mark positioning, etc.)
@@ -1676,7 +1930,11 @@ uint32_t VulkanGlyphAtlas::GenerateGlyphs(
             }
 
             // Compute pen position in physical pixels for sub-pixel ClearType.
-            float penXPhysical = (penX + offsetX) * dpiScale_;
+            // Sub-pixel positioning measures it from the final screen pen: the
+            // origin's quantized fraction is added here (and removed again
+            // below) so the phase — and the floor it is taken against — see
+            // origin + pen rather than the layout-local pen alone.
+            float penXPhysical = (penX + offsetX) * dpiScale_ + originPhaseOffset;
             float subpixelF = penXPhysical - std::floor(penXPhysical);
             // Quantize to 1/8 pixel (8 cached variants per glyph). At 1/4 pixel
             // the optical residual is up to 0.25px; being size-invariant it is a
@@ -1691,7 +1949,7 @@ uint32_t VulkanGlyphAtlas::GenerateGlyphs(
             // -> cached runs invalidated by the generation guard -> glyphs blink
             // in/out (the thin 'l' flickering). Sub-pixel phase is invisible under
             // deformation anyway, so one phase bounds the atlas to one entry/glyph.
-            uint8_t subpixelQuant = deformed
+            uint8_t subpixelQuant = (deformed || !useSubpixelPhases)
                 ? (uint8_t)0
                 : (uint8_t)std::min((int)(subpixelF * 8.0f), 7);
 
@@ -1749,9 +2007,25 @@ uint32_t VulkanGlyphAtlas::GenerateGlyphs(
                 // amplify the phase error beyond half a physical pixel. Fixed,
                 // axis-aligned runs are snapped once, in final physical space, by
                 // RenderText after the actual transform scale is applied.
-                float penXForPos = deformed
-                    ? penXPhysical
-                    : std::floor(penXPhysical);
+                // Without a sub-pixel phase there is no fractional offset baked
+                // into the bitmap, so floor() would bias every glyph up to a
+                // full pixel to the left and let that bias accumulate visibly
+                // across a line. Round instead: the residual becomes +/-0.5 px
+                // and averages out.
+                float penXForPos;
+                if (deformed) {
+                    penXForPos = penXPhysical;
+                } else if (!useSubpixelPhases) {
+                    penXForPos = std::round(penXPhysical);
+                } else {
+                    penXForPos = std::floor(penXPhysical);
+                }
+                // Sub-pixel positioning: back to layout-local space. The cached
+                // quad then sits at floor(origin + pen) - originPhase, emitRun
+                // adds the full origin, and RenderText's whole-pixel snap sees
+                // floor(origin + pen) + (originFrac - originPhase) with the
+                // residual < 1/8 px — it resolves to exactly floor(origin + pen).
+                penXForPos -= originPhaseOffset;
                 float glyphX = penXForPos * invDpi + entry.bearingX * invDpi * invRasterX;
                 float glyphY = run.baselineY - offsetY - entry.bearingY * invDpi * invRasterY;
 
@@ -1806,7 +2080,8 @@ uint32_t VulkanGlyphAtlas::GenerateGlyphs(
         built.gen = atlasGeneration_;
         const uint64_t ck = HashInstanceKey(layoutKey, dpiScale_,
                                             effectiveAaMode, effectiveHintingMode,
-                                            sxR, syR, crispAxisAligned);
+                                            sxR, syR, crispAxisAligned,
+                                            originPhaseX, subpixelRun);
         if (auto ex = instMap_.find(ck); ex != instMap_.end()) {
             instLru_.erase(ex->second);
             instMap_.erase(ex);

@@ -28,6 +28,12 @@ internal static class JalxamlParser
     public static XmlReader CreateReader(string jalxaml) => JalxamlReader.Create(jalxaml);
 
     /// <summary>
+    /// Creates a reader whose Razor code blocks and loops can read <paramref name="dataResolver"/>.
+    /// </summary>
+    public static XmlReader CreateReader(string jalxaml, Func<string, object?>? dataResolver)
+        => JalxamlReader.Create(jalxaml, dataResolver);
+
+    /// <summary>
     /// Creates a reader from a <see cref="TextReader"/>.
     /// </summary>
     public static XmlReader CreateReader(TextReader textReader) => JalxamlReader.Create(textReader);

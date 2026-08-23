@@ -1439,6 +1439,16 @@ public class DataGrid : MultiSelector, IColumnHeaderHost
     #region Row Management
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Rows are realized by UpdateRealizedRows into PART_RowsHost, keyed by row index and
+    /// virtualized against the data ScrollViewer. The base fallback items host would build a
+    /// second container for every item — the whole collection, unvirtualized, into a panel this
+    /// control never measures — and run the full prepare/clear lifecycle on it, so LoadingRow and
+    /// UnloadingRow fired twice per row and the shadow rows outlived every refresh.
+    /// </remarks>
+    private protected override bool UsesFallbackItemsHost => false;
+
+    /// <inheritdoc />
     protected override bool IsItemItsOwnContainerOverride(object item) => item is DataGridRow;
 
     /// <inheritdoc />

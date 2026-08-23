@@ -112,6 +112,10 @@ internal static partial class Win32Methods
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool ReleaseCapture();
 
+    /// <summary>当前线程里持有鼠标捕获的窗口；无捕获时返回 <see cref="nint.Zero"/>。</summary>
+    [DllImport("user32.dll")]
+    internal static extern nint GetCapture();
+
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool TrackMouseEvent(ref TRACKMOUSEEVENT lpEventTrack);

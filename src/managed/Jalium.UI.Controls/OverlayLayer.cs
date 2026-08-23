@@ -113,30 +113,65 @@ internal sealed class OverlayLayer : Canvas
         // Check if click is inside any popup root
         foreach (var root in _lightDismissRoots)
         {
-            // Use Canvas.Left/Top + actual size for robust bounds calculation,
-            // falling back to VisualBounds if Canvas properties are not set.
-            var left = GetLeft(root);
-            var top = GetTop(root);
-            Rect rootBounds;
-
-            if (!double.IsNaN(left) && !double.IsNaN(top))
-            {
-                var w = root.ActualWidth > 0 ? root.ActualWidth : root.DesiredSize.Width;
-                var h = root.ActualHeight > 0 ? root.ActualHeight : root.DesiredSize.Height;
-                rootBounds = new Rect(left, top, w, h);
-            }
-            else
-            {
-                rootBounds = root.VisualBounds;
-            }
-
-            if (rootBounds.Contains(windowPosition))
+            if (GetPopupRootBounds(root).Contains(windowPosition))
                 return false; // Click is inside a popup — don't dismiss
         }
 
         // Click is outside all light-dismiss popups — close them
         return CloseLightDismissPopups() > 0;
     }
+
+    /// <summary>
+    /// 返回覆盖层里包含 <paramref name="windowPosition"/> 的弹窗根（任意弹窗，不限 light-dismiss）；
+    /// 没有则为 <see langword="null"/>。后加入的画在上面，所以倒序找、取最上面那个。
+    /// </summary>
+    /// <remarks>
+    /// 供输入分发器判断「这次按下是不是落在某个覆盖层弹窗里」：落在里面时，该弹窗的祖先外飞弹窗
+    /// 不能按「点到外面」被 light dismiss，点击也要照常派发给弹窗内容。
+    /// </remarks>
+    internal PopupRoot? FindPopupRootAt(Point windowPosition)
+    {
+        if (_popupRoots.Count == 0) return null;
+
+        for (int i = Children.Count - 1; i >= 0; i--)
+        {
+            if (Children[i] is PopupRoot root
+                && _popupRoots.Contains(root)
+                && GetPopupRootBounds(root).Contains(windowPosition))
+            {
+                return root;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Popup root bounds in window space. Use Canvas.Left/Top + actual size for robust bounds
+    /// calculation, falling back to VisualBounds if Canvas properties are not set.
+    /// </summary>
+    private static Rect GetPopupRootBounds(PopupRoot root)
+    {
+        var left = GetLeft(root);
+        var top = GetTop(root);
+        if (!double.IsNaN(left) && !double.IsNaN(top))
+        {
+            // Popup 打开时就把内容尺寸写进了 root.Width/Height；首个布局 pass 之前 ActualSize 与
+            // DesiredSize 还都是 0，这时退回显式尺寸，别把弹窗当成空矩形。
+            var w = root.ActualWidth > 0 ? root.ActualWidth
+                : root.DesiredSize.Width > 0 ? root.DesiredSize.Width
+                : ExplicitOrZero(root.Width);
+            var h = root.ActualHeight > 0 ? root.ActualHeight
+                : root.DesiredSize.Height > 0 ? root.DesiredSize.Height
+                : ExplicitOrZero(root.Height);
+            return new Rect(left, top, w, h);
+        }
+
+        return root.VisualBounds;
+    }
+
+    private static double ExplicitOrZero(double length)
+        => double.IsNaN(length) || double.IsInfinity(length) || length < 0 ? 0 : length;
 
     internal int CloseLightDismissPopups()
     {

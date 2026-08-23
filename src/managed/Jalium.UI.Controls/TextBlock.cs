@@ -2128,22 +2128,32 @@ public class TextBlock : FrameworkElement, IAddChild, IServiceProvider, IContent
     /// The clip <see cref="OnRender"/> pushes around its own drawing.
     ///
     /// <para>
-    /// Plain <see cref="FrameworkElement.RenderSize"/>, deliberately: the line box is now measured
-    /// to contain the glyph ink (see <c>TextMeasurement.GetLineHeight</c>), so clipping to the
-    /// element's own size cannot shave descenders any more. This used to be inflated to work around
-    /// a line box that was too short — that was padding over a measurement bug, and it left every
-    /// OTHER consumer of the size (the layout slot, containers that size to this element) still
-    /// wrong. Fixing the height fixed all of them at once, so the inflation is gone.
+    /// This clip is HORIZONTAL. Overflow along x — the rare single-word-too-long fallback — must be
+    /// cut at the edge so it reads as clipped rather than being silently swallowed. Along y there is
+    /// no such intent, and bounding y at <see cref="FrameworkElement.RenderSize"/> was actively
+    /// wrong: that height is the LINE BOX (ascent + descent + line gap), which is a typographic
+    /// box, not an ink box. Font metrics put the line box exactly at the descent line, so any glyph
+    /// whose ink reaches that line — every descender, plus the antialiasing row beneath it — was
+    /// being shaved by the element's own clip. DirectWrite ships GetOverhangMetrics precisely
+    /// because ink routinely exceeds the layout box; this backend does not surface it, so the box
+    /// must simply not constrain y.
     /// </para>
     ///
     /// <para>
-    /// The clip itself stays because horizontal overflow — the rare single-word-too-long fallback —
-    /// must be cut at the edge so it reads as clipped rather than being silently swallowed.
+    /// Inflating by a whole line height on each side is the bound, not a guess: ink cannot overshoot
+    /// its line box by more than another entire line box. Nothing new gets drawn — the clip only
+    /// bounds what this element already renders at its own line positions — so the sole effect is
+    /// that glyphs stop being cut by the box that was measured for them.
     /// </para>
     /// </summary>
     private RectangleGeometry GetRenderClip()
     {
-        var clipRect = new Rect(RenderSize);
+        var verticalSlack = GetLineHeight();
+        var clipRect = new Rect(
+            0,
+            -verticalSlack,
+            RenderSize.Width,
+            RenderSize.Height + verticalSlack * 2);
         if (_renderClipCache is null || _renderClipCache.Rect != clipRect)
         {
             var geometry = new RectangleGeometry(clipRect);

@@ -230,6 +230,33 @@ public sealed class TransformJalxamlRazorTask : Microsoft.Build.Utilities.Task
         return string.IsNullOrWhiteSpace(relative) ? filename : relative;
     }
 
+    /// <summary>
+    /// Decodes the XML entities an expression still carries when it is lifted straight out of the
+    /// document text.
+    /// </summary>
+    /// <remarks>
+    /// The scan reads the file, not a parsed document, so an attribute written
+    /// <c>Text="@(x.ToString(&amp;quot;F1&amp;quot;))"</c> yields an expression that still says
+    /// <c>&amp;quot;</c>. Emitting that into generated C# does not compile, and the id derived from
+    /// it would not match either: at run time the expression arrives through the XML reader, which
+    /// has already decoded it. Decoding here is what keeps both halves talking about the same
+    /// string.
+    /// </remarks>
+    private static string DecodeXmlEntities(string value)
+    {
+        if (value.IndexOf('&') < 0)
+        {
+            return value;
+        }
+
+        return value
+            .Replace("&lt;", "<", StringComparison.Ordinal)
+            .Replace("&gt;", ">", StringComparison.Ordinal)
+            .Replace("&quot;", "\"", StringComparison.Ordinal)
+            .Replace("&apos;", "'", StringComparison.Ordinal)
+            .Replace("&amp;", "&", StringComparison.Ordinal); // last: an entity may encode '&' itself
+    }
+
     private static IEnumerable<string> ExtractExpressions(string content)
     {
         var expressions = new List<string>();
@@ -318,7 +345,7 @@ public sealed class TransformJalxamlRazorTask : Microsoft.Build.Utilities.Task
                     depth--;
                     if (depth == 0)
                     {
-                        var expr = content.Substring(exprStart, pos - exprStart).Trim();
+                        var expr = DecodeXmlEntities(content.Substring(exprStart, pos - exprStart).Trim());
                         if (!string.IsNullOrWhiteSpace(expr))
                             expressions.Add(expr);
                         i = pos + 1;
@@ -381,7 +408,7 @@ public sealed class TransformJalxamlRazorTask : Microsoft.Build.Utilities.Task
                                 depth--;
                                 if (depth == 0)
                                 {
-                                    var expr = content.Substring(exprStart, j - exprStart).Trim();
+                                    var expr = DecodeXmlEntities(content.Substring(exprStart, j - exprStart).Trim());
                                     if (!string.IsNullOrWhiteSpace(expr))
                                         expressions.Add(expr);
                                     i = j + 1;

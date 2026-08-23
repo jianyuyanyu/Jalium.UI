@@ -90,7 +90,7 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
     public static readonly DependencyProperty TickFrequencyProperty =
         DependencyProperty.Register(nameof(TickFrequency), typeof(double), typeof(Slider),
-            new PropertyMetadata(1.0, OnVisualPropertyChanged), IsFiniteDouble);
+            new PropertyMetadata(1.0, OnSegmentPropertyChanged), IsFiniteDouble);
 
     /// <summary>
     /// Identifies the IsSnapToTickEnabled dependency property.
@@ -99,6 +99,23 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
     public static readonly DependencyProperty IsSnapToTickEnabledProperty =
         DependencyProperty.Register(nameof(IsSnapToTickEnabled), typeof(bool), typeof(Slider),
             new PropertyMetadata(false));
+
+    /// <summary>
+    /// Identifies the TrackMode dependency property.
+    /// </summary>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty TrackModeProperty =
+        DependencyProperty.Register(nameof(TrackMode), typeof(SliderTrackMode), typeof(Slider),
+            new PropertyMetadata(SliderTrackMode.Continuous, OnSegmentPropertyChanged), IsValidTrackMode);
+
+    /// <summary>
+    /// Identifies the SegmentGap dependency property.
+    /// </summary>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty SegmentGapProperty =
+        DependencyProperty.Register(nameof(SegmentGap), typeof(double), typeof(Slider),
+            new PropertyMetadata(SliderSegmentGeometry.DefaultSegmentGap, OnSegmentPropertyChanged),
+            IsNonNegativeDouble);
 
     /// <summary>
     /// Identifies the TrackBrush dependency property.
@@ -238,6 +255,29 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
     }
 
     /// <summary>
+    /// Gets or sets how the track is painted. <see cref="SliderTrackMode.Segmented"/>
+    /// splits it into one segment per tick interval — the tick definition comes from
+    /// <see cref="Ticks"/> when set, otherwise from <see cref="TickFrequency"/>.
+    /// </summary>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public SliderTrackMode TrackMode
+    {
+        get => (SliderTrackMode)GetValue(TrackModeProperty)!;
+        set => SetValue(TrackModeProperty, value);
+    }
+
+    /// <summary>
+    /// Gets or sets the gap, in DIPs, between two segments of a
+    /// <see cref="SliderTrackMode.Segmented"/> track.
+    /// </summary>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public double SegmentGap
+    {
+        get => (double)GetValue(SegmentGapProperty)!;
+        set => SetValue(SegmentGapProperty, value);
+    }
+
+    /// <summary>
     /// Gets or sets the brush used for the track.
     /// </summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
@@ -274,6 +314,7 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
     private FrameworkElement? _trackBorder;
     private FrameworkElement? _selectionRangeBorder;
     private FrameworkElement? _thumbBorder;
+    private SegmentedTrackBar? _segmentBar;
 
     #endregion
 
@@ -384,15 +425,19 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
         _trackBorder = GetTemplateChild("PART_Track") as FrameworkElement;
         _selectionRangeBorder = GetTemplateChild("PART_SelectionRange") as FrameworkElement;
         _thumbBorder = GetTemplateChild("PART_Thumb") as FrameworkElement;
+        _segmentBar = GetTemplateChild("PART_Segments") as SegmentedTrackBar;
 
         UpdateSliderLayout();
     }
 
     private void UpdateSliderLayout(double? currentValue = null)
     {
+        var val = currentValue ?? Value;
+
+        UpdateSegmentBar(val);
+
         if (_thumbBorder == null) return;
 
-        var val = currentValue ?? Value;
         var percentage = GetVisualPercentage(val);
 
         if (Orientation == Orientation.Horizontal)
@@ -433,6 +478,34 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
                 _selectionRangeBorder.VerticalAlignment = VerticalAlignment.Top;
             }
         }
+    }
+
+    /// <summary>
+    /// Mirrors the slider's range state onto the segmented track part. The part keeps
+    /// working in value space (not ratios) so it can derive its own segment boundaries
+    /// from <see cref="Ticks"/> / <see cref="TickFrequency"/>.
+    /// </summary>
+    private void UpdateSegmentBar(double currentValue)
+    {
+        if (_segmentBar == null) return;
+
+        _segmentBar.Orientation = Orientation;
+        _segmentBar.Minimum = Minimum;
+        _segmentBar.Maximum = Maximum;
+        _segmentBar.IsDirectionReversed = IsDirectionReversed;
+        _segmentBar.ReservedSpace = ThumbSize;
+        _segmentBar.TrackThickness = TrackThickness;
+        _segmentBar.SegmentGap = SegmentGap;
+        _segmentBar.TickFrequency = TickFrequency;
+
+        // Read through the DP: the CLR getter lazily materialises a collection, which must
+        // not happen from inside a layout pass.
+        _segmentBar.Ticks = GetValue(TicksProperty) as Jalium.UI.Media.DoubleCollection;
+
+        var first = IsSelectionRangeEnabled ? SelectionStart : Minimum;
+        var second = IsSelectionRangeEnabled ? SelectionEnd : currentValue;
+        _segmentBar.RangeStart = Math.Min(first, second);
+        _segmentBar.RangeEnd = Math.Max(first, second);
     }
 
     #endregion
@@ -798,11 +871,20 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
 
         var bounds = new Rect(0, 0, RenderSize.Width, RenderSize.Height);
 
-        // Draw track
-        DrawTrack(dc, bounds);
+        if (TrackMode == SliderTrackMode.Segmented)
+        {
+            // Track and fill are one pass: a segment is either painted with the track brush
+            // or with the accent, never both.
+            DrawSegmentedTrack(dc, bounds);
+        }
+        else
+        {
+            // Draw track
+            DrawTrack(dc, bounds);
 
-        // Draw filled portion
-        DrawFilledTrack(dc, bounds);
+            // Draw filled portion
+            DrawFilledTrack(dc, bounds);
+        }
 
         // Draw tick marks if enabled
         if (TickPlacement != TickPlacement.None)
@@ -852,6 +934,32 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
         }
 
         dc.DrawRoundedRectangle(filledBrush, null, filledRect, 2, 2);
+    }
+
+    private void DrawSegmentedTrack(DrawingContext dc, Rect bounds)
+    {
+        var trackRect = ControlRenderGeometry.GetCenteredTrackRect(bounds, Orientation, ThumbSize, TrackThickness);
+
+        var boundaries = SliderSegmentGeometry.GetBoundaryRatios(
+            Minimum,
+            Maximum,
+            GetValue(TicksProperty) as Jalium.UI.Media.DoubleCollection,
+            TickFrequency,
+            IsDirectionReversed);
+
+        var first = IsSelectionRangeEnabled ? GetVisualPercentage(SelectionStart) : GetVisualPercentage(Minimum);
+        var second = IsSelectionRangeEnabled ? GetVisualPercentage(SelectionEnd) : GetVisualPercentage(Value);
+
+        SliderSegmentGeometry.Draw(
+            dc,
+            trackRect,
+            Orientation,
+            boundaries,
+            Math.Min(first, second),
+            Math.Max(first, second),
+            SegmentGap,
+            TrackBrush ?? s_trackBrush,
+            s_accentBrush);
     }
 
     private void DrawTicks(DrawingContext dc, Rect bounds)
@@ -919,6 +1027,20 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
         }
     }
 
+    /// <summary>
+    /// Segment geometry lives on the template part, so these properties have to be pushed
+    /// there before the repaint — an InvalidateVisual alone would only refresh the
+    /// template-less fallback path.
+    /// </summary>
+    private static void OnSegmentPropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is Slider slider)
+        {
+            slider.UpdateSliderLayout();
+            slider.InvalidateVisual();
+        }
+    }
+
     private static void OnSelectionStartChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
         if (d is not Slider slider) return;
@@ -956,12 +1078,17 @@ public class Slider : Jalium.UI.Controls.Primitives.RangeBase
         if (d is not Slider slider) return;
         if (e.OldValue is Jalium.UI.Media.DoubleCollection oldTicks) oldTicks.Changed -= slider.OnTicksCollectionChanged;
         if (e.NewValue is Jalium.UI.Media.DoubleCollection newTicks) newTicks.Changed += slider.OnTicksCollectionChanged;
+        slider.UpdateSliderLayout();
         slider.InvalidateVisual();
     }
 
     private void OnTicksCollectionChanged(object? sender, EventArgs e) => InvalidateVisual();
 
     private static bool IsFiniteDouble(object? value) => value is double number && double.IsFinite(number);
+    private static bool IsNonNegativeDouble(object? value) =>
+        value is double number && double.IsFinite(number) && number >= 0;
+    private static bool IsValidTrackMode(object? value) =>
+        value is SliderTrackMode mode && Enum.IsDefined(mode);
     private static bool IsValidAutoToolTipPlacement(object? value) =>
         value is AutoToolTipPlacement placement && Enum.IsDefined(placement);
     private static bool IsValidTickPlacement(object? value) =>

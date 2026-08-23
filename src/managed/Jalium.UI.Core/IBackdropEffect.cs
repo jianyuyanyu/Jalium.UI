@@ -22,7 +22,9 @@ public interface IBackdropEffect
     BackdropBlurType BlurType { get; }
 
     /// <summary>
-    /// Gets the noise intensity for frosted effects (0.0 - 1.0).
+    /// Gets the noise intensity for frosted effects (0.0 - 1.0). This is the
+    /// amplitude at which full-range grain is mixed into the material; typical
+    /// values are 0.02 - 0.05 (Acrylic uses 0.02).
     /// </summary>
     float NoiseIntensity { get; }
 
@@ -93,32 +95,39 @@ public interface IBackdropEffect
 public enum BackdropBlurType
 {
     /// <summary>
-    /// Gaussian blur (smooth, natural-looking).
+    /// Gaussian blur (smooth, natural-looking). Sigma is
+    /// <see cref="IBackdropEffect.BlurSigma"/>, or radius / 3 when unset.
     /// </summary>
     Gaussian,
 
     /// <summary>
-    /// Box blur (fast, uniform).
+    /// Box blur. Rendered as the box-equivalent Gaussian (sigma = radius / √3)
+    /// so every backend produces the same softness.
     /// </summary>
     Box,
 
     /// <summary>
-    /// Frosted blur with noise texture.
+    /// Frosted glass: Gaussian blur plus per-pixel sample jitter, so the
+    /// blurred backdrop picks up a fine frost grain on top of
+    /// <see cref="IBackdropEffect.NoiseIntensity"/>.
     /// </summary>
     Frosted,
 
     /// <summary>
-    /// Directional blur along a specific axis.
+    /// Directional blur along a specific axis. Not implemented by the native
+    /// backends yet; currently rendered as <see cref="Gaussian"/>.
     /// </summary>
     Directional,
 
     /// <summary>
-    /// Radial blur from center point.
+    /// Radial blur from center point. Not implemented by the native backends
+    /// yet; currently rendered as <see cref="Gaussian"/>.
     /// </summary>
     Radial,
 
     /// <summary>
-    /// Zoom blur effect.
+    /// Zoom blur effect. Not implemented by the native backends yet; currently
+    /// rendered as <see cref="Gaussian"/>.
     /// </summary>
     Zoom
 }

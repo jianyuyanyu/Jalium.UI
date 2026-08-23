@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <RootNamespace>Jalium.UI.Markup</RootNamespace>
@@ -45,6 +45,16 @@
   <ItemGroup>
     <TrimmableAssembly Include="Microsoft.CodeAnalysis" />
     <TrimmableAssembly Include="Microsoft.CodeAnalysis.CSharp" />
+  </ItemGroup>
+
+
+  <ItemGroup>
+    <!-- Shared with the other side of the @virtualize lowering. One copy, linked twice,
+         so a compiled loop body and a runtime-parsed one can never disagree. -->
+    <Compile Include="..\Shared\RazorLoopVariableRewriter.cs"
+             Link="RazorLoopVariableRewriter.cs" />
+    <Compile Include="..\Shared\RazorVirtualizeDirective.cs"
+             Link="RazorVirtualizeDirective.cs" />
   </ItemGroup>
 
 </Project>

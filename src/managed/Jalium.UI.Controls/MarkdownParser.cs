@@ -34,10 +34,33 @@ internal static class MarkdownParser
             return Array.Empty<MarkdownBlock>();
         }
 
-        var normalized = Normalize(markdown);
-        var lines = normalized.Split('\n');
+        return ParseLines(Normalize(markdown).Split('\n'), baseUri, blockLineStarts: null);
+    }
+
+    /// <summary>
+    /// 解析一段<b>已规范化</b>的行（<see cref="Normalize"/> 的产物），并可选地回填每个顶层块的起始行号。
+    /// 顶层块之间没有跨块状态（没有引用式链接定义这类需要全文档表的语法），因此从任意一个块的
+    /// 起始行重新解析，得到的结果与从头全量解析在该行之后的部分完全一致——增量解析正是靠这一点。
+    /// </summary>
+    internal static IReadOnlyList<MarkdownBlock> ParseLines(string[] lines, Uri? baseUri, List<int>? blockLineStarts)
+    {
+        var blocks = new List<MarkdownBlock>();
         var index = 0;
-        return ParseBlocks(lines, ref index, baseUri);
+
+        while (index < lines.Length)
+        {
+            if (string.IsNullOrWhiteSpace(lines[index]))
+            {
+                index++;
+                continue;
+            }
+
+            var start = index;
+            blocks.Add(ParseSingleBlock(lines, ref index, baseUri));
+            blockLineStarts?.Add(start);
+        }
+
+        return blocks;
     }
 
     private static IReadOnlyList<MarkdownBlock> ParseBlocks(string[] lines, ref int index, Uri? baseUri)
@@ -52,49 +75,48 @@ internal static class MarkdownParser
                 continue;
             }
 
-            var trimmed = lines[index].TrimStart();
-            if (TryParseCodeBlock(lines, ref index, out var codeBlock))
-            {
-                blocks.Add(codeBlock);
-                continue;
-            }
-
-            if (IsHorizontalRule(trimmed))
-            {
-                blocks.Add(new MarkdownRuleBlock());
-                index++;
-                continue;
-            }
-
-            if (TryParseHeading(trimmed, out var level, out var headingContent))
-            {
-                blocks.Add(new MarkdownHeadingBlock(level, ParseInlines(headingContent, baseUri)));
-                index++;
-                continue;
-            }
-
-            if (IsBlockQuoteLine(trimmed))
-            {
-                blocks.Add(ParseQuote(lines, ref index, baseUri));
-                continue;
-            }
-
-            if (TryMatchListMarker(lines[index], out _))
-            {
-                blocks.Add(ParseList(lines, ref index, baseUri));
-                continue;
-            }
-
-            if (IsTableStart(lines, index))
-            {
-                blocks.Add(ParseTable(lines, ref index, baseUri));
-                continue;
-            }
-
-            blocks.Add(ParseParagraph(lines, ref index, baseUri));
+            blocks.Add(ParseSingleBlock(lines, ref index, baseUri));
         }
 
         return blocks;
+    }
+
+    private static MarkdownBlock ParseSingleBlock(string[] lines, ref int index, Uri? baseUri)
+    {
+        var trimmed = lines[index].TrimStart();
+        if (TryParseCodeBlock(lines, ref index, out var codeBlock))
+        {
+            return codeBlock;
+        }
+
+        if (IsHorizontalRule(trimmed))
+        {
+            index++;
+            return new MarkdownRuleBlock();
+        }
+
+        if (TryParseHeading(trimmed, out var level, out var headingContent))
+        {
+            index++;
+            return new MarkdownHeadingBlock(level, ParseInlines(headingContent, baseUri));
+        }
+
+        if (IsBlockQuoteLine(trimmed))
+        {
+            return ParseQuote(lines, ref index, baseUri);
+        }
+
+        if (TryMatchListMarker(lines[index], out _))
+        {
+            return ParseList(lines, ref index, baseUri);
+        }
+
+        if (IsTableStart(lines, index))
+        {
+            return ParseTable(lines, ref index, baseUri);
+        }
+
+        return ParseParagraph(lines, ref index, baseUri);
     }
 
     private static bool TryParseCodeBlock(string[] lines, ref int index, out MarkdownCodeBlock block)
@@ -720,11 +742,145 @@ internal static class MarkdownParser
         return count;
     }
 
-    private static string Normalize(string markdown) =>
+    /// <summary>
+    /// 把源文本规范成「只有 \n 换行、制表符已展开」的形式。除了 <c>\r\n</c> 需要看相邻两个字符外，
+    /// 这个变换是逐字符的——增量解析据此只规范化新追加的那一段，前提是旧文本不以 <c>\r</c> 结尾。
+    /// </summary>
+    internal static string Normalize(string markdown) =>
         markdown
             .Replace("\r\n", "\n", StringComparison.Ordinal)
             .Replace('\r', '\n')
             .Replace("\t", "    ", StringComparison.Ordinal);
+
+    /// <summary>
+    /// 按值比较两个块。块是 <see langword="record"/>，但成员里的 <see cref="IReadOnlyList{T}"/> 走的是
+    /// 引用相等，两次解析产出的块永远不会相等，所以可视树 diff 必须用这个递归比较。
+    /// </summary>
+    internal static bool StructuralEquals(MarkdownBlock? left, MarkdownBlock? right)
+    {
+        if (ReferenceEquals(left, right))
+        {
+            return true;
+        }
+
+        return (left, right) switch
+        {
+            (MarkdownParagraphBlock a, MarkdownParagraphBlock b) => InlinesEqual(a.Inlines, b.Inlines),
+            (MarkdownHeadingBlock a, MarkdownHeadingBlock b) => a.Level == b.Level && InlinesEqual(a.Inlines, b.Inlines),
+            (MarkdownCodeBlock a, MarkdownCodeBlock b) =>
+                string.Equals(a.Text, b.Text, StringComparison.Ordinal) &&
+                string.Equals(a.Language, b.Language, StringComparison.Ordinal),
+            (MarkdownRuleBlock, MarkdownRuleBlock) => true,
+            (MarkdownQuoteBlock a, MarkdownQuoteBlock b) => BlocksEqual(a.Blocks, b.Blocks),
+            (MarkdownListBlock a, MarkdownListBlock b) => a.Ordered == b.Ordered && a.StartIndex == b.StartIndex && ItemsEqual(a.Items, b.Items),
+            (MarkdownTableBlock a, MarkdownTableBlock b) => RowsEqual(a.HeaderRows, b.HeaderRows) && RowsEqual(a.Rows, b.Rows),
+            _ => false,
+        };
+    }
+
+    internal static bool BlocksEqual(IReadOnlyList<MarkdownBlock> left, IReadOnlyList<MarkdownBlock> right)
+    {
+        if (left.Count != right.Count)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (!StructuralEquals(left[index], right[index]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool ItemsEqual(IReadOnlyList<MarkdownListItemBlock> left, IReadOnlyList<MarkdownListItemBlock> right)
+    {
+        if (left.Count != right.Count)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (left[index].TaskState != right[index].TaskState || !BlocksEqual(left[index].Blocks, right[index].Blocks))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool RowsEqual(IReadOnlyList<MarkdownTableRow> left, IReadOnlyList<MarkdownTableRow> right)
+    {
+        if (left.Count != right.Count)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            var leftCells = left[index].Cells;
+            var rightCells = right[index].Cells;
+            if (leftCells.Count != rightCells.Count)
+            {
+                return false;
+            }
+
+            for (var cell = 0; cell < leftCells.Count; cell++)
+            {
+                if (!InlinesEqual(leftCells[cell], rightCells[cell]))
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    internal static bool InlinesEqual(IReadOnlyList<MarkdownInline> left, IReadOnlyList<MarkdownInline> right)
+    {
+        if (left.Count != right.Count)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (!InlineEquals(left[index], right[index]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool InlineEquals(MarkdownInline left, MarkdownInline right)
+    {
+        if (ReferenceEquals(left, right))
+        {
+            return true;
+        }
+
+        return (left, right) switch
+        {
+            (MarkdownTextInline a, MarkdownTextInline b) => string.Equals(a.Text, b.Text, StringComparison.Ordinal),
+            (MarkdownCodeInline a, MarkdownCodeInline b) => string.Equals(a.Text, b.Text, StringComparison.Ordinal),
+            (MarkdownStrongInline a, MarkdownStrongInline b) => InlinesEqual(a.Children, b.Children),
+            (MarkdownEmphasisInline a, MarkdownEmphasisInline b) => InlinesEqual(a.Children, b.Children),
+            (MarkdownLineBreakInline, MarkdownLineBreakInline) => true,
+            (MarkdownLinkInline a, MarkdownLinkInline b) =>
+                a.Uri == b.Uri &&
+                string.Equals(a.Target, b.Target, StringComparison.Ordinal) &&
+                InlinesEqual(a.Children, b.Children),
+            _ => false,
+        };
+    }
 
     private readonly record struct ListMarkerMatch(int Indent, bool Ordered, int StartIndex, string Content, bool? TaskState);
 }

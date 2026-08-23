@@ -2629,8 +2629,12 @@ void D3D12RenderTarget::RenderText(
     // ClearType and Grayscale runs cache independently within the same frame.
     const int32_t aaMode = tf->ResolveEffectiveTextRenderingMode();
     const int32_t hintingMode = tf->GetTextHintingMode();
+    // Per-format sub-pixel positioning (managed DrawText turns it on for text
+    // under a live scale transform): glyph phases measured from the final
+    // screen pen instead of whole-pixel pen snapping.
+    const bool subpixelPositioning = tf->GetSubpixelPositioning();
     directRenderer_->AddText(layout.Get(), x, y, r, g, b, a, layoutKey, aaMode, hintingMode,
-                             textGradient);
+                             textGradient, subpixelPositioning);
 }
 
 // ============================================================================
@@ -3409,7 +3413,39 @@ void D3D12RenderTarget::DrawBackdropFilterEx(
     float noiseIntensity, float saturation, float luminosity,
     float cornerRadiusTL, float cornerRadiusTR, float cornerRadiusBR, float cornerRadiusBL)
 {
+    // Legacy string-based entry point: lift the subset it can carry into a
+    // material description and share the single material implementation.
+    float tintR = 1.0f, tintG = 1.0f, tintB = 1.0f;
+    ParseTintColorD3D12(materialTint, tintR, tintG, tintB);
+
+    JaliumBackdropMaterialDesc m = {};
+    m.structSize = sizeof(JaliumBackdropMaterialDesc);
+    m.blurType = JALIUM_BACKDROP_BLUR_GAUSSIAN;
+    m.x = x; m.y = y; m.width = w; m.height = h;
+    m.blurRadius = blurRadius;
+    m.blurSigma = 0.0f;
+    m.noiseIntensity = noiseIntensity;
+    m.tintR = tintR; m.tintG = tintG; m.tintB = tintB; m.tintA = tintOpacity;
+    m.saturation = saturation;
+    m.luminosity = luminosity;
+    m.brightness = 1.0f;
+    m.contrast = 1.0f;
+    m.hueRotation = 0.0f;
+    m.grayscale = 0.0f;
+    m.sepia = 0.0f;
+    m.invert = 0.0f;
+    m.opacity = 1.0f;
+    m.cornerRadiusTL = cornerRadiusTL;
+    m.cornerRadiusTR = cornerRadiusTR;
+    m.cornerRadiusBR = cornerRadiusBR;
+    m.cornerRadiusBL = cornerRadiusBL;
+    DrawBackdropMaterial(m);
+}
+
+void D3D12RenderTarget::DrawBackdropMaterial(const JaliumBackdropMaterialDesc& m)
+{
     if (!isDrawing_ || !directRenderer_) return;
+    if (m.width <= 0.0f || m.height <= 0.0f || m.opacity <= 0.0f) return;
     CommitDeferredState();
     if (!directRenderer_->FlushGraphicsForCompute()) return;  // device lost — frame will abort
     // Tag everything from here through the backdrop draw as the Backdrop GPU
@@ -3423,17 +3459,12 @@ void D3D12RenderTarget::DrawBackdropFilterEx(
         directRenderer_->MarkGpuTimingPoint(D3D12DirectRenderer::GpuTimingCategory::Other);
         return;
     }
-    // D4 parity with Vulkan's backdrop shader: the managed side passes the real
-    // material tint as "#RRGGBB", all four corner radii, and now the material
-    // grain (noiseIntensity), vibrancy (saturation) and brightness (luminosity)
-    // that AcrylicEffect / MicaEffect carry. DrawSnapshotBackdrop applies them
-    // in a single snapshot-backdrop PS pass; if that PSO is unavailable it falls
-    // back to the blur + tint blit (noise/sat/lum dropped, backdrop still shown).
-    float tintR = 1.0f, tintG = 1.0f, tintB = 1.0f;
-    ParseTintColorD3D12(materialTint, tintR, tintG, tintB);
-    directRenderer_->DrawSnapshotBackdrop(x, y, w, h, blurRadius, tintR, tintG, tintB, tintOpacity,
-        noiseIntensity, saturation, luminosity,
-        cornerRadiusTL, cornerRadiusTR, cornerRadiusBR, cornerRadiusBL);
+    // DrawSnapshotBackdrop: compute Gaussian region blur (DPI-scaled, 1x/2x/4x
+    // downsample, material sigma / kernel family) + the full colour pipeline,
+    // tint with alpha, grain, frost jitter, opacity and anti-aliased rounding
+    // in the snapshot-backdrop PS. If that PSO is unavailable it falls back to
+    // the blur + tint blit (colour pipeline dropped, backdrop still shown).
+    directRenderer_->DrawSnapshotBackdrop(m);
     directRenderer_->MarkGpuTimingPoint(D3D12DirectRenderer::GpuTimingCategory::Other);
 }
 

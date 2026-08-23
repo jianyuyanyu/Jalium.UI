@@ -168,6 +168,20 @@ public sealed class NativeTextFormat : IDisposable
     }
 
     /// <summary>
+    /// Sets per-format sub-pixel glyph positioning. Off (default) snaps every
+    /// glyph pen to a whole physical pixel (WPF Display-mode stability); on
+    /// keeps 1/8-pixel phases measured from the final screen position so a run
+    /// can slide or scale without per-glyph whole-pixel stepping. The glyph
+    /// bitmaps stay crisp (point-sampled); only their placement gains
+    /// sub-pixel accuracy.
+    /// </summary>
+    public void SetSubpixelPositioning(bool enabled)
+    {
+        ThrowIfDisposed();
+        NativeMethods.TextFormatSetSubpixelPositioning(_handle, enabled ? 1 : 0);
+    }
+
+    /// <summary>
     /// Measures text and returns metrics including dimensions and font information.
     /// </summary>
     /// <param name="text">The text to measure.</param>

@@ -102,6 +102,15 @@ public:
     /// Gets the font size in pixels.
     float GetFontSizePx() const { return fontSizePx_; }
 
+    /// Process-unique identity of this format instance (never reused, unlike
+    /// the object address) — backends key rendered-run caches on it.
+    uint64_t GetInstanceId() const { return instanceId_; }
+
+    /// Bumped by every layout-affecting setter (alignment / trimming / wrapping /
+    /// line spacing / max lines) so a cached rendering keyed on
+    /// (GetInstanceId, GetStyleGeneration) is invalidated by any change.
+    uint32_t GetStyleGeneration() const { return styleGeneration_; }
+
 private:
     // Layout engine internal types
     struct LayoutLine {
@@ -145,6 +154,8 @@ private:
     std::wstring    fontFamily_;
     int32_t         fontWeight_;
     int32_t         fontStyle_;
+    uint64_t        instanceId_ = 0;
+    uint32_t        styleGeneration_ = 0;
 
     struct FallbackFaceEntry {
         std::unique_ptr<FontFace> face;

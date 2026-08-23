@@ -948,14 +948,29 @@ public sealed partial class BitmapImage : BitmapSource, IDisposable, IReclaimabl
     /// lost permanently.
     /// </summary>
     /// <remarks>
-    /// Called by the framework's idle-resource reclaimer when an
+    /// <para>Called by the framework's idle-resource reclaimer when an
     /// <see cref="IReclaimableResource"/> element that owns this source has
     /// stayed off-screen past the configured idle window — see
     /// <c>JaliumAppExtensions.UseIdleResourceReclamation</c>. Safe to call
-    /// directly to free memory under pressure.
+    /// directly to free memory under pressure.</para>
+    /// <para>Refused while the source is still being drawn. The reclaimer's idle test is per
+    /// ELEMENT and this resource belongs to a SOURCE, so an element that went off-screen while
+    /// another element — or an image brush, or an image drawing, none of which the reclaimer can
+    /// see at all — keeps painting the same bitmap would otherwise free the pixels out from under
+    /// the live consumer. What the user sees is the visible image blanking for the length of one
+    /// re-decode and coming back, over and over: the reclaim clears the published decode state, the
+    /// live consumer's next frame finds no pixels and re-requests a full decode, that republishes,
+    /// and the next scan reclaims it again. The cycle sustains itself for as long as anything keeps
+    /// producing frames, which is why it reads as flicker while scrolling and stops the moment the
+    /// UI goes quiet.</para>
     /// </remarks>
     public void ReclaimIdleResources()
     {
+        if (WasDrawnRecently())
+        {
+            return;
+        }
+
         // Always evict GPU uploads — they can be rebuilt from either
         // _rawPixelData (if still around) or _imageData (re-decode).
         RaiseGpuCacheEviction(this);

@@ -35,7 +35,7 @@
 
 - GPU 原生渲染管线，支持 ClearType 亚像素文本渲染
 - 熟悉的编程模型（`DependencyObject`、`UIElement`、面板、模板、资源）
-- 带 Razor 语法扩展的 JALXAML 标记语言（`@Path`、`@(expr)`、`@{ ... }`、`@if`/`@for`/`@foreach`、`@section`/`@RenderSection`）
+- 带 Razor 语法扩展的 JALXAML 标记语言（`@Path`、`@(expr)`、`@{ ... }`、`@if`/`@virtualize`/`@foreach`、`@section`/`@RenderSection`）
 - 丰富的控件库：100+ 个控件，包括 Charts、Ribbon、Docking、InkCanvas、WebView、Terminal、MediaElement、MapView、PropertyGrid、WindowsFormsHost
 - 开发体验：JALXAML 热重载（实时可视化树修补），外加按需启用的内建 DevTools 检查器与调试 HUD
 - 通过 NuGet 提供构建期工具链（`Jalium.UI.Build`、`Jalium.UI.Xaml.SourceGenerator`）
@@ -233,14 +233,13 @@
 
 JALXAML 在现有 `{Binding ...}` 之上支持 Razor 风格语法作为附加语法糖：
 
-- `@Path`
-- `@(expr)`
-- `@{ ... }`
-- `@*...*@` 注释
+- `@Path`、`@(expr)`、`@{ ... }`、`@*...*@` 注释
+- `$.Path`（元素自身的属性）与 `#.Path`（仅 DataContext）
 - 混合文本模板（用于字符串/对象目标）
 - `@if(expr){<Element />}` 块指令（带完整的 `else if` / `else` 链）
+- `@virtualize` —— 数据绑定的虚拟化循环
 - 语句 / 控制流指令：`@for`、`@foreach`、`@while`、`@switch`、
-  `@using`、`@lock`（在解析时展开）
+  `@using`、`@lock`（在加载时一次性展开）
 - 用于模板化内容的 `@section`/`@RenderSection`
 - 转义：`@@` 和 `\@`
 
@@ -249,25 +248,45 @@ JALXAML 在现有 `{Binding ...}` 之上支持 Razor 风格语法作为附加语
 更新行为：
 
 - 可观察源（`INotifyPropertyChanged` / 依赖属性）：实时更新。
-- 不可观察的 CLR 源：在加载时进行一次性求值。
+- 不可观察的 CLR 源：加载时求值一次。
 
-### 编译期降级
+### 列表
 
-JALXAML 源生成器会在构建时降级以下内容，使热路径中
-不存在运行时解析开销：
+数量可能增长的列表都应该用 `@virtualize`。它会降级成一个数据绑定的虚拟化列表：
+元素数量跟随视口而不是数据量，容器会被回收，并且跟踪 `INotifyCollectionChanged`。
+
+```xml
+<ScrollViewer>
+  @virtualize(var row in Rows)
+  {
+    <Border Padding="8"><TextBlock Text="@row.Name" /></Border>
+  }
+</ScrollViewer>
+```
+
+循环体会成为 item 模板，因此必须是单个元素；同时该块需要一个有界的滚动轴 ——
+直接放在 `ScrollViewer` 内，或显式给出 `Height`/`MaxHeight`。
+数值形式（`@virtualize(var i = 0; i < Count; i++)`）同样支持。
+
+`@foreach` 与 `@for` 仍是静态展开：每个 item 一个真实元素、不回收、在加载时求值一次。
+它们适合短小固定的列表；数据驱动的场景请使用 `@virtualize`。
+
+### 编译期降级（lowering）
+
+JALXAML 源生成器在构建期降级以下内容，使热路径上没有运行时解析开销：
 
 - `@if` / `@else if` / `@else` 链。
 - `@section` / `@RenderSection`。
-- 值表达式（`@Path`、`@(expr)`）。
-- 经由 `SetCompiledBinding` 的 `{Binding ...}`（源生成器的 `SplitParameters`
+- `@virtualize`。
+- 值表达式（`@Path`、`@(expr)`、`$.`、`#.`）。
+- 通过 `SetCompiledBinding` 处理的 `{Binding ...}`（源生成器的 `SplitParameters`
   与运行时解析器保持逐行一致）。
-- 自定义 xmlns 元素类型 —— 当某个 `.jalxaml` 使用通过 `XmlnsDefinition`
-  暴露的控件库时，源生成器会在编译期解析出 CLR 类型，
-  而非回退到运行时反射（有助于裁剪 / AOT）。
+- 自定义 xmlns 元素类型 —— 当 `.jalxaml` 使用通过 `XmlnsDefinition` 暴露的控件库时，
+  源生成器在编译期解析 CLR 类型，而不是回退到运行时反射（有利于裁剪 / AOT）。
 
-`Setter.Value` 不会在编译期降级，这是有意设计。
+`Setter.Value` 有意不做降级。
 
-有关语法细节与规则，请参阅 [`docs/razor-syntax.md`](docs/razor-syntax.md)。
+语法细节与规则见 [`docs/razor-syntax.md`](https://github.com/VeryJokerJal/Jalium.UI/blob/master/docs/razor-syntax.md)。
 
 ## 安装
 

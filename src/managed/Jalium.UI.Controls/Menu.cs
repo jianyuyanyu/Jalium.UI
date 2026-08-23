@@ -124,6 +124,15 @@ public class MenuItem : HeaderedItemsControl
         return new Jalium.UI.Automation.Peers.MenuItemAutomationPeer(this);
     }
 
+    /// <summary>
+    /// The menu that hosts this item, when the item sits at the top level of a dismissable menu.
+    /// Set by <see cref="ContextMenu"/> as it re-parents items into its popup — at that point the
+    /// hosting menu is no longer on the item's visual parent chain, so clicking an item could not
+    /// otherwise find anything to close. Null for submenu entries (their chain ends at a MenuItem)
+    /// and for items in a permanently docked menu bar.
+    /// </summary>
+    internal MenuBase? OwnerMenu { get; set; }
+
     // Cached brushes for OnRender
     private static readonly SolidColorBrush s_highlightBrush = new(Color.FromRgb(60, 60, 60));
     private static readonly SolidColorBrush s_whiteBrush = new(Color.White);
@@ -956,12 +965,20 @@ public class MenuItem : HeaderedItemsControl
         // When items are hosted in a Popup, the visual parent chain is:
         //   MenuItem -> StackPanel (_submenuScrollHost.ItemsPanel) -> MenuPopupScrollHost -> Border (_submenuBorder) -> PopupRoot -> ...
         // We need to find parent MenuItems through the popup's PlacementTarget chain.
+        var topLevel = this;
         var current = FindParentMenuItem();
         while (current != null)
         {
             current.IsSubmenuOpen = false;
+            topLevel = current;
             current = current.FindParentMenuItem();
         }
+
+        // Walking the parent chain only collapses the submenus owned by *MenuItems*. The menu that
+        // hosts the top-level item — a ContextMenu's popup — is not a MenuItem and is not on the
+        // visual parent chain either (its items are re-parented into the popup), so without this it
+        // never closes: the user picks "Copy", the command runs, and the menu just sits there.
+        topLevel.OwnerMenu?.DismissMenu();
     }
 
     private void CloseSubmenuBranch()

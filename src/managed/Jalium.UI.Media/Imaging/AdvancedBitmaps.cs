@@ -377,4 +377,20 @@ public sealed class BitmapSizeOptions
     }
 }
 
-// Rotation and BitmapCreateOptions are defined in BitmapEncoder.cs and BitmapDecoder.cs respectively.
+/// <summary>
+/// Specifies the rotation to apply.
+/// </summary>
+/// <remarks>
+/// Lived in BitmapEncoder.cs while the JPEG / WMP encoder shells still existed. Those are gone;
+/// the remaining consumers are <see cref="BitmapSizeOptions.Rotation"/>,
+/// <see cref="BitmapImage.Rotation"/> and the decode pipeline's rotate step.
+/// </remarks>
+public enum Rotation
+{
+    Rotate0 = 0,
+    Rotate90 = 1,
+    Rotate180 = 2,
+    Rotate270 = 3
+}
+
+// BitmapCreateOptions is defined in BitmapDecoder.cs.

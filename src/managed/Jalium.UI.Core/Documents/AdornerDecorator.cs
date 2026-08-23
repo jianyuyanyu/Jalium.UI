@@ -87,7 +87,11 @@ public sealed class AdornerDecorator : Decorator
             Child.Arrange(childRect);
         }
 
-        // The adorner layer covers the same area
+        // The adorner layer covers the same area. Force it through ArrangeOverride on every
+        // pass (same as Window): its adorners track descendants whose position, size or very
+        // presence changes without the layer's own final rect changing, and the "same rect,
+        // already valid → skip" short-circuit would otherwise leave them stranded.
+        _adornerLayer.InvalidateArrange();
         _adornerLayer.Arrange(childRect);
 
         return finalSize;

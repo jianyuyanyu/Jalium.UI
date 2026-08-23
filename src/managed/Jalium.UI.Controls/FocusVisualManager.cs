@@ -60,6 +60,17 @@ public static class FocusVisualManager
 
             UIElement.IsKeyboardFocusedChangedStatic += OnKeyboardFocusedChanged;
 
+            // The ring is built from the style resolved at focus time. A FocusVisualStyle that
+            // changes afterwards — set directly, or delivered by a Style whose setter is applied
+            // after focus arrived (implicit style, theme switch, an {x:Null} opt-out) — must
+            // rebuild it, otherwise the theme default drawn at focus time stays on screen.
+            FrameworkElement.FocusVisualStyleInvalidatedStatic += OnFocusVisualStyleInvalidated;
+
+            // Focus that survives a tree change (element attached after it was focused, subtree
+            // moved) may have no ring yet — there was no adorner layer to put it in — or a ring
+            // that layout pruned while the element was briefly outside its window.
+            KeyboardFocusRevalidation.FocusRetained += OnKeyboardFocusRetained;
+
             // PreviewKeyDown tunnels from the root, so a class handler on UIElement sees
             // every keystroke before the focused element's own handler decides whether to
             // consume it. That lets us switch into "keyboard mode" even when the key ends
@@ -138,7 +149,16 @@ public static class FocusVisualManager
     {
         if (isFocused)
         {
-            s_currentFocusedElement = element;
+            if (!ReferenceEquals(s_currentFocusedElement, element))
+            {
+                if (s_currentFocusedElement is { } previous)
+                {
+                    previous.IsVisibleChanged -= OnFocusedElementIsVisibleChanged;
+                }
+
+                s_currentFocusedElement = element;
+                element.IsVisibleChanged += OnFocusedElementIsVisibleChanged;
+            }
 
             // Auto-scroll the focused element into view via the standard BringIntoView
             // routed-event pipeline. Runs unconditionally (not gated on ShowFocusCues)
@@ -165,8 +185,70 @@ public static class FocusVisualManager
         {
             if (ReferenceEquals(s_currentFocusedElement, element))
             {
+                element.IsVisibleChanged -= OnFocusedElementIsVisibleChanged;
                 s_currentFocusedElement = null;
             }
+            DetachAdorner(element);
+        }
+    }
+
+    private static void OnFocusVisualStyleInvalidated(FrameworkElement element)
+    {
+        if (!ReferenceEquals(s_currentFocusedElement, element) || !s_showFocusCues)
+            return;
+
+        // Rebuild only when the resolved style really differs from the one the ring was built
+        // from: a style-stack change that leaves FocusVisualStyle alone (or the property callback
+        // and the stack callback firing for the same change) must not tear the ring down twice.
+        var resolved = element.ResolveFocusVisualStyle();
+        if (s_activeAdorners.TryGetValue(element, out var existing)
+            && ReferenceEquals(existing.FocusVisualStyle, resolved)
+            && existing.VisualParent is not null)
+        {
+            return;
+        }
+
+        AttachAdorner(element);
+    }
+
+    private static void OnKeyboardFocusRetained(UIElement element)
+    {
+        if (!ReferenceEquals(s_currentFocusedElement, element) || !s_showFocusCues)
+            return;
+
+        // Nothing to do while a live ring is already sitting in the layer that serves the
+        // element's current position; anything else (no ring, pruned ring, ring left behind in
+        // another layer) is rebuilt in place.
+        if (s_activeAdorners.TryGetValue(element, out var existing)
+            && existing.VisualParent is AdornerLayer currentLayer
+            && ReferenceEquals(currentLayer, AdornerLayer.GetAdornerLayer(element)))
+        {
+            return;
+        }
+
+        AttachAdorner(element);
+    }
+
+    /// <summary>
+    /// The ring is a separate visual in the adorner layer, so it does not inherit the
+    /// adorned element's (effective) visibility: an element hidden by a collapsed ancestor
+    /// would keep its ring painted at the last position. Keyboard focus itself moves off a
+    /// hidden element one dispatcher turn later (deferred revalidation) — this only closes
+    /// the frame in between, and puts the ring back if the element becomes visible again
+    /// before focus moved.
+    /// </summary>
+    private static void OnFocusedElementIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (sender is not UIElement element || !ReferenceEquals(s_currentFocusedElement, element))
+            return;
+
+        if (element.IsVisible)
+        {
+            if (s_showFocusCues)
+                AttachAdorner(element);
+        }
+        else
+        {
             DetachAdorner(element);
         }
     }
@@ -179,7 +261,7 @@ public static class FocusVisualManager
         if (element is not FrameworkElement fe)
             return;
 
-        if (!fe.Focusable || !fe.IsEnabled || fe.Visibility != Visibility.Visible)
+        if (!fe.Focusable || !fe.IsEnabled || fe.Visibility != Visibility.Visible || !fe.IsVisible)
             return;
 
         var style = fe.ResolveFocusVisualStyle();

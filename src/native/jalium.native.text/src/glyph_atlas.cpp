@@ -48,8 +48,20 @@ const AtlasGlyphEntry& GlyphAtlas::GetOrInsert(
         uint32_t outX, outY;
         if (!PackGlyph(rasterized.width, rasterized.height, outX, outY))
         {
-            // Atlas is full — return invalid
-            return kInvalidEntry;
+            // Atlas is full. The old behaviour returned kInvalidEntry WITHOUT
+            // caching, so every later call re-rasterized the same glyph and
+            // still drew nothing — a long session that had touched enough
+            // distinct glyphs (CJK text, many sizes, 8 sub-pixel buckets)
+            // degraded into permanent per-call rasterization churn with
+            // missing glyphs. Reset the atlas (new generation) and retry once;
+            // consumers re-generate any run that straddled the reset.
+            ClearLocked();
+            if (!PackGlyph(rasterized.width, rasterized.height, outX, outY))
+            {
+                // A single glyph larger than the whole atlas — genuinely
+                // unrepresentable.
+                return kInvalidEntry;
+            }
         }
 
         entry.x = static_cast<uint16_t>(outX);
@@ -85,12 +97,18 @@ std::vector<AtlasDirtyRect> GlyphAtlas::TakeDirtyRects()
 void GlyphAtlas::Clear()
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    ClearLocked();
+}
+
+void GlyphAtlas::ClearLocked()
+{
     cache_.clear();
     dirtyRects_.clear();
     packX_ = 0;
     packY_ = 0;
     rowHeight_ = 0;
     std::memset(atlasPixels_.data(), 0, atlasPixels_.size());
+    generation_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 bool GlyphAtlas::PackGlyph(uint32_t w, uint32_t h, uint32_t& outX, uint32_t& outY)

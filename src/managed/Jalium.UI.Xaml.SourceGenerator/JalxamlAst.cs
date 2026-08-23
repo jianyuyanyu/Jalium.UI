@@ -74,6 +74,29 @@ public sealed class JalxamlAstNode
     /// would, with no document re-parse.
     /// </summary>
     public string? RazorIfCondition { get; set; }
+
+    /// <summary>
+    /// The parsed <c>@virtualize</c> header, set on a lifted <c>__RazorVirtualize</c> node by
+    /// <see cref="RazorVirtualizeLowering"/>. Null on every other node.
+    /// </summary>
+    internal Jalium.UI.Markup.RazorVirtualizeLoop? Virtualize { get; set; }
+}
+
+/// <summary>
+/// A problem found while lowering, reported once the generator has a file to attach it to.
+/// Carried on the parse result because the parser has no <c>SourceProductionContext</c>.
+/// </summary>
+public sealed class JalxamlLoweringDiagnostic
+{
+    public string Id { get; set; } = string.Empty;
+
+    public string Message { get; set; } = string.Empty;
+
+    public int LineNumber { get; set; }
+
+    public int LinePosition { get; set; }
+
+    public bool IsError { get; set; } = true;
 }
 
 /// <summary>

@@ -116,11 +116,87 @@ public sealed class CompileJalxamlTask : Microsoft.Build.Utilities.Task
         return !hasErrors;
     }
 
+    /// <summary>
+    /// True when the document still carries a Razor directive that has no <c>.uic</c> representation.
+    /// </summary>
+    /// <remarks>
+    /// Only structural directives count. A value expression such as <c>@Title</c> is just an
+    /// attribute value as far as XML is concerned and survives the round trip; a block directive
+    /// does not, and its header can carry characters that are not valid XML at all.
+    /// </remarks>
+    private static bool ContainsStructuralRazor(string sourcePath)
+    {
+        string content;
+        try
+        {
+            content = File.ReadAllText(sourcePath);
+        }
+        catch (IOException)
+        {
+            return false; // Let the compiler itself report an unreadable file.
+        }
+
+        for (var i = 0; i < content.Length - 1; i++)
+        {
+            if (content[i] != '@')
+            {
+                continue;
+            }
+
+            if (content[i + 1] == '@')
+            {
+                i++; // Escaped '@', not a directive.
+                continue;
+            }
+
+            if (content[i + 1] == '{')
+            {
+                return true;
+            }
+
+            foreach (var keyword in s_structuralRazorKeywords)
+            {
+                if (i + 1 + keyword.Length > content.Length ||
+                    string.CompareOrdinal(content, i + 1, keyword, 0, keyword.Length) != 0)
+                {
+                    continue;
+                }
+
+                // Require a delimiter after the keyword so an identifier such as `@sectionName`
+                // is not mistaken for a directive.
+                var next = i + 1 + keyword.Length;
+                if (next >= content.Length || content[next] is '(' or '{' or ' ' or '\t' or '\r' or '\n')
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static readonly string[] s_structuralRazorKeywords =
+    [
+        "virtualize", "if", "section", "RenderSection",
+        "for", "foreach", "while", "switch", "do", "try", "using", "lock",
+    ];
+
     private string? CompileFile(string sourcePath)
     {
         // 计算输出文件路径
         var fileName = Path.GetFileNameWithoutExtension(sourcePath);
         var outputPath = Path.Combine(OutputDirectory!, fileName + ".uic");
+
+        // .uic 是纯 XML 形态，无法表示结构化 Razor：指令本身没有对应的节点，而且指令头里的
+        // `<`（如 `@virtualize(var i = 0; i < Count; i++)` 或 `@if(a < b)`）会直接让 XML 解析失败。
+        // 这类文档在运行时本来就由 JalxamlLoader 检测出 Razor 并走解析器路径，生成出来的 .uic
+        // 从不会被使用，所以跳过它才是正确行为 —— 为一个不会被消费的产物中断构建没有道理。
+        if (ContainsStructuralRazor(sourcePath))
+        {
+            Log.LogMessage(MessageImportance.Normal,
+                "跳过 .uic 编译（文档包含结构化 Razor，运行时走 Razor 解析路径）: {0}", sourcePath);
+            return null;
+        }
 
         Log.LogMessage(MessageImportance.Low, "开始编译: {0}", sourcePath);
 

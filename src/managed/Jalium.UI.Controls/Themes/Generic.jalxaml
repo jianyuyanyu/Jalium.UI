@@ -36,6 +36,7 @@
         <ResourceDictionary Source="Controls/Dialogs.jalxaml" />
         <ResourceDictionary Source="Controls/Primitives.jalxaml" />
         <ResourceDictionary Source="Controls/Media.jalxaml" />
+        <ResourceDictionary Source="Controls/Markdown.jalxaml" />
         <ResourceDictionary Source="Controls/DockLayout.jalxaml" />
         <ResourceDictionary Source="Controls/MenusToolbars.jalxaml" />
         <ResourceDictionary Source="Controls/Terminal.jalxaml" />

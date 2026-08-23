@@ -132,8 +132,9 @@ internal static class DynamicResourceBindingOperations
         {
             BaseValueSource.ParentTemplate => DependencyObject.LayerValueSource.ParentTemplate,
             BaseValueSource.StyleTrigger => DependencyObject.LayerValueSource.StyleTrigger,
-            BaseValueSource.TemplateTrigger or BaseValueSource.ParentTemplateTrigger
-                => DependencyObject.LayerValueSource.TemplateTrigger,
+            BaseValueSource.TemplateTrigger => DependencyObject.LayerValueSource.TemplateTrigger,
+            BaseValueSource.ParentTemplateTrigger
+                => DependencyObject.LayerValueSource.ParentTemplateTrigger,
             BaseValueSource.Style or BaseValueSource.DefaultStyle
                 => DependencyObject.LayerValueSource.StyleSetter,
             _ => (DependencyObject.LayerValueSource?)null
@@ -553,14 +554,16 @@ internal static class DynamicResourceBindingOperations
 
     private static int GetLayerPrecedence(DependencyObject.LayerValueSource? source)
     {
+        // 数值越小优先级越高；顺序必须与 DependencyValueStore.RecomputeEffective 一致。
         return source switch
         {
             null => 0,
-            DependencyObject.LayerValueSource.TemplateTrigger => 1,
-            DependencyObject.LayerValueSource.StyleTrigger => 2,
-            DependencyObject.LayerValueSource.ParentTemplate => 3,
-            DependencyObject.LayerValueSource.StyleSetter => 4,
-            _ => 5
+            DependencyObject.LayerValueSource.ParentTemplateTrigger => 1,
+            DependencyObject.LayerValueSource.ParentTemplate => 2,
+            DependencyObject.LayerValueSource.StyleTrigger => 3,
+            DependencyObject.LayerValueSource.TemplateTrigger => 4,
+            DependencyObject.LayerValueSource.StyleSetter => 5,
+            _ => 6
         };
     }
 

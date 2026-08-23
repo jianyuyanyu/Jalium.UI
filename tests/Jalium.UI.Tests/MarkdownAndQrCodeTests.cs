@@ -121,41 +121,41 @@ public class MarkdownAndQrCodeTests
     }
 
     [Fact]
-    public void MarkdownCodeBlockView_ShouldHighlightXaml_CSharp_AndGeneric_WithLineNumbers()
+    public void MarkdownCodeTextPresenter_ShouldHighlightXaml_CSharp_AndGeneric_WithLineNumbers()
     {
-        var xamlView = new MarkdownCodeBlockView
+        var xamlView = new MarkdownCodeTextPresenter
         {
-            Language = "xaml",
-            Text = "<Grid Width=\"120\" />"
+            CodeLanguage = "xaml",
+            Code = "<Grid Width=\"120\" />"
         };
         Assert.Single(xamlView.DebugLines);
         Assert.Contains(xamlView.DebugLines[0].Tokens, token =>
             token.Classification == TokenClassification.TypeName ||
             token.Classification == TokenClassification.Property);
 
-        var csharpView = new MarkdownCodeBlockView
+        var csharpView = new MarkdownCodeTextPresenter
         {
-            Language = "csharp",
-            Text = "public sealed class Demo { }"
+            CodeLanguage = "csharp",
+            Code = "public sealed class Demo { }"
         };
         Assert.Contains(csharpView.DebugLines[0].Tokens, token => token.Classification == TokenClassification.Keyword);
 
-        var genericView = new MarkdownCodeBlockView
+        var genericView = new MarkdownCodeTextPresenter
         {
-            Language = "shell",
-            Text = "if value == 1"
+            CodeLanguage = "shell",
+            Code = "if value == 1"
         };
         Assert.Contains(genericView.DebugLines[0].Tokens, token =>
             token.Classification == TokenClassification.Keyword ||
             token.Classification == TokenClassification.Operator ||
             token.Classification == TokenClassification.Number);
 
-        var shortView = new MarkdownCodeBlockView { Text = "first\nsecond" };
+        var shortView = new MarkdownCodeTextPresenter { Code = "first\nsecond" };
         shortView.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
 
-        var longView = new MarkdownCodeBlockView
+        var longView = new MarkdownCodeTextPresenter
         {
-            Text = string.Join("\n", Enumerable.Range(1, 120).Select(index => $"line {index}"))
+            Code = string.Join("\n", Enumerable.Range(1, 120).Select(index => $"line {index}"))
         };
         longView.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
 
@@ -184,7 +184,7 @@ public class MarkdownAndQrCodeTests
             host.Measure(new Size(480, 240));
             host.Arrange(new Rect(0, 0, 480, 240));
 
-            Assert.True(ContainsVisualOfType<MarkdownCodeBlockView>(markdown));
+            Assert.True(ContainsVisualOfType<MarkdownCodeTextPresenter>(markdown));
         }
         finally
         {

@@ -136,6 +136,13 @@ internal sealed class ResourceReclaimer : IDisposable
         var idleTimeoutMs = _options.IdleTimeoutMs;
         if (idleTimeoutMs < 250) idleTimeoutMs = 250;
 
+        // Publish the same window to the image sources themselves. This scan decides per element,
+        // but the pixels and GPU uploads it releases belong to sources that elements SHARE (and
+        // that image brushes and drawings, which own no element at all, also consume). The source
+        // is therefore the last word on whether it may be reclaimed, and it answers with the very
+        // window used here: drawn within it means something is still painting it.
+        Jalium.UI.Media.ImageSource.ReclaimGraceMs = idleTimeoutMs;
+
         var nowMs = Environment.TickCount64;
         var threshold = nowMs - idleTimeoutMs;
 
@@ -168,7 +175,7 @@ internal sealed class ResourceReclaimer : IDisposable
                     catch { /* swallow — never let cleanup poison the loop */ }
                 }
 
-                if (invokeReclaimable)
+                if (invokeReclaimable && IsProvenOffScreen(visual))
                 {
                     try
                     {
@@ -205,6 +212,51 @@ internal sealed class ResourceReclaimer : IDisposable
             _lastBackendReclaimTickMs = nowMs;
             ReclaimBackendCaches();
         }
+    }
+
+    /// <summary>
+    /// Whether a visual that has not painted for the idle window is genuinely off screen, as
+    /// opposed to on screen and simply unchanged.
+    /// </summary>
+    /// <remarks>
+    /// <para>"Has not painted recently" is not the same question as "is not on screen", and under
+    /// partial presents the two answers routinely differ. A visible element that nothing has
+    /// changed falls outside every dirty rect, so it paints on no frame at all while the user
+    /// leaves it alone — a banner image, a title-bar logo, a preview pane. Reclaiming from that
+    /// signal alone frees the decoded pixels and GPU upload of a bitmap the window is displaying,
+    /// and the consequence is visible: the next frame that does repaint the element finds no pixels
+    /// and re-requests a full decode, so the image blanks and returns, over and over, for as long
+    /// as anything keeps producing frames (scrolling elsewhere in the window is enough).</para>
+    /// <para>The host window's last whole-window frame is the missing half of the test. A frame
+    /// that began AFTER this visual last painted, painted the entire window, and still did not
+    /// paint this visual, proves it was not on screen — collapsed, hidden, detached, or scrolled
+    /// out of the viewport, all of which the reclaimer should act on. Partial frames are excluded
+    /// by construction; they only ever paint part of the window and prove nothing about the rest.
+    /// A visual with no host window is unreachable from any presentation surface and needs no
+    /// witness at all.</para>
+    /// <para>Deliberately gates only <see cref="IReclaimableResource"/>. The retained drawing-cache
+    /// eviction above stays on the plain idle test: rebuilding a command list costs one render pass
+    /// and cannot make anything disappear.</para>
+    /// </remarks>
+    private static bool IsProvenOffScreen(Visual visual)
+    {
+        // Not reachable from any presentation surface: nothing can be displaying it, so no witness
+        // is needed. This is the common case the reclaimer was written for — a view that has been
+        // navigated away from and detached.
+        var host = Window.GetWindow(visual);
+        if (host is null)
+            return true;
+
+        // Collapsed or Hidden, here or at any ancestor. Also immediate: the element cannot be on
+        // screen no matter what the last frame did, and waiting for a whole-window frame to say so
+        // would strand the resources of every hidden tab until one happened to occur.
+        if (visual is UIElement { IsVisible: false })
+            return true;
+
+        // Attached and visible, so only a whole-window frame can settle it — see the remarks above.
+        // This is the scrolled-out-of-the-viewport case, and the one an on-screen static element is
+        // saved by.
+        return host.LastFullFramePaintStartTickMs > visual.LastRenderedTickMs;
     }
 
     private static void ReclaimBackendCaches()

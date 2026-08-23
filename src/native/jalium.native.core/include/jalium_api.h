@@ -811,6 +811,25 @@ JALIUM_API void jalium_text_format_set_text_formatting_mode(JaliumTextFormat* fo
 /// fade so the hinting doesn't pop a pixel mid-animation.
 JALIUM_API void jalium_text_format_set_text_hinting_mode(JaliumTextFormat* format, int32_t mode);
 
+/// Sets per-format sub-pixel glyph positioning (0 = off, default; non-zero = on).
+///
+/// Off: every glyph pen is snapped to a whole physical pixel (WPF Display-mode
+/// stability — a character is byte-identical wherever it lands). The cost is
+/// that any sub-pixel motion of the run steps by whole pixels, and under a
+/// live scale each glyph crosses its own pixel boundary at a different
+/// instant (the "characters tremble left/right while the box zooms" artifact).
+///
+/// On: the pen keeps 1/8-pixel phases measured from the FINAL screen position
+/// (run origin included), and the matching phase bitmap is sampled, so glyph
+/// spacing stays exact while a run slides or scales. Glyph bitmaps remain
+/// crisp (point-sampled); only their placement gains sub-pixel accuracy.
+/// Managed DrawText switches this on for every Ideal-formatting-mode run (the
+/// default — natural fractional advances need fractional placement, or the
+/// independent per-glyph rounding turns "Desktop" into "Desk to p" in bold UI
+/// labels) and for text rendered under a live scale transform; Display-mode
+/// text keeps the snapped path.
+JALIUM_API void jalium_text_format_set_subpixel_positioning(JaliumTextFormat* format, int32_t enabled);
+
 /// Hit-tests a point against a text layout.
 JALIUM_API JaliumResult jalium_text_format_hit_test_point(
     JaliumTextFormat* format,
@@ -1042,6 +1061,58 @@ JALIUM_API void jalium_draw_desktop_backdrop(
     float blurRadius,
     float tintR, float tintG, float tintB, float tintOpacity,
     float noiseIntensity, float saturation
+);
+
+// ============================================================================
+// In-App Backdrop Material
+// ============================================================================
+
+/// Draws an in-app backdrop filter (blur + tint) sampling the content already
+/// rendered behind the rect. Legacy entry point kept for ABI compatibility;
+/// prefer jalium_draw_backdrop_material.
+/// @param backdropFilter CSS-style filter string (informational only).
+/// @param material Material preset name (informational only).
+/// @param materialTint Tint colour as "#RRGGBB"; empty = white.
+JALIUM_API void jalium_draw_backdrop_filter(
+    JaliumRenderTarget* rt,
+    float x, float y, float width, float height,
+    const char* backdropFilter,
+    const char* material,
+    const char* materialTint,
+    float tintOpacity,
+    float blurRadius,
+    float cornerRadiusTL, float cornerRadiusTR,
+    float cornerRadiusBR, float cornerRadiusBL
+);
+
+/// jalium_draw_backdrop_filter plus noise / saturation / luminosity.
+/// Legacy entry point kept for ABI compatibility; prefer
+/// jalium_draw_backdrop_material.
+JALIUM_API void jalium_draw_backdrop_filter_ex(
+    JaliumRenderTarget* rt,
+    float x, float y, float width, float height,
+    const char* backdropFilter,
+    const char* material,
+    const char* materialTint,
+    float tintOpacity,
+    float blurRadius,
+    float noiseIntensity,
+    float saturation,
+    float luminosity,
+    float cornerRadiusTL, float cornerRadiusTR,
+    float cornerRadiusBR, float cornerRadiusBL
+);
+
+/// Draws an in-app backdrop material with the full parameter set
+/// (JaliumBackdropMaterialDesc: blur kernel, colour pipeline, tint with alpha,
+/// grain, opacity, per-corner rounding). Backends that have not implemented
+/// the material path fall back to the blur + tint + noise/saturation/luminosity
+/// subset, so this is safe to call on any backend.
+/// @param rt The render target.
+/// @param desc Material description; desc->structSize must be set.
+JALIUM_API void jalium_draw_backdrop_material(
+    JaliumRenderTarget* rt,
+    const JaliumBackdropMaterialDesc* desc
 );
 
 // ============================================================================

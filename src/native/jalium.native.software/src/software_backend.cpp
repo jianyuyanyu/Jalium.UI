@@ -3367,6 +3367,175 @@ void SoftwareRenderTarget::DrawBackdropFilter(
     }
 }
 
+// lowbias32 integer hash on the device pixel — the same function the D3D12 and
+// Vulkan backdrop shaders use, so the grain pattern matches across backends.
+static inline uint32_t BackdropHashPixel(uint32_t px, uint32_t py, uint32_t salt)
+{
+    uint32_t n = px * 1597334677u ^ py * 3812015801u ^ salt * 2654435761u;
+    n ^= n >> 16;
+    n *= 0x7feb352du;
+    n ^= n >> 15;
+    n *= 0x846ca68bu;
+    n ^= n >> 16;
+    return n;
+}
+
+static inline float BackdropHash01(uint32_t px, uint32_t py, uint32_t salt)
+{
+    return (float)BackdropHashPixel(px, py, salt) * (1.0f / 4294967295.0f);
+}
+
+// Colour pipeline — the SAME order on every backend (D3D12 snapshot-backdrop
+// PS, Vulkan backdrop_quad.frag.hlsl). CSS backdrop-filter semantics: the
+// filters act on the backdrop, the tint composites on top:
+//   blur -> brightness -> contrast -> saturation -> hueRotation -> grayscale
+//        -> sepia -> invert -> tint -> luminosity -> noise
+static inline void ApplyBackdropColorPipeline(const JaliumBackdropMaterialDesc& m,
+                                              float& r, float& g, float& b)
+{
+    const float brightness = std::max(0.0f, m.brightness);
+    r *= brightness; g *= brightness; b *= brightness;
+
+    const float contrast = std::max(0.0f, m.contrast);
+    r = (r - 0.5f) * contrast + 0.5f;
+    g = (g - 0.5f) * contrast + 0.5f;
+    b = (b - 0.5f) * contrast + 0.5f;
+
+    const float saturation = std::max(0.0f, m.saturation);
+    float luma = r * 0.299f + g * 0.587f + b * 0.114f;
+    r = luma + (r - luma) * saturation;
+    g = luma + (g - luma) * saturation;
+    b = luma + (b - luma) * saturation;
+
+    if (std::fabs(m.hueRotation) > 0.0001f) {
+        const float yv = r * 0.299f + g * 0.587f + b * 0.114f;
+        const float iv = r * 0.596f - g * 0.274f - b * 0.322f;
+        const float qv = r * 0.211f - g * 0.523f + b * 0.312f;
+        const float c = std::cos(m.hueRotation);
+        const float s = std::sin(m.hueRotation);
+        const float i2 = iv * c - qv * s;
+        const float q2 = iv * s + qv * c;
+        r = yv + 0.956f * i2 + 0.621f * q2;
+        g = yv - 0.272f * i2 - 0.647f * q2;
+        b = yv - 1.106f * i2 + 1.703f * q2;
+    }
+
+    const float grayscale = std::clamp(m.grayscale, 0.0f, 1.0f);
+    luma = r * 0.299f + g * 0.587f + b * 0.114f;
+    r = Lerp(r, luma, grayscale);
+    g = Lerp(g, luma, grayscale);
+    b = Lerp(b, luma, grayscale);
+
+    const float sepia = std::clamp(m.sepia, 0.0f, 1.0f);
+    if (sepia > 0.0f) {
+        const float sr = r * 0.393f + g * 0.769f + b * 0.189f;
+        const float sg = r * 0.349f + g * 0.686f + b * 0.168f;
+        const float sb = r * 0.272f + g * 0.534f + b * 0.131f;
+        r = Lerp(r, sr, sepia);
+        g = Lerp(g, sg, sepia);
+        b = Lerp(b, sb, sepia);
+    }
+
+    const float invert = std::clamp(m.invert, 0.0f, 1.0f);
+    r = Lerp(r, 1.0f - r, invert);
+    g = Lerp(g, 1.0f - g, invert);
+    b = Lerp(b, 1.0f - b, invert);
+
+    const float tintA = std::clamp(m.tintA, 0.0f, 1.0f);
+    r = Lerp(r, std::clamp(m.tintR, 0.0f, 1.0f), tintA);
+    g = Lerp(g, std::clamp(m.tintG, 0.0f, 1.0f), tintA);
+    b = Lerp(b, std::clamp(m.tintB, 0.0f, 1.0f), tintA);
+
+    const float luminosity = std::max(0.0f, m.luminosity);
+    r *= luminosity; g *= luminosity; b *= luminosity;
+}
+
+void SoftwareRenderTarget::DrawBackdropMaterial(const JaliumBackdropMaterialDesc& m)
+{
+    const float w = m.width, h = m.height;
+    if (w <= 0.0f || h <= 0.0f || m.opacity <= 0.0f) return;
+
+    float tx, ty;
+    currentTransform_.Apply(m.x, m.y, tx, ty);
+    const int32_t ix = (int32_t)tx, iy = (int32_t)ty;
+    const int32_t iw = (int32_t)(w + 0.5f), ih = (int32_t)(h + 0.5f);
+
+    // Clamp the panel to the framebuffer.
+    const int32_t x0 = std::max(0, ix), y0 = std::max(0, iy);
+    const int32_t x1 = std::min(fb_.width, ix + iw), y1 = std::min(fb_.height, iy + ih);
+    const int32_t rw = x1 - x0, rh = y1 - y0;
+    if (rw <= 0 || rh <= 0) return;
+
+    const bool hasCorners = (m.cornerRadiusTL > 0 || m.cornerRadiusTR > 0 ||
+                             m.cornerRadiusBR > 0 || m.cornerRadiusBL > 0);
+
+    // Kernel: the GPU backends run a Gaussian with sigma = radius / 3 (Box =
+    // box-equivalent sigma = radius / sqrt(3), explicit material sigma wins).
+    // Three box passes of half-width k have sigma ~= k + 0.5, so pick k from
+    // the target sigma rather than the old, unfounded radius / 2.
+    const float sxScale = std::sqrt(currentTransform_.m[0] * currentTransform_.m[0] + currentTransform_.m[1] * currentTransform_.m[1]);
+    const float syScale = std::sqrt(currentTransform_.m[2] * currentTransform_.m[2] + currentTransform_.m[3] * currentTransform_.m[3]);
+    const float effectScale = std::max(0.0001f, std::min(sxScale > 0.0f ? sxScale : 1.0f, syScale > 0.0f ? syScale : 1.0f));
+    float sigma = std::max(0.0f, m.blurRadius) / 3.0f;
+    if (m.blurType == JALIUM_BACKDROP_BLUR_BOX) {
+        sigma = std::max(0.0f, m.blurRadius) / 1.7320508f;
+    } else if (m.blurSigma > 0.0f) {
+        sigma = m.blurSigma;
+    }
+    sigma *= effectScale;
+    const int32_t boxRadius = sigma > 0.25f ? std::max(1, (int32_t)std::lround(sigma - 0.5f)) : 0;
+
+    // Blur the panel plus a kernel apron so edge pixels blur with their true
+    // neighbourhood instead of the clamped edge, then read back the panel.
+    const int32_t apron = boxRadius * 3 + 1;
+    const int32_t sx0 = std::max(0, x0 - apron), sy0 = std::max(0, y0 - apron);
+    const int32_t sx1 = std::min(fb_.width, x1 + apron), sy1 = std::min(fb_.height, y1 + apron);
+    const int32_t sw = sx1 - sx0, sh = sy1 - sy0;
+    if (sw <= 0 || sh <= 0) return;
+
+    SoftwareFramebuffer blurred;
+    CopyRegion(fb_, blurred, sx0, sy0, sw, sh);
+    if (boxRadius > 0) {
+        BoxBlur(blurred.pixels, sw, sh, boxRadius);
+    }
+
+    const float opacity = std::clamp(m.opacity, 0.0f, 1.0f) * currentOpacity_;
+    const float noise = std::clamp(m.noiseIntensity, 0.0f, 1.0f);
+    const float alphaFloor = 0.08f + std::clamp(m.tintA, 0.0f, 1.0f) * 0.25f;
+
+    for (int32_t row = 0; row < rh; row++) {
+        const int32_t py = y0 + row;
+        for (int32_t col = 0; col < rw; col++) {
+            const int32_t px = x0 + col;
+            if (hasCorners) {
+                const float lx = (float)(px - ix), ly = (float)(py - iy);
+                if (!IsInsidePerCornerRoundedRect(lx, ly, w, h,
+                        m.cornerRadiusTL, m.cornerRadiusTR, m.cornerRadiusBR, m.cornerRadiusBL))
+                    continue;
+            }
+            if (!clipStack_.empty() && IsClipped((float)px, (float)py)) continue;
+
+            const size_t srcIdx = ((size_t)(py - sy0) * sw + (px - sx0)) * 4;
+            const float srcA = blurred.pixels[srcIdx + 3] / 255.0f;
+            // The framebuffer is premultiplied; the pipeline runs on straight colour.
+            const float inv = srcA > 0.0f ? 1.0f / srcA : 0.0f;
+            float r = (blurred.pixels[srcIdx + 2] / 255.0f) * inv;
+            float g = (blurred.pixels[srcIdx + 1] / 255.0f) * inv;
+            float b = (blurred.pixels[srcIdx + 0] / 255.0f) * inv;
+
+            ApplyBackdropColorPipeline(m, r, g, b);
+
+            if (noise > 0.0f) {
+                const float grain = (BackdropHash01((uint32_t)px, (uint32_t)py, 3u) - 0.5f) * noise;
+                r += grain; g += grain; b += grain;
+            }
+
+            const float outA = std::max(srcA, alphaFloor) * opacity;
+            fb_.BlendPixel(px, py, FloatToU8(r), FloatToU8(g), FloatToU8(b), FloatToU8(outA));
+        }
+    }
+}
+
 void SoftwareRenderTarget::DrawGlowingBorderHighlight(
     float x, float y, float w, float h,
     float animationPhase,

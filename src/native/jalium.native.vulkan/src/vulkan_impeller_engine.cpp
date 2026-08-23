@@ -776,7 +776,31 @@ bool ImpellerVulkanEngine::EncodeStrokePath(
     const bool gradientStroke =
         (brush.type == 1 || brush.type == 2 || brush.type == 3) &&
         brush.stops && brush.stopCount > 0;
+
+    // ── Anti-aliasing route gate (same predicate as fill, D3D12 parity) ──
+    // The cached mesh feathers only the straight segment quads; joins and caps
+    // are emitted at full alpha and full half-width, so a flattened curve gets
+    // a hard-edged bead at every vertex ("string of pearls") and diagonals
+    // stair-step. At icon / control scale that is what PreferAnalyticFill
+    // exists to prevent, so anything small falls through to the analytic body
+    // below. Explicit Aliased (edgeMode == 1) is honoured — only an
+    // unspecified edge mode is upgraded.
+    bool preferAnalyticStroke = false;
+    if (em != 1 || edgeMode < 0) {
+        float lminX, lminY, lmaxX, lmaxY;
+        if (PathCommandExtent(startX, startY, commands, commandLength,
+                              lminX, lminY, lmaxX, lmaxY)) {
+            const float halfW = strokeWidth * 0.5f;
+            float devW, devH;
+            TransformedExtent(lminX - halfW, lminY - halfW,
+                              lmaxX + halfW, lmaxY + halfW,
+                              transform, devW, devH);
+            preferAnalyticStroke = PreferAnalyticFill(devW, devH);
+        }
+    }
+
     if (StrokeCacheEnabled() && !analytic && !gradientStroke &&
+        !preferAnalyticStroke &&
         (!dashPattern || dashCount == 0) &&
         commands && commandLength > 0 && strokeWidth > 0.0f) {
 

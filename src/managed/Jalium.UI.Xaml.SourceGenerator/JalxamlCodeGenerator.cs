@@ -481,8 +481,27 @@ internal static class JalxamlCodeGenerator
         if (templateNode.Children.Count == 0)
             return;
 
+        EmitTemplateFactory(sb, templateVar, templateNode.Children[0], counter, indent, ctx);
+    }
+
+    /// <summary>
+    /// Emit <c>SetVisualTree(() =&gt; ...)</c> for one visual root.
+    /// </summary>
+    /// <remarks>
+    /// Shared by control/data templates and by the <c>@virtualize</c> host so all three prime the
+    /// ambient resource stack identically. The push/pop around the body is what lets
+    /// <c>{StaticResource}</c> inside the tree walk back into the owning view's resources; the
+    /// build session has otherwise finished by the time a template is instantiated.
+    /// </remarks>
+    private static void EmitTemplateFactory(
+        StringBuilder sb,
+        string templateVar,
+        JalxamlAstNode rootChild,
+        IndexCounter counter,
+        int indent,
+        EmitContext ctx)
+    {
         var pad = new string(' ', indent);
-        var rootChild = templateNode.Children[0];
 
         sb.AppendLine($"{pad}{templateVar}.SetVisualTree(() =>");
         sb.AppendLine($"{pad}{{");
@@ -527,6 +546,94 @@ internal static class JalxamlCodeGenerator
         sb.AppendLine($"{innerPad}}}");
 
         sb.AppendLine($"{pad}}});");
+    }
+
+    /// <summary>
+    /// Emit the host a <c>@virtualize</c> block lowers to: the sequence it draws from, and the
+    /// loop body as a single shared <see cref="Jalium.UI.DataTemplate"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The template is built once per host, not once per item, and that is load-bearing rather
+    /// than merely tidy. <c>ContentPresenter</c> only takes its recycling fast path — swapping a
+    /// container's DataContext instead of rebuilding its subtree — when the template it generated
+    /// from is reference-equal to the current one. A fresh template per item would defeat
+    /// recycling while still looking correct.
+    /// </para>
+    /// <para>
+    /// The visual tree goes through <c>SetVisualTree</c> with the same ambient-resource priming as
+    /// a hand-written template, so <c>{StaticResource}</c> inside a loop body resolves against the
+    /// owning view exactly as it would anywhere else.
+    /// </para>
+    /// </remarks>
+    private static void EmitRazorVirtualizeHost(
+        StringBuilder sb,
+        JalxamlAstNode node,
+        string hostVar,
+        IndexCounter counter,
+        int indent,
+        EmitContext ctx)
+    {
+        var loop = node.Virtualize;
+        if (loop is null || node.Children.Count != 1)
+        {
+            return; // A diagnostic was already reported; emit a bare host rather than bad code.
+        }
+
+        var pad = new string(' ', indent);
+
+        // Batch the property writes: ItemsControl coalesces its item refresh while initializing.
+        sb.AppendLine($"{pad}{hostVar}.BeginInit();");
+
+        var templateIndex = counter.Next();
+        var templateVar = $"__vt{templateIndex}";
+        sb.AppendLine($"{pad}var {templateVar} = new global::Jalium.UI.DataTemplate();");
+        EmitTemplateFactory(sb, templateVar, node.Children[0], counter, indent, ctx);
+
+        // Template before source: assigning the source first would refresh the items once against
+        // no template and again once it arrives.
+        sb.AppendLine($"{pad}{hostVar}.ItemTemplate = {templateVar};");
+
+        if (loop.Kind == global::Jalium.UI.Markup.RazorVirtualizeKind.Collection)
+        {
+            EmitRazorBoundProperty(sb, hostVar, "ItemsSource", loop.SourceExpression, pad);
+        }
+        else
+        {
+            sb.AppendLine($"{pad}{hostVar}.IsRangeSource = true;");
+            sb.AppendLine($"{pad}{hostVar}.RangeEndInclusive = {(loop.EndInclusive ? "true" : "false")};");
+            EmitRazorBoundProperty(sb, hostVar, "RangeStart", loop.StartExpression, pad);
+            EmitRazorBoundProperty(sb, hostVar, "RangeEnd", loop.EndExpression, pad);
+            EmitRazorBoundProperty(sb, hostVar, "RangeStep", loop.StepExpression, pad);
+        }
+
+        sb.AppendLine($"{pad}{hostVar}.EndInit();");
+    }
+
+    /// <summary>
+    /// Assign one host property from a loop-header expression, as a literal when the expression is
+    /// a constant and as a Razor binding otherwise.
+    /// </summary>
+    /// <remarks>
+    /// The literal case matters for the numeric form: a loop written <c>i = 0; i &lt; 500; i++</c>
+    /// has nothing to observe, and binding it would build three multi-bindings that can never
+    /// change.
+    /// </remarks>
+    private static void EmitRazorBoundProperty(
+        StringBuilder sb, string hostVar, string propertyName, string expression, string pad)
+    {
+        var trimmed = expression.Trim();
+        if (int.TryParse(trimmed, System.Globalization.NumberStyles.AllowLeadingSign,
+                System.Globalization.CultureInfo.InvariantCulture, out var literal))
+        {
+            sb.AppendLine($"{pad}{hostVar}.{propertyName} = {literal.ToString(System.Globalization.CultureInfo.InvariantCulture)};");
+            return;
+        }
+
+        var razor = "@(" + trimmed + ")";
+        var deps = RazorExpressionLowering.ExtractConditionDependencies(trimmed);
+        sb.AppendLine(
+            $"{pad}global::Jalium.UI.Markup.XamlBuilder.SetRazorBinding({hostVar}, \"{propertyName}\", {EscapeStringLiteral(razor)}, {RazorExpressionLowering.EmitDependencyArray(deps)}, __ctx);");
     }
 
     /// <summary>
@@ -1097,15 +1204,23 @@ internal static class JalxamlCodeGenerator
         // public parameterless constructor, so we seed with string.Empty and let the
         // SetContentText path inside EmitElementBody overwrite the value via the
         // SetContentProperty pipeline (matching what the runtime XamlReader does).
-        if (child.ResolvedClrTypeName == "System.String")
+        if (child.LocalName == JalxamlParser.RazorVirtualizeElementName)
+        {
+            // The synthetic node's only attribute is the raw header, which is not a property of
+            // anything — so this builds the host directly instead of running EmitElementBody.
+            sb.AppendLine($"{innerPad}var {childVar} = new global::Jalium.UI.Controls.RazorItemsHost();");
+            EmitRazorVirtualizeHost(sb, child, childVar, counter, inner, ctx);
+        }
+        else if (child.ResolvedClrTypeName == "System.String")
         {
             sb.AppendLine($"{innerPad}var {childVar} = string.Empty;");
+            EmitElementBody(sb, child, childVar, counter, namedAlready, inner, ctx);
         }
         else
         {
             sb.AppendLine($"{innerPad}var {childVar} = new global::{child.ResolvedClrTypeName!}();");
+            EmitElementBody(sb, child, childVar, counter, namedAlready, inner, ctx);
         }
-        EmitElementBody(sb, child, childVar, counter, namedAlready, inner, ctx);
 
         if (asPropertyElementChild != null)
         {

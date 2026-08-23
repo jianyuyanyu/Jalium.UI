@@ -376,6 +376,76 @@ public abstract class ImageSource : Animation.Animatable, IFormattable
         }
     }
 
+    private long _lastDrawnTickMs;
+
+    /// <summary>
+    /// Wall-clock tick (<see cref="Environment.TickCount64"/>) of the last time any renderer
+    /// realized this source's pixels for a draw, or 0 if it has never been drawn.
+    /// </summary>
+    /// <remarks>
+    /// <para>An <see cref="ImageSource"/> is SHARED: the same instance routinely backs several
+    /// elements (a wizard's preview pane and the banner of a later step, a list row and its detail
+    /// view) and non-element consumers such as an image brush or an image drawing. The idle
+    /// reclaimer, in contrast, decides per ELEMENT — so an off-screen element that happens to hold
+    /// a reference to a source another element is painting every frame would drop that source's
+    /// decoded pixels and GPU upload out from under the live consumer. The visible result is an
+    /// image that blanks for the length of one re-decode and comes back, over and over, for as
+    /// long as anything keeps rendering; see <c>Image.ReclaimIdleResources</c>, which uses this
+    /// stamp to tell "nobody is drawing this any more" apart from "somebody else still is".</para>
+    /// <para>Stamped by the drawing context at the single choke point every bitmap consumer funnels
+    /// through, so brushes and drawings protect a source exactly as an element does. It is one
+    /// volatile write per realized draw and is never read on the render hot path.</para>
+    /// </remarks>
+    internal long LastDrawnTickMs => Volatile.Read(ref _lastDrawnTickMs);
+
+    /// <summary>
+    /// Records that this source's pixels were just realized for a draw.
+    /// </summary>
+    /// <remarks>
+    /// Called for the source the CALLER asked to draw, not for whatever derived raster the
+    /// renderer substituted for it (a downscaled thumbnail, an animation frame): the substitute is
+    /// a private, rebuildable artifact, while the source the application holds is the one an idle
+    /// element may be about to reclaim.
+    /// </remarks>
+    internal void MarkDrawn() => Volatile.Write(ref _lastDrawnTickMs, Environment.TickCount64);
+
+    private static long s_reclaimGraceMs = 2000;
+
+    /// <summary>
+    /// How recently this source must have been drawn for a reclaim to be refused, in milliseconds.
+    /// Kept in step with the idle reclaimer's own idle window.
+    /// </summary>
+    /// <remarks>
+    /// The reclaimer decides per element; the resource it frees belongs to a source that any number
+    /// of elements, brushes and drawings may share. A source drawn within the same window the
+    /// reclaimer calls "idle" therefore has a live consumer BY DEFINITION, whichever element the
+    /// scan happened to arrive from — so this is the last word on reclamation, and it is a property
+    /// of the source rather than of any one holder of it.
+    /// </remarks>
+    internal static long ReclaimGraceMs
+    {
+        get => Volatile.Read(ref s_reclaimGraceMs);
+        set => Volatile.Write(ref s_reclaimGraceMs, value);
+    }
+
+    /// <summary>
+    /// True when a renderer realized this source's pixels within <see cref="ReclaimGraceMs"/>.
+    /// </summary>
+    /// <remarks>
+    /// A source that has never been drawn answers false: it holds no upload anything is sampling,
+    /// and refusing to reclaim it would strand the decoded buffer of an image that was prepared and
+    /// then never shown — the exact allocation the reclaimer exists to release.
+    /// </remarks>
+    internal bool WasDrawnRecently()
+    {
+        var drawn = LastDrawnTickMs;
+        if (drawn == 0)
+            return false;
+
+        var since = Environment.TickCount64 - drawn;
+        return since >= 0 && since < ReclaimGraceMs;
+    }
+
     /// <summary>
     /// Monotonically-increasing stamp of the pixel content currently behind this source. A cache
     /// that recorded the value at upload time can detect that the source's raster was replaced

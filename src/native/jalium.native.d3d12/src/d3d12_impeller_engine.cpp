@@ -1785,6 +1785,11 @@ void ImpellerD3D12Engine::StrokeCacheInsert(
         auto& lru = strokeCacheList_.back();
         strokeCacheMap_.erase(lru.key);
         strokeCacheList_.pop_back();
+        // Surfaced in DevTools. A nonzero per-frame eviction count is the
+        // signal that the working set outgrew the LRU and every entry is
+        // being thrown away before the next frame can reuse it — which reads
+        // as a low hit rate with no obvious cause.
+        path_stats::AddCacheEviction(1);
     }
     strokeCacheList_.push_front({key, std::move(entry)});
     strokeCacheMap_[key] = strokeCacheList_.begin();
@@ -1812,6 +1817,7 @@ void ImpellerD3D12Engine::StrokeAnalyticCacheInsert(
         auto& lru = strokeAnalyticCacheList_.back();
         strokeAnalyticCacheMap_.erase(lru.key);
         strokeAnalyticCacheList_.pop_back();
+        path_stats::AddCacheEviction(1);
     }
     strokeAnalyticCacheList_.push_front({key, std::move(entry)});
     strokeAnalyticCacheMap_[key] = strokeAnalyticCacheList_.begin();
@@ -1861,6 +1867,7 @@ void ImpellerD3D12Engine::FillCacheInsert(
         auto& lru = fillCacheList_.back();
         fillCacheMap_.erase(lru.key);
         fillCacheList_.pop_back();
+        path_stats::AddCacheEviction(1);
     }
     fillCacheList_.push_front({key, std::move(entry)});
     fillCacheMap_[key] = fillCacheList_.begin();
@@ -1912,6 +1919,40 @@ bool ImpellerD3D12Engine::EncodeStrokePath(
             dashPattern, dashCount, dashOffset, transformIn, edgeMode);
     }
 
+    // ── Anti-aliasing route gate (same predicate as fill) ───────────────
+    // The binary-mesh route below feathers only the straight segment quads;
+    // joins and caps are emitted at full alpha and full half-width, so on a
+    // flattened curve every vertex plants a hard-edged bead that pokes past
+    // the feathered edge — a "string of pearls" along the outline, plus a
+    // plain staircase on diagonals. At icon / control scale that is exactly
+    // the artifact PreferAnalyticFill exists to prevent, and the analytic
+    // stroke path (widen → RasterizePathToRects, same coverage algorithm as
+    // fill, already what Vulkan does) is affordable and cached there. Big
+    // artwork keeps the constant-cost mesh.
+    //
+    // An explicit Aliased request (edgeMode == 1, pixel-art / hairline
+    // rulings) is honoured: only an unspecified edge mode is upgraded.
+    if (em != 1 || edgeMode < 0) {
+        float lminX, lminY, lmaxX, lmaxY;
+        if (PathCommandExtent(startX, startY, commands, commandLength,
+                              lminX, lminY, lmaxX, lmaxY)) {
+            // The stroke covers half a width beyond the path outline on each
+            // side; the rasterizer pays for that area, so gate on it.
+            const float halfW = strokeWidth * 0.5f;
+            float devW, devH;
+            TransformedExtent(lminX - halfW, lminY - halfW,
+                              lmaxX + halfW, lmaxY + halfW,
+                              transformIn, devW, devH);
+            if (PreferAnalyticFill(devW, devH)) {
+                return EncodeStrokePathPixelCached(
+                    startX, startY, commands, commandLength, brush,
+                    strokeWidth, closed, lineJoin, miterLimit, lineCap,
+                    dashPattern, dashCount, dashOffset, transformIn,
+                    /*edgeMode*/ 2 /* Antialiased → analytic coverage */);
+            }
+        }
+    }
+
     const float maxScale    = MaxScaleFromTransform(transformIn);
     const uint32_t scaleBkt = ScaleBucketFromMaxScale(maxScale);
 
@@ -1957,13 +1998,61 @@ bool ImpellerD3D12Engine::EncodeStrokePath(
     auto emitLocalMesh = [&](const CachedStrokeRects& m) {
         const size_t vc = m.positions.size() / 2;
         if (vc == 0 || m.indices.empty()) return;
-        ImpellerDrawBatch batch;
-        batch.vertices.resize(vc);
-        batch.indices = m.indices;
+
+        // Writes straight into the batch that will keep this geometry, the
+        // same in-place coalescing emitCachedMesh / emitStrokeRectsAsBatch
+        // already use. Building a temporary ImpellerDrawBatch and handing it
+        // to PushBatchWithCoverage did every byte twice — allocate + fill the
+        // temp, then have the coalescer copy both arrays into the previous
+        // batch — plus two heap allocations on each of the hundreds of cached
+        // strokes a frame emits.
+        ImpellerDrawBatch* target = nullptr;
+        if (!batches_.empty()) {
+            auto& last = batches_.back();
+            if (last.pipelineType == 0 && last.stencilContours.empty() &&
+                last.hasScissor == hasScissor_ &&
+                (!hasScissor_ ||
+                 (last.scissorL == scissorLeft_ && last.scissorT == scissorTop_ &&
+                  last.scissorR == scissorRight_ && last.scissorB == scissorBottom_)) &&
+                last.hasRoundedClip == hasRoundedClip_ &&
+                (!hasRoundedClip_ ||
+                 (last.roundedClipRect[0] == roundedClipRect_[0] && last.roundedClipRect[1] == roundedClipRect_[1] &&
+                  last.roundedClipRect[2] == roundedClipRect_[2] && last.roundedClipRect[3] == roundedClipRect_[3] &&
+                  last.roundedClipCornerRadii[0] == roundedClipCornerRadii_[0] && last.roundedClipCornerRadii[1] == roundedClipCornerRadii_[1] &&
+                  last.roundedClipCornerRadii[2] == roundedClipCornerRadii_[2] && last.roundedClipCornerRadii[3] == roundedClipCornerRadii_[3])))
+            {
+                target = &last;
+            }
+        }
+        if (target == nullptr) {
+            batches_.emplace_back();
+            target = &batches_.back();
+            target->pipelineType = 0;
+            target->hasScissor = hasScissor_;
+            if (hasScissor_) {
+                target->scissorL = scissorLeft_;
+                target->scissorT = scissorTop_;
+                target->scissorR = scissorRight_;
+                target->scissorB = scissorBottom_;
+            }
+            target->hasRoundedClip = hasRoundedClip_;
+            if (hasRoundedClip_) {
+                target->roundedClipRect[0] = roundedClipRect_[0]; target->roundedClipRect[1] = roundedClipRect_[1];
+                target->roundedClipRect[2] = roundedClipRect_[2]; target->roundedClipRect[3] = roundedClipRect_[3];
+                target->roundedClipCornerRadii[0] = roundedClipCornerRadii_[0]; target->roundedClipCornerRadii[1] = roundedClipCornerRadii_[1];
+                target->roundedClipCornerRadii[2] = roundedClipCornerRadii_[2]; target->roundedClipCornerRadii[3] = roundedClipCornerRadii_[3];
+            }
+        }
+
+        const size_t oldV = target->vertices.size();
+        const size_t oldI = target->indices.size();
+        target->vertices.resize(oldV + vc);
+        target->indices.resize(oldI + m.indices.size());
+
         const float kInv255 = 1.0f / 255.0f;
         const float* pp = m.positions.data();
         const uint8_t* cp = m.coverage.data();
-        ImpellerVertex* vp = batch.vertices.data();
+        ImpellerVertex* vp = target->vertices.data() + oldV;
         const float tm11 = transformIn.m11, tm21 = transformIn.m21, tdx = transformIn.dx;
         const float tm12 = transformIn.m12, tm22 = transformIn.m22, tdy = transformIn.dy;
         float minX =  std::numeric_limits<float>::infinity();
@@ -1992,8 +2081,27 @@ bool ImpellerD3D12Engine::EncodeStrokePath(
             if (x > maxX) maxX = x;
             if (y > maxY) maxY = y;
         }
-        batch.pipelineType = 0;
-        PushBatchWithCoverage(std::move(batch), minX, minY, maxX, maxY);
+
+        uint32_t* ip = target->indices.data() + oldI;
+        const uint32_t* sip = m.indices.data();
+        const uint32_t base = (uint32_t)oldV;
+        const size_t indexCount = m.indices.size();
+        for (size_t i = 0; i < indexCount; ++i) ip[i] = sip[i] + base;
+
+        if (maxX > minX && maxY > minY) {
+            if (target->hasCoverage) {
+                if (minX < target->coverageL) target->coverageL = minX;
+                if (minY < target->coverageT) target->coverageT = minY;
+                if (maxX > target->coverageR) target->coverageR = maxX;
+                if (maxY > target->coverageB) target->coverageB = maxY;
+            } else {
+                target->hasCoverage = true;
+                target->coverageL = minX;
+                target->coverageT = minY;
+                target->coverageR = maxX;
+                target->coverageB = maxY;
+            }
+        }
         encodedPathCount_++;
     };
 
@@ -2546,21 +2654,26 @@ bool ImpellerD3D12Engine::EncodeStrokePathPixelCached(
         meshIndices.reserve(contours.size() * 96);
     }
 
-    auto expandSubStroke = [&](uint32_t pointCount, bool subClosed) {
+    auto expandSubStrokeFrom = [&](const float* pts, uint32_t pointCount, bool subClosed) {
         jalium::ExpandStrokePath<ImpellerVertex>(
             meshVerts, meshIndices,
-            flatPoints_.data(), pointCount,
+            pts, pointCount,
             pxStrokeWidth, join, miterLimit, cap, subClosed,
             brush.r, brush.g, brush.b, brush.a,
             /* collectContours */ useAnalytic ? &strokeContours : nullptr);
+    };
+    auto expandSubStroke = [&](uint32_t pointCount, bool subClosed) {
+        expandSubStrokeFrom(flatPoints_.data(), pointCount, subClosed);
     };
 
     for (auto& c : contours) {
         if (c.VertexCount() < 2) continue;
 
-        flatPoints_ = c.points;
-
         if (!pxDashPattern.empty()) {
+            // The dash walker rewrites flatPoints_ per sub-stroke, so it needs
+            // its own mutable copy; the undashed path can widen straight out
+            // of the flattener's buffer.
+            flatPoints_ = c.points;
             uint32_t pointCount = (uint32_t)(flatPoints_.size() / 2);
             if (pointCount < 2) continue;
 
@@ -2614,7 +2727,7 @@ bool ImpellerD3D12Engine::EncodeStrokePathPixelCached(
                 expandSubStroke((uint32_t)(flatPoints_.size() / 2), false);
             }
         } else {
-            expandSubStroke((uint32_t)(flatPoints_.size() / 2), closed);
+            expandSubStrokeFrom(c.points.data(), c.VertexCount(), closed);
         }
     }
 

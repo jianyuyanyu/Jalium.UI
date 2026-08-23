@@ -1170,6 +1170,21 @@ JALIUM_API void jalium_draw_backdrop_filter_ex(
     }
 }
 
+// Struct-based backdrop material: the primary backdrop entry point. Carries
+// the blur kernel family/sigma, the full colour pipeline, tint alpha, grain,
+// opacity and per-corner rounding that the string-based entries above cannot.
+// structSize guards against a managed/native layout mismatch: a caller built
+// against a smaller or larger struct is rejected instead of being read past.
+JALIUM_API void jalium_draw_backdrop_material(
+    JaliumRenderTarget* rt,
+    const JaliumBackdropMaterialDesc* desc)
+{
+    if (!rt || !desc || desc->structSize != sizeof(JaliumBackdropMaterialDesc)) {
+        return;
+    }
+    reinterpret_cast<jalium::RenderTarget*>(rt)->DrawBackdropMaterial(*desc);
+}
+
 JALIUM_API void jalium_draw_glowing_border_highlight(
     JaliumRenderTarget* rt,
     float x, float y, float width, float height,
