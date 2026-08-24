@@ -90,6 +90,12 @@ public:
 class VulkanBitmap : public Bitmap {
 public:
     VulkanBitmap(uint32_t width, uint32_t height, std::vector<uint8_t> pixelData);
+    // Wraps an already-shared pixel buffer WITHOUT copying it. Used by cached
+    // producers (the self-hosted text-run cache) so repeated draws of the same
+    // content carry the same COW-stable pointer and hit the render target's
+    // resident-bitmap cache instead of re-uploading every frame.
+    VulkanBitmap(uint32_t width, uint32_t height,
+                 std::shared_ptr<std::vector<uint8_t>> sharedPixelData);
 
     uint32_t GetWidth() const override { return width_; }
     uint32_t GetHeight() const override { return height_; }

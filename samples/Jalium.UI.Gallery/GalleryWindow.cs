@@ -24,7 +24,7 @@ namespace Jalium.UI.Gallery;
 /// </summary>
 internal static partial class GalleryWindow
 {
-    private const int TotalSectionCount = 16;
+    private const int TotalSectionCount = 17;
 
     private static readonly DeferredSection[] s_deferredSections =
     [
@@ -55,6 +55,7 @@ internal static partial class GalleryWindow
             "Drawing, codes, viewers, editors and resource-backed hosts.",
             CreateSpecializedCards()),
         new("Gallery.Section.Dialogs", BuildDialogsSection),
+        new("Gallery.Section.Effects", BuildEffectsSection),
     ];
 
     // ── Dark-theme-matched chrome palette ───────────────────────────────────

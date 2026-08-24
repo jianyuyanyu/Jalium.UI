@@ -279,6 +279,28 @@ public class TreeView : ItemsControl
         }
     }
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// Prepare/Clear 对称的另一半。<see cref="PrepareContainerForItem"/> 通过
+    /// <see cref="TreeViewItem.ApplyHierarchicalDataTemplate"/> 在容器上留下了层级状态
+    /// （模板生成的子容器、延迟实例化状态机、数据节点桥接、展开 / 选中本地值），
+    /// 容器被推进回收池之前必须原样撤销。<br/>
+    /// 少了这一步，ItemsSource 集合 Clear() + Add() 之后从池里 pop 回来的旧容器会带着上一轮
+    /// 的整棵子树，被重新 Prepare 时新子树直接 AddRange 到旧子树后面 —— 整棵树渲染两遍。
+    /// </remarks>
+    protected override void ClearContainerForItem(FrameworkElement element, object item)
+    {
+        if (element is TreeViewItem tvi && !ReferenceEquals(element, item))
+        {
+            tvi.ResetContainerState();
+            tvi.ParentTreeView = null;
+            tvi.ParentItem = null;
+            tvi.Level = 0;
+        }
+
+        base.ClearContainerForItem(element, item);
+    }
+
     private static void OnSelectedValuePathChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
         var treeView = (TreeView)d;
@@ -545,6 +567,19 @@ public class TreeViewItem : HeaderedItemsControl
     private object? _deferredItemsSource;
     private HierarchicalDataTemplate? _deferredTemplate;
     private bool _childrenRealized;
+
+    // 由 EnsureChildrenRealized 从 HierarchicalDataTemplate 生成并塞进 Items 的子容器。
+    // 记住这批引用，才能在容器被回收 / 重新 Prepare 时精确撤销（只删自己造的，不碰
+    // 使用者在 XAML 里手写的 <TreeViewItem> 子项）。null = 当前没有模板生成的子项。
+    private List<object>? _templateRealizedChildren;
+
+    // HierarchicalDataTemplate 解析出的子集合本体 + 该层用的模板。与 _deferredItemsSource 的
+    // 区别：后者是"一次性 arm"，EnsureChildrenRealized 消费完就置 null；这两个字段在整个绑定
+    // 期间保留，用于订阅子集合的 CollectionChanged —— 数据节点运行时往 Children 增删
+    // （懒加载展开、局部刷新）才能反映到已实例化的子容器上。
+    private IEnumerable? _boundChildSource;
+    private HierarchicalDataTemplate? _boundChildTemplate;
+    private System.Collections.Specialized.NotifyCollectionChangedEventHandler? _boundChildCollectionHandler;
 
     // 桥接的 dataItem（HierarchicalDataTemplate 模式下背后的 ViewModel 节点）。
     // IsExpanded / IsSelected 的双向同步通过 DP PropertyChanged 回调直接写回 dataItem，
@@ -849,6 +884,22 @@ public class TreeViewItem : HeaderedItemsControl
         {
             childTvi.HeaderTemplate = ItemTemplate;
         }
+    }
+
+    /// <inheritdoc />
+    /// <remarks>与 <see cref="TreeView.ClearContainerForItem"/> 同理 —— 子层级的容器
+    /// （使用者把 <see cref="ItemsControl.ItemsSource"/> 绑到子节点集合时由生成器管理的那些）
+    /// 回收前也要撤销层级状态，否则同样会出现子树重复。</remarks>
+    protected override void ClearContainerForItem(FrameworkElement element, object item)
+    {
+        if (element is TreeViewItem childTvi && !ReferenceEquals(element, item))
+        {
+            childTvi.ResetContainerState();
+            childTvi.ParentTreeView = null;
+            childTvi.ParentItem = null;
+        }
+
+        base.ClearContainerForItem(element, item);
     }
 
     #region Template
@@ -1830,6 +1881,16 @@ public class TreeViewItem : HeaderedItemsControl
     [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("HierarchicalDataTemplate ItemsSource may resolve via PropertyAccessorRegistry reflection on data items.")]
     internal static void ApplyHierarchicalDataTemplate(TreeViewItem tvi, object dataItem, HierarchicalDataTemplate hdt)
     {
+        // 幂等前提：本方法下面会把 _childrenRealized 重置为 false 并重新 arm _deferredItemsSource，
+        // 所以对一个「已经实例化过子容器」的 tvi 再调一次，EnsureChildrenRealized 会把新一批子容器
+        // AddRange 到仍留着旧子容器的 Items 上 —— 整棵子树被渲染两遍。
+        //
+        // 这不是理论情况：ItemContainerGenerator.OnReset 走的是分层回收（recycle: true），
+        // 把容器推进 _recyclePool 而不是丢弃；ItemsSource 集合 Clear() + Add() 之后（例如
+        // 解决方案树刷新），下一次 measure 从池里 pop 回同一个 TreeViewItem 实例并重新 Prepare，
+        // 于是旧子树 + 新子树并存。先撤销上一轮模板生成的子项，保证重入等价于首次应用。
+        tvi.ClearTemplateRealizedChildren();
+
         // Set the header template
         tvi.Header = dataItem;
         tvi.HeaderTemplate = hdt;
@@ -1850,24 +1911,19 @@ public class TreeViewItem : HeaderedItemsControl
         // Defer child creation: only resolve whether children exist (for the expander arrow),
         // but don't create TreeViewItem containers until the node is expanded.
         var childItems = ResolveHierarchicalChildItems(hdt.ItemsSource, dataItem);
-        if (childItems is IEnumerable enumerable)
+        var childTemplate = hdt.ItemTemplate as HierarchicalDataTemplate ?? hdt;
+
+        // 订阅子集合的增删（若它是 ObservableCollection 这类 INotifyCollectionChanged）。
+        // 少了这一步，子容器只在 EnsureChildrenRealized 那一刻对集合快照一次，之后数据节点
+        // 再往 Children 里加东西（典型场景：节点展开时才异步解析出真实子项）UI 一动不动。
+        tvi.AttachBoundChildSource(childItems as IEnumerable, childTemplate);
+
+        if (childItems is IEnumerable enumerable && HasAnyItem(enumerable))
         {
-            // Check if there are any children without enumerating everything
-            var enumerator = enumerable.GetEnumerator();
-            try
-            {
-                if (enumerator.MoveNext())
-                {
-                    // Has children — store for deferred realization
-                    tvi._deferredItemsSource = childItems;
-                    tvi._deferredTemplate = hdt.ItemTemplate as HierarchicalDataTemplate ?? hdt;
-                    tvi._childrenRealized = false;
-                }
-            }
-            finally
-            {
-                (enumerator as IDisposable)?.Dispose();
-            }
+            // Has children — store for deferred realization
+            tvi._deferredItemsSource = childItems;
+            tvi._deferredTemplate = childTemplate;
+            tvi._childrenRealized = false;
         }
 
         // 把 dataItem.IsExpanded / IsSelected 桥接到 TreeViewItem 的对应 DP 上 —
@@ -2035,13 +2091,16 @@ public class TreeViewItem : HeaderedItemsControl
             return;
         }
 
-        // Pre-resolve the TreeViewItem style once to avoid per-item resource lookups
-        var cachedStyle = ParentTreeView?._cachedTreeViewItemStyle
-            ?? TryFindResource(typeof(TreeViewItem)) as Style;
-        if (cachedStyle != null && ParentTreeView != null)
-        {
-            ParentTreeView._cachedTreeViewItemStyle = cachedStyle;
-        }
+        // Pre-resolve the TreeViewItem style once to avoid per-item resource lookups.
+        //
+        // ItemContainerStyle wins over the implicit default (WPF semantics). This branch
+        // is the ONLY place nested rows get a style: the pre-applied style leaves
+        // container.Style non-null, so the later ItemsControl pass
+        // (ShouldApplyItemContainerStyle) sees a local value and skips ItemContainerStyle.
+        // Taking the implicit style here unconditionally meant a consumer-supplied
+        // ItemContainerStyle only ever reached the root row — every deeper level silently
+        // fell back to the theme default.
+        var cachedStyle = EffectiveChildContainerStyle();
 
         // Build all child containers first, without adding to any collection
         var childContainers = new List<object>();
@@ -2090,6 +2149,9 @@ public class TreeViewItem : HeaderedItemsControl
             _suppressChildItemsChanged = false;
         }
 
+        // 记住这批「模板生成的」子容器，供容器回收 / 重新 Prepare 时精确撤销。
+        _templateRealizedChildren = childContainers;
+
         // Set parent/level metadata
         for (int i = 0; i < childContainers.Count; i++)
         {
@@ -2104,6 +2166,323 @@ public class TreeViewItem : HeaderedItemsControl
         // Standard pipeline handles panel population via RefreshItems
         UpdateExpanderVisibility();
         InvalidateMeasure();
+    }
+
+    /// <summary>
+    /// 记住 <see cref="HierarchicalDataTemplate"/> 解析出的子集合并订阅它的集合变更，让数据节点
+    /// 运行时往 <c>Children</c> 增删能反映到 UI（WPF 下 HDT 绑 ObservableCollection 本就是这个行为）。<br/>
+    /// 换绑 / 容器复用时先解掉上一份订阅，避免旧数据节点把容器 root 住。
+    /// </summary>
+    private void AttachBoundChildSource(IEnumerable? source, HierarchicalDataTemplate? template)
+    {
+        DetachBoundChildSource();
+
+        _boundChildSource = source;
+        _boundChildTemplate = template;
+
+        if (source is System.Collections.Specialized.INotifyCollectionChanged incc)
+        {
+            _boundChildCollectionHandler = OnBoundChildCollectionChanged;
+            incc.CollectionChanged += _boundChildCollectionHandler;
+        }
+    }
+
+    /// <summary>解掉 <see cref="AttachBoundChildSource"/> 建立的集合订阅。幂等。</summary>
+    private void DetachBoundChildSource()
+    {
+        if (_boundChildSource is System.Collections.Specialized.INotifyCollectionChanged incc &&
+            _boundChildCollectionHandler != null)
+        {
+            incc.CollectionChanged -= _boundChildCollectionHandler;
+        }
+
+        _boundChildCollectionHandler = null;
+        _boundChildSource = null;
+        _boundChildTemplate = null;
+    }
+
+    /// <summary>
+    /// 绑定的子集合发生增删 → 按集合当前内容重新实例化子容器。<br/>
+    /// 展开着的节点立刻重建并重填面板；仍收起的节点只重新 arm 延迟状态机 + 刷新展开箭头，
+    /// 真正的容器创建照旧留到首次展开（保持大树的延迟实例化收益）。
+    /// </summary>
+    private void OnBoundChildCollectionChanged(
+        object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+    {
+        var source = _boundChildSource;
+        if (source == null)
+        {
+            return;
+        }
+
+        var template = _boundChildTemplate;
+
+        // 单纯的增 / 删走增量。懒加载回填的典型形态是 Clear() 之后逐个 Add 几十上百个子项，
+        // 每次都全量重建的话第 i 次要造 i 个容器 —— O(n²)，几百个成员就肉眼可见地卡。
+        if (_childrenRealized && TryApplyIncrementalChildChange(e, template))
+        {
+            UpdateExpanderVisibility();
+            if (IsExpanded)
+            {
+                RefreshItems();
+            }
+
+            InvalidateMeasure();
+            ParentTreeView?.InvalidateMeasure();
+            return;
+        }
+
+        // 其余形态（Reset / Replace / Move，或索引对不上）：撤销上一批模板生成的子容器
+        // （同时把延迟状态机复位）再按新内容重新 arm —— 等价于「拿新数据重走一次首次应用」，
+        // 也就不会出现新旧子树并存。
+        ClearTemplateRealizedChildren();
+
+        if (HasAnyItem(source))
+        {
+            _deferredItemsSource = source;
+            _deferredTemplate = template;
+            _childrenRealized = false;
+
+            if (IsExpanded)
+            {
+                EnsureChildrenRealized();
+                RefreshItems();
+            }
+        }
+
+        UpdateExpanderVisibility();
+        InvalidateMeasure();
+        ParentTreeView?.InvalidateMeasure();
+    }
+
+    /// <summary>
+    /// 把子集合的一次 Add / Remove 增量地施加到已实例化的子容器上，避免整批重建。<br/>
+    /// 返回 false = 这次变更没法增量处理（Reset / Replace / Move、索引越界，或 Items 里
+    /// 还混着 XAML 手写的子项使索引对不上），调用方回退到全量重建。
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage("Trimming", "IL2026:RequiresUnreferencedCode",
+        Justification = "Same opt-in contract as EnsureChildrenRealized: only reached on the HierarchicalDataTemplate path the consumer chose, where ApplyHierarchicalDataTemplate's reflection-based child/state resolution is the documented prerequisite.")]
+    private bool TryApplyIncrementalChildChange(
+        System.Collections.Specialized.NotifyCollectionChangedEventArgs e,
+        HierarchicalDataTemplate? template)
+    {
+        var realized = _templateRealizedChildren;
+
+        // 索引必须能一一对应到 Items —— 混入 XAML 手写子项时对不上，交给全量重建。
+        if (realized is null || realized.Count != Items.Count)
+        {
+            return false;
+        }
+
+        switch (e.Action)
+        {
+            case System.Collections.Specialized.NotifyCollectionChangedAction.Add
+                when e.NewItems is { Count: > 0 } added && e.NewStartingIndex >= 0
+                     && e.NewStartingIndex <= realized.Count:
+            {
+                var cachedStyle = EffectiveChildContainerStyle();
+                for (var i = 0; i < added.Count; i++)
+                {
+                    var childItem = added[i];
+                    if (childItem is null)
+                    {
+                        return false;
+                    }
+
+                    var index = e.NewStartingIndex + i;
+                    var container = CreateChildContainer(childItem, template, cachedStyle);
+                    Items.Insert(index, container);
+                    realized.Insert(index, container);
+                }
+                return true;
+            }
+
+            case System.Collections.Specialized.NotifyCollectionChangedAction.Remove
+                when e.OldItems is { Count: > 0 } removed && e.OldStartingIndex >= 0
+                     && e.OldStartingIndex + removed.Count <= realized.Count:
+            {
+                for (var i = removed.Count - 1; i >= 0; i--)
+                {
+                    var index = e.OldStartingIndex + i;
+                    if (realized[index] is TreeViewItem childTvi)
+                    {
+                        childTvi.ResetContainerState();
+                        childTvi.ParentTreeView = null;
+                        childTvi.ParentItem = null;
+                    }
+
+                    Items.RemoveAt(index);
+                    realized.RemoveAt(index);
+                }
+                return true;
+            }
+
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// 本节点生成子容器时该套的样式：<see cref="ItemsControl.ItemContainerStyle"/>（本节点自己的，
+    /// 通常由 <see cref="ApplyHierarchicalDataTemplate"/> 从 HierarchicalDataTemplate 拷过来）
+    /// → 宿主 TreeView 上设的那份 → 隐式默认样式。
+    ///
+    /// <para>前两级缺一不可：只在 TreeView 上写 <c>ItemContainerStyle</c> 是最自然的用法
+    /// （WPF 的 HeaderedItemsControl 也是这样逐级传下去的），只在 HierarchicalDataTemplate
+    /// 上写则是本框架 HDT 路径的写法。两条都得认，否则"根行变了、子行没变"。</para>
+    /// </summary>
+    private Style? EffectiveChildContainerStyle()
+        => ItemContainerStyle
+           ?? ParentTreeView?.ItemContainerStyle
+           ?? ResolveImplicitTreeViewItemStyle();
+
+    /// <summary>
+    /// 隐式 <c>TreeViewItem</c> 默认样式，按 TreeView 缓存一次（子容器成百上千，每个都做一次
+    /// 资源字典向上查找是可观的开销）。仅在没有 <see cref="ItemsControl.ItemContainerStyle"/>
+    /// 时才用得上。
+    /// </summary>
+    private Style? ResolveImplicitTreeViewItemStyle()
+    {
+        var cached = ParentTreeView?._cachedTreeViewItemStyle
+            ?? TryFindResource(typeof(TreeViewItem)) as Style;
+        if (cached != null && ParentTreeView != null)
+        {
+            ParentTreeView._cachedTreeViewItemStyle = cached;
+        }
+        return cached;
+    }
+
+    /// <summary>造一个模板生成的子容器（与 <see cref="EnsureChildrenRealized"/> 里那段等价）。</summary>
+    [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("HierarchicalDataTemplate ItemsSource may resolve via PropertyAccessorRegistry reflection on data items.")]
+    private TreeViewItem CreateChildContainer(object childItem, HierarchicalDataTemplate? template, Style? cachedStyle)
+    {
+        if (childItem is TreeViewItem existing)
+        {
+            existing.ParentTreeView = ParentTreeView;
+            existing.ParentItem = this;
+            existing.Level = Level + 1;
+            return existing;
+        }
+
+        var container = new TreeViewItem
+        {
+            Header = childItem,
+            DataContext = childItem,
+        };
+
+        if (cachedStyle != null && container.Style == null)
+        {
+            container.Style = cachedStyle;
+        }
+
+        if (template != null)
+        {
+            ApplyHierarchicalDataTemplate(container, childItem, template);
+        }
+
+        container.ParentTreeView = ParentTreeView;
+        container.ParentItem = this;
+        container.Level = Level + 1;
+        return container;
+    }
+
+    /// <summary>集合是否至少有一项 —— 只推进一步枚举器，不遍历全集合。</summary>
+    private static bool HasAnyItem(IEnumerable source)
+    {
+        var enumerator = source.GetEnumerator();
+        try
+        {
+            return enumerator.MoveNext();
+        }
+        finally
+        {
+            (enumerator as IDisposable)?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// 撤销上一次 <see cref="ApplyHierarchicalDataTemplate"/> / <see cref="EnsureChildrenRealized"/>
+    /// 在本容器上生成的子项，把延迟实例化状态机复位到「尚未 arm」。<br/>
+    /// 只移除本控件自己生成的那批容器（<see cref="_templateRealizedChildren"/>），使用者在 XAML 里
+    /// 手写的 <c>&lt;TreeViewItem&gt;</c> 子项不受影响。被移除的子容器递归做一次完整
+    /// <see cref="ResetContainerState"/>，顺带解掉整棵陈旧子树对旧数据节点的 INPC 订阅。
+    /// </summary>
+    internal void ClearTemplateRealizedChildren()
+    {
+        var realized = _templateRealizedChildren;
+        _templateRealizedChildren = null;
+
+        // 延迟状态机复位：调用方紧接着会用新数据重新 arm。
+        _deferredItemsSource = null;
+        _deferredTemplate = null;
+        _childrenRealized = false;
+
+        if (realized is null || realized.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var child in realized)
+        {
+            if (child is not TreeViewItem childTvi)
+            {
+                continue;
+            }
+
+            childTvi.ResetContainerState();
+            childTvi.ParentTreeView = null;
+            childTvi.ParentItem = null;
+        }
+
+        // Items 里除了这批还可能有别的（理论上不会同时出现，但按引用删更安全）。
+        if (Items.Count == realized.Count)
+        {
+            Items.Clear();
+        }
+        else
+        {
+            foreach (var child in realized)
+            {
+                Items.Remove(child);
+            }
+        }
+
+        UpdateExpanderVisibility();
+    }
+
+    /// <summary>
+    /// 容器被回收进对象池（或被丢弃）前的完整复位 —— 与 <c>PrepareContainerForItem</c> +
+    /// <see cref="ApplyHierarchicalDataTemplate"/> 对称：解除数据节点桥接、丢掉模板生成的子树、
+    /// 清掉展开 / 选中的本地值。<br/>
+    /// 顺序要求：<b>必须先解除桥接再清 IsExpanded / IsSelected</b>。反过来的话
+    /// <see cref="OnIsExpandedChanged"/> / <see cref="OnIsSelectedChanged"/> 会把 false 回写进
+    /// <c>_bridgedDataItem</c>，把仍在使用中的数据节点的展开 / 选中状态抹掉。
+    /// </summary>
+    internal void ResetContainerState()
+    {
+        if (_bridgedDataItem is System.ComponentModel.INotifyPropertyChanged oldInpc &&
+            _bridgedINPCHandler != null)
+        {
+            oldInpc.PropertyChanged -= _bridgedINPCHandler;
+        }
+        _bridgedINPCHandler = null;
+        _bridgedDataItem = null;
+
+        // 子集合订阅与数据节点桥接同属「指向旧 dataItem 的引用」，一并解掉；
+        // ClearTemplateRealizedChildren 刻意不做这件事 —— 它也被 ApplyHierarchicalDataTemplate
+        // 的开头调用，那条路径紧接着就要重新订阅同一个集合。
+        DetachBoundChildSource();
+
+        ClearTemplateRealizedChildren();
+
+        if (IsExpanded)
+        {
+            ClearValue(IsExpandedProperty);
+        }
+        if (IsSelected)
+        {
+            ClearValue(IsSelectedProperty);
+        }
     }
 
     [System.Diagnostics.CodeAnalysis.RequiresUnreferencedCode("HierarchicalDataTemplate ItemsSource path is resolved against runtime types via PropertyAccessorRegistry.")]

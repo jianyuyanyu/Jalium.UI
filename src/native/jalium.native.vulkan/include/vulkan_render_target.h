@@ -109,6 +109,7 @@ public:
     void DestroyRetainedLayer(void* layer) override;
     void DrawBackdropFilter(float x, float y, float w, float h, const char* backdropFilter, const char* material, const char* materialTint, float tintOpacity, float blurRadius, float cornerRadiusTL, float cornerRadiusTR, float cornerRadiusBR, float cornerRadiusBL) override;
     void DrawBackdropFilterEx(float x, float y, float w, float h, const char* backdropFilter, const char* material, const char* materialTint, float tintOpacity, float blurRadius, float noiseIntensity, float saturation, float luminosity, float cornerRadiusTL, float cornerRadiusTR, float cornerRadiusBR, float cornerRadiusBL) override;
+    void DrawBackdropMaterial(const JaliumBackdropMaterialDesc& desc) override;
     void DrawGlowingBorderHighlight(float x, float y, float w, float h, float animationPhase, float glowColorR, float glowColorG, float glowColorB, float strokeWidth, float trailLength, float dimOpacity, float screenWidth, float screenHeight) override;
     void DrawGlowingBorderTransition(float fromX, float fromY, float fromW, float fromH, float toX, float toY, float toW, float toH, float headProgress, float tailProgress, float animationPhase, float glowColorR, float glowColorG, float glowColorB, float strokeWidth, float trailLength, float dimOpacity, float screenWidth, float screenHeight) override;
     void DrawRippleEffect(float x, float y, float w, float h, float rippleProgress, float glowColorR, float glowColorG, float glowColorB, float strokeWidth, float dimOpacity, float screenWidth, float screenHeight) override;
@@ -450,6 +451,19 @@ private:
         float uvOffsetY = 0.0f;
         float uvScaleX = 1.0f;
         float uvScaleY = 1.0f;
+        // Material colour pipeline (JaliumBackdropMaterialDesc), replayed as
+        // the two trailing float4s of BackdropPushConstants. Defaults are the
+        // identity so the legacy string entry points render unchanged.
+        float brightness = 1.0f;
+        float contrast = 1.0f;
+        float hueRotation = 0.0f;
+        float grayscale = 0.0f;
+        float sepia = 0.0f;
+        float invert = 0.0f;
+        float opacity = 1.0f;
+        // Frosted kernel: per-pixel sample jitter in sampled-source texels
+        // (0 = none). Set from the material blur type at record time.
+        float frostJitter = 0.0f;
     };
 
     struct GpuGlowCommand {
@@ -879,7 +893,20 @@ private:
     // Used on the GPU replay path, where BeginEffectCapture is a pass-through so
     // the element already rendered into the frame.
     bool TryRecordGpuLiveBlurCommand(float x, float y, float w, float h, float radius, float opacity, bool alphaOnlyTint = false, float tintR = 0.0f, float tintG = 0.0f, float tintB = 0.0f, float tintA = 1.0f, bool sourceOffscreen = false);
-    bool TryRecordGpuBackdropCommand(const std::vector<uint8_t>& pixels, uint32_t pixelWidth, uint32_t pixelHeight, float x, float y, float w, float h, float blurRadius, float cornerRadiusTL, float cornerRadiusTR, float cornerRadiusBR, float cornerRadiusBL, float tintR, float tintG, float tintB, float tintOpacity, float saturation = 1.0f, float noiseIntensity = 0.0f, float luminosity = 1.0f, bool remapSourceUv = false);
+    // Material extras for TryRecordGpuBackdropCommand (nullptr = identity):
+    // the colour pipeline and kernel family that the legacy string entry
+    // points cannot express. blurType is a JaliumBackdropBlurType.
+    struct BackdropMaterialExtra {
+        uint32_t blurType = 0;
+        float brightness = 1.0f;
+        float contrast = 1.0f;
+        float hueRotation = 0.0f;
+        float grayscale = 0.0f;
+        float sepia = 0.0f;
+        float invert = 0.0f;
+        float opacity = 1.0f;
+    };
+    bool TryRecordGpuBackdropCommand(const std::vector<uint8_t>& pixels, uint32_t pixelWidth, uint32_t pixelHeight, float x, float y, float w, float h, float blurRadius, float cornerRadiusTL, float cornerRadiusTR, float cornerRadiusBR, float cornerRadiusBL, float tintR, float tintG, float tintB, float tintOpacity, float saturation = 1.0f, float noiseIntensity = 0.0f, float luminosity = 1.0f, bool remapSourceUv = false, const BackdropMaterialExtra* extra = nullptr);
     bool TryRecordGpuGlowCommand(float x, float y, float w, float h, float cornerRadius, float strokeWidth, float glowR, float glowG, float glowB, float glowA, float dimOpacity, float intensity);
     bool TryRecordGpuLiquidGlassCommand(const std::vector<uint8_t>& pixels, uint32_t pixelWidth, uint32_t pixelHeight, float x, float y, float w, float h, float cornerRadius, float blurRadius, float refractionAmount, float chromaticAberration, float tintR, float tintG, float tintB, float tintOpacity, float lightX, float lightY, float highlightBoost, int shapeType, float shapeExponent, int neighborCount, float fusionRadius, const float* neighborData);
     bool TryRecordGpuDimOutsideRectCommand(float x, float y, float w, float h, uint8_t b, uint8_t g, uint8_t r, uint8_t a);

@@ -487,6 +487,76 @@ public sealed class BitmapDeferredDecodeTests
     }
 
     /// <summary>
+    /// <c>PreloadAsync</c> is the public "I know this source is about to be shown" hook: it decodes
+    /// a deferred source without anything drawing it, at the display bucket the given device-pixel
+    /// slot resolves to, and completes once those pixels are published.
+    /// </summary>
+    /// <remarks>
+    /// Before it existed the only way to get ahead of the first draw was the eager
+    /// <c>FromBytes</c> path — a synchronous full-resolution decode that also disables the bucket
+    /// ladder — so a sprite animation built from URI-backed frames had each frame miss its first
+    /// draw (the decode started when the frame was shown and the frame painted nothing until it
+    /// landed), which read as a flicker on the first playback and never again.
+    /// </remarks>
+    [Fact]
+    public async Task PreloadAsyncDecodesADeferredSourceBeforeAnythingDrawsIt()
+    {
+        var decoder = new RecordingImageDecoder { NaturalWidth = 1024, NaturalHeight = 512 };
+        BitmapImage.SetDecoder(decoder);
+
+        using var file = new TempImageFile();
+        using var image = file.CreateDeferredImage();
+
+        Assert.Equal(0, decoder.DecodeCalls);
+        Assert.True(image.IsDeferredDecodePending);
+
+        await image.PreloadAsync(100, 50).WaitAsync(ImagePipelineTestHarness.DecodeTimeout);
+
+        // Pixels are resident at the bucket the slot resolves to, so a draw at that size can no
+        // longer miss; the intrinsic size is canonical, exactly as after a draw-driven decode.
+        Assert.Equal(1, decoder.DecodeCalls);
+        Assert.False(image.IsDeferredDecodePending);
+        Assert.True(image.TryGetPixelSnapshot(out var snapshot));
+        Assert.NotNull(snapshot);
+        Assert.Equal((128, 64), ImagePipelineTestHarness.PublishedBucket(image));
+        Assert.Equal(1024, image.PixelWidth);
+        Assert.Equal(512, image.PixelHeight);
+
+        // Idempotent: a request the published bucket already covers is a completed task and no
+        // decode, so a caller may re-preload on every state change without cost.
+        var repeat = image.PreloadAsync(100, 50);
+        Assert.True(repeat.IsCompletedSuccessfully);
+        Assert.Equal(1, decoder.DecodeCalls);
+
+        // A larger slot is an upgrade through the same ladder. The previous pixels stay drawable
+        // until the new bucket lands (the snapshot is replaced, never cleared).
+        await image.PreloadAsync(1000, 500).WaitAsync(ImagePipelineTestHarness.DecodeTimeout);
+        Assert.Equal(2, decoder.DecodeCalls);
+        Assert.Equal((1024, 512), ImagePipelineTestHarness.PublishedBucket(image));
+        Assert.True(image.TryGetPixelSnapshot(out _));
+    }
+
+    [Fact]
+    public void PreloadAsyncRejectsNegativeSizesAndIsANoOpForAnEagerSource()
+    {
+        var decoder = new RecordingImageDecoder { NaturalWidth = 16, NaturalHeight = 16 };
+        BitmapImage.SetDecoder(decoder);
+
+        using var file = new TempImageFile();
+        using var deferred = file.CreateDeferredImage();
+        // The guard throws synchronously, before any task exists — an Action lambda, deliberately,
+        // so the assertion sees the throw itself and not a faulted Task.
+        Assert.Throws<ArgumentOutOfRangeException>(() => { _ = deferred.PreloadAsync(-1, 10); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { _ = deferred.PreloadAsync(10, -1); });
+
+        // An eager source already owns its pixels: nothing to wait for, nothing scheduled.
+        var eager = BitmapImage.FromBytes([0x89, 0x50, 0x4E, 0x47]);
+        var calls = decoder.DecodeCalls;
+        Assert.True(eager.PreloadAsync(10, 10).IsCompletedSuccessfully);
+        Assert.Equal(calls, decoder.DecodeCalls);
+    }
+
+    /// <summary>
     /// The four corner pixels of a publication, in BGRA order, as one 16-byte probe.
     /// </summary>
     private static byte[] SampleCorners(BitmapPixelSnapshot snapshot)

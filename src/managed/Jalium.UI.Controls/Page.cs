@@ -331,7 +331,7 @@ public class Page : FrameworkElement, IAddChild, IWindowService
                 _appliedTemplateTriggers = Template.Triggers;
                 foreach (TriggerBase trigger in _appliedTemplateTriggers)
                 {
-                    trigger.ParentTemplateTriggers = _appliedTemplateTriggers;
+                    trigger.DeclareTemplateOwner(_appliedTemplateTriggers, hostIsTemplatedParent: true);
                     trigger.Attach(this);
                 }
             }
@@ -357,8 +357,8 @@ public class Page : FrameworkElement, IAddChild, IWindowService
         {
             foreach (TriggerBase trigger in _appliedTemplateTriggers)
             {
+                // 模板归属是 trigger 的不变量，共享模板下不能清空——见 Control.ClearTemplateContent。
                 trigger.Detach(this);
-                trigger.ParentTemplateTriggers = null;
             }
             _appliedTemplateTriggers = null;
         }

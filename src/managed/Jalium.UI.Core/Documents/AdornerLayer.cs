@@ -185,6 +185,8 @@ public sealed class AdornerLayer : FrameworkElement
     /// </summary>
     protected override Size MeasureOverride(Size constraint)
     {
+        PruneOrphanedAdorners();
+
         foreach (var info in _adorners)
         {
             info.Adorner.Measure(constraint);
@@ -199,6 +201,8 @@ public sealed class AdornerLayer : FrameworkElement
     /// </summary>
     protected override Size ArrangeOverride(Size finalSize)
     {
+        PruneOrphanedAdorners();
+
         foreach (var info in _adorners)
         {
             var adorner = info.Adorner;
@@ -214,6 +218,74 @@ public sealed class AdornerLayer : FrameworkElement
 
         return finalSize;
     }
+
+    /// <summary>
+    /// Drops adorners whose adorned element has left the subtree this layer serves — removed
+    /// together with its page, replaced by a template rebuild, recycled by a virtualizing panel
+    /// (WPF <c>AdornerLayer.UpdateAdorner</c> semantics). An adorner is positioned from its
+    /// element's bounds, so one that outlives its element keeps painting at the element's last
+    /// location; running the sweep from layout makes it vanish in the same frame the element
+    /// does instead of whenever its owner next notices. Deliberately does not invalidate layout:
+    /// it runs from inside Measure/Arrange.
+    /// </summary>
+    private void PruneOrphanedAdorners()
+    {
+        if (_adorners.Count == 0)
+            return;
+
+        var host = GetHost();
+        if (host is null)
+            return;
+
+        for (var index = _adorners.Count - 1; index >= 0; index--)
+        {
+            var adorner = _adorners[index].Adorner;
+            if (IsAncestorOrSelf(host, adorner.AdornedElement))
+                continue;
+
+            _adorners.RemoveAt(index);
+            RemoveVisualChild(adorner);
+            InvalidateVisual();
+        }
+    }
+
+    /// <summary>
+    /// The element whose subtree this layer adorns: the nearest ancestor that hands this very
+    /// layer out (<see cref="IAdornerLayerHost"/> or <see cref="AdornerDecorator"/>), falling
+    /// back to the visual root for a layer parented some other way. Null while the layer itself
+    /// is detached — nothing is pruned then; the sweep resumes once it is back in a tree.
+    /// </summary>
+    private Visual? GetHost()
+    {
+        Visual? top = null;
+        var depth = 0;
+        for (Visual? current = InternalVisualParent; current is not null && depth++ < MaxTreeDepth; current = current.VisualParent)
+        {
+            if (current is IAdornerLayerHost host && ReferenceEquals(host.AdornerLayer, this))
+                return current;
+
+            if (current is AdornerDecorator decorator && ReferenceEquals(decorator.AdornerLayer, this))
+                return current;
+
+            top = current;
+        }
+
+        return top;
+    }
+
+    private static bool IsAncestorOrSelf(Visual ancestor, Visual element)
+    {
+        var depth = 0;
+        for (Visual? current = element; current is not null && depth++ < MaxTreeDepth; current = current.VisualParent)
+        {
+            if (ReferenceEquals(current, ancestor))
+                return true;
+        }
+
+        return false;
+    }
+
+    private const int MaxTreeDepth = 4096;
 
     /// <summary>
     /// Renders the adorner layer.

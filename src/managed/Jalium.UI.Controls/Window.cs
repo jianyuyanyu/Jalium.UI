@@ -383,6 +383,34 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     // override is picked up after the first present so the flush still covers every
     // buffer.
     private int _lastSwapBufferCount = 2;
+    // ── Full-frame witness, for the idle-resource reclaimer ──────────────
+    // Wall-clock tick at which the most recent SUCCESSFULLY PRESENTED whole-window frame BEGAN
+    // rendering (full or promoted; a partial frame never counts).
+    //
+    // The reclaimer needs to know whether a visual is still on screen, and asks
+    // Visual.LastRenderedTickMs — "when did this element last paint". Under partial presents that
+    // question does not answer the one being asked: an element that is perfectly visible but has
+    // not CHANGED is outside every dirty rect and therefore paints on no frame at all, for as long
+    // as the user leaves it alone. Left on its own the reclaimer reads that as "off screen" and
+    // frees the element's resources — for an Image, the decoded pixels and GPU upload of a bitmap
+    // the window is displaying right now.
+    //
+    // Pairing the two stamps restores the intended meaning: a whole-window frame that began AFTER
+    // the element last painted, and still did not paint it, is proof the element was not on screen
+    // during that frame — whether it was collapsed, detached, or scrolled out of the viewport. The
+    // frame's START is recorded rather than its end so an element painted during a frame that
+    // straddles a tick boundary is never mistaken for one the frame skipped.
+    private long _lastFullFramePaintStartTickMs;
+
+    /// <summary>
+    /// Tick at which this window's most recent presented whole-window frame started rendering, or
+    /// 0 when it has never presented one.
+    /// </summary>
+    internal long LastFullFramePaintStartTickMs => Volatile.Read(ref _lastFullFramePaintStartTickMs);
+
+    private void MarkFullFramePainted(long frameStartTickMs) =>
+        Volatile.Write(ref _lastFullFramePaintStartTickMs, frameStartTickMs);
+
     private long _lastRenderTicks;          // Timestamp of last completed render (for rate-limiting)
     // Monotonic count of frames that reached a successful Present. Unlike
     // _lastRenderTicks it cannot alias when two fast frames finish in the same
@@ -465,6 +493,15 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     private readonly Jalium.UI.WindowCollection _ownedWindowCollection;
     private const double DefaultTitleBarHeightDip = 32.0;
     private const int GpuBusyRetryDelayMs = 1;
+    // Consecutive TryBeginDraw failures. The first few retries stay at
+    // GpuBusyRetryDelayMs (a one-frame GPU hiccup must not add latency); a
+    // longer streak backs off geometrically up to one refresh interval so a
+    // surface that keeps refusing frames (throttled GPU, WSI repair window)
+    // cannot turn the retry into a ~1 kHz layout + dirty-region spin — on a
+    // phone that is a positive thermal feedback loop (hotter → GPU throttles
+    // → more failures → faster spin). Reset by every successful BeginDraw.
+    private int _beginDrawFailureStreak;
+    private const int GpuBusyRetryFastAttempts = 4;
     private const int RenderRecoveryRetryInitialDelayMs = 120;
     private const int RenderRecoveryRetryMaxDelayMs = 2000;
     private const int DeviceLostBackendFallbackThreshold = 2;
@@ -1456,12 +1493,52 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         CreateTitleBar();
 
         EnsureImageContentInvalidationHook();
+        EnsureOrphanedFocusImeHook();
     }
 
     /// <summary>
     /// Set once the process-wide image-content repaint hook has been installed.
     /// </summary>
     private static int s_imageContentHookInstalled;
+
+    /// <summary>
+    /// Set once the process-wide orphaned-focus IME hook has been installed.
+    /// </summary>
+    private static int s_orphanedFocusImeHookInstalled;
+
+    /// <summary>
+    /// The routed Got/LostKeyboardFocus handlers keep each window's IME association in step
+    /// with focus changes that route through that window. Focus dropped from an element that has
+    /// already left its window — the deferred revalidation after a page swap or template rebuild —
+    /// routes through nothing, so without this a text control's IME context would stay attached
+    /// to the window while nothing can receive the composition. Process-wide and never
+    /// unsubscribed for the same reason as the image hook: it holds no window reference and
+    /// re-snapshots the live window set on every call.
+    /// </summary>
+    private static void EnsureOrphanedFocusImeHook()
+    {
+        if (Interlocked.CompareExchange(ref s_orphanedFocusImeHookInstalled, 1, 0) != 0)
+        {
+            return;
+        }
+
+        UIElement.IsKeyboardFocusedChangedStatic += OnAnyKeyboardFocusedChanged;
+    }
+
+    private static void OnAnyKeyboardFocusedChanged(UIElement element, bool isFocused)
+    {
+        // The provider assigns the new focused element before raising the old one's
+        // transition, so this only fires when focus was cleared outright — the one case the
+        // routed handlers cannot cover when the old element sits outside every window.
+        if (isFocused || Keyboard.FocusedElement is not null)
+            return;
+
+        var windows = SnapshotOpenWindows();
+        for (var i = 0; i < windows.Length; i++)
+        {
+            windows[i].UpdateInputMethodAssociation();
+        }
+    }
 
     /// <summary>
     /// Installs the one process-wide handler that turns "a batch of images finished decoding" into
@@ -3722,25 +3799,8 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             }
         }
 
-        uint dwExStyle = TitleBarStyle == WindowTitleBarStyle.Custom
-            ? WS_EX_APPWINDOW
-            : 0;
-
-        if (!ShowInTaskbar)
-        {
-            dwExStyle |= WS_EX_TOOLWINDOW;
-            dwExStyle &= ~WS_EX_APPWINDOW;
-        }
-
-        if (AllowsTransparency)
-        {
-            // Use WS_EX_NOREDIRECTIONBITMAP so the HWND has no redirection
-            // surface and the render backend can present through DirectComposition
-            // for real per-pixel transparency. WS_EX_LAYERED would only support
-            // uniform GDI alpha and does not composite D3D12 swap chains, which
-            // made layered fullscreen windows appear click-through.
-            dwExStyle |= WS_EX_NOREDIRECTIONBITMAP;
-        }
+        uint dwExStyle = ComputeWin32ExStyle(
+            TitleBarStyle, ShowInTaskbar, AllowsTransparency, Topmost);
 
         // Query system DPI for initial window sizing (before HWND exists)
         uint systemDpi = GetDpiForSystem();
@@ -3980,6 +4040,57 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         if (allowsTransparency)
             style |= Transparent;
         return style;
+    }
+
+    /// <summary>
+    /// Builds the Win32 <c>dwExStyle</c> passed to <c>CreateWindowEx</c>.
+    /// </summary>
+    /// <remarks>
+    /// Extracted from <c>EnsureHandle</c> so the flag matrix is unit-testable — it is
+    /// the only place several window properties are honoured, and a property missing
+    /// here is silently dropped for the whole life of the window.
+    ///
+    /// <para><b>Topmost must be handled here.</b> <c>OnTopmostChanged</c> returns early
+    /// while <c>Handle</c> is still zero, which is exactly the case for
+    /// <c>Topmost = true</c> assigned in a constructor — the normal way to declare an
+    /// always-on-top overlay. Before this was added such windows were created without
+    /// <c>WS_EX_TOPMOST</c> and never became topmost: drag-and-drop guide overlays were
+    /// created, sized and positioned correctly but rendered *under* the window being
+    /// dragged, so the drop targets were invisible and a floating window could never be
+    /// docked back.</para>
+    /// </remarks>
+    internal static uint ComputeWin32ExStyle(
+        WindowTitleBarStyle titleBarStyle,
+        bool showInTaskbar,
+        bool allowsTransparency,
+        bool topmost)
+    {
+        uint dwExStyle = titleBarStyle == WindowTitleBarStyle.Custom
+            ? WS_EX_APPWINDOW
+            : 0;
+
+        if (!showInTaskbar)
+        {
+            dwExStyle |= WS_EX_TOOLWINDOW;
+            dwExStyle &= ~WS_EX_APPWINDOW;
+        }
+
+        if (allowsTransparency)
+        {
+            // Use WS_EX_NOREDIRECTIONBITMAP so the HWND has no redirection
+            // surface and the render backend can present through DirectComposition
+            // for real per-pixel transparency. WS_EX_LAYERED would only support
+            // uniform GDI alpha and does not composite D3D12 swap chains, which
+            // made layered fullscreen windows appear click-through.
+            dwExStyle |= WS_EX_NOREDIRECTIONBITMAP;
+        }
+
+        if (topmost)
+        {
+            dwExStyle |= WS_EX_TOPMOST;
+        }
+
+        return dwExStyle;
     }
 
     internal static WindowState MapPlatformWindowState(int nativeState) => nativeState switch
@@ -7292,7 +7403,8 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     return nint.Zero;
 
                 case WM_CAPTURECHANGED:
-                    window._inputDispatcher.HandleNativeCaptureChanged();
+                    // lParam = 即将拿到捕获的窗口；等于自己时不算丢捕获，理由见 HandleNativeCaptureChanged。
+                    window._inputDispatcher.HandleNativeCaptureChanged(lParam, hWnd);
                     return nint.Zero;
 
                 case WM_CANCELMODE:
@@ -9763,6 +9875,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             }
             if (RenderTarget?.TryBeginDraw() == true)
             {
+                Volatile.Write(ref _beginDrawFailureStreak, 0);
                 return true;
             }
             // external pacing 下 BeginDraw 不等 waitable，失败=fence/设备问题。
@@ -9771,12 +9884,13 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
             _debugHud.OnBeginFail();
             Jalium.UI.Diagnostics.HoverTrace.Bump(Jalium.UI.Diagnostics.HoverTrace.BEGIN_FAIL);
             if (DebugRender) System.Diagnostics.Debug.WriteLine("[TryBeginDraw] FAIL: fence/device busy (credit returned)");
-            ScheduleDeferredRender(GpuBusyRetryDelayMs);
+            ScheduleDeferredRender(NextBeginDrawRetryDelayMs());
             return false;
         }
 
         if (RenderTarget?.TryBeginDraw() == true)
         {
+            Volatile.Write(ref _beginDrawFailureStreak, 0);
             return true;
         }
 
@@ -9792,9 +9906,27 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
         // 依赖 RenderFlag_DirtyBetween，总是调度 ProcessRender），这里与之对齐。
         // ScheduleDeferredRender 经 TrySetRenderFlag(Scheduled) 幂等：动画进行中与动画 tick
         // 并存也不会重复渲染（先到者渲染并清 dirty，后到者 RenderFlag_Rendering 早退）。
-        ScheduleDeferredRender(GpuBusyRetryDelayMs);
+        ScheduleDeferredRender(NextBeginDrawRetryDelayMs());
 
         return false;
+    }
+
+    /// <summary>
+    /// Retry delay for a failed TryBeginDraw: <see cref="GpuBusyRetryDelayMs"/> for the
+    /// first <see cref="GpuBusyRetryFastAttempts"/> consecutive failures, then doubling
+    /// per failure up to one refresh interval. See <see cref="_beginDrawFailureStreak"/>.
+    /// </summary>
+    private int NextBeginDrawRetryDelayMs()
+    {
+        int streak = Interlocked.Increment(ref _beginDrawFailureStreak);
+        if (streak <= GpuBusyRetryFastAttempts)
+        {
+            return GpuBusyRetryDelayMs;
+        }
+
+        int shift = Math.Min(streak - GpuBusyRetryFastAttempts, 6);
+        int capMs = Math.Max(GpuBusyRetryDelayMs, CompositionTarget.FrameIntervalMs);
+        return Math.Min(capMs, GpuBusyRetryDelayMs << shift);
     }
 
     /// <summary>
@@ -10230,6 +10362,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     return;
                 }
 
+                var fullFrameStartTick = Environment.TickCount64;
                 try
                 {
                     _debugHud.OnFull();
@@ -10244,6 +10377,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     if (AbortRenderFrameIfLifecycleChanged(frameLifecycleGeneration, frameRenderTarget)) return;
                     // EndDraw/present 失败不再丢脏：直接 return，捕获集由 finally 归还。
                     if (!CompleteOwnedNativeDrawSession()) { return; }
+                    MarkFullFramePainted(fullFrameStartTick);
                     // Present 成功——捕获的脏状态已经上屏，此刻才真正消费掉。
                     // RC4-c：结构性 full 跳过了 ComputeDirtyRegions（LastDirtyBounds 的
                     // 唯一常规写点），Discard 前必须补回写，否则首帧后缓存恒为陈旧值，
@@ -10386,6 +10520,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                     // 全量重涂后自然老化。
                     frameRenderTarget.SetFullInvalidation();
                     if (!TryBeginOwnedNativeDrawSession()) { return; }
+                    var promotedFrameStartTick = Environment.TickCount64;
                     try
                     {
                         _debugHud.OnPromoted();
@@ -10400,6 +10535,7 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
                         OnRender(frameRenderTarget);
                         if (AbortRenderFrameIfLifecycleChanged(frameLifecycleGeneration, frameRenderTarget)) return;
                         if (!CompleteOwnedNativeDrawSession()) { return; }
+                        MarkFullFramePainted(promotedFrameStartTick);
                         if (requiresBackBufferConvergence && !LegacyPromoteBehavior)
                         {
                             // painted(=全窗) ⊇ changed：以上界入 ring，不依赖"全树重放
@@ -11492,6 +11628,26 @@ public partial class Window : ContentControl, IWindowHost, ILayoutManagerHost, I
     /// <summary>
     /// Calls Win32 ReleaseCapture to stop capturing mouse messages outside the window.
     /// </summary>
+    /// <summary>
+    /// 兜底释放：仅当 Win32 捕获**确实**握在本窗口手里时才调 ReleaseCapture。
+    ///
+    /// <para>
+    /// 托管捕获与原生捕获是两笔账：<see cref="UIElement.OnNativeCaptureChanged"/>（WM_CAPTURECHANGED）
+    /// 按契约只清托管那笔、不碰原生，而 <see cref="UIElement.ReleaseMouseCapture"/> 只在
+    /// <c>_mouseCaptured == this</c> 时才释放原生。两者交错时（典型：按下按钮拿到捕获后，
+    /// tooltip / popup 中途 SetCapture 触发 WM_CAPTURECHANGED 把托管那笔清成 null）原生捕获就没人还了。
+    /// 而窗口一旦长期扣着 Win32 捕获，系统**不再发送 WM_SETCURSOR、也不再做标题栏命中** ——
+    /// 表现就是「光标卡在上一个形状不变」和「窗口拖不动」。
+    /// </para>
+    /// </summary>
+    internal void ReleaseNativeCaptureIfOwned()
+    {
+        if (!PlatformFactory.IsWindows) return;
+        if (Handle == nint.Zero) return;
+        if (GetCapture() != Handle) return;   // 捕获在别的窗口（例如 popup）手里，不能替它做主
+        _ = ReleaseCapture();
+    }
+
     public void ReleaseNativeCapture()
     {
         // Capture is framework-managed on the native platform backends. Test

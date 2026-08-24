@@ -14,6 +14,11 @@ struct PushConstants
     float4 quadPoint23;
     float2 geometryFlags;
     float2 uvRemapScale;    // (was padding2) source-uv scale over the panel quad
+    // Material colour pipeline (field-for-field with the D3D12
+    // snapshot-backdrop PS). Appended to BOTH the VS and FS blocks — the
+    // pipeline layout's push range spans both stages (VUID-10069).
+    float4 materialInfo0;   // x=brightness y=contrast z=hueRotation (radians) w=opacity
+    float4 materialInfo1;   // x=grayscale y=sepia z=invert w=frost jitter (source texels)
 };
 
 [[vk::push_constant]]
@@ -24,6 +29,72 @@ struct PsInput
     float4 position : SV_Position;
     float2 uv : TEXCOORD0;
 };
+
+// lowbias32 integer hash on the device pixel: stable per pixel, no visible
+// lattice, identical in the D3D12 snapshot-backdrop PS so the grain matches.
+uint HashPixel(uint2 p, uint salt)
+{
+    uint n = p.x * 1597334677u ^ p.y * 3812015801u ^ salt * 2654435761u;
+    n ^= n >> 16;
+    n *= 0x7feb352du;
+    n ^= n >> 15;
+    n *= 0x846ca68bu;
+    n ^= n >> 16;
+    return n;
+}
+
+float Hash01(uint2 p, uint salt)
+{
+    return (float)HashPixel(p, salt) * (1.0f / 4294967295.0f);
+}
+
+// Colour pipeline: the SAME order on every backend (D3D12 snapshot-backdrop
+// PS, the software backend). CSS backdrop-filter semantics: the filters act on
+// the backdrop, the tint composites on top:
+//   blur -> brightness -> contrast -> saturation -> hueRotation -> grayscale
+//        -> sepia -> invert -> tint -> luminosity -> noise
+float3 ApplyColorPipeline(float3 color)
+{
+    color *= max(gPushConstants.materialInfo0.x, 0.0f);
+    color = (color - 0.5f) * max(gPushConstants.materialInfo0.y, 0.0f) + 0.5f;
+
+    const float saturation = max(0.0f, gPushConstants.extraInfo.x);
+    float luma = dot(color, float3(0.299f, 0.587f, 0.114f));
+    color = lerp(float3(luma, luma, luma), color, saturation);
+
+    const float hue = gPushConstants.materialInfo0.z;
+    if (abs(hue) > 0.0001f) {
+        const float yv = dot(color, float3(0.299f, 0.587f, 0.114f));
+        const float iv = dot(color, float3(0.596f, -0.274f, -0.322f));
+        const float qv = dot(color, float3(0.211f, -0.523f, 0.312f));
+        const float c = cos(hue);
+        const float s = sin(hue);
+        const float i2 = iv * c - qv * s;
+        const float q2 = iv * s + qv * c;
+        color = float3(yv + 0.956f * i2 + 0.621f * q2,
+                       yv - 0.272f * i2 - 0.647f * q2,
+                       yv - 1.106f * i2 + 1.703f * q2);
+    }
+
+    luma = dot(color, float3(0.299f, 0.587f, 0.114f));
+    color = lerp(color, float3(luma, luma, luma), saturate(gPushConstants.materialInfo1.x));
+
+    const float3 sepia = float3(
+        dot(color, float3(0.393f, 0.769f, 0.189f)),
+        dot(color, float3(0.349f, 0.686f, 0.168f)),
+        dot(color, float3(0.272f, 0.534f, 0.131f)));
+    color = lerp(color, sepia, saturate(gPushConstants.materialInfo1.y));
+
+    color = lerp(color, 1.0f - color, saturate(gPushConstants.materialInfo1.z));
+
+    color = lerp(color, gPushConstants.tintColor.rgb, saturate(gPushConstants.tintColor.a));
+
+    // Luminosity (MicaEffect raises perceived brightness a few percent).
+    // extraInfo.w is an INDEPENDENT slot from extraInfo.z (the fallback
+    // alpha-floor switch).
+    color *= max(0.0f, gPushConstants.extraInfo.w);
+    return color;
+}
 
 float RoundedRectDistancePerCorner(float2 p, float2 halfSize, float4 radii)
 {
@@ -143,11 +214,20 @@ float4 main(PsInput input) : SV_Target
         panelUv = (input.position.xy - gPushConstants.rect.xy) /
             max(gPushConstants.rect.zw, float2(0.0001f, 0.0001f));
     }
-    const float2 srcUv = gPushConstants.uvRemapOffset +
+    float2 srcUv = gPushConstants.uvRemapOffset +
         panelUv * gPushConstants.uvRemapScale;
     const float2 texelStep = float2(
         gPushConstants.backdropInfo1.z,
         gPushConstants.backdropInfo1.w);
+    const uint2 pixel = (uint2)input.position.xy;
+
+    // Frosted kernel: jitter the resample position per pixel so the smooth
+    // Gaussian picks up a fine frost grain that tracks the content beneath.
+    const float frost = max(gPushConstants.materialInfo1.w, 0.0f);
+    if (frost > 0.0f) {
+        const float2 jitter = float2(Hash01(pixel, 11u), Hash01(pixel, 29u)) - 0.5f;
+        srcUv += jitter * frost * texelStep;
+    }
     const float radius = clamp(gPushConstants.backdropInfo1.y, 0.0f, 64.0f);
     const bool isVerticalPass = gPushConstants.backdropInfo1.x < 0.0f;
     const float2 validUvScale = float2(
@@ -181,25 +261,25 @@ float4 main(PsInput input) : SV_Target
     const float2 centeredPx = (input.uv - 0.5f) * panelSizePx;
     const float maxRadiusPx = min(halfSizePx.x, halfSizePx.y);
     const float4 radiiPx = clamp(gPushConstants.cornerRadii, 0.0f, maxRadiusPx);
-    if (RoundedRectDistancePerCorner(centeredPx, halfSizePx, radiiPx) > 0.0f) {
+    // Anti-aliased silhouette: the SDF is in pixel units, so a one-pixel
+    // smoothstep around the edge gives the same coverage ramp the D3D12
+    // shader derives from fwidth(). Fully outside pixels still discard so
+    // the blend never touches them.
+    const float cornerDist = RoundedRectDistancePerCorner(centeredPx, halfSizePx, radiiPx);
+    const float cornerCov = 1.0f - smoothstep(-0.5f, 0.5f, cornerDist);
+    if (cornerCov <= 0.0f) {
         discard;
     }
 
-    float3 color = lerp(blurred.rgb, gPushConstants.tintColor.rgb, gPushConstants.tintColor.a);
-    const float saturation = max(0.0f, gPushConstants.extraInfo.x);
-    const float luminance = dot(color, float3(0.299, 0.587, 0.114));
-    color = lerp(float3(luminance, luminance, luminance), color, saturation);
+    float3 color = ApplyColorPipeline(blurred.rgb);
 
-    // Luminosity (MicaEffect raises perceived brightness a few percent). Applied
-    // after tint+saturation and before noise, field-for-field with the D3D12
-    // snapshot-backdrop PS. extraInfo.w == 1 leaves the colour unchanged; it is
-    // an INDEPENDENT slot from extraInfo.z (the fallback-alpha-floor switch).
-    const float luminosity = max(0.0f, gPushConstants.extraInfo.w);
-    color *= luminosity;
-
+    // Full-range hash grain mixed at noiseIntensity (no 0.04 attenuation: the
+    // intensity IS the amplitude, 0.02-0.05 reads as Acrylic film grain).
     const float noiseIntensity = max(0.0f, gPushConstants.extraInfo.y);
-    const float noise = frac(sin(dot(input.position.xy, float2(12.9898, 78.233))) * 43758.5453);
-    color += (noise - 0.5) * noiseIntensity * 0.04;
+    if (noiseIntensity > 0.0f) {
+        color += (Hash01(pixel, 3u) - 0.5f) * noiseIntensity;
+    }
+    color = saturate(color);
 
     // A15: the 0.08 + tintA*0.25 alpha FLOOR is a legacy visibility hack for
     // the FALLBACK source only (TRANSFER_SRC capture unavailable → the sampled
@@ -209,5 +289,6 @@ float4 main(PsInput input) : SV_Target
     // flows through unmodified instead of being clamped up.
     const float fallbackFloor = saturate(gPushConstants.extraInfo.z);
     const float floorAlpha = (0.08 + gPushConstants.tintColor.a * 0.25) * fallbackFloor;
-    return float4(color, max(blurred.a, floorAlpha));
+    const float opacity = saturate(gPushConstants.materialInfo0.w);
+    return float4(color, max(blurred.a, floorAlpha) * cornerCov * opacity);
 }

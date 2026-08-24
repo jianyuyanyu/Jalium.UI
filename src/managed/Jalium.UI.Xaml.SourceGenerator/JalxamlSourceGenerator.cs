@@ -508,10 +508,27 @@ public sealed class JalxamlSourceGenerator : IIncrementalGenerator
         //   2. Any other rejection (unresolved CLR type, illegal template shape, etc.) —
         //      surface JALXAML002 so the developer can fix the document. Runtime
         //      fallback would still throw at parse time, just later.
+        if (ReportLoweringDiagnostics(context, filePath, result))
+        {
+            return null;
+        }
+
         var initializeBody = JalxamlCodeGenerator.TryEmitInitializeBody(result, symbols, xmlnsResolver);
         var useRuntimeFallback = false;
         if (initializeBody == null)
         {
+            if (result.HasVirtualize || result.HasUnloweredVirtualize)
+            {
+                // The runtime reader does understand @virtualize, so this would render. It would
+                // just do so having thrown away the compile-time lowering, which is the one thing
+                // the directive is for — so say so instead.
+                context.ReportDiagnostic(Diagnostic.Create(
+                    VirtualizeLoweringDescriptor, Location.None,
+                    $"'@virtualize' in '{filePath}' cannot be lowered at compile time because {DescribeBailReason(result)}. " +
+                    "Convert any remaining structural Razor in this document, or move the '@virtualize' block into its own file."));
+                return null;
+            }
+
             if (CanUseRuntimeFallback(result))
             {
                 useRuntimeFallback = true;
@@ -813,6 +830,37 @@ public sealed class JalxamlSourceGenerator : IIncrementalGenerator
         defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    /// <summary>
+    /// Reports a <c>@virtualize</c> the generator could not lower. Unlike other Razor constructs
+    /// this is never allowed to slip to the runtime fallback silently: falling back costs the
+    /// directive the compile-time lowering it exists for, and the list would still render — just
+    /// without the virtualization the author asked for. A quiet performance cliff is worse than a
+    /// build error that names the fix.
+    /// </summary>
+    private static readonly DiagnosticDescriptor VirtualizeLoweringDescriptor = new(
+        id: "JALXAML004",
+        title: "@virtualize cannot be lowered",
+        messageFormat: "{0}",
+        category: "Jalium.UI.Xaml",
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    private static readonly DiagnosticDescriptor VirtualizeBodyDescriptor = new(
+        id: "JALXAML005",
+        title: "@virtualize body cannot be an item template",
+        messageFormat: "{0}",
+        category: "Jalium.UI.Xaml",
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    private static readonly DiagnosticDescriptor VirtualizeOuterVariableDescriptor = new(
+        id: "JALXAML006",
+        title: "@virtualize body references an enclosing loop variable",
+        messageFormat: "{0}",
+        category: "Jalium.UI.Xaml",
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     private static readonly DiagnosticDescriptor MissingProjectDirDescriptor = new(
         id: "JALXAML003",
         title: "JALXAML cannot resolve project directory",
@@ -820,6 +868,34 @@ public sealed class JalxamlSourceGenerator : IIncrementalGenerator
         category: "Jalium.UI.Xaml",
         defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
+
+    /// <summary>
+    /// Emits everything the lowering pass collected. Returns true when at least one was an error,
+    /// so the caller can stop rather than generate code from a tree it already knows is wrong.
+    /// </summary>
+    private static bool ReportLoweringDiagnostics(
+        SourceProductionContext context, string filePath, JalxamlParseResult result)
+    {
+        var hadError = false;
+        foreach (var diagnostic in result.LoweringDiagnostics)
+        {
+            var descriptor = diagnostic.Id switch
+            {
+                RazorVirtualizeLowering.UnsupportedBodyId => VirtualizeBodyDescriptor,
+                RazorVirtualizeLowering.OuterVariableId => VirtualizeOuterVariableDescriptor,
+                _ => VirtualizeLoweringDescriptor,
+            };
+
+            var message = diagnostic.LineNumber > 0
+                ? $"{diagnostic.Message} ({filePath} line {diagnostic.LineNumber})"
+                : $"{diagnostic.Message} ({filePath})";
+
+            context.ReportDiagnostic(Diagnostic.Create(descriptor, Location.None, message));
+            hadError |= diagnostic.IsError;
+        }
+
+        return hadError;
+    }
 
     private static void ReportCodegenBail(SourceProductionContext context, string filePath, JalxamlParseResult result)
     {
@@ -957,6 +1033,24 @@ public sealed class JalxamlParseResult
     /// or <c>XamlReader.Parse</c>).
     /// </summary>
     public bool HasLoweredStructuralRazor { get; set; }
+
+    /// <summary>
+    /// True once a <c>@virtualize</c> block has been lifted and lowered. Unlike the other Razor
+    /// flags this one also blocks the runtime fallback: the runtime reader understands
+    /// <c>@virtualize</c>, but a document that reaches the fallback because of some *other*
+    /// unlowerable construct would quietly lose the compile-time work, so the generator reports
+    /// that instead of degrading in silence.
+    /// </summary>
+    public bool HasVirtualize { get; set; }
+
+    /// <summary>
+    /// True when a <c>@virtualize</c> survived into the legacy strip path, meaning the lift did
+    /// not take. Used to turn what would otherwise be a silent fallback into a diagnostic.
+    /// </summary>
+    public bool HasUnloweredVirtualize { get; set; }
+
+    /// <summary>Problems found during lowering, drained by the generator once it has a file.</summary>
+    public List<JalxamlLoweringDiagnostic> LoweringDiagnostics { get; } = new();
 
     /// <summary>
     /// Set during the lifted parse when an <c>@if</c> or <c>@section</c> block turned out

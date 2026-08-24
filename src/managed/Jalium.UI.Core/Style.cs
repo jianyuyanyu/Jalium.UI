@@ -613,11 +613,12 @@ public class Setter : SetterBase, ISupportInitialize
         if (actualProperty == null)
             return;
 
-        // Don't override local values - WPF style behavior
-        // Local values have higher precedence than style values
-        if (target.HasLocalValue(actualProperty))
-            return;
-
+        // 注意：这里**不**因为"目标已有 local 值"就跳过。style 值必须照常落进 StyleSetter 层，
+        // 由层优先级去裁决谁可见（local 天然赢）。早先的短路让 style 值根本不存在于层里，于是：
+        //   • 标记里 <Button Background="Red" Style="{StaticResource X}"/> —— local 值总是先于
+        //     style 应用（style 在入树时才应用），style 的 Background setter 被整条丢弃；
+        //   • 之后 ClearValue(BackgroundProperty) 回落到 DP 默认值而不是 style 值；
+        //     SetCurrentValue / 动画结束后的回落同理。
         if (Value is IDynamicResourceReference dynamicReference)
         {
             DynamicResourceBindingOperations.SetDynamicResource(
@@ -638,12 +639,17 @@ public class Setter : SetterBase, ISupportInitialize
 
         // Setter.Value 可以是一个 BindingBase（典型场景：jalxaml 里写
         // <Setter Property="Foo" Value="{TemplateBinding Bar}" /> 或 RelativeSource Binding）。
-        // 之前会把整个 BindingBase 当成属性值塞进 layer，OnRender 时强转成 Brush 等
-        // 目标类型直接抛 InvalidCastException — 控件渲染崩溃。这里改为标准 WPF 行为：
-        // 让 binding 在目标 DP 上建立连接，由 BindingExpression 自行把 source 值流到 layer。
+        //
+        // 不能直接 target.SetBinding(actualProperty, binding)：BindingExpression 写目标走的是
+        // Target.SetValue → **local 层**。那样一条 style setter 会拿到 local 优先级，压过所有
+        // trigger —— 结果就是"给控件加了个 {Binding} 的 Foreground setter，hover/pressed 全部
+        // 失效"；而且 Style 被换掉时 Setter.Remove 只清 StyleSetter 层，绑定会留在元素上。
+        //
+        // 改用与 TriggerBase 相同的 shadow-property 方案：绑定跑在本 setter 私有的 attached DP
+        // 上，把它的当前值镜像进 StyleSetter 层，优先级与生命周期都归位。
         if (Value is BindingBase binding)
         {
-            target.SetBinding(actualProperty, binding);
+            ApplyBindingValue(target, actualProperty, binding);
             return;
         }
 
@@ -657,11 +663,131 @@ public class Setter : SetterBase, ISupportInitialize
         // clearing this layer's contribution, mirroring the TemplateBinding transfer guards.
         if (!actualProperty.IsValidType(valueToSet))
         {
-            target.ClearLayerValue(actualProperty, DependencyObject.LayerValueSource.StyleSetter);
+            target.ClearLayerValue(
+                actualProperty,
+                DependencyObject.LayerValueSource.StyleSetter,
+                allowAutoTransition: false);
             return;
         }
 
-        target.SetLayerValue(actualProperty, valueToSet, DependencyObject.LayerValueSource.StyleSetter);
+        // allowAutoTransition: false —— style setter 是**基线**值，不是动态状态切换。
+        // UIElement.ScheduleAutomaticTransitionArm 的注释把这条写成了不变量（"Style.Setter
+        // (baseline) 走 allowAutoTransition=false"），但此处一直在用默认 true 的重载：主题切换 /
+        // 隐式样式重算 / Style 换绑时，每个带 Transition 的属性都会从旧值动画过去，还会打断
+        // 正在进行的 trigger 过渡。只有 Trigger.Setter 才参与自动过渡。
+        target.SetLayerValue(
+            actualProperty,
+            valueToSet,
+            DependencyObject.LayerValueSource.StyleSetter,
+            allowAutoTransition: false);
+
+        // 宿主元素的失效由唯一调用链 FrameworkElement.UpdateStyleStack 末尾的 InvalidateVisual
+        // 统一负责，这里不重复；只有 TargetName 打到别的元素时才需要单独安排一次。
+        if (!ReferenceEquals(target, element))
+        {
+            TriggerBase.EnsureSetterInvalidation(target, actualProperty);
+        }
+    }
+
+    /// <summary>
+    /// 本 setter 私有的 shadow attached DP（懒注册）。绑定挂在它上面求值，真正的目标属性只收到
+    /// 镜像进 StyleSetter 层的结果值。一个 Setter 实例一个 shadow DP，跨元素靠 attached 值天然隔离。
+    /// </summary>
+    private DependencyProperty? _bindingShadowProperty;
+    private readonly object _bindingShadowGate = new();
+    private static int s_styleSetterBindingPropertyCounter;
+
+    private sealed class BindingSetterState
+    {
+        public required DependencyProperty TargetProperty { get; init; }
+        public required DependencyProperty ShadowProperty { get; init; }
+        public required Action<DependencyProperty, object?, object?> Handler { get; init; }
+    }
+
+    private readonly ConditionalWeakTable<FrameworkElement, BindingSetterState> _bindingStates = new();
+
+    private DependencyProperty GetBindingShadowProperty()
+    {
+        if (_bindingShadowProperty != null)
+            return _bindingShadowProperty;
+
+        lock (_bindingShadowGate)
+        {
+            return _bindingShadowProperty ??= DependencyProperty.RegisterAttached(
+                $"_StyleSetterBindingValue{Interlocked.Increment(ref s_styleSetterBindingPropertyCounter)}",
+                typeof(object),
+                typeof(Setter),
+                new PropertyMetadata(null));
+        }
+    }
+
+    private void ApplyBindingValue(
+        FrameworkElement target,
+        DependencyProperty actualProperty,
+        BindingBase binding)
+    {
+        if (_bindingStates.TryGetValue(target, out var existing))
+        {
+            PublishBindingValue(target, existing);
+            return;
+        }
+
+        var shadowProperty = GetBindingShadowProperty();
+
+        BindingSetterState? state = null;
+        Action<DependencyProperty, object?, object?> handler = (changedProperty, _, _) =>
+        {
+            if (!ReferenceEquals(changedProperty, shadowProperty) || state is null)
+                return;
+
+            PublishBindingValue(target, state);
+        };
+
+        state = new BindingSetterState
+        {
+            TargetProperty = actualProperty,
+            ShadowProperty = shadowProperty,
+            Handler = handler
+        };
+
+        _bindingStates.Add(target, state);
+        target.PropertyChangedInternal += handler;
+        target.SetBinding(shadowProperty, binding);
+        PublishBindingValue(target, state);
+    }
+
+    private static void PublishBindingValue(FrameworkElement target, BindingSetterState state)
+    {
+        var value = target.GetValue(state.ShadowProperty);
+        if (ReferenceEquals(value, DependencyProperty.UnsetValue) ||
+            !state.TargetProperty.IsValidType(value))
+        {
+            target.ClearLayerValue(
+                state.TargetProperty,
+                DependencyObject.LayerValueSource.StyleSetter,
+                allowAutoTransition: false);
+        }
+        else
+        {
+            target.SetLayerValue(
+                state.TargetProperty,
+                value,
+                DependencyObject.LayerValueSource.StyleSetter,
+                allowAutoTransition: false);
+        }
+
+        TriggerBase.EnsureSetterInvalidation(target, state.TargetProperty);
+    }
+
+    private void RemoveBindingValue(FrameworkElement target)
+    {
+        if (!_bindingStates.TryGetValue(target, out var state))
+            return;
+
+        _bindingStates.Remove(target);
+        target.PropertyChangedInternal -= state.Handler;
+        target.ClearBinding(state.ShadowProperty);
+        target.ClearValue(state.ShadowProperty);
     }
 
     /// <summary>
@@ -811,11 +937,22 @@ public class Setter : SetterBase, ISupportInitialize
         var actualProperty = ResolvePropertyForTarget(resolvedProperty, target);
         if (actualProperty == null) return;
 
+        // 拆掉 shadow 绑定，否则 Style 换掉之后绑定还活着，源一变就把值重新灌回层里。
+        RemoveBindingValue(target);
+
         DynamicResourceBindingOperations.ClearDynamicResource(
             target,
             actualProperty,
             DependencyObject.LayerValueSource.StyleSetter);
-        target.ClearLayerValue(actualProperty, DependencyObject.LayerValueSource.StyleSetter);
+        target.ClearLayerValue(
+            actualProperty,
+            DependencyObject.LayerValueSource.StyleSetter,
+            allowAutoTransition: false);
+
+        if (!ReferenceEquals(target, element))
+        {
+            TriggerBase.EnsureSetterInvalidation(target, actualProperty);
+        }
     }
 
     /// <summary>
@@ -1012,10 +1149,58 @@ public abstract class TriggerBase : DependencyObject
     internal Style? ParentStyle { get; set; }
 
     /// <summary>
-    /// Gets or sets the parent template triggers collection.
-    /// This is set when the trigger is attached as part of a ControlTemplate.
+    /// 本 trigger 所属模板的 trigger 集合（声明顺序仲裁用），trigger 声明在
+    /// ControlTemplate / DataTemplate 里时非空。
+    ///
+    /// <para><b>只设一次，永不清空。</b>一个 ControlTemplate（尤其主题模板）是被成百个控件
+    /// **共享**的单例，模板里的 TriggerBase 实例同样共享。早先的实现在控件 teardown 时把它
+    /// 置回 null，于是任何一个控件换模板/卸载，都会让仍然活着的同类控件上的同一个 trigger
+    /// 变成"无宿主模板"：写值的层从 trigger 层掉回 StyleTrigger 层（写/清不同层 → 值被永久
+    /// 钉死），并且 <see cref="GetSiblingTriggers"/> 拿不到兄弟集合 → 声明顺序仲裁彻底失效
+    /// → 退化成 last-write-wins（hover/pressed 残留）。声明归属是 trigger 的不变量，
+    /// 与"当前挂在哪个元素上"无关，因此这里按不变量处理。</para>
     /// </summary>
-    internal IList<TriggerBase>? ParentTemplateTriggers { get; set; }
+    internal IList<TriggerBase>? ParentTemplateTriggers { get; private set; }
+
+    /// <summary>
+    /// 宿主元素是否就是"被模板化的控件本身"。ControlTemplate 把 trigger 挂在控件上
+    /// （true）；DataTemplate 把 trigger 挂在模板内容的根元素上（false，整棵内容树都是
+    /// 模板生成物）。这一位决定无 TargetName 的 setter 落哪个 trigger 层，见
+    /// <see cref="GetTriggerLayerSource"/>。
+    /// </summary>
+    private bool _hostIsTemplatedParent;
+
+    /// <summary>
+    /// 声明本 trigger 归属某个模板。幂等；重复调用同一集合不做任何事。
+    /// </summary>
+    internal void DeclareTemplateOwner(IList<TriggerBase> owner, bool hostIsTemplatedParent)
+    {
+        ArgumentNullException.ThrowIfNull(owner);
+        ParentTemplateTriggers = owner;
+        _hostIsTemplatedParent = hostIsTemplatedParent;
+    }
+
+    /// <summary>
+    /// 解析本 trigger 的某条 setter 应当写入的值层。
+    ///
+    /// <para>Style 上的 trigger → <c>StyleTrigger</c>。</para>
+    /// <para>模板上的 trigger 分两种（WPF 也是这么分的）：带 TargetName 打到模板内具名部件的，
+    /// 代表宿主控件对自己模板部件的支配，落 <c>ParentTemplateTrigger</c>（仅次于 local）；
+    /// 不带 TargetName、打在被模板化控件自身上的，落 <c>TemplateTrigger</c>——它必须**低于**
+    /// 该控件自己 Style 上的 trigger，否则用户写的 <c>&lt;Style.Triggers&gt;</c> 永远盖不过
+    /// 主题模板内建的 hover/pressed 反馈。</para>
+    /// </summary>
+    private DependencyObject.LayerValueSource GetTriggerLayerSource(
+        FrameworkElement element,
+        FrameworkElement target)
+    {
+        if (ParentTemplateTriggers == null)
+            return DependencyObject.LayerValueSource.StyleTrigger;
+
+        return _hostIsTemplatedParent && ReferenceEquals(target, element)
+            ? DependencyObject.LayerValueSource.TemplateTrigger
+            : DependencyObject.LayerValueSource.ParentTemplateTrigger;
+    }
 
     internal void RegisterStyleAttachment(FrameworkElement element)
     {
@@ -1125,10 +1310,6 @@ public abstract class TriggerBase : DependencyObject
     /// </summary>
     protected void ApplyTriggerSetters(FrameworkElement element)
     {
-        var layerSource = ParentTemplateTriggers != null
-            ? DependencyObject.LayerValueSource.TemplateTrigger
-            : DependencyObject.LayerValueSource.StyleTrigger;
-
         var siblings = GetSiblingTriggers(element);
         var myIndex = siblings?.IndexOf(this) ?? -1;
 
@@ -1137,6 +1318,7 @@ public abstract class TriggerBase : DependencyObject
             var setter = resolvedSetter.Setter;
             var target = resolvedSetter.Target;
             var actualProperty = resolvedSetter.Property;
+            var layerSource = GetTriggerLayerSource(element, target);
 
             // Track that this trigger conceptually owns this property — even if we end up
             // skipping the write below, we still need to remember the ownership so that
@@ -1320,10 +1502,7 @@ public abstract class TriggerBase : DependencyObject
                 myIndex))
             return;
 
-        var layerSource = ParentTemplateTriggers != null
-            ? DependencyObject.LayerValueSource.TemplateTrigger
-            : DependencyObject.LayerValueSource.StyleTrigger;
-        ApplyBindingSetterValue(state, layerSource);
+        ApplyBindingSetterValue(state, GetTriggerLayerSource(element, state.Target));
     }
 
     private static void ApplyBindingSetterValue(
@@ -1393,7 +1572,7 @@ public abstract class TriggerBase : DependencyObject
     /// 链路自然 invalidate，**不**走这条兜底——避免对每个 setter 都 paranoid
     /// 整体 InvalidateVisual。compositionOnly DP 路由到 InvalidateComposition。
     /// </summary>
-    private static void EnsureSetterInvalidation(FrameworkElement target, DependencyProperty dp)
+    internal static void EnsureSetterInvalidation(FrameworkElement target, DependencyProperty dp)
     {
         var metadata = dp.GetMetadata(target.GetType());
         if (metadata.PropertyChangedCallback != null)
@@ -1576,10 +1755,6 @@ public abstract class TriggerBase : DependencyObject
     /// </summary>
     protected void RemoveTriggerSetters(FrameworkElement element)
     {
-        var layerSource = ParentTemplateTriggers != null
-            ? DependencyObject.LayerValueSource.TemplateTrigger
-            : DependencyObject.LayerValueSource.StyleTrigger;
-
         var siblings = GetSiblingTriggers(element);
         var myIndex = siblings?.IndexOf(this) ?? -1;
 
@@ -1590,6 +1765,7 @@ public abstract class TriggerBase : DependencyObject
             var setter = resolvedSetter.Setter;
             var target = resolvedSetter.Target;
             var actualProperty = resolvedSetter.Property;
+            var layerSource = GetTriggerLayerSource(element, target);
             if (!IsSetterActive(target, actualProperty))
                 continue;
 
@@ -2115,9 +2291,12 @@ public sealed class Trigger : TriggerBase, ISupportInitialize
         if (Property == null)
             return;
 
+        // 幂等：先拆干净上一次的挂载。仅仅 _elementStates.Remove 是不够的——旧的 handler
+        // 还订阅在 source 上（重复求值 + 泄漏），旧的激活值也还钉在层里。
+        Detach(element);
+
         // Create per-element state
         var state = new ElementState();
-        _elementStates.Remove(element);
         _elementStates.Add(element, state);
 
         // 解析 SourceName：null/空 → 监听 templated parent 自己；否则去命名部件。
@@ -2593,9 +2772,11 @@ public sealed class MultiTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
     /// <inheritdoc />
     internal override void Attach(FrameworkElement element)
     {
+        // 幂等：见 Trigger.Attach 的说明。
+        Detach(element);
+
         // Create per-element state
         var state = new ElementState();
-        _elementStates.Remove(element);
         _elementStates.Add(element, state);
 
         // 解析每条 Condition 的 source（SourceName=null → templated parent 自己）。
@@ -2849,9 +3030,11 @@ public sealed class DataTrigger : TriggerBase
     /// <inheritdoc />
     internal override void Attach(FrameworkElement element)
     {
+        // 幂等：见 Trigger.Attach 的说明。
+        Detach(element);
+
         // Create per-element state
         var state = new ElementState();
-        _elementStates.Remove(element);
         _elementStates.Add(element, state);
 
         var shadowProp = ShadowProperty;
@@ -3165,9 +3348,11 @@ public sealed class MultiDataTrigger : TriggerBase, Jalium.UI.Markup.IAddChild
     /// <inheritdoc />
     internal override void Attach(FrameworkElement element)
     {
+        // 幂等：见 Trigger.Attach 的说明。
+        Detach(element);
+
         // Create per-element state
         var state = new ElementState();
-        _elementStates.Remove(element);
         _elementStates.Add(element, state);
 
         // Shadow properties describe the trigger declaration, not an attached

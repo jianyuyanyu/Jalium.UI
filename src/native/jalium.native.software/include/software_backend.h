@@ -331,6 +331,10 @@ public:
         float blurRadius,
         float cornerRadiusTL, float cornerRadiusTR,
         float cornerRadiusBR, float cornerRadiusBL) override;
+    // Full in-app backdrop material on the CPU: apron box blur (3-pass,
+    // sigma-matched to the GPU Gaussian), the shared colour pipeline, tint
+    // with alpha, hash grain, opacity and per-corner rounding.
+    void DrawBackdropMaterial(const JaliumBackdropMaterialDesc& desc) override;
     void DrawGlowingBorderHighlight(
         float x, float y, float w, float h,
         float animationPhase,

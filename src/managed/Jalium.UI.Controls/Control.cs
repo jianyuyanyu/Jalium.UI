@@ -610,9 +610,9 @@ public class Control : FrameworkElement
             _appliedTemplateTriggers = template.Triggers;
             foreach (var trigger in _appliedTemplateTriggers)
             {
-                // Set the parent template triggers so the trigger can find sibling triggers
-                // when it needs to re-apply values after deactivation
-                trigger.ParentTemplateTriggers = _appliedTemplateTriggers;
+                // 声明归属：让 trigger 能找到兄弟 trigger 做声明顺序仲裁，并知道自己写哪个值层。
+                // hostIsTemplatedParent: true —— ControlTemplate 的 trigger 挂在被模板化的控件上。
+                trigger.DeclareTemplateOwner(_appliedTemplateTriggers, hostIsTemplatedParent: true);
                 trigger.Attach(this);
             }
         }
@@ -642,8 +642,10 @@ public class Control : FrameworkElement
         {
             foreach (var trigger in _appliedTemplateTriggers)
             {
+                // 只 Detach，**不**清 trigger 的模板归属：ControlTemplate 及其 TriggerBase 实例
+                // 被所有使用该模板的控件共享，清空会连带毁掉其它仍然活着的控件的值层归属与
+                // 声明顺序仲裁（详见 TriggerBase.ParentTemplateTriggers 的注释）。
                 trigger.Detach(this);
-                trigger.ParentTemplateTriggers = null;
             }
             _appliedTemplateTriggers = null;
         }

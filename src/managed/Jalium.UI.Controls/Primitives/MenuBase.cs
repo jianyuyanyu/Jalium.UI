@@ -108,6 +108,23 @@ public abstract class MenuBase : ItemsControl
 
     #endregion
 
+    #region Dismissal
+
+    /// <summary>
+    /// Dismisses this menu after one of its items has been invoked.
+    /// </summary>
+    /// <remarks>
+    /// A <see cref="MenuItem"/> only closes the submenus of its <em>parent</em> items when clicked;
+    /// nothing in that chain owns the popup that hosts the top-level items, so a context menu would
+    /// stay on screen after the user picked a command. Menus that can be dismissed (context menus)
+    /// override this; a permanently docked menu bar has nothing to close, hence the empty default.
+    /// </remarks>
+    internal virtual void DismissMenu()
+    {
+    }
+
+    #endregion
+
     #region Private Fields
 
     private int _currentIndex = -1;

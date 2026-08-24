@@ -168,14 +168,6 @@ public sealed class ImagingRefreshedParityTests
 
         BitmapEncoder encoder = BitmapEncoder.Create(new Guid("1b7cfaf4-713f-473c-bbcd-6137425faeaf"));
         Assert.IsType<PngBitmapEncoder>(encoder);
-        var wmp = new WmpBitmapEncoder
-        {
-            UseCodecOptions = true,
-            QualityLevel = 80,
-            Rotation = Rotation.Rotate90,
-            HorizontalTileSlices = 2,
-        };
-        Assert.Equal((byte)80, wmp.QualityLevel);
-        Assert.Equal((short)2, wmp.HorizontalTileSlices);
+        Assert.True(typeof(BitmapEncoder).GetMethod(nameof(BitmapEncoder.Save))?.IsAbstract is true);
     }
 }

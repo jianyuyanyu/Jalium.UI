@@ -33,3 +33,19 @@ public enum AutoToolTipPlacement
     /// <summary>For a horizontal slider, the tooltip appears below the thumb. For a vertical slider, the tooltip appears to the right.</summary>
     BottomRight
 }
+
+/// <summary>
+/// Specifies how the track of a <see cref="Jalium.UI.Controls.Slider"/> or
+/// <see cref="Jalium.UI.Controls.RangeSlider"/> is painted.
+/// </summary>
+public enum SliderTrackMode
+{
+    /// <summary>The track is a single continuous bar.</summary>
+    Continuous,
+
+    /// <summary>
+    /// The track is split into discrete segments at every tick position, separated by a
+    /// gap. Segments covered by the current value are painted with the fill brush.
+    /// </summary>
+    Segmented
+}

@@ -9,11 +9,18 @@ public sealed class D3D12ResizeScratchTests
     private const int NarrowWidth = 640;
     private const int Height = 480;
 
+    // 600×450 device-space bounds from the (20,20) start point. The size is
+    // load-bearing: D3D12RenderTarget::FillPath only takes the stencil-then-cover
+    // route — the one that allocates the path scratch this test measures — for a
+    // solid fill whose bounds fail PreferAnalyticFill (jalium_flatten.h, 512×512
+    // px of area). Anything smaller goes to the analytic scanline rasterizer and
+    // leaves PathBytes at 0. It also has to fit the NARROW viewport, so the same
+    // path keeps allocating scratch after the resize.
     private static readonly float[] s_pathCommands =
     [
-        0f, 420f, 40f,
-        0f, 420f, 300f,
-        0f, 40f, 300f,
+        0f, 620f, 20f,
+        0f, 620f, 470f,
+        0f, 20f, 470f,
         5f
     ];
 

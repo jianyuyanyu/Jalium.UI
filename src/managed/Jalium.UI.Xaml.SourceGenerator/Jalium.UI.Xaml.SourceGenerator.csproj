@@ -56,4 +56,14 @@
     <None Include="$(OutputPath)\$(AssemblyName).dll" Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
   </ItemGroup>
 
+
+  <ItemGroup>
+    <!-- Shared with the other side of the @virtualize lowering. One copy, linked twice,
+         so a compiled loop body and a runtime-parsed one can never disagree. -->
+    <Compile Include="..\Shared\RazorLoopVariableRewriter.cs"
+             Link="RazorLoopVariableRewriter.cs" />
+    <Compile Include="..\Shared\RazorVirtualizeDirective.cs"
+             Link="RazorVirtualizeDirective.cs" />
+  </ItemGroup>
+
 </Project>

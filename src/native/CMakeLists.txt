@@ -41,6 +41,34 @@ if(MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# Debug build profile for the render hot path
+# ---------------------------------------------------------------------------
+# The IDE that consumes this framework runs the Debug native payload, and
+# MSVC's stock Debug flags (/Od /RTC1, plus checked STL iterators from /MDd)
+# make the CPU path rasterizer roughly 4x slower than Release. That is enough
+# that UI smoothness cannot be judged in the configuration developers actually
+# run, which is how a 300us-per-icon stroke went unnoticed.
+#
+# So the four DLLs that carry the per-frame CPU rendering work build Debug with
+# the optimizer on. /MDd and full PDBs stay, so managed-side debugging, crash
+# dumps and symbolized stacks are unaffected; only stepping through *these*
+# targets' C++ line-by-line is degraded (inlined frames, elided locals).
+#
+# /O2 and /RTC1 are mutually exclusive (cl reports D8016), and CMake has no
+# portable way to drop a flag from one target, so /RTC1 comes out of the shared
+# Debug flags here and is handed back to every other target below.
+if(MSVC)
+    string(REPLACE "/RTC1" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    string(REPLACE "/RTC1" "" CMAKE_C_FLAGS_DEBUG   "${CMAKE_C_FLAGS_DEBUG}")
+    set(JALIUM_RENDER_HOT_TARGETS
+        jalium.native.core
+        jalium.native.d3d12
+        jalium.native.vulkan
+        jalium.native.software
+        jalium.native.text)
+endif()
+
+# ---------------------------------------------------------------------------
 # Build flavor: shared (default, NuGet) or static (NativeAOT single-exe)
 # ---------------------------------------------------------------------------
 option(JALIUM_BUILD_STATIC "Build native libraries as static archives for NativeAOT linking" OFF)
@@ -318,6 +346,41 @@ else()
 endif()
 
 add_subdirectory(jalium.native.software)
+
+# Apply the Debug profile decided above. Done after every add_subdirectory()
+# so the walk below sees the full set of targets: render-path targets opt into
+# the optimizer, everything else gets the runtime checks put back.
+if(MSVC)
+    # Walk the directory tree via the SUBDIRECTORIES property rather than by
+    # guessing folder names — backends are added conditionally (no Vulkan on
+    # some hosts, no d3d12 off Windows), and a folder that exists on disk but
+    # was never add_subdirectory()'d makes get_property(DIRECTORY) a hard error.
+    set(_jalium_pending_dirs "${CMAKE_CURRENT_SOURCE_DIR}")
+    set(_jalium_all_targets "")
+    while(_jalium_pending_dirs)
+        list(POP_FRONT _jalium_pending_dirs _jalium_dir)
+        get_property(_jalium_dir_targets DIRECTORY "${_jalium_dir}"
+                     PROPERTY BUILDSYSTEM_TARGETS)
+        list(APPEND _jalium_all_targets ${_jalium_dir_targets})
+        get_property(_jalium_sub_dirs DIRECTORY "${_jalium_dir}"
+                     PROPERTY SUBDIRECTORIES)
+        list(APPEND _jalium_pending_dirs ${_jalium_sub_dirs})
+    endwhile()
+    list(REMOVE_DUPLICATES _jalium_all_targets)
+
+    foreach(_jalium_target IN LISTS _jalium_all_targets)
+        get_target_property(_jalium_target_type ${_jalium_target} TYPE)
+        if(_jalium_target_type STREQUAL "INTERFACE_LIBRARY" OR
+           _jalium_target_type STREQUAL "UTILITY")
+            continue()
+        endif()
+        if(_jalium_target IN_LIST JALIUM_RENDER_HOT_TARGETS)
+            target_compile_options(${_jalium_target} PRIVATE $<$<CONFIG:Debug>:/O2;/Ob2>)
+        else()
+            target_compile_options(${_jalium_target} PRIVATE $<$<CONFIG:Debug>:/RTC1>)
+        endif()
+    endforeach()
+endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT JALIUM_BUILD_STATIC)
     jalium_apply_linux_export_policy(jalium.native.core core.map)

@@ -50,6 +50,15 @@ public static class JalxamlParser
     /// </summary>
     internal const string RazorRenderSectionElementName = "__RazorRenderSection";
 
+    /// <summary>
+    /// Synthetic element a <c>@virtualize(header) { body }</c> block is lifted into. Codegen
+    /// turns it into a <see cref="Jalium.UI.Controls.RazorItemsHost"/> whose item template is the
+    /// body, so the loop becomes a bound, virtualized list rather than one element per item.
+    /// The header is carried verbatim on <c>__Header</c> and parsed later, against the real tree,
+    /// where a diagnostic can name a line. Never resolves to a CLR type; never AOT-pinned.
+    /// </summary>
+    internal const string RazorVirtualizeElementName = "__RazorVirtualize";
+
     // Mapping from XML element names to C# fully-qualified type names. Covers framework
     // types whose simple name maps to a single CLR type at compile time. Anything not in
     // this table (e.g. user-defined controls, third-party controls) is resolved through
@@ -272,6 +281,7 @@ public static class JalxamlParser
                 // @if purity is flagged during the parse (FlattenRazorIf). @section nodes
                 // survive the tree, so validate their single-root-element shape here.
                 ValidateLiftedSections(liftedResult.Root!, liftedResult);
+                RazorVirtualizeLowering.Lower(liftedResult);
             }
             if (liftedResult.Root != null && !liftedResult.RazorLiftUnfaithful)
             {
@@ -297,6 +307,11 @@ public static class JalxamlParser
         var stripped = StripRazorCodeBlocks(content, out var hasStructural, out var hasExpressions);
         result.HasStructuralRazor = hasStructural;
         result.HasRazorExpressions = hasExpressions;
+
+        // Reaching the legacy path with a @virtualize still in the text means the lift did not
+        // take. The generator turns that into a diagnostic rather than a quiet fallback, because
+        // falling back is precisely what costs the directive its compile-time lowering.
+        result.HasUnloweredVirtualize = content.IndexOf("@virtualize", StringComparison.Ordinal) >= 0;
 
         if (!TryStreamingParse(stripped, result))
         {
@@ -376,7 +391,8 @@ public static class JalxamlParser
                     // this document — fail so the caller falls back to the legacy path.
                     if (result.Root != null &&
                         (result.Root.LocalName == RazorIfElementName ||
-                         result.Root.LocalName == RazorSectionElementName))
+                         result.Root.LocalName == RazorSectionElementName ||
+                         result.Root.LocalName == RazorVirtualizeElementName))
                     {
                         ResetStreamingState(result);
                         return false;
@@ -415,7 +431,8 @@ public static class JalxamlParser
         var localName = reader.LocalName;
         var isSynthetic = localName == RazorIfElementName ||
                           localName == RazorSectionElementName ||
-                          localName == RazorRenderSectionElementName;
+                          localName == RazorRenderSectionElementName ||
+                          localName == RazorVirtualizeElementName;
 
         // Synthetic type resolution:
         //  - __RazorRenderSection  → a real RazorSectionHost (flows through normal codegen
@@ -434,6 +451,13 @@ public static class JalxamlParser
         {
             resolved = RazorSectionElementName;
             fallback = "Jalium.UI.FrameworkElement";
+        }
+        else if (localName == RazorVirtualizeElementName)
+        {
+            // Sentinel: non-empty so FindFirstUnresolved leaves it alone, but codegen matches on
+            // the local name and builds a host instead of ever newing this.
+            resolved = RazorVirtualizeElementName;
+            fallback = "Jalium.UI.Controls.RazorItemsHost";
         }
         else if (localName == RazorIfElementName)
         {
@@ -479,7 +503,9 @@ public static class JalxamlParser
         // — its x:Names are scoped to that subtree (like a template), NOT codebehind
         // fields on the defining component, matching the runtime which parses the section
         // separately. Suppress name capture for everything inside a __RazorSection.
-        var childSuppressNames = suppressNames || localName == RazorSectionElementName;
+        var childSuppressNames = suppressNames ||
+                                 localName == RazorSectionElementName ||
+                                 localName == RazorVirtualizeElementName;
 
         if (reader.IsEmptyElement)
         {
@@ -1229,7 +1255,7 @@ public static class JalxamlParser
 
     private static readonly string[] s_structuralKeywords =
     {
-        "if", "section", "RenderSection",
+        "if", "section", "RenderSection", "virtualize",
         // Stray flow-control that escaped the build task. Same treatment.
         "for", "foreach", "while", "switch", "do", "try", "using", "lock"
     };
@@ -1271,7 +1297,8 @@ public static class JalxamlParser
         rewritten = content;
         if (content.IndexOf("@if", StringComparison.Ordinal) < 0 &&
             content.IndexOf("@section", StringComparison.Ordinal) < 0 &&
-            content.IndexOf("@RenderSection", StringComparison.Ordinal) < 0)
+            content.IndexOf("@RenderSection", StringComparison.Ordinal) < 0 &&
+            content.IndexOf("@virtualize", StringComparison.Ordinal) < 0)
         {
             return false;
         }
@@ -1418,6 +1445,31 @@ public static class JalxamlParser
                     continue;
                 }
 
+                // @virtualize ( header ) {  → open a virtualized-loop block. Checked before the
+                // leaked-keyword bail below so it is never mistaken for a loop to expand;
+                // expanding is exactly what it exists to avoid.
+                if (IsWordAt(content, i + 1, "virtualize", out var afterVirtualize))
+                {
+                    var openParen = SkipWhitespace(content, afterVirtualize);
+                    if (openParen >= content.Length || content[openParen] != '(')
+                        return false;
+                    if (!TryReadBalancedParens(content, openParen, out var header, out var afterHeader))
+                        return false;
+                    var brace = SkipWhitespace(content, afterHeader);
+                    if (brace >= content.Length || content[brace] != '{')
+                        return false;
+
+                    // Prefixed so CaptureAttributes cannot mistake it for an x:Name, which would
+                    // emit a codebehind field for a synthetic element.
+                    sb.Append('<').Append(RazorVirtualizeElementName)
+                      .Append(" __Header=\"").Append(EscapeXmlAttribute(header.Trim()))
+                      .Append("\">");
+                    blocks.Push(new RazorBlock { Kind = 'V' });
+                    liftedAny = true;
+                    i = brace + 1;
+                    continue;
+                }
+
                 // Stray @{ ... } or a leaked loop/flow keyword — cannot lower.
                 if (content[i + 1] == '{' || IsLeakedFlowKeywordAt(content, i + 1))
                     return false;
@@ -1434,6 +1486,11 @@ public static class JalxamlParser
             {
                 var frame = blocks.Pop();
                 i++;
+                if (frame.Kind == 'V')
+                {
+                    sb.Append("</").Append(RazorVirtualizeElementName).Append('>');
+                    continue;
+                }
                 if (frame.Kind != 'I')
                 {
                     sb.Append("</").Append(RazorSectionElementName).Append('>');

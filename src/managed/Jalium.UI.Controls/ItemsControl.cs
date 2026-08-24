@@ -121,6 +121,22 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
     protected Panel? ItemsHost => _itemsPresenter?.ItemsPanel ?? _fallbackItemsHost;
 
     /// <summary>
+    /// Whether this control lets the base items pipeline build its own fallback items-host
+    /// panel and materialize a container into it for every item.
+    /// </summary>
+    /// <remarks>
+    /// A control that realizes its containers itself out of named template parts — DataGrid
+    /// builds rows into PART_RowsHost — overrides this to <c>false</c>. It still routes through
+    /// GetContainerForItemOverride / PrepareContainerForItemOverride / ClearContainerForItemOverride,
+    /// it just calls them directly. Leaving the fallback host on gives such a control a SECOND,
+    /// never-virtualized container per item inside a panel that is never measured, arranged or
+    /// rendered once a template is up, which doubles every container's prepare/clear lifecycle
+    /// (DataGrid's LoadingRow/UnloadingRow fired twice per row) and keeps the shadow containers
+    /// alive for as long as the control.
+    /// </remarks>
+    private protected virtual bool UsesFallbackItemsHost => true;
+
+    /// <summary>
     /// Internal accessor for the items-host panel. Used by the DevTools inspector to
     /// map a right-clicked item container back to its item index for delete/undo
     /// (the generator map is only populated on the virtualizing path). Mirrors the
@@ -364,7 +380,7 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
         var panel = ItemsHost;
 
         // If no panel from template, create fallback
-        if (panel == null && !HasTemplate)
+        if (panel == null && !HasTemplate && UsesFallbackItemsHost)
         {
             _fallbackItemsHost = CreateItemsPanel();
             AddVisualChild(_fallbackItemsHost);
@@ -540,7 +556,7 @@ public partial class ItemsControl : Control, Jalium.UI.Markup.IAddChild, IContai
         }
 
         // Fallback: direct items host rendering (no template)
-        if (_fallbackItemsHost == null)
+        if (_fallbackItemsHost == null && UsesFallbackItemsHost)
         {
             RefreshItems();
         }

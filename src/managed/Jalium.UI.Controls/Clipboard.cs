@@ -1,6 +1,5 @@
 using System.Buffers.Binary;
 using System.Collections.Specialized;
-using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -1753,7 +1752,7 @@ internal static partial class ClipboardPlatform
                 width,
                 height,
                 stride,
-                out int packedStride,
+                out _,
                 out int sourceByteCount,
                 out _) ||
             bgraPixels.Length < sourceByteCount)
@@ -1761,43 +1760,11 @@ internal static partial class ClipboardPlatform
             throw new ArgumentException("The pixel buffer layout is invalid or exceeds the clipboard image limit.", nameof(bgraPixels));
         }
 
+        var source = BitmapSource.Create(
+            width, height, 96, 96, PixelFormat.Bgra32, null, bgraPixels, stride);
+        var encoder = new PngBitmapEncoder { Frames = { BitmapFrame.Create(source) } };
         using var output = new MemoryStream();
-        output.Write([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
-
-        var header = new byte[13];
-        BinaryPrimitives.WriteInt32BigEndian(header.AsSpan(0, 4), width);
-        BinaryPrimitives.WriteInt32BigEndian(header.AsSpan(4, 4), height);
-        header[8] = 8;
-        header[9] = 6;
-        WritePngChunk(output, "IHDR"u8, header);
-
-        byte[] compressed;
-        using (var buffer = new MemoryStream())
-        {
-            using (var zlib = new ZLibStream(buffer, CompressionLevel.Optimal, leaveOpen: true))
-            {
-                var rgbaRow = new byte[packedStride];
-                for (int y = 0; y < height; y++)
-                {
-                    zlib.WriteByte(0);
-                    int sourceOffset = y * stride;
-                    for (int x = 0; x < width; x++)
-                    {
-                        int sourcePixel = sourceOffset + x * 4;
-                        int targetPixel = x * 4;
-                        rgbaRow[targetPixel] = bgraPixels[sourcePixel + 2];
-                        rgbaRow[targetPixel + 1] = bgraPixels[sourcePixel + 1];
-                        rgbaRow[targetPixel + 2] = bgraPixels[sourcePixel];
-                        rgbaRow[targetPixel + 3] = bgraPixels[sourcePixel + 3];
-                    }
-                    zlib.Write(rgbaRow);
-                }
-            }
-            compressed = buffer.ToArray();
-        }
-
-        WritePngChunk(output, "IDAT"u8, compressed);
-        WritePngChunk(output, "IEND"u8, []);
+        encoder.Save(output);
         return output.ToArray();
     }
 
@@ -1844,29 +1811,6 @@ internal static partial class ClipboardPlatform
         data.Length >= 8 &&
         data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 &&
         data[4] == 0x0D && data[5] == 0x0A && data[6] == 0x1A && data[7] == 0x0A;
-
-    private static void WritePngChunk(Stream output, ReadOnlySpan<byte> type, ReadOnlySpan<byte> data)
-    {
-        Span<byte> field = stackalloc byte[4];
-        BinaryPrimitives.WriteInt32BigEndian(field, data.Length);
-        output.Write(field);
-        output.Write(type);
-        output.Write(data);
-        uint crc = UpdatePngCrc(UpdatePngCrc(uint.MaxValue, type), data) ^ uint.MaxValue;
-        BinaryPrimitives.WriteUInt32BigEndian(field, crc);
-        output.Write(field);
-    }
-
-    private static uint UpdatePngCrc(uint crc, ReadOnlySpan<byte> data)
-    {
-        foreach (byte value in data)
-        {
-            crc ^= value;
-            for (int bit = 0; bit < 8; bit++)
-                crc = (crc & 1) != 0 ? 0xEDB88320u ^ (crc >> 1) : crc >> 1;
-        }
-        return crc;
-    }
 
     private static uint ResolveClipboardFormat(string format)
     {

@@ -1221,6 +1221,20 @@ public partial class Popup : FrameworkElement
         bool supportsExternalPopup,
         out Point overlayPosition)
     {
+        // 锚点已经在一个外飞的 PopupWindow 里（级联子菜单、外飞 Flyout 里的下拉/提示）：Windows 上一律
+        // 跟着外飞，不看装不装得下。退回主窗口覆盖层的话它会画在 topmost 的父弹窗 HWND 之下；更糟的是
+        // 它的按下事件先经主窗口的输入分发器——那里把「外飞弹窗开着时落在主窗口里的按下」当 light
+        // dismiss：父菜单被关、点击被吞、子菜单却留在原地还能继续点。
+        // 只在 Windows 上强制：Wayland 的嵌套 xdg_popup 必须以最顶层的 grab 弹窗为 parent，而原生层目前
+        // 一律挂在顶层窗口下，强制外飞会招来协议错误；Linux 仍按「装不下才外飞」。
+        if (supportsExternalPopup
+            && Platform.PlatformFactory.IsWindows
+            && IsAnchoredInsideExternalPopupWindow())
+        {
+            overlayPosition = requestedPosition;
+            return true;
+        }
+
         // Constrained popups never leave the owner, so their placement keeps using the
         // window-level flip exclusively — screen resolution would only add noise there.
         var resolvedPosition = !supportsExternalPopup || ShouldConstrainToRootBounds
@@ -1692,6 +1706,75 @@ public partial class Popup : FrameworkElement
             if (current is PopupWindow popupWindow)
                 return popupWindow.OwnerWindow;
             current = current.VisualParent;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 本弹窗的锚点（自身或 <see cref="PlacementTarget"/>）是否已经位于某个外飞的
+    /// <see cref="PopupWindow"/> 之内——也就是说，它是一个「从外飞弹窗里再弹出来」的级联弹窗。
+    /// 与 <see cref="ResolveOwningWindow"/> 同一条向上路径：先遇到 <see cref="Window"/> 算在窗口内，
+    /// 先遇到 <see cref="PopupWindow"/> 算在外飞弹窗内。
+    /// </summary>
+    internal bool IsAnchoredInsideExternalPopupWindow()
+    {
+        return IsInsideExternalPopupWindow(this) || IsInsideExternalPopupWindow(PlacementTarget);
+    }
+
+    private static bool IsInsideExternalPopupWindow(Visual? start)
+    {
+        for (var current = start; current != null; current = current.VisualParent)
+        {
+            if (current is Window)
+                return false;
+            if (current is PopupWindow)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 本弹窗是否是 <paramref name="root"/> 所属弹窗的祖先——即 <paramref name="root"/> 是从本弹窗的
+    /// 内容里（直接或经由更多层弹窗）级联弹出来的。沿「弹窗根 → 其 Popup 的锚点 → 视觉祖先」逐层上溯，
+    /// 每穿过一个 <see cref="PopupRoot"/> 就比对它的 OwnerPopup。
+    /// </summary>
+    /// <remarks>
+    /// 供宿主窗口的输入分发器做链感知的 light dismiss：点击落在某个覆盖层弹窗里时，它的祖先外飞弹窗
+    /// 不算「被点到外面」，不能关。
+    /// </remarks>
+    internal bool IsAncestorOfPopupRoot(PopupRoot root)
+    {
+        if (ReferenceEquals(root, _popupRoot))
+            return false;
+
+        var popup = root.OwnerPopup;
+        // 防御环状 PlacementTarget（A 的锚点在 B 里、B 的锚点又指回 A）导致死循环。
+        const int maxHops = 64;
+        for (int hop = 0; hop < maxHops; hop++)
+        {
+            var ancestorRoot = FindAncestorPopupRoot(popup.PlacementTarget)
+                ?? FindAncestorPopupRoot(popup);
+            if (ancestorRoot == null)
+                return false;
+            if (ReferenceEquals(ancestorRoot.OwnerPopup, this))
+                return true;
+
+            popup = ancestorRoot.OwnerPopup;
+        }
+
+        return false;
+    }
+
+    private static PopupRoot? FindAncestorPopupRoot(Visual? start)
+    {
+        for (var current = start; current != null; current = current.VisualParent)
+        {
+            if (current is PopupRoot popupRoot)
+                return popupRoot;
+            if (current is Window)
+                return null;
         }
 
         return null;

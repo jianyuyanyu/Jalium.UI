@@ -942,7 +942,10 @@ internal sealed partial class PopupWindow : Decorator, IWindowHost, ILayoutManag
                     return nint.Zero;
 
                 case WM_CAPTURECHANGED:
-                    UIElement.OnNativeCaptureChanged();
+                    // lParam == 本窗口 => 是自己重新 SetCapture 引发的回声，捕获没易主，不能清托管那笔。
+                    // 详见 Window.WndProcCore 里同一分支的说明。
+                    if (lParam != hWnd)
+                        UIElement.OnNativeCaptureChanged();
                     return nint.Zero;
 
                 case WM_SETCURSOR:

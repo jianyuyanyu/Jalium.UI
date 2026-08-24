@@ -17,11 +17,17 @@ public sealed class MenuFlyoutSubItem : MenuFlyoutItem
     private Popup? _subPopup;
     private Border? _subPopupBorder;
     private MenuPopupScrollHost? _subPopupScrollHost;
+    private Popup? _hostPopup;
 
     /// <summary>
     /// Gets the collection of menu elements in the sub-menu.
     /// </summary>
     public IList<MenuFlyoutItem> Items => _items;
+
+    /// <summary>
+    /// 子菜单当前是否打开。
+    /// </summary>
+    internal bool IsSubMenuOpen => _subPopup?.IsOpen == true;
 
     /// <summary>
     /// Initializes a new instance of the MenuFlyoutSubItem class.
@@ -31,6 +37,12 @@ public sealed class MenuFlyoutSubItem : MenuFlyoutItem
         AddHandler(MouseEnterEvent, new Input.MouseEventHandler(OnSubItemMouseEnter));
         AddHandler(MouseLeaveEvent, new Input.MouseEventHandler(OnSubItemMouseLeave));
     }
+
+    /// <summary>
+    /// 子菜单开着时父项保持高亮：指针移进子菜单（外飞时是另一个窗口）后本项的 IsMouseOver 会掉，
+    /// 但 Win32/WPF/WinUI 的菜单都让打开子菜单的那一项一直亮着，否则看不出子菜单是从哪儿弹出来的。
+    /// </summary>
+    protected override bool IsHighlighted => base.IsHighlighted || IsSubMenuOpen;
 
     /// <inheritdoc />
     protected override void OnRender(DrawingContext drawingContext)
@@ -62,7 +74,9 @@ public sealed class MenuFlyoutSubItem : MenuFlyoutItem
         CloseSiblingSubMenus();
         EnsureSubPopup();
         PopulateSubPopup();
+        AttachHostPopup();
         _subPopup!.IsOpen = true;
+        InvalidateVisual();
     }
 
     /// <summary>
@@ -71,7 +85,12 @@ public sealed class MenuFlyoutSubItem : MenuFlyoutItem
     public void HideSubMenu()
     {
         CloseDescendantSubMenus();
+        var wasOpen = IsSubMenuOpen;
         _subPopup?.IsOpen = false;
+        // 弹窗从未真正打开过（没解析到宿主窗口）时 IsOpen=false 不会触发 Closed，这里兜底退订并重画。
+        DetachHostPopup();
+        if (wasOpen)
+            InvalidateVisual();
     }
 
     internal void FocusFirstSubMenuItem()
@@ -132,6 +151,7 @@ public sealed class MenuFlyoutSubItem : MenuFlyoutItem
             StaysOpen = false,
             IsLightDismissEnabled = true,
             // Allow nested submenu to use external popup window when it overflows.
+            // 父菜单已经外飞成独立窗口时，Popup 自己会让子菜单跟着外飞（见 Popup.ResolveHostPlacement）。
             ShouldConstrainToRootBounds = false,
             Child = _subPopupBorder
         };
@@ -159,6 +179,55 @@ public sealed class MenuFlyoutSubItem : MenuFlyoutItem
     {
         CloseDescendantSubMenus();
         _subPopupScrollHost?.ItemsPanel.Children.Clear();
+        DetachHostPopup();
+        InvalidateVisual();
+    }
+
+    /// <summary>
+    /// 订阅承载本项的那个弹窗（祖先 PopupRoot 的 OwnerPopup）的 Closed：父菜单不论因何关闭
+    /// （点外面 light dismiss、Hide()、窗口失活、MenuBar 切分支……），子菜单都必须跟着关。
+    /// 否则父菜单的呈现器只是从自己的 PopupRoot 上摘下来，本项的 VisualParent（项面板）并没变，
+    /// OnVisualParentChanged 不会触发，子菜单就成了留在屏幕上的孤儿窗口。
+    /// </summary>
+    private void AttachHostPopup()
+    {
+        var host = FindHostPopup();
+        if (ReferenceEquals(host, _hostPopup))
+            return;
+
+        DetachHostPopup();
+        if (host == null)
+            return;
+
+        _hostPopup = host;
+        host.Closed += OnHostPopupClosed;
+    }
+
+    private void DetachHostPopup()
+    {
+        if (_hostPopup == null)
+            return;
+
+        _hostPopup.Closed -= OnHostPopupClosed;
+        _hostPopup = null;
+    }
+
+    private void OnHostPopupClosed(object? sender, EventArgs e)
+    {
+        HideSubMenu();
+    }
+
+    private Popup? FindHostPopup()
+    {
+        for (Visual? current = this; current != null; current = current.VisualParent)
+        {
+            if (current is PopupRoot popupRoot)
+                return popupRoot.OwnerPopup;
+            if (current is Window)
+                return null;
+        }
+
+        return null;
     }
 
     private void OnSubItemMouseEnter(object sender, Input.MouseEventArgs e)

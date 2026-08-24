@@ -93,6 +93,15 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
     private static readonly bool s_retainedLayersDisabled =
         Environment.GetEnvironmentVariable("JALIUM_DISABLE_RETAINED_LAYERS") == "1";
 
+    // Kill-switch for sub-pixel glyph positioning — both the Ideal-mode identity
+    // path (exact inter-glyph spacing for static text) and the scale-compensated
+    // DrawText branch (no per-glyph trembling under a live zoom).
+    // JALIUM_TEXT_SUBPIXEL_POSITIONING=0 restores the whole-pixel pen snapping of
+    // every glyph everywhere — useful to A/B "Desk to p" spacing / zoom tremble
+    // against the fix.
+    private static readonly bool s_subpixelPositioningDisabled =
+        Environment.GetEnvironmentVariable("JALIUM_TEXT_SUBPIXEL_POSITIONING") == "0";
+
     // True between BeginLayerCapture / EndLayerCapture (the RT is redirected into a
     // layer texture). Prevents nested layer capture.
     private bool _inLayerCapture;
@@ -124,6 +133,31 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
     // outright). Kept in lockstep with _effectCaptureCullSuspendDepth.
     private readonly Stack<Rect> _effectCaptureCullOverrideStack = new();
 
+    // ── Effect capture under a live non-translate transform ────────────────
+    // An element effect is captured while its ancestors' RenderTransform /
+    // LayoutTransform / Viewbox zoom is live on the native matrix stack, so the
+    // offscreen texture holds SCREEN-space pixels (the capture applies the
+    // matrix once). The composite must therefore be a 1:1 screen-space blit
+    // instead of "pre-transform rect × live matrix" — otherwise the content is
+    // transformed a second time on the way back and cropped to the singly-
+    // transformed rect (a scaled shadow layer showed a square dark slab behind
+    // its pill). One frame per open BeginEffectCapture scope, popped by
+    // EndEffectCapture into _lastEndedEffectCapture for the ApplyElementEffect
+    // that follows: it carries the SCREEN-space capture origin the composite's
+    // UV offset must be relative to. Cleared with the cull override on the
+    // per-frame self-heal.
+    private readonly Stack<EffectCaptureFrame> _effectCaptureFrameStack = new();
+    private EffectCaptureFrame _lastEndedEffectCapture;
+    private readonly float[] _effectInverseMatrixScratch = new float[6];
+
+    /// <summary>
+    /// Screen-space (surface DIP) origin of an effect capture. <see cref="Transformed"/>
+    /// is true when a non-identity native matrix was live at BeginEffectCapture, i.e.
+    /// when <see cref="ScreenX"/>/<see cref="ScreenY"/> differ from the untransformed
+    /// rect the caller passed.
+    /// </summary>
+    internal readonly record struct EffectCaptureFrame(double ScreenX, double ScreenY, bool Transformed);
+
     // Scoped opt-out for effects that deliberately deform their content with
     // the active matrix. Liquid glass drag uses this so text follows the same
     // transform as child borders and bitmaps instead of becoming a font-size
@@ -149,7 +183,8 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         int FontStyle,
         int TextRenderingMode,
         int TextFormattingMode,
-        int TextHintingMode);
+        int TextHintingMode,
+        bool SubpixelPositioning);
 
     private sealed class BitmapCacheEntry
     {
@@ -618,22 +653,49 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         // (the caller has already set Offset = childOffset). Opacity is passed to
         // the composite directly (AddBitmap folds in ambient opacity), so it is
         // NOT pushed here.
+        //
+        // A pure TranslateTransform (the RenderTransformOrigin-free case, i.e. the
+        // overwhelmingly common slide / reorder / follow-the-pointer animation) is NOT
+        // pushed onto the native matrix stack: PushTransform(Transform) folds it into the
+        // managed Offset fast path, which every regular draw op honours by adding Offset to
+        // its coordinates before crossing into native. worldBounds, however, is already an
+        // absolute (childOffset-based) rectangle and was handed straight to native, so the
+        // translation silently vanished: the cached layer was composited at the element's
+        // UN-translated slot while dirty tracking (GetDirtyRenderBounds) and child culling
+        // (ShouldRenderChild) both followed the translated one. Symptom: a TranslateTransform-
+        // animated container does not move at all, and neighbours it passes over get
+        // partially erased (they are culled against the translated bounds yet drawn — if at
+        // all — at the stale position). Fold the Offset delta produced by the push into the
+        // composite rectangle so the quad lands where the element's ink is accounted for;
+        // non-translate transforms still travel through the native matrix and see no delta.
+        var offsetBeforePush = Offset;
         bool pushed = false;
         if (transform != null)
         {
             ((ITransformDrawingContext)this).PushTransform(transform, originX, originY);
             pushed = true;
         }
+        var translateX = Offset.X - offsetBeforePush.X;
+        var translateY = Offset.Y - offsetBeforePush.Y;
 
         NativeMethods.RenderTargetCompositeLayer(
             _renderTarget.Handle, layer,
-            (float)worldBounds.X, (float)worldBounds.Y,
+            (float)(worldBounds.X + translateX), (float)(worldBounds.Y + translateY),
             (float)worldBounds.Width, (float)worldBounds.Height,
             (float)opacity);
+        LastCompositedLayerRectForTests = new Rect(
+            worldBounds.X + translateX, worldBounds.Y + translateY, worldBounds.Width, worldBounds.Height);
+        CompositedLayerCountForTests++;
 
         if (pushed)
             ((ITransformDrawingContext)this).PopTransform();
     }
+
+    /// <summary>Screen-space rectangle handed to native by the most recent <see cref="CompositeLayer"/> (tests).</summary>
+    internal Rect LastCompositedLayerRectForTests { get; private set; }
+
+    /// <summary>Number of <see cref="CompositeLayer"/> calls that reached native on this context (tests).</summary>
+    internal int CompositedLayerCountForTests { get; private set; }
 
     /// <summary>
     /// The owning thread's frame prologue. Destroys retained layers queued by
@@ -667,6 +729,8 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         // native side has the symmetric guard in ResetGpuReplay).
         _effectCaptureCullSuspendDepth = 0;
         _effectCaptureCullOverrideStack.Clear();
+        _effectCaptureFrameStack.Clear();
+        _lastEndedEffectCapture = default;
         _suppressedEffectCaptureDepth = 0;
         if (_renderTarget == null || _renderTarget.Handle == nint.Zero) return;
         while (Visual.TryDequeuePendingLayerDestroy(out nint h))
@@ -1483,6 +1547,28 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
         if (isIdentity || preserveNativeScaleDeformation)
         {
+            // Glyph placement policy follows TextOptions.TextFormattingMode, the
+            // same split WPF makes:
+            //   Ideal   (default) → sub-pixel positioning. The layout's advances are
+            //             natural (fractional) DirectWrite metrics, so every glyph
+            //             pen lands on a fraction; the native atlas keeps 1/8-px
+            //             phases measured from the final screen pen and the run is
+            //             drawn with the spacing the font designer intended.
+            //   Display           → whole-pixel pen snapping (each glyph pen rounded
+            //             to the nearest physical pixel, byte-identical bitmap for
+            //             every instance of a character).
+            // Display used to be the only behaviour. With natural advances it rounds
+            // each pen INDEPENDENTLY, so two neighbouring gaps can be off by up to a
+            // whole pixel in opposite directions: in a 14px bold label "Desktop" read
+            // as "Desk to p" because the k→t gap rounded wide and s→k / t→o rounded
+            // tight. A pixel is a large fraction of a bold letter gap, so the
+            // inconsistency is obvious at small UI sizes — the exact case the
+            // snapping was supposed to make look crisp. Sub-pixel placement keeps the
+            // bitmaps point-sampled (no resampling blur); only where a glyph lands
+            // changes, by at most 1/8 px from its true position.
+            // JALIUM_TEXT_SUBPIXEL_POSITIONING=0 restores the snapped path for A/B.
+            var identitySubpixel = !s_subpixelPositioningDisabled &&
+                formattedText.TextFormattingMode == (int)TextFormattingMode.Ideal;
             var format = GetTextFormat(
                 formattedText.FontFamily,
                 effectiveFontSize,
@@ -1490,7 +1576,8 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
                 formattedText.FontStyle,
                 formattedText.TextRenderingMode,
                 formattedText.TextFormattingMode,
-                formattedText.TextHintingMode);
+                formattedText.TextHintingMode,
+                subpixelPositioning: identitySubpixel);
             if (format == null) return;
 
             var x = (float)mx;
@@ -1503,6 +1590,16 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             return;
         }
 
+        // Under a live scale the run's pens move continuously — every frame of a
+        // 1.00→1.03 hover zoom re-lays the text out at a slightly different em
+        // size, so each glyph's screen X drifts by a fraction of a pixel. With
+        // whole-pixel pen snapping every glyph crosses its own pixel boundary at
+        // a different instant and the characters visibly tremble left/right
+        // against the smoothly scaling box. Sub-pixel positioning keeps 1/8-px
+        // phases measured from the final screen pen instead, so the spacing
+        // stays exact while the glyph bitmaps remain crisp. Unlike the identity
+        // branch it is requested regardless of TextFormattingMode: a Display-mode
+        // label that zooms still has to stay still while it zooms.
         var scaledFormat = GetTextFormat(
             formattedText.FontFamily,
             effectiveFontSize,
@@ -1510,7 +1607,8 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             formattedText.FontStyle,
             formattedText.TextRenderingMode,
             formattedText.TextFormattingMode,
-            formattedText.TextHintingMode);
+            formattedText.TextHintingMode,
+            subpixelPositioning: !s_subpixelPositioningDisabled);
         if (scaledFormat == null) return;
 
         // Screen-space origin = current matrix applied to (mx, my). The origin
@@ -2396,6 +2494,14 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
 
         if (cmds.Count == 0) return;
 
+        // A closed figure's final edge (last point back to StartPoint) exists
+        // only as the ClosePath tag — AppendFigureSegments emits segments, not
+        // the wrap. Without it the native flattener produced an open contour
+        // and the stroker drew every side of the outline except the closing
+        // one (the "warehouse icon has no right wall" bug). The multi-figure
+        // fill path already emits this tag; the single-figure path did not.
+        if (figure.IsClosed) cmds.Add(5f); // ClosePath tag
+
         float startX = (float)(figure.StartPoint.X + ox);
         float startY = (float)(figure.StartPoint.Y + oy);
         float bx = (float)(geoBounds.X + ox), by = (float)(geoBounds.Y + oy);
@@ -2795,6 +2901,13 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
     {
         if (_closed || imageSource == null) return;
 
+        // Stamped for the source the CALLER named, before any of the substitutions below can
+        // replace it: the raster branch may hand GetNativeBitmap a downscaled thumbnail and the
+        // animated branch a frame, and neither of those is the instance an idle element is about to
+        // reclaim. The stamp is what tells that element's reclaim "somebody is still drawing this",
+        // so it has to name the shared source, not the renderer's private stand-in for it.
+        imageSource.MarkDrawn();
+
         // Video surface fast path: when the source is a D3DImage backed by a
         // NativeVideoSurface, skip the bitmap-cache machinery entirely and
         // dispatch straight to jalium_render_target_draw_video_surface so the
@@ -3063,43 +3176,15 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             return;
         }
 
-        // Convert IBackdropEffect to native parameters
-        // Build backdrop filter string based on effect properties
-        var backdropFilter = BuildBackdropFilterString(effect);
-
-        // Build material string based on blur type
-        var material = effect.BlurType switch
-        {
-            BackdropBlurType.Frosted => "acrylic",
-            _ when effect.TintOpacity > 0 => "acrylic",
-            _ => string.Empty
-        };
-
-        // Convert tint color from ARGB uint to hex string
-        var tintColorArgb = effect.TintColorArgb;
-        var materialTint = tintColorArgb != 0
-            ? $"#{(tintColorArgb >> 16) & 0xFF:X2}{(tintColorArgb >> 8) & 0xFF:X2}{tintColorArgb & 0xFF:X2}"
-            : string.Empty;
-
-        // Pass the full material parameter set. The blur+tint+corners were
-        // always forwarded; noiseIntensity (Acrylic film grain), saturation and
-        // luminosity (Mica vibrancy/brightness) were previously built into the
-        // CSS `backdropFilter` string but never consumed by native — now they
-        // reach the snapshot-backdrop shader through DrawBackdropFilterEx.
-        _renderTarget.DrawBackdropFilterEx(
-            x, y, width, height,
-            backdropFilter,
-            material,
-            materialTint,
-            effect.TintOpacity,
-            effect.BlurRadius,
-            effect.NoiseIntensity,
-            effect.Saturation,
-            effect.Luminosity,
-            (float)normalizedCornerRadius.TopLeft,
-            (float)normalizedCornerRadius.TopRight,
-            (float)normalizedCornerRadius.BottomRight,
-            (float)normalizedCornerRadius.BottomLeft);
+        // Every IBackdropEffect parameter travels as one struct: blur kernel
+        // family + sigma, the colour pipeline (brightness/contrast/saturation/
+        // hue/grayscale/sepia/invert), tint with alpha, grain, opacity and the
+        // per-corner rounding. The old string-based entry points could only
+        // carry blur/tint/noise/saturation/luminosity and silently dropped the
+        // rest. Native converts DIPs to physical pixels itself.
+        var material = BackdropMaterialDesc.FromEffect(
+            effect, x, y, width, height, in normalizedCornerRadius);
+        _renderTarget.DrawBackdropMaterial(in material);
     }
 
     /// <summary>
@@ -3195,61 +3280,6 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             parameters.LightX, parameters.LightY, parameters.HighlightBoost,
             parameters.ShapeType, parameters.ShapeExponent,
             parameters.NeighborCount, parameters.FusionRadius, neighborData);
-    }
-
-    /// <summary>
-    /// Builds a CSS-style backdrop filter string from the effect properties.
-    /// </summary>
-    private static string BuildBackdropFilterString(IBackdropEffect effect)
-    {
-        var parts = new List<string>();
-
-        if (effect.BlurRadius > 0)
-        {
-            parts.Add($"blur({effect.BlurRadius}px)");
-        }
-
-        if (Math.Abs(effect.Brightness - 1.0f) > 0.001f)
-        {
-            parts.Add($"brightness({effect.Brightness})");
-        }
-
-        if (Math.Abs(effect.Contrast - 1.0f) > 0.001f)
-        {
-            parts.Add($"contrast({effect.Contrast})");
-        }
-
-        if (Math.Abs(effect.Saturation - 1.0f) > 0.001f)
-        {
-            parts.Add($"saturate({effect.Saturation})");
-        }
-
-        if (effect.Grayscale > 0)
-        {
-            parts.Add($"grayscale({effect.Grayscale})");
-        }
-
-        if (effect.Sepia > 0)
-        {
-            parts.Add($"sepia({effect.Sepia})");
-        }
-
-        if (effect.Invert > 0)
-        {
-            parts.Add($"invert({effect.Invert})");
-        }
-
-        if (Math.Abs(effect.HueRotation) > 0.001f)
-        {
-            parts.Add($"hue-rotate({effect.HueRotation}rad)");
-        }
-
-        if (Math.Abs(effect.Opacity - 1.0f) > 0.001f)
-        {
-            parts.Add($"opacity({effect.Opacity})");
-        }
-
-        return string.Join(" ", parts);
     }
 
     /// <inheritdoc />
@@ -3404,15 +3434,44 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         var exactRight = offsetBounds.Right;
         var exactBottom = offsetBounds.Bottom;
 
-        // Aliased (scissor-only) clips are snapped to the pixel grid by expanding
-        // OUTWARD (Floor start, Ceiling end). Drawing operations pixel-snap their
-        // origin via Math.Round, so a snapped stroke can land up to 0.5px outside
-        // the mathematical clip region; a tight integer scissor would shave it off
-        // and produce asymmetric border thickness.
-        var x = (float)Math.Floor(exactLeft);
-        var y = (float)Math.Floor(exactTop);
-        var w = (float)Math.Ceiling(exactRight) - x;
-        var h = (float)Math.Ceiling(exactBottom) - y;
+        // Aliased (scissor-only) clips have NO antialiased mask behind them — the scissor
+        // rectangle is the visual boundary itself — so it must never be looser than the
+        // geometric one. It used to be snapped OUTWARD (Floor start, Ceiling end) on the
+        // premise that drawing operations pixel-snap their origin via Math.Round, and that
+        // premise does not hold: SnapCoordinate is deliberately a no-op so fills keep
+        // sub-pixel motion smooth. So an outward scissor let clipped content survive a full
+        // pixel past the clip at FULL coverage while every sibling fill in the same container
+        // stopped on its own antialiased edge.
+        //
+        // That is exactly the bright 1px line an Image under a gradient scrim shows at the
+        // bottom of a ClipToBounds host: the scrim's last row is a fractional fill and cannot
+        // cover the image row the loosened scissor let through whole, so the seam reads
+        // BRIGHTER than the rows above and below it. (The rounded-clip path below already
+        // learned this and hands the mask the exact rect; this is the square-clip half.)
+        //
+        // Snapping INWARD is the correct direction for a hard clip: a row that was only
+        // fractionally inside the region is dropped rather than painted at full strength,
+        // which is what CSS overflow:hidden and a scissor do anyway. The cost is up to one
+        // pixel of an edge that was never fully inside the clip to begin with.
+        var x = (float)Math.Ceiling(exactLeft);
+        var y = (float)Math.Ceiling(exactTop);
+        var w = (float)Math.Floor(exactRight) - x;
+        var h = (float)Math.Floor(exactBottom) - y;
+
+        // A clip thinner than one pixel must not collapse to nothing: inward snapping would
+        // erase a 0.4px-tall region entirely, and a caller that asked to clip to a hairline
+        // still expects to see the hairline. Fall back to the nearest whole pixel, which is
+        // the smallest region that can be scissored at all.
+        if (w <= 0 && exactRight > exactLeft)
+        {
+            x = (float)Math.Round(exactLeft);
+            w = Math.Max(1f, (float)Math.Round(exactRight) - x);
+        }
+        if (h <= 0 && exactBottom > exactTop)
+        {
+            y = (float)Math.Round(exactTop);
+            h = Math.Max(1f, (float)Math.Round(exactBottom) - y);
+        }
 
         // Rounded clips get the EXACT rect instead. Their backend counterpart is an
         // antialiased SDF coverage mask evaluated per fragment (rounded_clip.hlsli,
@@ -3428,6 +3487,11 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         // further and showed through unscrimmed. The backend still expands the
         // scissor itself (D3D12RenderTarget::EmitRoundedClipPair), so the hard cull
         // stays conservative while the mask stays exact.
+        //
+        // Snapping this one INWARD as well was tried for the pale rim along the corner arcs
+        // and is NOT the answer: the rim survived unchanged (it is not clipped content
+        // reaching past the fill) and the inward snap cost a row of the image at the top
+        // edge, trading a bright seam for a dark one. Leave it exact.
         var ex = (float)exactLeft;
         var ey = (float)exactTop;
         var ew = (float)Math.Max(0, exactRight - exactLeft);
@@ -3731,6 +3795,16 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
     /// <summary>
     /// Begins capturing element content into an offscreen bitmap for effect processing.
     /// </summary>
+    /// <remarks>
+    /// <paramref name="x"/>/<paramref name="y"/>/<paramref name="w"/>/<paramref name="h"/> are
+    /// in the current managed drawing space (Offset-included, BEFORE the live native
+    /// matrix), like every other draw call. Under a non-identity native matrix the
+    /// capture must still cover the element's whole SCREEN footprint (a scaled-up
+    /// element overflows its untransformed rect), so the screen-space AABB is
+    /// computed here and recorded for <see cref="ApplyElementEffect"/>; whether the
+    /// AABB or the untransformed rect is handed to native depends on which space
+    /// the backend expects — see <see cref="NativeEffectCaptureRectIsPostTransform"/>.
+    /// </remarks>
     public void BeginEffectCapture(float x, float y, float w, float h)
     {
         if (_closed) return;
@@ -3758,7 +3832,25 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
                 _currentNativeMatrix[4], _currentNativeMatrix[5])
             : captureRect);
         _effectCaptureCullSuspendDepth++;
-        _renderTarget.BeginEffectCapture(x, y, w, h);
+
+        float nativeX = x, nativeY = y, nativeW = w, nativeH = h;
+        var frame = new EffectCaptureFrame(x, y, Transformed: false);
+        if (TryGetActiveNativeTransform(out var liveMatrix))
+        {
+            var screenRect = ComputeScreenEffectCaptureRect(
+                new Rect(x, y, w, h), liveMatrix,
+                _renderTarget.DpiScaleX, _renderTarget.DpiScaleY);
+            frame = new EffectCaptureFrame(screenRect.X, screenRect.Y, Transformed: true);
+            if (NativeEffectCaptureRectIsPostTransform)
+            {
+                nativeX = (float)screenRect.X;
+                nativeY = (float)screenRect.Y;
+                nativeW = (float)screenRect.Width;
+                nativeH = (float)screenRect.Height;
+            }
+        }
+        _effectCaptureFrameStack.Push(frame);
+        _renderTarget.BeginEffectCapture(nativeX, nativeY, nativeW, nativeH);
     }
 
     /// <summary>
@@ -3776,28 +3868,200 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             _effectCaptureCullSuspendDepth--;
         if (_effectCaptureCullOverrideStack.Count > 0)
             _effectCaptureCullOverrideStack.Pop();
+        _lastEndedEffectCapture = _effectCaptureFrameStack.Count > 0
+            ? _effectCaptureFrameStack.Pop()
+            : default;
         _renderTarget.EndEffectCapture();
     }
+
+    /// <summary>
+    /// True when the native backend treats the rect handed to its effect capture as
+    /// POST-transform (screen) space: D3D12's <c>BeginOffscreenCapture</c> composes
+    /// <c>T(-x,-y)</c> on top of the live transform stack and sizes the texture by
+    /// <c>(w,h)</c> directly, so under a live matrix it needs the screen-space AABB
+    /// or the transformed content overflows / lands outside the texture. Vulkan
+    /// (OffscreenBegin marker) and the software rasterizer map the incoming rect
+    /// through the live transform themselves and must keep receiving the
+    /// untransformed rect — feeding them the AABB would transform it twice.
+    /// </summary>
+    private bool NativeEffectCaptureRectIsPostTransform =>
+        _renderTarget.Backend == RenderBackend.D3D12;
+
+    /// <summary>
+    /// Returns the live native matrix when a non-identity non-translate transform is
+    /// active (surface = drawing × matrix), false at identity so the untransformed
+    /// fast paths stay bit-identical to their historical behaviour.
+    /// </summary>
+    private bool TryGetActiveNativeTransform(out Jalium.UI.Media.Matrix matrix)
+    {
+        matrix = Jalium.UI.Media.Matrix.Identity;
+        if (_nativeTransformDepth <= 0)
+            return false;
+
+        var m11 = _currentNativeMatrix[0];
+        var m12 = _currentNativeMatrix[1];
+        var m21 = _currentNativeMatrix[2];
+        var m22 = _currentNativeMatrix[3];
+        var dx = _currentNativeMatrix[4];
+        var dy = _currentNativeMatrix[5];
+        const double eps = 1e-6;
+        if (Math.Abs(m11 - 1.0) < eps && Math.Abs(m12) < eps &&
+            Math.Abs(m21) < eps && Math.Abs(m22 - 1.0) < eps &&
+            Math.Abs(dx) < eps && Math.Abs(dy) < eps)
+        {
+            return false;
+        }
+
+        matrix = new Jalium.UI.Media.Matrix(m11, m12, m21, m22, dx, dy);
+        return true;
+    }
+
+    /// <summary>
+    /// Screen-space capture rect for an untransformed capture rect under
+    /// <paramref name="matrix"/>: the transformed AABB, snapped OUTWARD to the
+    /// physical pixel grid. The snap is what keeps the composite crisp — the
+    /// composite samples the capture texture at
+    /// <c>texel = (screenPixelCentre − captureOrigin) × dpi</c>, so an origin on the
+    /// pixel grid puts every sample on a texel centre (a 1:1 copy) instead of a
+    /// bilinear blend of neighbours that softens text and vector edges.
+    /// </summary>
+    internal static Rect ComputeScreenEffectCaptureRect(
+        Rect captureRect, Jalium.UI.Media.Matrix matrix, double dpiScaleX, double dpiScaleY)
+    {
+        var aabb = TransformRectAabb(captureRect,
+            matrix.M11, matrix.M12, matrix.M21, matrix.M22, matrix.OffsetX, matrix.OffsetY);
+        double sx = dpiScaleX > 0 ? dpiScaleX : 1.0;
+        double sy = dpiScaleY > 0 ? dpiScaleY : 1.0;
+        double left = Math.Floor(aabb.X * sx) / sx;
+        double top = Math.Floor(aabb.Y * sy) / sy;
+        double right = Math.Ceiling((aabb.X + aabb.Width) * sx) / sx;
+        double bottom = Math.Ceiling((aabb.Y + aabb.Height) * sy) / sy;
+        return new Rect(left, top, Math.Max(0.0, right - left), Math.Max(0.0, bottom - top));
+    }
+
+    /// <summary>
+    /// Per-axis scale magnitudes of an affine matrix and the average used to scale
+    /// isotropic effect quantities (blur radius, corner radii). Matches the native
+    /// backends' own convention (Vulkan scales its shadow radius/sigma by the same
+    /// average of the column norms).
+    /// </summary>
+    internal static void GetTransformScales(Jalium.UI.Media.Matrix matrix,
+        out double scaleX, out double scaleY, out double average)
+    {
+        scaleX = Math.Sqrt(matrix.M11 * matrix.M11 + matrix.M12 * matrix.M12);
+        scaleY = Math.Sqrt(matrix.M21 * matrix.M21 + matrix.M22 * matrix.M22);
+        average = 0.5 * (scaleX + scaleY);
+    }
+
+    /// <summary>
+    /// Test seam: the frame recorded by the most recent EndEffectCapture.
+    /// </summary>
+    internal EffectCaptureFrame LastEndedEffectCaptureForTests => _lastEndedEffectCapture;
 
     /// <summary>
     /// Applies the given element effect to the captured content and draws the result.
     /// Dispatches to the appropriate native rendering method based on concrete effect type.
     /// </summary>
+    /// <remarks>
+    /// Under a live non-identity native matrix the capture texture already holds the
+    /// element transformed once (screen space). Compositing it through the live matrix
+    /// again would transform it twice, so this neutralizes the matrix for the duration
+    /// of the native call (pushes its inverse — the same trick DrawText uses to
+    /// rasterize glyphs at screen resolution) and hands native SCREEN-space geometry:
+    /// the AABB of the transformed element rect, the shadow/glow offsets mapped through
+    /// the linear part, isotropic radii scaled by the average axis scale, and a UV
+    /// offset relative to the screen-space capture origin recorded at
+    /// <see cref="BeginEffectCapture"/>. Rotation/skew degrade to the AABB for the
+    /// analytic shadow shape (the content composite stays exact) — the same
+    /// approximation the Vulkan backend applies natively.
+    /// </remarks>
     public void ApplyElementEffect(IEffect effect, float x, float y, float w, float h,
         float captureOriginX = 0, float captureOriginY = 0,
         float cornerTL = 0, float cornerTR = 0, float cornerBR = 0, float cornerBL = 0)
     {
         if (_closed || effect == null || SimplifyElementEffects) return;
+
+        if (!TryGetActiveNativeTransform(out var liveMatrix) ||
+            !liveMatrix.TryInvert(out var inverse))
+        {
+            // Identity (or singular — nothing sensible to draw): the historical path,
+            // untouched. UV offset = element position relative to the capture origin.
+            ApplyElementEffectCore(effect, x, y, w, h,
+                x - captureOriginX, y - captureOriginY,
+                Jalium.UI.Media.Matrix.Identity, 1.0,
+                cornerTL, cornerTR, cornerBR, cornerBL);
+            return;
+        }
+
+        var elementRect = TransformRectAabb(new Rect(x, y, w, h),
+            liveMatrix.M11, liveMatrix.M12, liveMatrix.M21, liveMatrix.M22,
+            liveMatrix.OffsetX, liveMatrix.OffsetY);
+        GetTransformScales(liveMatrix, out _, out _, out var scale);
+
+        // Screen-space capture origin: what BeginEffectCapture recorded for this scope.
+        // A frame that was NOT recorded under a transform (unbalanced push between Begin
+        // and Apply — never the case for Visual/PushEffect) degrades to mapping the
+        // untransformed origin through the same snap, so the composite still lands on
+        // the element instead of drawing from a stale field.
+        var frame = _lastEndedEffectCapture;
+        double captureScreenX, captureScreenY;
+        if (frame.Transformed)
+        {
+            captureScreenX = frame.ScreenX;
+            captureScreenY = frame.ScreenY;
+        }
+        else
+        {
+            var mappedOrigin = ComputeScreenEffectCaptureRect(
+                new Rect(captureOriginX, captureOriginY, 0, 0), liveMatrix,
+                _renderTarget.DpiScaleX, _renderTarget.DpiScaleY);
+            captureScreenX = mappedOrigin.X;
+            captureScreenY = mappedOrigin.Y;
+        }
+
+        var inv = _effectInverseMatrixScratch;
+        inv[0] = (float)inverse.M11; inv[1] = (float)inverse.M12;
+        inv[2] = (float)inverse.M21; inv[3] = (float)inverse.M22;
+        inv[4] = (float)inverse.OffsetX; inv[5] = (float)inverse.OffsetY;
+
+        // Native's compose is new_top = old_top * incoming, so pushing the inverse of
+        // the mirrored matrix leaves native at identity (D3D12) / the DPI root only
+        // (Vulkan): the screen-space geometry below goes straight onto the surface.
+        _renderTarget.PushTransform(inv);
+        try
+        {
+            ApplyElementEffectCore(effect,
+                (float)elementRect.X, (float)elementRect.Y,
+                (float)elementRect.Width, (float)elementRect.Height,
+                (float)(elementRect.X - captureScreenX), (float)(elementRect.Y - captureScreenY),
+                liveMatrix, scale,
+                (float)(cornerTL * scale), (float)(cornerTR * scale),
+                (float)(cornerBR * scale), (float)(cornerBL * scale));
+        }
+        finally
+        {
+            _renderTarget.PopTransform();
+        }
+    }
+
+    /// <summary>
+    /// Effect dispatch in the space native will draw in. <paramref name="space"/> is the
+    /// live matrix whose linear part maps effect OFFSET vectors (shadow/inner-shadow
+    /// offsets, emboss light direction) into that space; <paramref name="scale"/> scales
+    /// isotropic pixel quantities (blur radii, glow size, emboss relief). Identity /
+    /// 1.0 at identity, where the arguments are the caller's untransformed values.
+    /// EffectGroup recursion stays inside this method so the compensation above is
+    /// applied exactly once per capture.
+    /// </summary>
+    private void ApplyElementEffectCore(IEffect effect, float x, float y, float w, float h,
+        float uvOffX, float uvOffY,
+        Jalium.UI.Media.Matrix space, double scale,
+        float cornerTL, float cornerTR, float cornerBR, float cornerBL)
+    {
         if (!_effectApplicationPath.Add(effect)) return;
 
         try
         {
-
-        // UV offset: difference between element position and capture origin.
-        // The offscreen texture starts at captureOrigin; the element content sits
-        // at (x - captureOriginX, y - captureOriginY) inside the texture.
-        float uvOffX = x - captureOriginX;
-        float uvOffY = y - captureOriginY;
 
         if (effect is Media.Effects.BlurEffect blur)
         {
@@ -3811,7 +4075,7 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
                     float maxR = Math.Max(Math.Max(cornerTL, cornerTR), Math.Max(cornerBR, cornerBL));
                     _renderTarget.PushRoundedRectClip(x, y, w, h, maxR, maxR);
                 }
-                _renderTarget.DrawBlurEffect(x, y, w, h, (float)blur.Radius, uvOffX, uvOffY);
+                _renderTarget.DrawBlurEffect(x, y, w, h, (float)(blur.Radius * scale), uvOffX, uvOffY);
                 if (hasCorners)
                 {
                     _renderTarget.PopClip();
@@ -3821,16 +4085,17 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         else if (effect is Media.Effects.ElementBlurEffect elementBlur)
         {
             if (elementBlur.Radius > 0)
-                _renderTarget.DrawBlurEffect(x, y, w, h, (float)elementBlur.Radius, uvOffX, uvOffY);
+                _renderTarget.DrawBlurEffect(x, y, w, h, (float)(elementBlur.Radius * scale), uvOffX, uvOffY);
         }
         else if (effect is Media.Effects.DropShadowEffect shadow)
         {
             var color = shadow.Color;
             var effectiveAlpha = (color.A / 255f) * (float)shadow.Opacity;
+            MapEffectVector(space, shadow.OffsetX, shadow.OffsetY, out var offsetX, out var offsetY);
             _renderTarget.DrawDropShadowEffect(x, y, w, h,
-                (float)shadow.BlurRadius,
-                (float)shadow.OffsetX,
-                (float)shadow.OffsetY,
+                (float)(shadow.BlurRadius * scale),
+                (float)offsetX,
+                (float)offsetY,
                 color.R / 255f, color.G / 255f, color.B / 255f,
                 effectiveAlpha,
                 uvOffX, uvOffY,
@@ -3841,7 +4106,7 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             var color = glow.GlowColor;
             var effectiveAlpha = (color.A / 255f) * (float)glow.Opacity;
             _renderTarget.DrawOuterGlowEffect(x, y, w, h,
-                (float)glow.EffectiveBlurRadius,
+                (float)(glow.EffectiveBlurRadius * scale),
                 color.R / 255f, color.G / 255f, color.B / 255f,
                 effectiveAlpha, (float)glow.Intensity,
                 uvOffX, uvOffY,
@@ -3851,10 +4116,11 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         {
             var color = innerShadow.Color;
             var effectiveAlpha = (color.A / 255f) * (float)innerShadow.Opacity;
+            MapEffectVector(space, innerShadow.OffsetX, innerShadow.OffsetY, out var offsetX, out var offsetY);
             _renderTarget.DrawInnerShadowEffect(x, y, w, h,
-                (float)innerShadow.BlurRadius,
-                (float)innerShadow.OffsetX,
-                (float)innerShadow.OffsetY,
+                (float)(innerShadow.BlurRadius * scale),
+                (float)offsetX,
+                (float)offsetY,
                 color.R / 255f, color.G / 255f, color.B / 255f,
                 effectiveAlpha,
                 uvOffX, uvOffY,
@@ -3862,11 +4128,12 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         }
         else if (effect is Media.Effects.EmbossEffect emboss)
         {
+            MapEffectVector(space, emboss.LightDirectionX, emboss.LightDirectionY, out var lightX, out var lightY);
             _renderTarget.DrawEmbossEffect(x, y, w, h,
                 (float)emboss.Amount,
-                (float)emboss.LightDirectionX,
-                (float)emboss.LightDirectionY,
-                (float)emboss.Relief);
+                (float)lightX,
+                (float)lightY,
+                (float)(emboss.Relief * scale));
         }
         else if (effect is Media.Effects.ColorMatrixEffect colorMatrix)
         {
@@ -3902,7 +4169,7 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
                 }
                 else
                 {
-                    _renderTarget.DrawBlurEffect(x, y, w, h, 0);
+                    _renderTarget.DrawBlurEffect(x, y, w, h, 0f, uvOffX, uvOffY);
                 }
             }
         }
@@ -3912,13 +4179,16 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             // supported child reads the same isolated capture and is dispatched in
             // declaration order. Preserve the original capture origin and corner
             // radii; resetting them to zero shifts sampling for padded effects and
-            // was enough to make grouped shadows/glows disappear.
+            // was enough to make grouped shadows/glows disappear. The arguments are
+            // already in native's drawing space — recurse into the core, not the
+            // public entry, so the transform compensation is not applied twice.
             var activeEffects = group.ActiveEffects;
             for (int i = 0; i < activeEffects.Count; i++)
             {
                 var child = activeEffects[i];
-                ApplyElementEffect(child, x, y, w, h,
-                    captureOriginX, captureOriginY,
+                ApplyElementEffectCore(child, x, y, w, h,
+                    uvOffX, uvOffY,
+                    space, scale,
                     cornerTL, cornerTR, cornerBR, cornerBL);
             }
         }
@@ -3934,6 +4204,18 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         {
             _effectApplicationPath.Remove(effect);
         }
+    }
+
+    /// <summary>
+    /// Maps an effect offset VECTOR (no translation) through the linear part of
+    /// <paramref name="space"/> — WPF row-vector convention, the same one
+    /// <see cref="TransformRectAabb"/> uses.
+    /// </summary>
+    private static void MapEffectVector(Jalium.UI.Media.Matrix space, double vx, double vy,
+        out double outX, out double outY)
+    {
+        outX = vx * space.M11 + vy * space.M21;
+        outY = vx * space.M12 + vy * space.M22;
     }
 
     /// <inheritdoc />
@@ -4642,7 +4924,8 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         int fontStyle,
         int textRenderingMode,
         int textFormattingMode,
-        int textHintingMode)
+        int textHintingMode,
+        bool subpixelPositioning = false)
     {
         if (string.IsNullOrWhiteSpace(fontFamily))
         {
@@ -4667,7 +4950,8 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             fontStyle,
             textRenderingMode,
             textFormattingMode,
-            textHintingMode);
+            textHintingMode,
+            subpixelPositioning);
 
         if (_textFormatCache.TryGetValue(key, out var cached) && cached.IsValid)
         {
@@ -4693,6 +4977,15 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
             format.SetTextRenderingMode(textRenderingMode);
             format.SetTextFormattingMode(textFormattingMode);
             format.SetTextHintingMode(textHintingMode);
+            // Sub-pixel positioning is a placement policy derived by DrawText from
+            // TextFormattingMode (Ideal → on, Display → off) plus the live-scale
+            // branch, which always asks for it. It is part of the cache key above,
+            // so a Display-mode label and an Ideal-mode label with the same font
+            // never share a native format.
+            if (subpixelPositioning)
+            {
+                format.SetSubpixelPositioning(true);
+            }
             format.LastAccessSequence = ++_textFormatCacheSequence;
             _textFormatCache[key] = format;
         }
@@ -4795,6 +5088,13 @@ public sealed class RenderTargetDrawingContext : DrawingContextAdapter, IOffsetD
         bool hintCover = false)
     {
         if (imageSource == null) return null;
+
+        // The choke point every bitmap consumer funnels through, which is why the "still in use"
+        // stamp belongs here as well as in DrawImage: an ImageBrush tile fill, an ImageDrawing or a
+        // Shape.Fill backed by the same source reaches this method and nothing else, so stamping
+        // only at DrawImage would leave a brush-painted image unprotected from an idle element that
+        // shares its source.
+        imageSource.MarkDrawn();
 
         // Animated bitmaps are just a sequence of BitmapImage frames + a timer.
         // Forward to whichever BitmapImage frame is currently displayed so each

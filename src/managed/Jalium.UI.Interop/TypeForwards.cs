@@ -4,6 +4,8 @@ using System.Runtime.CompilerServices;
 
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.Interop.ActiveXHost))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.Interop.AdapterInfo))]
+[assembly: TypeForwardedTo(typeof(global::Jalium.UI.Interop.BackdropMaterialBlurType))]
+[assembly: TypeForwardedTo(typeof(global::Jalium.UI.Interop.BackdropMaterialDesc))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.Interop.BrowserInteropHelper))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.Interop.BrushConstantsNative))]
 [assembly: TypeForwardedTo(typeof(global::Jalium.UI.Interop.BrushShaderHandle))]

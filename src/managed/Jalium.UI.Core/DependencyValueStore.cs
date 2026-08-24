@@ -23,6 +23,7 @@ internal sealed class DependencyValueStore
         TemplateTrigger = 1 << 3,
         StyleSetter = 1 << 4,
         Current = 1 << 5,
+        ParentTemplateTrigger = 1 << 6,
     }
 
     internal enum Layer : byte
@@ -33,11 +34,13 @@ internal sealed class DependencyValueStore
         TemplateTrigger,
         StyleSetter,
         Current,
+        ParentTemplateTrigger,
     }
 
     private sealed class LayerValues
     {
         public object? Local;
+        public object? ParentTemplateTrigger;
         public object? ParentTemplate;
         public object? StyleTrigger;
         public object? TemplateTrigger;
@@ -309,6 +312,18 @@ internal sealed class DependencyValueStore
         }
     }
 
+    /// <summary>
+    /// 依赖属性优先级（高 → 低），与 WPF 的 <see cref="BaseValueSource"/> 数值序一致：
+    /// Local(11) &gt; ParentTemplateTrigger(10) &gt; ParentTemplate(9) &gt; StyleTrigger(7)
+    /// &gt; TemplateTrigger(6) &gt; Style(5)。
+    ///
+    /// <para>两个 trigger 层的区别（这正是 WPF 把它们分开的原因）：
+    /// <c>ParentTemplateTrigger</c> 是**模板对自己生成的具名部件**下的 trigger（
+    /// <c>&lt;Setter TargetName="PART_Bd" …/&gt;</c>），它代表宿主控件对模板内部件的支配，
+    /// 优先级仅次于 local；<c>TemplateTrigger</c> 是模板对**被模板化的控件自身**下的
+    /// trigger（无 TargetName），它必须低于该控件自己 Style 上的 trigger，否则用户写的
+    /// <c>&lt;Style.Triggers&gt;</c> 永远盖不过主题模板的 hover/pressed 反馈。</para>
+    /// </summary>
     private static void RecomputeEffective(ref Entry entry)
     {
         var values = entry.Values!;
@@ -317,20 +332,25 @@ internal sealed class DependencyValueStore
             entry.EffectiveValue = values.Local;
             entry.EffectiveSource = BaseValueSource.Local;
         }
-        else if ((entry.Mask & LayerMask.TemplateTrigger) != 0)
+        else if ((entry.Mask & LayerMask.ParentTemplateTrigger) != 0)
         {
-            entry.EffectiveValue = values.TemplateTrigger;
-            entry.EffectiveSource = BaseValueSource.TemplateTrigger;
+            entry.EffectiveValue = values.ParentTemplateTrigger;
+            entry.EffectiveSource = BaseValueSource.ParentTemplateTrigger;
+        }
+        else if ((entry.Mask & LayerMask.ParentTemplate) != 0)
+        {
+            entry.EffectiveValue = values.ParentTemplate;
+            entry.EffectiveSource = BaseValueSource.ParentTemplate;
         }
         else if ((entry.Mask & LayerMask.StyleTrigger) != 0)
         {
             entry.EffectiveValue = values.StyleTrigger;
             entry.EffectiveSource = BaseValueSource.StyleTrigger;
         }
-        else if ((entry.Mask & LayerMask.ParentTemplate) != 0)
+        else if ((entry.Mask & LayerMask.TemplateTrigger) != 0)
         {
-            entry.EffectiveValue = values.ParentTemplate;
-            entry.EffectiveSource = BaseValueSource.ParentTemplate;
+            entry.EffectiveValue = values.TemplateTrigger;
+            entry.EffectiveSource = BaseValueSource.TemplateTrigger;
         }
         else if ((entry.Mask & LayerMask.StyleSetter) != 0)
         {
@@ -353,6 +373,7 @@ internal sealed class DependencyValueStore
         switch (layer)
         {
             case Layer.Local: values.Local = value; break;
+            case Layer.ParentTemplateTrigger: values.ParentTemplateTrigger = value; break;
             case Layer.ParentTemplate: values.ParentTemplate = value; break;
             case Layer.StyleTrigger: values.StyleTrigger = value; break;
             case Layer.TemplateTrigger: values.TemplateTrigger = value; break;
@@ -368,6 +389,7 @@ internal sealed class DependencyValueStore
     private static object? GetLayerValue(LayerValues values, Layer layer) => layer switch
     {
         Layer.Local => values.Local,
+        Layer.ParentTemplateTrigger => values.ParentTemplateTrigger,
         Layer.ParentTemplate => values.ParentTemplate,
         Layer.StyleTrigger => values.StyleTrigger,
         Layer.TemplateTrigger => values.TemplateTrigger,
@@ -382,6 +404,7 @@ internal sealed class DependencyValueStore
     private static LayerMask ToMask(Layer layer) => layer switch
     {
         Layer.Local => LayerMask.Local,
+        Layer.ParentTemplateTrigger => LayerMask.ParentTemplateTrigger,
         Layer.ParentTemplate => LayerMask.ParentTemplate,
         Layer.StyleTrigger => LayerMask.StyleTrigger,
         Layer.TemplateTrigger => LayerMask.TemplateTrigger,
@@ -393,6 +416,7 @@ internal sealed class DependencyValueStore
     private static BaseValueSource GetFixedSource(Layer layer) => layer switch
     {
         Layer.Local => BaseValueSource.Local,
+        Layer.ParentTemplateTrigger => BaseValueSource.ParentTemplateTrigger,
         Layer.ParentTemplate => BaseValueSource.ParentTemplate,
         Layer.StyleTrigger => BaseValueSource.StyleTrigger,
         Layer.TemplateTrigger => BaseValueSource.TemplateTrigger,
@@ -414,6 +438,7 @@ internal sealed class DependencyValueStore
         return mask switch
         {
             LayerMask.Local => Layer.Local,
+            LayerMask.ParentTemplateTrigger => Layer.ParentTemplateTrigger,
             LayerMask.ParentTemplate => Layer.ParentTemplate,
             LayerMask.StyleTrigger => Layer.StyleTrigger,
             LayerMask.TemplateTrigger => Layer.TemplateTrigger,

@@ -1,0 +1,314 @@
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- ============================================== -->
+    <!-- Markdown 根容器                                 -->
+    <!-- ============================================== -->
+    <Style TargetType="Markdown">
+        <Setter Property="Background" Value="{ThemeResource LayerFillColorDefaultBrush}" />
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
+        <Setter Property="BorderBrush" Value="{ThemeResource SurfaceStrokeColorDefaultBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="Padding" Value="12" />
+        <Setter Property="CornerRadius" Value="12" />
+        <Setter Property="MinHeight" Value="120" />
+
+        <!-- 行内文本的主题色：这些属性会沿可视树继承到每个 MarkdownTextPresenter -->
+        <Setter Property="LinkForeground" Value="{ThemeResource HyperlinkForeground}" />
+        <Setter Property="InlineCodeBackground" Value="{ThemeResource ControlFillColorDefaultBrush}" />
+
+        <Setter Property="Template">
+            <ControlTemplate TargetType="Markdown">
+                <Border Name="PART_Container"
+                        Shape="RoundedRectangle"
+                        Background="{TemplateBinding Background}"
+                        BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="{TemplateBinding BorderThickness}"
+                        CornerRadius="{TemplateBinding CornerRadius}"
+                        Padding="{TemplateBinding Padding}"
+                        ClipToBounds="True" />
+            </ControlTemplate>
+        </Setter>
+
+        <Style.Triggers>
+            <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.65" />
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+
+    <!-- ============================================== -->
+    <!-- 标题                                            -->
+    <!-- ============================================== -->
+    <Style TargetType="MarkdownHeadingPresenter">
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
+        <Setter Property="FontWeight" Value="Bold" />
+        <Setter Property="FontSizeRatio" Value="1.0" />
+        <Setter Property="LineHeightRatio" Value="1.3" />
+        <Setter Property="Margin" Value="0,4,0,12" />
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="SeparatorBrush" Value="{ThemeResource DividerStrokeColorDefaultBrush}" />
+        <Setter Property="SeparatorThickness" Value="1" />
+        <Setter Property="Template">
+            <ControlTemplate TargetType="MarkdownHeadingPresenter">
+                <StackPanel Orientation="Vertical">
+                    <ContentPresenter HorizontalAlignment="Stretch" Margin="{TemplateBinding Padding}" />
+                    <Border Name="PART_Separator"
+                            Height="{TemplateBinding SeparatorThickness}"
+                            MinHeight="{TemplateBinding SeparatorThickness}"
+                            Background="{TemplateBinding SeparatorBrush}"
+                            Visibility="Collapsed" />
+                </StackPanel>
+                <ControlTemplate.Triggers>
+                    <Trigger Property="HasSeparator" Value="True">
+                        <Setter TargetName="PART_Separator" Property="Visibility" Value="Visible" />
+                    </Trigger>
+                </ControlTemplate.Triggers>
+            </ControlTemplate>
+        </Setter>
+        <Style.Triggers>
+            <Trigger Property="Level" Value="1">
+                <Setter Property="FontSizeRatio" Value="2.0" />
+                <Setter Property="LineHeightRatio" Value="1.0" />
+                <Setter Property="Margin" Value="0,0,0,12" />
+                <Setter Property="Padding" Value="0,0,0,2" />
+                <Setter Property="HasSeparator" Value="True" />
+            </Trigger>
+            <Trigger Property="Level" Value="2">
+                <Setter Property="FontSizeRatio" Value="1.65" />
+                <Setter Property="LineHeightRatio" Value="1.0" />
+                <Setter Property="Padding" Value="0,0,0,2" />
+                <Setter Property="HasSeparator" Value="True" />
+            </Trigger>
+            <Trigger Property="Level" Value="3">
+                <Setter Property="FontSizeRatio" Value="1.4" />
+            </Trigger>
+            <Trigger Property="Level" Value="4">
+                <Setter Property="FontSizeRatio" Value="1.2" />
+            </Trigger>
+            <Trigger Property="Level" Value="5">
+                <Setter Property="FontSizeRatio" Value="1.05" />
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+
+    <!-- ============================================== -->
+    <!-- 段落                                            -->
+    <!-- ============================================== -->
+    <Style TargetType="MarkdownParagraphPresenter">
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
+        <Setter Property="Margin" Value="0,0,0,12" />
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="Template">
+            <ControlTemplate TargetType="MarkdownParagraphPresenter">
+                <ContentPresenter HorizontalAlignment="Stretch" Margin="{TemplateBinding Padding}" />
+            </ControlTemplate>
+        </Setter>
+        <Style.Triggers>
+            <Trigger Property="IsNested" Value="True">
+                <Setter Property="Margin" Value="0,0,0,6" />
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+
+    <!-- ============================================== -->
+    <!-- 块引用                                          -->
+    <!-- ============================================== -->
+    <Style TargetType="MarkdownQuotePresenter">
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
+        <Setter Property="Background" Value="{ThemeResource LayerFillColorAltBrush}" />
+        <Setter Property="BorderBrush" Value="{ThemeResource HyperlinkForeground}" />
+        <Setter Property="BorderThickness" Value="4,0,0,0" />
+        <Setter Property="CornerRadius" Value="6" />
+        <Setter Property="Padding" Value="12,10,10,6" />
+        <Setter Property="Margin" Value="0,0,0,12" />
+        <Setter Property="Template">
+            <ControlTemplate TargetType="MarkdownQuotePresenter">
+                <Border Shape="RoundedRectangle"
+                        Background="{TemplateBinding Background}"
+                        BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="{TemplateBinding BorderThickness}"
+                        CornerRadius="{TemplateBinding CornerRadius}"
+                        Padding="{TemplateBinding Padding}">
+                    <ContentPresenter HorizontalAlignment="Stretch" />
+                </Border>
+            </ControlTemplate>
+        </Setter>
+    </Style>
+
+    <!-- ============================================== -->
+    <!-- 分隔线                                          -->
+    <!-- ============================================== -->
+    <Style TargetType="MarkdownRulePresenter">
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
+        <Setter Property="Background" Value="{ThemeResource DividerStrokeColorDefaultBrush}" />
+        <Setter Property="Height" Value="1" />
+        <Setter Property="MinHeight" Value="1" />
+        <Setter Property="MaxHeight" Value="1" />
+        <Setter Property="Margin" Value="0,4,0,16" />
+        <Setter Property="Template">
+            <ControlTemplate TargetType="MarkdownRulePresenter">
+                <Border Background="{TemplateBinding Background}" />
+            </ControlTemplate>
+        </Setter>
+    </Style>
+
+    <!-- ============================================== -->
+    <!-- 围栏代码块                                      -->
+    <!-- ============================================== -->
+    <Style TargetType="MarkdownCodePresenter">
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
+        <Setter Property="Background" Value="{ThemeResource ControlFillColorDefaultBrush}" />
+        <Setter Property="CornerRadius" Value="8" />
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="Margin" Value="0,0,0,12" />
+        <Setter Property="CodePadding" Value="12" />
+        <Setter Property="ShowLineNumbers" Value="True" />
+        <Setter Property="LineNumberForeground" Value="{ThemeResource TextSecondary}" />
+        <Setter Property="GutterBackground" Value="{ThemeResource LayerFillColorAltBrush}" />
+        <Setter Property="GutterSeparatorBrush" Value="{ThemeResource ControlBorder}" />
+        <Setter Property="Template">
+            <ControlTemplate TargetType="MarkdownCodePresenter">
+                <Border Shape="RoundedRectangle"
+                        Background="{TemplateBinding Background}"
+                        BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="{TemplateBinding BorderThickness}"
+                        CornerRadius="{TemplateBinding CornerRadius}"
+                        Padding="{TemplateBinding Padding}"
+                        ClipToBounds="True">
+                    <MarkdownCodeTextPresenter
+                        Name="PART_CodeText"
+                        Code="{TemplateBinding Code}"
+                        CodeLanguage="{TemplateBinding CodeLanguage}"
+                        ShowLineNumbers="{TemplateBinding ShowLineNumbers}"
+                        LineNumberForeground="{TemplateBinding LineNumberForeground}"
+                        GutterBackground="{TemplateBinding GutterBackground}"
+                        GutterSeparatorBrush="{TemplateBinding GutterSeparatorBrush}"
+                        Padding="{TemplateBinding CodePadding}" />
+                </Border>
+            </ControlTemplate>
+        </Setter>
+    </Style>
+
+    <!-- ============================================== -->
+    <!-- mermaid 图表                                    -->
+    <!-- ============================================== -->
+    <!-- 图表用经典 mermaid 配色（浅底深线），所以固定放在浅色卡片上，不随应用主题翻转。 -->
+    <Style TargetType="MarkdownDiagramPresenter">
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
+        <Setter Property="Background" Value="#FFFAFBFE" />
+        <Setter Property="BorderBrush" Value="{ThemeResource DividerStrokeColorDefaultBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="8" />
+        <Setter Property="Padding" Value="12" />
+        <Setter Property="Margin" Value="0,0,0,12" />
+        <Setter Property="Template">
+            <ControlTemplate TargetType="MarkdownDiagramPresenter">
+                <Border Shape="RoundedRectangle"
+                        Background="{TemplateBinding Background}"
+                        BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="{TemplateBinding BorderThickness}"
+                        CornerRadius="{TemplateBinding CornerRadius}"
+                        Padding="{TemplateBinding Padding}">
+                    <ContentPresenter HorizontalAlignment="Stretch" />
+                </Border>
+            </ControlTemplate>
+        </Setter>
+    </Style>
+
+    <!-- ============================================== -->
+    <!-- 列表                                            -->
+    <!-- ============================================== -->
+    <Style TargetType="MarkdownListPresenter">
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
+        <Setter Property="Margin" Value="0,0,0,12" />
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="Template">
+            <ControlTemplate TargetType="MarkdownListPresenter">
+                <ContentPresenter HorizontalAlignment="Stretch" Margin="{TemplateBinding Padding}" />
+            </ControlTemplate>
+        </Setter>
+    </Style>
+
+    <!-- ============================================== -->
+    <!-- 列表项                                          -->
+    <!-- ============================================== -->
+    <Style TargetType="MarkdownListItemPresenter">
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
+        <Setter Property="Margin" Value="0,0,0,6" />
+        <Setter Property="MarkerWidth" Value="28" />
+        <Setter Property="MarkerMargin" Value="0,2,10,0" />
+        <Setter Property="MarkerForeground" Value="{ThemeResource TextSecondary}" />
+        <Setter Property="Template">
+            <ControlTemplate TargetType="MarkdownListItemPresenter">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Name="PART_Marker"
+                               Grid.Column="0"
+                               Text="{TemplateBinding Marker}"
+                               Foreground="{TemplateBinding MarkerForeground}"
+                               MinWidth="{TemplateBinding MarkerWidth}"
+                               Margin="{TemplateBinding MarkerMargin}"
+                               VerticalAlignment="Top"
+                               TextWrapping="NoWrap" />
+                    <ContentPresenter Grid.Column="1" HorizontalAlignment="Stretch" />
+                </Grid>
+            </ControlTemplate>
+        </Setter>
+        <Style.Triggers>
+            <Trigger Property="IsLastItem" Value="True">
+                <Setter Property="Margin" Value="0" />
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+
+    <!-- ============================================== -->
+    <!-- 表格                                            -->
+    <!-- ============================================== -->
+    <Style TargetType="MarkdownTablePresenter">
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
+        <Setter Property="Margin" Value="0,0,0,12" />
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="Template">
+            <ControlTemplate TargetType="MarkdownTablePresenter">
+                <ContentPresenter HorizontalAlignment="Stretch" Margin="{TemplateBinding Padding}" />
+            </ControlTemplate>
+        </Setter>
+    </Style>
+
+    <!-- ============================================== -->
+    <!-- 表格单元格                                      -->
+    <!-- ============================================== -->
+    <Style TargetType="MarkdownTableCellPresenter">
+        <Setter Property="Foreground" Value="{ThemeResource TextPrimary}" />
+        <Setter Property="BorderBrush" Value="{ThemeResource DividerStrokeColorDefaultBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="Padding" Value="8,6,8,6" />
+        <Setter Property="Template">
+            <ControlTemplate TargetType="MarkdownTableCellPresenter">
+                <Border Name="PART_CellBorder"
+                        Background="{TemplateBinding Background}"
+                        BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="{TemplateBinding BorderThickness}"
+                        Padding="{TemplateBinding Padding}">
+                    <ContentPresenter HorizontalAlignment="Stretch" />
+                </Border>
+                <ControlTemplate.Triggers>
+                    <Trigger Property="IsHeaderCell" Value="True">
+                        <Setter TargetName="PART_CellBorder" Property="Background" Value="{ThemeResource LayerFillColorAltBrush}" />
+                    </Trigger>
+                </ControlTemplate.Triggers>
+            </ControlTemplate>
+        </Setter>
+        <Style.Triggers>
+            <Trigger Property="IsHeaderCell" Value="True">
+                <Setter Property="FontWeight" Value="Bold" />
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+
+</ResourceDictionary>

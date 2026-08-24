@@ -1,6 +1,6 @@
-using System.Buffers.Binary;
-using System.IO.Compression;
 using System.Runtime.InteropServices;
+using Jalium.UI.Media;
+using Jalium.UI.Media.Imaging;
 using static Jalium.UI.Interop.Win32.Win32GdiMethods;
 
 namespace Jalium.UI.Controls.Helpers;
@@ -23,11 +23,13 @@ internal static partial class IconHelper
         if (pixels == null)
             return null;
 
-        var rgbaPixels = (byte[])pixels.Value.Pixels.Clone();
-        for (var i = 0; i < rgbaPixels.Length; i += 4)
-            (rgbaPixels[i], rgbaPixels[i + 2]) = (rgbaPixels[i + 2], rgbaPixels[i]);
-
-        return EncodePng(pixels.Value.Width, pixels.Value.Height, rgbaPixels);
+        var source = BitmapSource.Create(
+            pixels.Value.Width, pixels.Value.Height, 96, 96, PixelFormat.Bgra32, null,
+            pixels.Value.Pixels, pixels.Value.Stride);
+        var encoder = new PngBitmapEncoder { Frames = { BitmapFrame.Create(source) } };
+        using var output = new MemoryStream();
+        encoder.Save(output);
+        return output.ToArray();
     }
 
     internal static ProcessIconPixels? ExtractProcessIconPixels(string exePath)
@@ -240,102 +242,6 @@ internal static partial class IconHelper
             if (iconInfo.hbmMask != 0) DeleteObject(iconInfo.hbmMask);
         }
     }
-
-    /// <summary>
-    /// Encodes raw RGBA pixel data as a minimal PNG file.
-    /// </summary>
-    private static byte[] EncodePng(int width, int height, byte[] rgbaPixels)
-    {
-        using var output = new MemoryStream();
-
-        // PNG signature.
-        output.Write([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
-
-        // IHDR chunk.
-        var ihdr = new byte[13];
-        BinaryPrimitives.WriteInt32BigEndian(ihdr.AsSpan(0), width);
-        BinaryPrimitives.WriteInt32BigEndian(ihdr.AsSpan(4), height);
-        ihdr[8] = 8;  // bit depth
-        ihdr[9] = 6;  // color type: RGBA
-        ihdr[10] = 0; // compression
-        ihdr[11] = 0; // filter
-        ihdr[12] = 0; // interlace
-        WriteChunk(output, "IHDR"u8, ihdr);
-
-        // IDAT chunk: deflate the filtered scanlines.
-        byte[] idatPayload;
-        using (var compressedStream = new MemoryStream())
-        {
-            using (var zlib = new ZLibStream(compressedStream, CompressionLevel.Optimal, leaveOpen: true))
-            {
-                var stride = width * 4;
-                for (var y = 0; y < height; y++)
-                {
-                    zlib.WriteByte(0); // filter: None
-                    zlib.Write(rgbaPixels, y * stride, stride);
-                }
-            }
-
-            idatPayload = compressedStream.ToArray();
-        }
-
-        WriteChunk(output, "IDAT"u8, idatPayload);
-
-        // IEND chunk.
-        WriteChunk(output, "IEND"u8, []);
-
-        return output.ToArray();
-    }
-
-    private static void WriteChunk(Stream output, ReadOnlySpan<byte> type, ReadOnlySpan<byte> data)
-    {
-        Span<byte> lengthBuf = stackalloc byte[4];
-        BinaryPrimitives.WriteInt32BigEndian(lengthBuf, data.Length);
-        output.Write(lengthBuf);
-        output.Write(type);
-        output.Write(data);
-
-        // CRC32 over type + data.
-        var crcState = UpdateCrc32(0xFFFFFFFF, type);
-        crcState = UpdateCrc32(crcState, data);
-        var crcValue = crcState ^ 0xFFFFFFFF;
-        Span<byte> crcBuf = stackalloc byte[4];
-        BinaryPrimitives.WriteUInt32BigEndian(crcBuf, crcValue);
-        output.Write(crcBuf);
-    }
-
-    #region CRC32
-
-    private static readonly uint[] Crc32Table = GenerateCrc32Table();
-
-    private static uint[] GenerateCrc32Table()
-    {
-        var table = new uint[256];
-        for (uint i = 0; i < 256; i++)
-        {
-            var crc = i;
-            for (var j = 0; j < 8; j++)
-            {
-                crc = (crc & 1) != 0 ? 0xEDB88320u ^ (crc >> 1) : crc >> 1;
-            }
-
-            table[i] = crc;
-        }
-
-        return table;
-    }
-
-    private static uint UpdateCrc32(uint crc, ReadOnlySpan<byte> data)
-    {
-        foreach (var b in data)
-        {
-            crc = Crc32Table[(crc ^ b) & 0xFF] ^ (crc >> 8);
-        }
-
-        return crc;
-    }
-
-    #endregion
 
     #region Win32 P/Invoke
 

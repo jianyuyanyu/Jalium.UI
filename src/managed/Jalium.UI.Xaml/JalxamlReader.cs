@@ -48,6 +48,13 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
         public int SourceStart;
         /// <summary>Offset in preprocessed source where this event's token ends.</summary>
         public int SourceEnd;
+        /// <summary>
+        /// The text the offsets above index into. Normally the whole preprocessed document, but a
+        /// directive such as <c>@virtualize</c> is tokenized from synthetic markup instead, and
+        /// slicing the outer document with those offsets would read the wrong characters — or run
+        /// off the end.
+        /// </summary>
+        public string? Source;
     }
 
     private sealed class AttrEntry
@@ -76,12 +83,25 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
     // Public construction
     // ─────────────────────────────────────────────────────────────
 
-    public static new JalxamlReader Create(string jalxaml)
+    public static new JalxamlReader Create(string jalxaml) => Create(jalxaml, dataResolver: null);
+
+    /// <summary>
+    /// Creates a reader that can resolve names inside <c>@{ }</c> / <c>@foreach</c> / <c>@for</c>
+    /// bodies through <paramref name="dataResolver"/>.
+    /// </summary>
+    /// <remarks>
+    /// Loops are expanded while tokenizing, long before any element exists, so the only data they
+    /// can possibly see is what the caller already holds — the component being loaded and whatever
+    /// DataContext it carries at that moment. That makes this a load-time evaluation, matching the
+    /// documented rule that a non-observable value is read once at load. A collection that changes
+    /// afterwards will not re-expand; <c>@virtualize</c> is the directive that tracks its source.
+    /// </remarks>
+    public static JalxamlReader Create(string jalxaml, Func<string, object?>? dataResolver)
     {
         // No pre-processing. The tokenizer is fully native: it parses XML and
         // Razor constructs in a single pass, calling the AOT-safe interpreter
         // on-demand for @{ }, @for, @foreach, etc. code blocks.
-        return new JalxamlReader(jalxaml ?? string.Empty);
+        return new JalxamlReader(jalxaml ?? string.Empty, dataResolver);
     }
 
     public static new JalxamlReader Create(TextReader textReader)
@@ -96,10 +116,10 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
         return Create(reader);
     }
 
-    private JalxamlReader(string source)
+    private JalxamlReader(string source, Func<string, object?>? dataResolver = null)
     {
         _source = source;
-        var tokenizer = new Tokenizer(source);
+        var tokenizer = new Tokenizer(source, dataResolver);
         _events = tokenizer.Tokenize();
     }
 
@@ -492,7 +512,10 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
 
         var start = e.InnerSourceStart;
         var end = e.InnerSourceEnd;
-        var inner = start >= 0 && end >= start ? _source.Substring(start, end - start) : string.Empty;
+        var text = e.Source ?? _source;
+        var inner = start >= 0 && end >= start && end <= text.Length
+            ? text.Substring(start, end - start)
+            : string.Empty;
 
         // Advance past the matching EndElement (XmlReader.ReadInnerXml consumes through the end tag).
         _index = e.MatchingEndIndex;
@@ -523,7 +546,10 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
             _index = e.MatchingEndIndex;
         }
 
-        return start >= 0 && end >= start ? _source.Substring(start, end - start) : string.Empty;
+        var text = e.Source ?? _source;
+        return start >= 0 && end >= start && end <= text.Length
+            ? text.Substring(start, end - start)
+            : string.Empty;
     }
 
     // IXmlLineInfo
@@ -584,9 +610,12 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
         // the global RazorExpressionRegistry when a section isn't defined locally.
         private readonly Dictionary<string, string> _sections = new(StringComparer.Ordinal);
 
-        public Tokenizer(string src)
+        private readonly Func<string, object?>? _dataResolver;
+
+        public Tokenizer(string src, Func<string, object?>? dataResolver = null)
         {
             _src = src;
+            _dataResolver = dataResolver;
             _nsStack.Add(new Dictionary<string, string>(StringComparer.Ordinal));
             _preserveWhitespace.Push(false);
         }
@@ -926,6 +955,7 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
                 LinePosition = startCol,
                 SourceStart = startPos,
                 SourceEnd = _pos,
+                Source = _src,
                 InnerSourceStart = _pos
             };
 
@@ -1007,7 +1037,8 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
                 LineNumber = startLine,
                 LinePosition = startCol,
                 SourceStart = startPos,
-                SourceEnd = _pos
+                SourceEnd = _pos,
+                Source = _src
             };
 
             int endIndex = _events.Count;
@@ -1117,6 +1148,15 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
                             continue;
                         }
 
+                        // @virtualize is checked before the flow-control block below so it is
+                        // never mistaken for a loop to expand. Expanding is exactly what it
+                        // exists to avoid.
+                        if (TryMatchWord("@virtualize") &&
+                            HandleVirtualize(sb, ref textStartLine, ref textStartCol, ref textStartPos))
+                        {
+                            continue;
+                        }
+
                         // Flow-control blocks (@for/@foreach/@while/@switch/@using/@lock/@do/@try)
                         // are expanded via the interpreter. @if is kept as text because XamlReader
                         // handles conditional visibility at runtime using the DataContext.
@@ -1181,7 +1221,8 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
                 LineNumber = startLine,
                 LinePosition = startCol,
                 SourceStart = startPos,
-                SourceEnd = _pos
+                SourceEnd = _pos,
+                Source = _src
             });
 
             startLine = _line;
@@ -1208,7 +1249,7 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
 
             // Collect the complete adjacent execution group before expanding any part of it.
             // This guarantees that side effects run once and every construct shares one scope.
-            var expanded = RazorCodeBlockPreprocessor.ExpandCodeBlock(code);
+            var expanded = RazorCodeBlockPreprocessor.ExpandCodeBlock(code, _dataResolver);
 
             // Advance past every construct in the collected group.
             while (_pos < consumedEnd) Advance();
@@ -1245,7 +1286,7 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
             }
 
             // Expand once, after the complete adjacent execution group has been collected.
-            var expanded = RazorCodeBlockPreprocessor.ExpandCodeBlock(code);
+            var expanded = RazorCodeBlockPreprocessor.ExpandCodeBlock(code, _dataResolver);
 
             FlushText(sb, ref startLine, ref startCol, ref startPos);
 
@@ -1389,6 +1430,60 @@ internal sealed class JalxamlReader : XmlReader, IXmlLineInfo
                    || _src[_pos] == '\r' || _src[_pos] == '\n'))
                 Advance();
 
+            return true;
+        }
+
+        /// <summary>
+        /// Handles <c>@virtualize(header) { body }</c> at <c>_pos</c> by emitting a
+        /// <see cref="Jalium.UI.Controls.RazorItemsHost"/> whose item template is the loop body.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// This is the whole point of the directive. The loop keywords next door are expanded
+        /// here in the tokenizer — the body is appended once per element and re-tokenized — which
+        /// produces a real element per item and caps out at ten thousand of them. Emitting a host
+        /// plus a template instead hands the collection to the virtualization pipeline, so the
+        /// element count follows the viewport rather than the data.
+        /// </para>
+        /// <para>
+        /// Substituting synthetic markup into the token stream is the same trick
+        /// <see cref="HandleRenderSection"/> uses for an unregistered section.
+        /// </para>
+        /// </remarks>
+        private bool HandleVirtualize(StringBuilder sb, ref int startLine, ref int startCol, ref int startPos)
+        {
+            // _src[_pos..] starts with "@virtualize"
+            var p = _pos + 11;
+            while (p < _src.Length && char.IsWhiteSpace(_src[p])) p++;
+            if (p >= _src.Length || _src[p] != '(') return false;
+
+            var headerEnd = RazorCodeBlockPreprocessor.FindMatchingParen(_src, p + 1);
+            if (headerEnd < 0) return false;
+
+            // FindMatchingParen returns the index just past ')'.
+            var header = _src[(p + 1)..(headerEnd - 1)];
+
+            var bracePos = headerEnd;
+            while (bracePos < _src.Length && char.IsWhiteSpace(_src[bracePos])) bracePos++;
+            if (bracePos >= _src.Length || _src[bracePos] != '{') return false;
+
+            var bodyEnd = RazorCodeBlockPreprocessor.FindMatchingBrace(_src, bracePos + 1);
+            if (bodyEnd < 0) return false;
+
+            if (!RazorVirtualizeDirective.TryParseHeader(header, out var loop))
+            {
+                return false;
+            }
+
+            var body = _src[(bracePos + 1)..bodyEnd].Trim();
+            if (body.Length == 0) return false;
+
+            var markup = RazorVirtualizeDirective.BuildHostMarkup(loop, body);
+
+            FlushText(sb, ref startLine, ref startCol, ref startPos);
+            while (_pos <= bodyEnd) Advance();
+
+            TokenizeNested(markup);
             return true;
         }
 

@@ -167,6 +167,11 @@ JALIUM_API void jalium_text_format_set_text_hinting_mode(JaliumTextFormat* forma
     reinterpret_cast<jalium::TextFormat*>(format)->SetTextHintingMode(mode);
 }
 
+JALIUM_API void jalium_text_format_set_subpixel_positioning(JaliumTextFormat* format, int32_t enabled) {
+    if (!format) return;
+    reinterpret_cast<jalium::TextFormat*>(format)->SetSubpixelPositioning(enabled != 0);
+}
+
 JALIUM_API JaliumResult jalium_text_format_hit_test_point(
     JaliumTextFormat* format,
     const wchar_t* text, uint32_t textLength,

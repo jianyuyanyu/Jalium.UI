@@ -1395,6 +1395,35 @@ internal sealed class RazorExpressionParser
         if (Current.Kind == close) Consume();
     }
 
+    /// <summary>
+    /// Splits <c>#.Value.ToString</c> into the path <c>#.Value</c> and the method <c>ToString</c>.
+    /// </summary>
+    /// <remarks>
+    /// Returns false for anything that is not a prefixed path with a member to call, so an ordinary
+    /// identifier keeps its existing behaviour. <c>#.ToString</c> splits to the bare prefix, which
+    /// the resolver reads as the DataContext itself.
+    /// </remarks>
+    private static bool TrySplitPrefixedCall(string name, out string targetPath, out string methodName)
+    {
+        targetPath = string.Empty;
+        methodName = string.Empty;
+
+        if (name.Length < 3 || (name[0] != '#' && name[0] != '$') || name[1] != '.')
+        {
+            return false;
+        }
+
+        var lastDot = name.LastIndexOf('.');
+        if (lastDot < 1 || lastDot == name.Length - 1)
+        {
+            return false;
+        }
+
+        targetPath = name.Substring(0, lastDot);
+        methodName = name.Substring(lastDot + 1);
+        return methodName.Length > 0;
+    }
+
     private object? EvalMethodCall(object? target, string methodName, Func<string, object?> resolver)
     {
         Consume(); // (
@@ -1729,6 +1758,17 @@ internal sealed class RazorExpressionParser
                 // Check for method call on resolved identifier
                 if (Current.Kind == RazorTokenKind.OpenParen)
                 {
+                    // A "#." / "$." path is tokenized as a single identifier, dots and all, so
+                    // "#.Value.ToString(...)" arrives here as one name and the call has nothing to
+                    // attach to — the resolver has no such path and the invocation yields null.
+                    // Splitting the final segment off gives the resolver a path it understands and
+                    // the invocation a target. Plain paths never need this: they stop at the first
+                    // dot and reach the call through ordinary member access.
+                    if (TrySplitPrefixedCall(name, out var targetPath, out var prefixedMethod))
+                    {
+                        return EvalMethodCall(resolver(targetPath), prefixedMethod, resolver);
+                    }
+
                     var target = resolver(name);
 
                     // Local function (stored as Func<object?[], object?>)

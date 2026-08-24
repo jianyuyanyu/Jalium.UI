@@ -2469,6 +2469,12 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
             var peer = element._automationPeer;
             if (peer != null)
                 peer.RaisePropertyChangedEvent(Automation.AutomationProperty.IsEnabledProperty, oldValue, newValue);
+
+            // A disabled element cannot hold keyboard focus, and neither can anything beneath it
+            // (IsEnabled is effective down the chain). Deferred so a false→true flip inside one
+            // dispatcher batch does not move focus.
+            if (!newValue)
+                Input.KeyboardFocusRevalidation.OnFocusabilityChanged(element);
         }
     }
 
@@ -2885,12 +2891,17 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
             return false;
         }
 
+        // 先让 Win32 认下捕获，再写托管那笔。SetCapture 是**同步**的：捕获易主时系统会立刻把
+        // WM_CAPTURECHANGED 送进 WndProc，而那条消息的处理会把 _mouseCaptured 清成 null。
+        // 若按「先写托管、再 SetCapture」的顺序，刚写好的捕获会在 CaptureMouse 返回之前被自己的
+        // 这条消息清掉，调用方完全察觉不到（返回值仍是 true），后续鼠标事件不再路由给捕获元素 ——
+        // 表现就是「按钮按下拿捕获、祖先接管拖拽」这类标准写法一拖就断。
+        GetWindowHostOrNull()?.SetNativeCapture();
+
+        // 回声若已经把上一个捕获者清掉，它也已经收到过 LostMouseCapture，这里就别再通知第二遍。
         var previousCaptured = _mouseCaptured;
         _mouseCaptured = this;
         UpdateMouseCaptureDependencyState(previousCaptured, this);
-
-        // Tell Win32 to keep sending mouse messages even when cursor is outside the window
-        GetWindowHostOrNull()?.SetNativeCapture();
 
         // Notify the previously captured element
         if (previousCaptured != null && previousCaptured != this)
@@ -5997,6 +6008,13 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     {
         UpdateIsVisibleFromTree();
 
+        // Keyboard focus is a process-wide pointer that does not follow the tree: a focused
+        // subtree that leaves its window (page swap, template rebuild, container recycling) must
+        // hand focus back to a still-connected element, and one that moves must refresh the
+        // IsKeyboardFocusWithin flags along its new ancestor chain. Deferred, so a detach that is
+        // immediately followed by a re-attach within the same dispatcher batch is a no-op.
+        Input.KeyboardFocusRevalidation.OnVisualParentChanged(this, oldParent);
+
         if (VisualParent != null)
         {
             ScheduleAutomaticTransitionArmRecursive(this);
@@ -6671,7 +6689,13 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
 
     private static void OnFocusablePropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
-        if (d is UIElement element) element.FocusableChanged?.Invoke(element, e);
+        if (d is UIElement element)
+        {
+            element.FocusableChanged?.Invoke(element, e);
+
+            if (!(bool)(e.NewValue ?? false))
+                Input.KeyboardFocusRevalidation.OnSelfFocusabilityChanged(element);
+        }
     }
 
     private static void OnIsMouseCapturedPropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
@@ -6720,6 +6744,12 @@ public partial class UIElement : Visual, IInputElement, Animation.IFrameAnimatab
     {
         var element = (UIElement)d;
         element.IsVisibleChanged?.Invoke(element, e);
+
+        // IsVisible is effective (own Visibility && ancestors), so a collapsed ancestor reaches
+        // the focused element through UpdateIsVisibleFromTree; an element that is no longer
+        // visible cannot keep keyboard focus.
+        if (!(bool)(e.NewValue ?? true))
+            Input.KeyboardFocusRevalidation.OnSelfFocusabilityChanged(element);
     }
 
     private void RaiseIsEnabledChanged(DependencyPropertyChangedEventArgs e) => IsEnabledChanged?.Invoke(this, e);

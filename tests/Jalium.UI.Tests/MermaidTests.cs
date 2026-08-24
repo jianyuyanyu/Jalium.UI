@@ -204,7 +204,7 @@ public class MermaidTests
             host.Arrange(new Rect(0, 0, 640, 480));
 
             Assert.True(ContainsVisualOfType<MermaidDiagram>(markdown));
-            Assert.False(ContainsVisualOfType<MarkdownCodeBlockView>(markdown));
+            Assert.False(ContainsVisualOfType<MarkdownCodeTextPresenter>(markdown));
         }
         finally
         {
@@ -231,7 +231,7 @@ public class MermaidTests
             host.Arrange(new Rect(0, 0, 480, 240));
 
             Assert.False(ContainsVisualOfType<MermaidDiagram>(markdown));
-            Assert.True(ContainsVisualOfType<MarkdownCodeBlockView>(markdown));
+            Assert.True(ContainsVisualOfType<MarkdownCodeTextPresenter>(markdown));
         }
         finally
         {

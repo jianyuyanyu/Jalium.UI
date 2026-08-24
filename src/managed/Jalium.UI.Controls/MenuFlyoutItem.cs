@@ -188,7 +188,7 @@ public class MenuFlyoutItem : Control
         if (RenderSize.Width <= 0 || RenderSize.Height <= 0) return;
 
         // Background (hover state handled by IsMouseOver)
-        if (IsMouseOver || IsKeyboardFocused)
+        if (IsHighlighted)
         {
             const double hoverInset = 2.0;
             var hoverBrush = ResolveBrush("OneSurfaceHover", "MenuFlyoutItemBackgroundHover", s_fallbackHoverBrush);
@@ -242,6 +242,12 @@ public class MenuFlyoutItem : Control
             dc.DrawText(accelFormatted, new Point(accelX, (RenderSize.Height - accelFormatted.Height) / 2));
         }
     }
+
+    /// <summary>
+    /// 本项当前是否应画成高亮（悬停底色）。基类：指针悬停或键盘焦点；
+    /// <see cref="MenuFlyoutSubItem"/> 在子菜单打开期间额外保持高亮。
+    /// </summary>
+    protected virtual bool IsHighlighted => IsMouseOver || IsKeyboardFocused;
 
     private void OnMouseDownHandler(object sender, MouseButtonEventArgs e)
     {

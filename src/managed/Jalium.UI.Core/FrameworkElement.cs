@@ -336,7 +336,30 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
     public static readonly DependencyProperty FocusVisualStyleProperty =
         DependencyProperty.Register(nameof(FocusVisualStyle), typeof(Style), typeof(FrameworkElement),
-            new PropertyMetadata(null));
+            new PropertyMetadata(null, OnFocusVisualStyleChanged));
+
+    /// <summary>
+    /// Raised when the effective focus visual style of an element that currently holds keyboard
+    /// focus may have changed — a <see cref="FocusVisualStyle"/> value change, or a style-stack
+    /// change (explicit / implicit / theme style applied or removed, which is how a
+    /// <c>&lt;Setter Property="FocusVisualStyle"/&gt;</c> arrives, including <c>{x:Null}</c>
+    /// which does not move the effective value and therefore never fires the property callback).
+    /// Consumed by the focus visual manager in Controls to rebuild the ring instead of leaving the
+    /// one created at focus time in place.
+    /// </summary>
+    internal static event Action<FrameworkElement>? FocusVisualStyleInvalidatedStatic;
+
+    private static void OnFocusVisualStyleChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is FrameworkElement element)
+            element.NotifyFocusVisualStyleInvalidated();
+    }
+
+    private void NotifyFocusVisualStyleInvalidated()
+    {
+        if (IsKeyboardFocused)
+            FocusVisualStyleInvalidatedStatic?.Invoke(this);
+    }
 
     /// <summary>
     /// Resource key used to look up the ambient default <see cref="FocusVisualStyle"/> from
@@ -832,6 +855,10 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
     {
         if (d is UIElement element)
         {
+            // 提示内容换了（含被清成 null）：正挂在屏幕上的那个气泡必须先收掉 —— 它显示的是旧文案；
+            // 清成 null 的情形更糟，连 MouseLeave 都不再订阅，等于没人再来关它，气泡会一直留着。
+            ToolTipHideRequested?.Invoke(element);
+
             // Subscribe/unsubscribe directly in Core — no delegate timing issues
             element.MouseEnter -= OnToolTipMouseEnter;
             element.MouseLeave -= OnToolTipMouseLeave;
@@ -2067,6 +2094,10 @@ public partial class FrameworkElement : UIElement, IFrameworkInputElement, Marku
         newTop?.Apply(this);
 
         InvalidateVisual();
+
+        // A style that arrives (or leaves) while this element has keyboard focus may carry a
+        // FocusVisualStyle setter; the ring drawn at focus time must follow it.
+        NotifyFocusVisualStyleInvalidated();
     }
 
     /// <summary>

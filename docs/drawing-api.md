@@ -7,7 +7,7 @@
 - `src/managed/Jalium.UI.Interop/RenderTarget.cs`
 - `src/managed/Jalium.UI.Media/Brush.cs`
 - `src/managed/Jalium.UI.Media/ImageSource.cs`
-- `src/managed/Jalium.UI.Media/BackdropEffect.cs`
+- `src/managed/Jalium.UI.Core/Media/BackdropEffect.cs`
 - `src/managed/Jalium.UI.Media/RenderTargetBitmap.cs`
 
 适用场景：
@@ -395,9 +395,9 @@ if (drawingContext is Jalium.UI.Interop.RenderTargetDrawingContext rtdc)
 
 ## 6. 背景特效 `IBackdropEffect`
 
-`DrawBackdropEffect` 依赖 `IBackdropEffect`，常见实现位于 `Jalium.UI.Media/BackdropEffect.cs`：
+`DrawBackdropEffect` 依赖 `IBackdropEffect`，常见实现位于 `Jalium.UI.Core/Media/BackdropEffect.cs`（注意与元素自身特效 `Jalium.UI.Media.Effects.BlurEffect` 区分：背景特效作用于元素**背后**的内容）：
 
-- `BlurEffect`
+- `BackdropBlurEffect`
 - `AcrylicEffect`
 - `MicaEffect`
 - `FrostedGlassEffect`
@@ -413,6 +413,21 @@ dc.DrawBackdropEffect(
     effect,
     new CornerRadius(12));
 ```
+
+### 材质管线
+
+`RenderTargetDrawingContext.DrawBackdropEffect` 把 `IBackdropEffect` 的全部参数映射为 `BackdropMaterialDesc`（`Jalium.UI.Interop/BackdropMaterialDesc.cs`），经 `jalium_draw_backdrop_material` 交给 native。D3D12 / Vulkan / Software 三个后端按**同一顺序**处理（CSS `backdrop-filter` 语义：滤镜作用于背景，tint 压在其上）：
+
+```
+blur → brightness → contrast → saturation → hueRotation → grayscale
+     → sepia → invert → tint → luminosity → noise
+```
+
+- `BlurRadius` 为 DIP，native 乘以 DPI 后做可分离高斯（D3D12 compute、Vulkan 两段 fragment），σ = `BlurSigma`（0 时取 `BlurRadius / 3`）；大半径自动 2×/4× 降采样。
+- `BlurType`：`Gaussian` 标准高斯；`Box` 为 box 等方差的高斯（σ = radius / √3）；`Frosted` 在高斯之上叠加逐像素采样抖动（磨砂颗粒感）。`Directional` / `Radial` / `Zoom` 目前按 `Gaussian` 渲染。
+- `TintColor` 的 alpha 与 `TintOpacity` 相乘得到有效 tint 不透明度；`TintColor` 为 `Transparent`（alpha 0）视为未设置，按白色处理。
+- `NoiseIntensity` 是满幅颗粒的混合幅度，典型值 0.02–0.05。
+- `Opacity` 缩放整个效果输出；为 0 时背景完全不受影响。
 
 常用属性：
 
@@ -589,7 +604,7 @@ protected override void OnRender(DrawingContext drawingContext)
 - `src/managed/Jalium.UI.Media/Brush.cs`
 - `src/managed/Jalium.UI.Media/ImageSource.cs`
 - `src/managed/Jalium.UI.Media/Transform.cs`
-- `src/managed/Jalium.UI.Media/BackdropEffect.cs`
+- `src/managed/Jalium.UI.Core/Media/BackdropEffect.cs`
 - `src/managed/Jalium.UI.Interop/RenderTargetDrawingContext.cs`
 - `src/managed/Jalium.UI.Interop/RenderTarget.cs`
 - `src/managed/Jalium.UI.Media/RenderTargetBitmap.cs`

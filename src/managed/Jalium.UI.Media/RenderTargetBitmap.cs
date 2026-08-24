@@ -3,11 +3,17 @@ using Jalium.UI.Media;
 namespace Jalium.UI.Media.Imaging;
 
 /// <summary>
-/// Converts a visual object into a bitmap using Jalium's native rendering path.
+/// Converts a visual object into a bitmap using Jalium's software rendering path.
 /// </summary>
+/// <remarks>
+/// The visual is rasterized at the bitmap's origin: its own arrange offset is NOT applied, so
+/// rendering a deeply nested element does not push it off the edge of a small target. Offsets
+/// INSIDE the subtree are applied normally. See <see cref="SoftwareDrawingContext"/> for the
+/// primitives this path supports and the ones it deliberately skips (text, images, backdrops).
+/// </remarks>
 public sealed partial class RenderTargetBitmap : BitmapSource
 {
-    private byte[] _pixelBuffer;
+    private readonly byte[] _pixelBuffer;
     private readonly int _pixelWidth;
     private readonly int _pixelHeight;
     private readonly int _stride;
@@ -84,24 +90,18 @@ public sealed partial class RenderTargetBitmap : BitmapSource
     {
         if (visual == null) throw new ArgumentNullException(nameof(visual));
 
-        // Create an off-screen drawing context
-        var drawingContext = new RenderTargetDrawingContext(this);
+        var drawingContext = new SoftwareDrawingContext(this);
 
-        // Render the visual hierarchy
-        RenderVisual(visual, drawingContext);
+        // Visual.Render is the public render entry point: it invokes the element's OnRender and
+        // then recurses into the subtree. Children's arrange offsets, opacity and render
+        // transforms are NOT baked into the recursion — Visual.RenderChildVisualInline applies
+        // them by driving the drawing context's IOffsetDrawingContext / IOpacityDrawingContext /
+        // ITransformDrawingContext facets, and layout clips travel through IClipDrawingContext.
+        // SoftwareDrawingContext implements all four; a context that does not would receive an
+        // untransformed, unclipped flattening of the subtree.
+        visual.Render(drawingContext);
 
         drawingContext.Close();
-    }
-
-    private static void RenderVisual(Visual visual, DrawingContext drawingContext)
-    {
-        // Visual.Render is the public render entry point: it invokes the
-        // element's OnRender into the supplied drawing context and then
-        // recurses into the visual subtree (children, templated content and
-        // applied transforms / clips / opacity). Driving rendering through it
-        // keeps the Jalium render target bitmap consistent with the on-screen render path
-        // instead of merely walking the child collection.
-        visual.Render(drawingContext);
     }
 
     /// <summary>
@@ -169,283 +169,7 @@ public sealed partial class RenderTargetBitmap : BitmapSource
     internal byte[] GetPixelBuffer() => _pixelBuffer;
 
     /// <summary>
-    /// Sets a pixel at the specified coordinates.
+    /// Gets the row pitch of <see cref="GetPixelBuffer"/> in bytes.
     /// </summary>
-    internal void SetPixel(int x, int y, Color color)
-    {
-        if (x < 0 || x >= _pixelWidth || y < 0 || y >= _pixelHeight) return;
-
-        var offset = (y * _stride) + (x * PixelBufferLayout.BytesPerPixel);
-        _pixelBuffer[offset] = color.B;
-        _pixelBuffer[offset + 1] = color.G;
-        _pixelBuffer[offset + 2] = color.R;
-        _pixelBuffer[offset + 3] = color.A;
-    }
-}
-
-/// <summary>
-/// Drawing context for <see cref="RenderTargetBitmap"/>.
-/// </summary>
-internal sealed class RenderTargetDrawingContext : DrawingContextAdapter
-{
-    private readonly RenderTargetBitmap _target;
-    private readonly Stack<Matrix> _transformStack = new();
-    private Matrix _currentTransform = Matrix.Identity;
-
-    public RenderTargetDrawingContext(RenderTargetBitmap target)
-    {
-        _target = target;
-    }
-
-    public override void DrawRectangle(Brush? brush, Pen? pen, Rect rect)
-    {
-        // Apply current transform
-        var transformedRect = TransformRect(rect);
-
-        // Fill rectangle
-        if (brush is SolidColorBrush solidBrush)
-        {
-            FillRect(transformedRect, solidBrush.Color);
-        }
-
-        // Draw border
-        if (pen?.Brush is SolidColorBrush strokeBrush)
-        {
-            DrawRectOutline(transformedRect, strokeBrush.Color, pen.Thickness);
-        }
-    }
-
-    public override void DrawRoundedRectangle(Brush? brush, Pen? pen, Rect rect, double radiusX, double radiusY)
-    {
-        // Simplified: draw as regular rectangle
-        DrawRectangle(brush, pen, rect);
-    }
-
-    public override void DrawLine(Pen pen, Point point0, Point point1)
-    {
-        if (pen?.Brush is not SolidColorBrush brush) return;
-
-        var p0 = TransformPoint(point0);
-        var p1 = TransformPoint(point1);
-
-        DrawLineBresenham((int)p0.X, (int)p0.Y, (int)p1.X, (int)p1.Y, brush.Color);
-    }
-
-    public override void DrawEllipse(Brush? brush, Pen? pen, Point center, double radiusX, double radiusY)
-    {
-        var transformedCenter = TransformPoint(center);
-
-        if (brush is SolidColorBrush fillBrush)
-        {
-            FillEllipse(transformedCenter, radiusX, radiusY, fillBrush.Color);
-        }
-
-        if (pen?.Brush is SolidColorBrush strokeBrush)
-        {
-            DrawEllipseOutline(transformedCenter, radiusX, radiusY, strokeBrush.Color);
-        }
-    }
-
-    public override void DrawText(FormattedText formattedText, Point origin)
-    {
-        // Text rendering would require font rasterization
-        // This is a placeholder - in production, use a font library
-    }
-
-    public override void DrawImage(ImageSource imageSource, Rect rect)
-    {
-        // Image compositing would require proper blending
-        // This is a placeholder
-    }
-
-    public override void DrawGeometry(Brush? brush, Pen? pen, Geometry geometry)
-    {
-        // Geometry rendering - draw the bounding rect as approximation
-        var bounds = geometry.Bounds;
-        DrawRectangle(brush, pen, bounds);
-    }
-
-    public override void DrawBackdropEffect(Rect rectangle, IBackdropEffect effect, CornerRadius cornerRadius)
-    {
-        // Backdrop effects are not supported in software rendering
-        // This is a placeholder
-    }
-
-    public override void PushClip(Geometry clipGeometry)
-    {
-        // Clipping would require proper clip region management
-        // This is a placeholder - store clip geometry for later use
-    }
-
-    public override void PushOpacity(double opacity)
-    {
-        // Opacity would require proper alpha blending
-        // This is a placeholder
-    }
-
-    public override void PushTransform(Transform transform)
-    {
-        _transformStack.Push(_currentTransform);
-        _currentTransform = Matrix.Multiply(_currentTransform, transform.Value);
-    }
-
-    public override void Pop()
-    {
-        if (_transformStack.Count > 0)
-        {
-            _currentTransform = _transformStack.Pop();
-        }
-    }
-
-    public override void Close()
-    {
-        // Finalize rendering
-    }
-
-    private Rect TransformRect(Rect rect)
-    {
-        var topLeft = TransformPoint(new Point(rect.X, rect.Y));
-        var bottomRight = TransformPoint(new Point(rect.Right, rect.Bottom));
-        return new Rect(topLeft.X, topLeft.Y, bottomRight.X - topLeft.X, bottomRight.Y - topLeft.Y);
-    }
-
-    private Point TransformPoint(Point point)
-    {
-        return _currentTransform.Transform(point);
-    }
-
-    private void FillRect(Rect rect, Color color)
-    {
-        var x1 = Math.Max(0, (int)rect.X);
-        var y1 = Math.Max(0, (int)rect.Y);
-        var x2 = Math.Min(_target.PixelWidth, (int)rect.Right);
-        var y2 = Math.Min(_target.PixelHeight, (int)rect.Bottom);
-
-        for (var y = y1; y < y2; y++)
-        {
-            for (var x = x1; x < x2; x++)
-            {
-                _target.SetPixel(x, y, color);
-            }
-        }
-    }
-
-    private void DrawRectOutline(Rect rect, Color color, double thickness)
-    {
-        var t = (int)Math.Max(1, thickness);
-
-        // Top
-        FillRect(new Rect(rect.X, rect.Y, rect.Width, t), color);
-        // Bottom
-        FillRect(new Rect(rect.X, rect.Bottom - t, rect.Width, t), color);
-        // Left
-        FillRect(new Rect(rect.X, rect.Y, t, rect.Height), color);
-        // Right
-        FillRect(new Rect(rect.Right - t, rect.Y, t, rect.Height), color);
-    }
-
-    private void DrawLineBresenham(int x0, int y0, int x1, int y1, Color color)
-    {
-        var dx = Math.Abs(x1 - x0);
-        var dy = Math.Abs(y1 - y0);
-        var sx = x0 < x1 ? 1 : -1;
-        var sy = y0 < y1 ? 1 : -1;
-        var err = dx - dy;
-
-        while (true)
-        {
-            _target.SetPixel(x0, y0, color);
-
-            if (x0 == x1 && y0 == y1) break;
-
-            var e2 = 2 * err;
-            if (e2 > -dy)
-            {
-                err -= dy;
-                x0 += sx;
-            }
-            if (e2 < dx)
-            {
-                err += dx;
-                y0 += sy;
-            }
-        }
-    }
-
-    private void FillEllipse(Point center, double rx, double ry, Color color)
-    {
-        var cx = (int)center.X;
-        var cy = (int)center.Y;
-        var irx = (int)rx;
-        var iry = (int)ry;
-
-        for (var y = -iry; y <= iry; y++)
-        {
-            for (var x = -irx; x <= irx; x++)
-            {
-                if ((x * x * iry * iry + y * y * irx * irx) <= irx * irx * iry * iry)
-                {
-                    _target.SetPixel(cx + x, cy + y, color);
-                }
-            }
-        }
-    }
-
-    private void DrawEllipseOutline(Point center, double rx, double ry, Color color)
-    {
-        // Midpoint ellipse algorithm
-        var cx = (int)center.X;
-        var cy = (int)center.Y;
-        var a = (int)rx;
-        var b = (int)ry;
-
-        var a2 = a * a;
-        var b2 = b * b;
-        var fa2 = 4 * a2;
-        var fb2 = 4 * b2;
-
-        // First region
-        var x = 0;
-        var y = b;
-        var sigma = 2 * b2 + a2 * (1 - 2 * b);
-
-        while (b2 * x <= a2 * y)
-        {
-            SetEllipsePoints(cx, cy, x, y, color);
-
-            if (sigma >= 0)
-            {
-                sigma += fa2 * (1 - y);
-                y--;
-            }
-            sigma += b2 * (4 * x + 6);
-            x++;
-        }
-
-        // Second region
-        x = a;
-        y = 0;
-        sigma = 2 * a2 + b2 * (1 - 2 * a);
-
-        while (a2 * y <= b2 * x)
-        {
-            SetEllipsePoints(cx, cy, x, y, color);
-
-            if (sigma >= 0)
-            {
-                sigma += fb2 * (1 - x);
-                x--;
-            }
-            sigma += a2 * (4 * y + 6);
-            y++;
-        }
-    }
-
-    private void SetEllipsePoints(int cx, int cy, int x, int y, Color color)
-    {
-        _target.SetPixel(cx + x, cy + y, color);
-        _target.SetPixel(cx - x, cy + y, color);
-        _target.SetPixel(cx + x, cy - y, color);
-        _target.SetPixel(cx - x, cy - y, color);
-    }
+    internal int Stride => _stride;
 }

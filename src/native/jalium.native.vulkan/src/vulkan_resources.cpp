@@ -64,6 +64,24 @@ VulkanBitmap::VulkanBitmap(uint32_t width, uint32_t height, std::vector<uint8_t>
     }
 }
 
+VulkanBitmap::VulkanBitmap(uint32_t width, uint32_t height,
+                           std::shared_ptr<std::vector<uint8_t>> sharedPixelData)
+    : width_(width > 0 ? width : 1)
+    , height_(height > 0 ? height : 1)
+    , pixelData_(sharedPixelData ? std::move(sharedPixelData)
+                                 : std::make_shared<std::vector<uint8_t>>())
+{
+    // The buffer is shared with the caller's cache: its identity is what the
+    // render target's resident-bitmap cache keys on, so it must not be resized
+    // here — a short buffer is padded through a private copy instead.
+    size_t expected = static_cast<size_t>(width_) * height_ * 4;
+    if (pixelData_->size() < expected) {
+        auto padded = std::make_shared<std::vector<uint8_t>>(*pixelData_);
+        padded->resize(expected, 0);
+        pixelData_ = std::move(padded);
+    }
+}
+
 bool VulkanBitmap::UpdatePackedPixels(const uint8_t* pixels, uint32_t width, uint32_t height, uint32_t stride)
 {
     PackedBgraLayout layout{};

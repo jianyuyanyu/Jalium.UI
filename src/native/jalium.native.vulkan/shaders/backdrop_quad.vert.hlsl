@@ -11,6 +11,10 @@ struct PushConstants
     float4 quadPoint23;
     float2 geometryFlags;
     float2 padding2;
+    // Material colour pipeline, fragment-only fields: the push range spans
+    // both stages (VUID-10069), so the VS block mirrors them.
+    float4 materialInfo0;
+    float4 materialInfo1;
 };
 
 [[vk::push_constant]]

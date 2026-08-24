@@ -341,6 +341,15 @@ public class ContextMenu : MenuBase
         IsOpen = false;
     }
 
+    /// <inheritdoc />
+    internal override void DismissMenu()
+    {
+        if (IsOpen)
+        {
+            IsOpen = false;
+        }
+    }
+
     #endregion
 
     #region Popup Management
@@ -400,11 +409,20 @@ public class ContextMenu : MenuBase
                     {
                         element.DetachFromVisualParent();
                     }
+
+                    // Items live inside the popup, so this ContextMenu is not on their visual
+                    // parent chain. Hand each top-level item a direct reference so that clicking
+                    // it can dismiss the whole menu (see MenuItem.CloseParentMenus).
+                    if (element is MenuItem hosted)
+                    {
+                        hosted.OwnerMenu = this;
+                    }
+
                     panel.Children.Add(element);
                 }
                 else if (item is string text)
                 {
-                    panel.Children.Add(new MenuItem { Header = text });
+                    panel.Children.Add(new MenuItem { Header = text, OwnerMenu = this });
                 }
             }
         }

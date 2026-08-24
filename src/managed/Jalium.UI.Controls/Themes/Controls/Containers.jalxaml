@@ -212,6 +212,11 @@
                     <Trigger Property="IsMouseOver" Value="True">
                         <Setter TargetName="PART_Root" Property="Background" Value="{ThemeResource AccentBrush}" />
                     </Trigger>
+                    <!-- 拖动态走模板层：GridSplitter 代码里不再写 Background 本地值，
+                         否则拖完一次就会把使用者自己设的 Background 抹掉。 -->
+                    <Trigger Property="IsDragging" Value="True">
+                        <Setter TargetName="PART_Root" Property="Background" Value="{ThemeResource AccentBrushPressed}" />
+                    </Trigger>
                 </ControlTemplate.Triggers>
             </ControlTemplate>
         </Setter>

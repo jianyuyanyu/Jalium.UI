@@ -1508,6 +1508,23 @@ public sealed class RenderTarget : IDisposable
     }
 
     /// <summary>
+    /// Draws an in-app backdrop material with the full parameter set. This is
+    /// the primary backdrop entry point; <see cref="DrawBackdropFilter"/> and
+    /// <see cref="DrawBackdropFilterEx"/> are the legacy string-based subset.
+    /// Safe on every backend: native forwards un-upgraded backends to the
+    /// blur + tint + noise/saturation/luminosity subset.
+    /// </summary>
+    public unsafe void DrawBackdropMaterial(in BackdropMaterialDesc desc)
+    {
+        ThrowIfDisposed();
+        long t0 = ApiStart();
+        var local = desc;
+        local.StructSize = BackdropMaterialDesc.NativeStructSize;
+        NativeMethods.DrawBackdropMaterial(_handle, &local);
+        ApiEnd("DrawBackdropMaterial", t0);
+    }
+
+    /// <summary>
     /// Draws a glowing border highlight effect for DevTools element inspection.
     /// </summary>
     /// <param name="x">The x coordinate of the element.</param>

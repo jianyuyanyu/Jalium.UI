@@ -2,6 +2,7 @@ using System.Reflection;
 using Jalium.UI;
 using Jalium.UI.Controls;
 using Jalium.UI.Controls.Themes;
+using Jalium.UI.Input;
 using Jalium.UI.Markup;
 
 namespace Jalium.UI.Tests;
@@ -19,6 +20,34 @@ public class RangeSliderTests
             BindingFlags.NonPublic | BindingFlags.Static);
         resetMethod?.Invoke(null, null);
     }
+
+    private static void ResetInputState()
+    {
+        Keyboard.Initialize();
+        Keyboard.ClearFocus();
+        UIElement.ForceReleaseMouseCapture();
+    }
+
+    private static void SetShowFocusCues(bool value)
+    {
+        var method = typeof(FocusVisualManager).GetMethod("SetShowFocusCues",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(method);
+        method!.Invoke(null, new object[] { value });
+    }
+
+    private static KeyEventArgs KeyDown(Key key, ModifierKeys modifiers = ModifierKeys.None) =>
+        new(UIElement.KeyDownEvent, key, modifiers, isDown: true, isRepeat: false, timestamp: 0);
+
+    private static RangeSlider CreateKeyboardSlider() => new()
+    {
+        Minimum = 0,
+        Maximum = 100,
+        RangeStart = 20,
+        RangeEnd = 80,
+        SmallChange = 1,
+        LargeChange = 10,
+    };
 
     [Fact]
     public void RangeSlider_DefaultBounds_AreFullRange()
@@ -243,9 +272,137 @@ public class RangeSliderTests
         Assert.Equal(90, slider.RangeEnd);
     }
 
+    [Fact]
+    public void RangeSlider_PlainTab_IsNotHandled_SoFocusNavigationCanLeaveTheControl()
+    {
+        ResetInputState();
+        try
+        {
+            var slider = CreateKeyboardSlider();
+            Assert.True(slider.Focus());
+            Assert.True(slider.IsKeyboardFocused);
+
+            var tab = KeyDown(Key.Tab);
+            slider.RaiseEvent(tab);
+            Assert.False(tab.Handled);
+
+            var shiftTab = KeyDown(Key.Tab, ModifierKeys.Shift);
+            slider.RaiseEvent(shiftTab);
+            Assert.False(shiftTab.Handled);
+
+            // Neither Tab flavour touched the active thumb: the arrows still drive the start thumb.
+            slider.RaiseEvent(KeyDown(Key.Right));
+            Assert.Equal(21, slider.RangeStart);
+            Assert.Equal(80, slider.RangeEnd);
+        }
+        finally
+        {
+            ResetInputState();
+        }
+    }
+
+    [Fact]
+    public void RangeSlider_CtrlTab_SwitchesActiveThumb_AndIsHandled()
+    {
+        ResetInputState();
+        try
+        {
+            var slider = CreateKeyboardSlider();
+            Assert.True(slider.Focus());
+
+            var ctrlTab = KeyDown(Key.Tab, ModifierKeys.Control);
+            slider.RaiseEvent(ctrlTab);
+            Assert.True(ctrlTab.Handled);
+
+            slider.RaiseEvent(KeyDown(Key.Right));
+            Assert.Equal(20, slider.RangeStart);
+            Assert.Equal(81, slider.RangeEnd);
+
+            slider.RaiseEvent(KeyDown(Key.PageDown));
+            Assert.Equal(71, slider.RangeEnd);
+
+            slider.RaiseEvent(KeyDown(Key.End));
+            Assert.Equal(100, slider.RangeEnd);
+
+            var ctrlShiftTab = KeyDown(Key.Tab, ModifierKeys.Control | ModifierKeys.Shift);
+            slider.RaiseEvent(ctrlShiftTab);
+            Assert.True(ctrlShiftTab.Handled);
+
+            slider.RaiseEvent(KeyDown(Key.Left));
+            Assert.Equal(19, slider.RangeStart);
+            Assert.Equal(100, slider.RangeEnd);
+        }
+        finally
+        {
+            ResetInputState();
+        }
+    }
+
+    [Fact]
+    public void RangeSlider_TabThroughInputDispatcher_LeavesTheSlider_CtrlTabStaysInside()
+    {
+        ResetInputState();
+        SetShowFocusCues(false);
+        try
+        {
+            var before = new FocusProbe();
+            var slider = CreateKeyboardSlider();
+            var after = new FocusProbe();
+            var panel = new StackPanel();
+            panel.Children.Add(before);
+            panel.Children.Add(slider);
+            panel.Children.Add(after);
+
+            var window = new Window
+            {
+                TitleBarStyle = WindowTitleBarStyle.Native,
+                Width = 320,
+                Height = 240,
+                Content = panel,
+            };
+            window.Measure(new Size(window.Width, window.Height));
+            window.Arrange(new Rect(0, 0, window.Width, window.Height));
+
+            var dispatcher = new WindowInputDispatcher(window);
+
+            Assert.True(slider.Focus());
+
+            // Ctrl+Tab is consumed by the slider: focus stays put and the end thumb becomes active.
+            Assert.True(dispatcher.HandleKeyDown(Key.Tab, ModifierKeys.Control, isRepeat: false, timestamp: 1));
+            Assert.Same(slider, Keyboard.FocusedElement);
+            Assert.True(dispatcher.HandleKeyDown(Key.Right, ModifierKeys.None, isRepeat: false, timestamp: 2));
+            Assert.Same(slider, Keyboard.FocusedElement);
+            Assert.Equal(20, slider.RangeStart);
+            Assert.Equal(81, slider.RangeEnd);
+
+            // Plain Tab leaves the slider (the reported focus trap); Shift+Tab goes back before it.
+            Assert.True(dispatcher.HandleKeyDown(Key.Tab, ModifierKeys.None, isRepeat: false, timestamp: 3));
+            Assert.Same(after, Keyboard.FocusedElement);
+
+            Assert.True(slider.Focus());
+            Assert.True(dispatcher.HandleKeyDown(Key.Tab, ModifierKeys.Shift, isRepeat: false, timestamp: 4));
+            Assert.Same(before, Keyboard.FocusedElement);
+        }
+        finally
+        {
+            SetShowFocusCues(false);
+            ResetInputState();
+        }
+    }
+
     private static T? GetPrivateField<T>(object instance, string fieldName) where T : class
     {
         var field = instance.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
         return field?.GetValue(instance) as T;
+    }
+
+    private sealed class FocusProbe : FrameworkElement
+    {
+        public FocusProbe()
+        {
+            Focusable = true;
+            Width = 40;
+            Height = 20;
+        }
     }
 }

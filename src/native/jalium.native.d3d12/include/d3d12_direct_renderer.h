@@ -308,12 +308,18 @@ public:
     ///
     /// The caller keeps `gradientBrush` (and the stop array it points at) alive for
     /// the duration of the call; nothing is retained past return.
+    ///
+    /// `subpixelPositioning` (TextFormat::GetSubpixelPositioning) keeps 1/8-pixel
+    /// glyph phases measured from the final screen position instead of snapping
+    /// every pen to a whole pixel — see D3D12GlyphAtlas::GenerateGlyphs. It only
+    /// changes WHERE a glyph lands; the crisp POINT-sampled path is unchanged.
     void AddText(IDWriteTextLayout* layout, float x, float y,
                  float r, float g, float b, float a,
                  uint64_t layoutKey = 0,
                  int32_t aaMode = 0,
                  int32_t hintingMode = 0,
-                 const EngineBrushData* gradientBrush = nullptr);
+                 const EngineBrushData* gradientBrush = nullptr,
+                 bool subpixelPositioning = false);
     void AddBitmap(float x, float y, float w, float h, float opacity,
                    ID3D12Resource* textureResource, DXGI_FORMAT format,
                    float uvMaxX = 1.0f, float uvMaxY = 1.0f,
@@ -386,18 +392,12 @@ public:
     // when the backdrop PSO is unavailable (older driver / PSO create failure),
     // which reproduces the legacy blur+tint (no noise/sat/lum) rather than
     // dropping the backdrop entirely.
-    void DrawSnapshotBackdrop(float x, float y, float w, float h,
-                              float blurRadius,
-                              float tintR, float tintG, float tintB, float tintOpacity,
-                              float noiseIntensity, float saturation, float luminosity,
-                              float cornerTL, float cornerTR, float cornerBR, float cornerBL);
-    // Full-screen snapshot-backdrop PS pass. Returns false when the PSO is
-    // unavailable so DrawSnapshotBackdrop can fall back to the legacy path.
-    bool TryDrawSnapshotBackdropQuad(float x, float y, float w, float h,
-                                     float blurRadius,
-                                     float tintR, float tintG, float tintB, float tintOpacity,
-                                     float noiseIntensity, float saturation, float luminosity,
-                                     float cornerTL, float cornerTR, float cornerBR, float cornerBL);
+    void DrawSnapshotBackdrop(const JaliumBackdropMaterialDesc& material);
+    // Snapshot-backdrop PS pass over the panel quad: BlurSnapshotRegion first
+    // (compute Gaussian into blurTempA_), then the material colour pipeline /
+    // grain / rounding resample. Returns false when the PSO is unavailable so
+    // DrawSnapshotBackdrop can fall back to the legacy path.
+    bool TryDrawSnapshotBackdropQuad(const JaliumBackdropMaterialDesc& material);
 
     // --- Full Liquid Glass rendering ---
     // Renders complete liquid glass with SDF refraction, chromatic aberration,
@@ -1406,13 +1406,48 @@ private:
     // #921 OBJECT_DELETED_WHILE_STILL_IN_USE at Close. Reset each BeginFrame.
     bool pathMsaaUsedThisFrame_ = false;
 
-    // Blur constants layout (must match cbuffer in shader)
+    // Blur constants layout (must match cbuffer in gaussian_blur.cs.hlsl).
+    // The source-remap block is only read by the horizontal pass when srcMode
+    // is 1 (backdrop region blur: crop + downsample straight out of the
+    // snapshot); every other caller leaves the defaults, which reproduce the
+    // historical Load-at-output-coordinate behaviour byte for byte.
     struct BlurConstants {
-        uint32_t direction;   // 0 = horizontal, 1 = vertical
-        float    radius;      // blur radius in pixels
-        uint32_t texWidth;
-        uint32_t texHeight;
+        uint32_t direction = 0;    // 0 = horizontal, 1 = vertical
+        float    radius = 0.0f;    // kernel radius in OUTPUT texels (extent)
+        uint32_t texWidth = 0;     // output line dimensions
+        uint32_t texHeight = 0;
+        uint32_t srcMode = 0;      // 0 = Load(output coord), 1 = sample srcOffset + (out+0.5)*srcScale
+        float    srcOffsetX = 0.0f;
+        float    srcOffsetY = 0.0f;
+        float    srcScale = 1.0f;  // source texels per output texel
+        float    sigma = 0.0f;     // Gaussian sigma in output texels; 0 = radius / 3
+        float    srcClampW = 0.0f; // valid source extent (srcMode == 1): samples clamp inside it
+        float    srcClampH = 0.0f;
+        uint32_t pad0 = 0;
+        float    invSrcAllocW = 0.0f; // 1 / source texture allocation size (uv normalisation)
+        float    invSrcAllocH = 0.0f;
+        uint32_t pad1 = 0;
+        uint32_t pad2 = 0;
     };
+    static_assert(sizeof(BlurConstants) == 64, "BlurConstants must stay 16 dwords (root constants)");
+
+    // Result of BlurSnapshotRegion: where the blurred panel region lives in
+    // blurTempA_ and how it maps back onto the snapshot.
+    struct BackdropBlurRegion {
+        float    srcX = 0.0f;       // region origin in snapshot physical pixels
+        float    srcY = 0.0f;
+        uint32_t downsample = 1;    // snapshot pixels per scratch texel
+        uint32_t outW = 0;          // scratch extent actually written
+        uint32_t outH = 0;
+    };
+
+    // Blurs the panel region (+ kernel apron) of the current snapshot into
+    // blurTempA_ with the separable Gaussian compute shader: DPI-scaled radius,
+    // 1x/2x/4x downsample picked from the physical radius (Vulkan parity),
+    // sigma/kernel family from the material. Returns false when the compute
+    // route is unavailable so the caller can fall back to the in-PS box blur.
+    bool BlurSnapshotRegion(const JaliumBackdropMaterialDesc& material,
+                            BackdropBlurRegion& outRegion);
 
     // --- Liquid glass resources ---
     ComPtr<ID3D12RootSignature> lgRootSignature_;

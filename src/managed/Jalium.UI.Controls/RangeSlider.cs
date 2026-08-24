@@ -1,4 +1,5 @@
-﻿using Jalium.UI.Controls.Themes;
+﻿using Jalium.UI.Controls.Primitives;
+using Jalium.UI.Controls.Themes;
 using Jalium.UI.Input;
 using Jalium.UI.Media;
 
@@ -8,6 +9,21 @@ namespace Jalium.UI.Controls;
 /// Represents a control that lets the user select a continuous sub-range (a start and an end value)
 /// from within a numeric range by dragging two thumbs along a track.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Keyboard interaction mirrors <see cref="Slider"/> and applies to the active thumb:
+/// Left/Down and Right/Up move it by <see cref="SmallChange"/>, PageDown/PageUp by
+/// <see cref="LargeChange"/>; Home sends the start thumb to <see cref="Minimum"/> (or the end thumb
+/// down to the start thumb plus <see cref="MinimumRange"/>) and End sends the end thumb to
+/// <see cref="Maximum"/> (or the start thumb up to the end thumb minus <see cref="MinimumRange"/>).
+/// </para>
+/// <para>
+/// Ctrl+Tab (or Ctrl+Shift+Tab) switches the active thumb between start and end — the same gesture
+/// <see cref="TabControl"/> uses to cycle its tabs. Clicking or dragging a thumb also makes it the
+/// active one. Plain Tab and Shift+Tab are deliberately left unhandled so keyboard focus moves on to
+/// the next or previous control exactly as it does for every other control.
+/// </para>
+/// </remarks>
 public class RangeSlider : Control
 {
     /// <inheritdoc />
@@ -98,7 +114,7 @@ public class RangeSlider : Control
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Other)]
     public static readonly DependencyProperty TickFrequencyProperty =
         DependencyProperty.Register(nameof(TickFrequency), typeof(double), typeof(RangeSlider),
-            new PropertyMetadata(0.0, OnVisualPropertyChanged));
+            new PropertyMetadata(0.0, OnSegmentPropertyChanged));
 
     /// <summary>
     /// Identifies the IsSnapToTickEnabled dependency property.
@@ -107,6 +123,24 @@ public class RangeSlider : Control
     public static readonly DependencyProperty IsSnapToTickEnabledProperty =
         DependencyProperty.Register(nameof(IsSnapToTickEnabled), typeof(bool), typeof(RangeSlider),
             new PropertyMetadata(false));
+
+    /// <summary>
+    /// Identifies the TrackMode dependency property.
+    /// </summary>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty TrackModeProperty =
+        DependencyProperty.Register(nameof(TrackMode), typeof(SliderTrackMode), typeof(RangeSlider),
+            new PropertyMetadata(SliderTrackMode.Continuous, OnSegmentPropertyChanged),
+            value => value is SliderTrackMode mode && Enum.IsDefined(mode));
+
+    /// <summary>
+    /// Identifies the SegmentGap dependency property.
+    /// </summary>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public static readonly DependencyProperty SegmentGapProperty =
+        DependencyProperty.Register(nameof(SegmentGap), typeof(double), typeof(RangeSlider),
+            new PropertyMetadata(SliderSegmentGeometry.DefaultSegmentGap, OnSegmentPropertyChanged),
+            value => value is double number && double.IsFinite(number) && number >= 0);
 
     /// <summary>
     /// Identifies the TrackBrush dependency property.
@@ -244,6 +278,28 @@ public class RangeSlider : Control
         set => SetValue(IsSnapToTickEnabledProperty, value);
     }
 
+    /// <summary>
+    /// Gets or sets how the track is painted. <see cref="SliderTrackMode.Segmented"/>
+    /// splits it into one segment per <see cref="TickFrequency"/> interval.
+    /// </summary>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public SliderTrackMode TrackMode
+    {
+        get => (SliderTrackMode)GetValue(TrackModeProperty)!;
+        set => SetValue(TrackModeProperty, value);
+    }
+
+    /// <summary>
+    /// Gets or sets the gap, in DIPs, between two segments of a
+    /// <see cref="SliderTrackMode.Segmented"/> track.
+    /// </summary>
+    [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
+    public double SegmentGap
+    {
+        get => (double)GetValue(SegmentGapProperty)!;
+        set => SetValue(SegmentGapProperty, value);
+    }
+
     /// <summary>Gets or sets the brush used for the unfilled track.</summary>
     [DevToolsPropertyCategory(DevToolsPropertyCategory.Appearance)]
     public Brush? TrackBrush
@@ -275,6 +331,7 @@ public class RangeSlider : Control
     private FrameworkElement? _selectionRangeBorder;
     private FrameworkElement? _startThumbBorder;
     private FrameworkElement? _endThumbBorder;
+    private SegmentedTrackBar? _segmentBar;
 
     #endregion
 
@@ -314,12 +371,15 @@ public class RangeSlider : Control
         _selectionRangeBorder = GetTemplateChild("PART_SelectionRange") as FrameworkElement;
         _startThumbBorder = GetTemplateChild("PART_StartThumb") as FrameworkElement;
         _endThumbBorder = GetTemplateChild("PART_EndThumb") as FrameworkElement;
+        _segmentBar = GetTemplateChild("PART_Segments") as SegmentedTrackBar;
 
         UpdateLayoutGeometry();
     }
 
     private void UpdateLayoutGeometry()
     {
+        UpdateSegmentBar();
+
         if (_startThumbBorder == null && _endThumbBorder == null)
         {
             return;
@@ -367,6 +427,25 @@ public class RangeSlider : Control
                 _selectionRangeBorder.VerticalAlignment = VerticalAlignment.Top;
             }
         }
+    }
+
+    /// <summary>
+    /// Mirrors the selected range onto the segmented track part; the part derives its own
+    /// segment boundaries from <see cref="TickFrequency"/>.
+    /// </summary>
+    private void UpdateSegmentBar()
+    {
+        if (_segmentBar == null) return;
+
+        _segmentBar.Orientation = Orientation;
+        _segmentBar.Minimum = Minimum;
+        _segmentBar.Maximum = Maximum;
+        _segmentBar.ReservedSpace = ThumbSize;
+        _segmentBar.TrackThickness = TrackThickness;
+        _segmentBar.SegmentGap = SegmentGap;
+        _segmentBar.TickFrequency = TickFrequency;
+        _segmentBar.RangeStart = Math.Min(RangeStart, RangeEnd);
+        _segmentBar.RangeEnd = Math.Max(RangeStart, RangeEnd);
     }
 
     #endregion
@@ -492,9 +571,10 @@ public class RangeSlider : Control
     {
         switch (e.Key)
         {
-            case Key.Tab:
-                _focusedThumb = _focusedThumb == ActiveThumb.Start ? ActiveThumb.End : ActiveThumb.Start;
-                InvalidateVisual();
+            // Plain Tab / Shift+Tab stay unhandled: WindowInputDispatcher only moves focus when the
+            // KeyDown bubble is unhandled, so consuming them here made the slider a focus trap.
+            case Key.Tab when e.IsControlDown:
+                SwitchActiveThumb();
                 e.Handled = true;
                 break;
             case Key.Left:
@@ -530,6 +610,12 @@ public class RangeSlider : Control
                 e.Handled = true;
                 break;
         }
+    }
+
+    private void SwitchActiveThumb()
+    {
+        _focusedThumb = _focusedThumb == ActiveThumb.Start ? ActiveThumb.End : ActiveThumb.Start;
+        InvalidateVisual();
     }
 
     private void AdjustFocusedThumb(double delta)
@@ -642,8 +728,17 @@ public class RangeSlider : Control
 
         var bounds = new Rect(0, 0, RenderSize.Width, RenderSize.Height);
 
-        DrawTrack(dc, bounds);
-        DrawSelectionRange(dc, bounds);
+        if (TrackMode == SliderTrackMode.Segmented)
+        {
+            // Track and fill are one pass: a segment is either painted with the track brush
+            // or with the accent, never both.
+            DrawSegmentedTrack(dc, bounds);
+        }
+        else
+        {
+            DrawTrack(dc, bounds);
+            DrawSelectionRange(dc, bounds);
+        }
 
         if (TickFrequency > 0)
         {
@@ -692,6 +787,29 @@ public class RangeSlider : Control
         }
 
         dc.DrawRoundedRectangle(fillBrush, null, filledRect, 2, 2);
+    }
+
+    private void DrawSegmentedTrack(DrawingContext dc, Rect bounds)
+    {
+        var trackRect = ControlRenderGeometry.GetCenteredTrackRect(bounds, Orientation, ThumbSize, TrackThickness);
+
+        var boundaries = SliderSegmentGeometry.GetBoundaryRatios(
+            Minimum, Maximum, null, TickFrequency, isDirectionReversed: false);
+
+        var range = Maximum - Minimum;
+        var startRatio = range > 0 ? Math.Clamp((RangeStart - Minimum) / range, 0, 1) : 0;
+        var endRatio = range > 0 ? Math.Clamp((RangeEnd - Minimum) / range, 0, 1) : 0;
+
+        SliderSegmentGeometry.Draw(
+            dc,
+            trackRect,
+            Orientation,
+            boundaries,
+            Math.Min(startRatio, endRatio),
+            Math.Max(startRatio, endRatio),
+            SegmentGap,
+            TrackBrush ?? s_trackBrush,
+            s_accentBrush);
     }
 
     private void DrawTicks(DrawingContext dc, Rect bounds)
@@ -849,6 +967,7 @@ public class RangeSlider : Control
     {
         if (d is RangeSlider slider)
         {
+            slider.UpdateLayoutGeometry();
             slider.InvalidateMeasure();
         }
     }
@@ -857,6 +976,20 @@ public class RangeSlider : Control
     {
         if (d is RangeSlider slider)
         {
+            slider.InvalidateVisual();
+        }
+    }
+
+    /// <summary>
+    /// Segment geometry lives on the template part, so these properties have to be pushed
+    /// there before the repaint — an InvalidateVisual alone would only refresh the
+    /// template-less fallback path.
+    /// </summary>
+    private static void OnSegmentPropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is RangeSlider slider)
+        {
+            slider.UpdateLayoutGeometry();
             slider.InvalidateVisual();
         }
     }

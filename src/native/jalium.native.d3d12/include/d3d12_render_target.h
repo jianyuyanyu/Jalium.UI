@@ -191,6 +191,8 @@ public:
         float cornerRadiusTL, float cornerRadiusTR,
         float cornerRadiusBR, float cornerRadiusBL) override;
 
+    void DrawBackdropMaterial(const JaliumBackdropMaterialDesc& desc) override;
+
     void DrawGlowingBorderHighlight(
         float x, float y, float w, float h,
         float animationPhase,

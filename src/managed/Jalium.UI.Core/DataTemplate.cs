@@ -80,7 +80,10 @@ public class DataTemplate : FrameworkTemplate
     {
         foreach (var trigger in _triggers)
         {
-            trigger.ParentTemplateTriggers = _triggers;
+            // hostIsTemplatedParent: false —— DataTemplate 的 trigger 挂在模板内容的根元素上，
+            // 整棵内容树都是模板生成物，因此无 TargetName 的 setter 也按 ParentTemplateTrigger
+            // （模板对自己生成物的支配）计优先级，而不是 TemplateTrigger。
+            trigger.DeclareTemplateOwner(_triggers, hostIsTemplatedParent: false);
             trigger.Attach(root);
         }
 

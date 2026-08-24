@@ -36,7 +36,7 @@ WPF-inspired APIs, JALXAML with Razor extensions, and native rendering on Window
 
 - GPU-native rendering pipeline with ClearType sub-pixel text rendering
 - Familiar programming model (`DependencyObject`, `UIElement`, panels, templates, resources)
-- JALXAML markup with Razor syntax extensions (`@Path`, `@(expr)`, `@{ ... }`, `@if`/`@for`/`@foreach`, `@section`/`@RenderSection`)
+- JALXAML markup with Razor syntax extensions (`@Path`, `@(expr)`, `@{ ... }`, `@if`/`@virtualize`/`@foreach`, `@section`/`@RenderSection`)
 - Rich control library: 100+ controls including Charts, Ribbon, Docking, InkCanvas, WebView, Terminal, MediaElement, MapView, PropertyGrid, WindowsFormsHost
 - Developer experience: JALXAML hot reload (live visual-tree patching) plus an opt-in built-in DevTools inspector and debug HUD
 - Build-time tooling via NuGet (`Jalium.UI.Build`, `Jalium.UI.Xaml.SourceGenerator`)
@@ -237,14 +237,13 @@ before publishing.
 
 JALXAML supports Razor-style syntax as additive sugar on top of existing `{Binding ...}`:
 
-- `@Path`
-- `@(expr)`
-- `@{ ... }`
-- `@*...*@` comments
+- `@Path`, `@(expr)`, `@{ ... }`, `@*...*@` comments
+- `$.Path` (the element's own property) and `#.Path` (the DataContext only)
 - mixed text templates (for string/object targets)
 - `@if(expr){<Element />}` block directives (with full `else if` / `else` chains)
-- statement / control-flow directives: `@for`, `@foreach`, `@while`, `@switch`,
-  `@using`, `@lock` (expanded at parse time)
+- `@virtualize` — a data-bound, virtualized loop
+- statement directives: `@for`, `@foreach`, `@while`, `@switch`, `@using`, `@lock`
+  (expanded once, at load)
 - `@section`/`@RenderSection` for templated content
 - escapes: `@@` and `\@`
 
@@ -255,6 +254,28 @@ Update behavior:
 - Observable source (`INotifyPropertyChanged` / dependency property): real-time updates.
 - Non-observable CLR source: one-time evaluation at load.
 
+### Lists
+
+`@virtualize` is the one to use for anything that can grow. It lowers to a bound, virtualized list:
+elements follow the viewport rather than the data, containers are recycled, and the list tracks
+`INotifyCollectionChanged`.
+
+```xml
+<ScrollViewer>
+  @virtualize(var row in Rows)
+  {
+    <Border Padding="8"><TextBlock Text="@row.Name" /></Border>
+  }
+</ScrollViewer>
+```
+
+The body becomes the item template, so it must be a single element, and the block needs a bounded
+scrolling axis — directly inside a `ScrollViewer`, or with an explicit `Height`/`MaxHeight`. A
+numeric form (`@virtualize(var i = 0; i < Count; i++)`) is also supported.
+
+`@foreach` and `@for` still expand statically: one real element per item, no recycling, evaluated
+once at load. They suit a short fixed list; anything data-driven should use `@virtualize`.
+
 ### Compile-time lowering
 
 The JALXAML source generator lowers the following at build time so there is no
@@ -262,7 +283,8 @@ runtime parsing cost in the hot path:
 
 - `@if` / `@else if` / `@else` chains.
 - `@section` / `@RenderSection`.
-- Value expressions (`@Path`, `@(expr)`).
+- `@virtualize`.
+- Value expressions (`@Path`, `@(expr)`, `$.`, `#.`).
 - `{Binding ...}` via `SetCompiledBinding` (SG `SplitParameters` is kept
   line-for-line consistent with the runtime parser).
 - Custom-xmlns element types — when a `.jalxaml` uses a controls library exposed

@@ -1,4 +1,5 @@
-using Jalium.UI.Controls;
+﻿using Jalium.UI.Controls;
+using Jalium.UI.Controls.Primitives;
 using Jalium.UI.Media;
 
 namespace Jalium.UI.Gallery;
@@ -17,6 +18,7 @@ internal static partial class GalleryWindow
         Card("RadioButton", RadioButtonGroup()),
         Card("ToggleSwitch", ToggleSwitchVariants()),
         Card("Slider", SliderDemo(), width: 300),
+        Card("Slider (Segmented)", SegmentedSliderDemo(), width: 300),
         Card("RangeSlider", RangeSliderDemo(), width: 300));
 
     private static UIElement CheckBoxVariants()
@@ -106,6 +108,59 @@ internal static partial class GalleryWindow
             HorizontalAlignment = HorizontalAlignment.Left,
             VerticalAlignment = VerticalAlignment.Center,
         };
+    }
+
+    private static UIElement SegmentedSliderDemo()
+    {
+        var stack = new StackPanel { Orientation = Orientation.Vertical, Spacing = 14 };
+
+        // Snapped: the value always lands on a segment boundary.
+        stack.Children.Add(new Slider
+        {
+            Minimum = 0,
+            Maximum = 100,
+            Value = 60,
+            TickFrequency = 20,
+            IsSnapToTickEnabled = true,
+            TrackMode = SliderTrackMode.Segmented,
+            Width = 220,
+            Height = 28,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+
+        // Free value: the segment under the thumb fills proportionally.
+        stack.Children.Add(new Slider
+        {
+            Minimum = 0,
+            Maximum = 100,
+            Value = 45,
+            Ticks = new DoubleCollection { 10, 30, 60 },
+            SegmentGap = 5,
+            TrackMode = SliderTrackMode.Segmented,
+            Width = 220,
+            Height = 28,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+
+        // The same track mode on a two-thumb range.
+        stack.Children.Add(new RangeSlider
+        {
+            Minimum = 0,
+            Maximum = 100,
+            RangeStart = 20,
+            RangeEnd = 80,
+            TickFrequency = 20,
+            IsSnapToTickEnabled = true,
+            TrackMode = SliderTrackMode.Segmented,
+            Width = 220,
+            Height = 28,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+
+        return stack;
     }
 
     private static UIElement RangeSliderDemo()

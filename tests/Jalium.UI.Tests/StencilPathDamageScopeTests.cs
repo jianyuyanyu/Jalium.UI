@@ -15,12 +15,21 @@ namespace Jalium.UI.Tests;
 ///      (the later run's clear must cover everything its resolve reads),
 ///   3. batch scissors still clip the path exactly as before,
 ///   4. off-extent and transformed geometry clamp safely.
+///
+/// GEOMETRY SIZE IS LOAD-BEARING. <c>D3D12RenderTarget::FillPath</c> only takes
+/// the stencil-then-cover route for a solid fill whose device-space bounds fail
+/// <c>PreferAnalyticFill</c> (jalium_flatten.h): at or under 512×512 px of area
+/// the fill goes to the analytic scanline rasterizer instead, which never
+/// allocates the MSAA scratch and never reaches <c>computePathRunDamage</c>.
+/// Every path below is therefore deliberately larger than that gate — icon-scale
+/// geometry here would leave the whole class green while covering nothing (which
+/// is exactly what the <c>PathBytes</c> guard in <see cref="Render"/> catches).
 /// </summary>
 [Collection("Application")]
 public sealed class StencilPathDamageScopeTests
 {
-    private const int Width = 256;
-    private const int Height = 128;
+    private const int Width = 1280;
+    private const int Height = 768;
 
     // Division of labor: this test pins "damage never clips a path away" and
     // the blit copy semantics; the stale-scratch LEAK direction (a run's
@@ -33,25 +42,27 @@ public sealed class StencilPathDamageScopeTests
         var pixels = Render((target, context) =>
         {
             using var white = context.CreateSolidBrush(1f, 1f, 1f, 1f);
-            // Run 1: small path in the top-left corner.
-            target.FillPath(16f, 16f, RectPathCommands(16f, 16f, 48f, 48f), white);
-            // Non-path batch splits the two paths into separate runs.
-            target.FillRectangle(120f, 56f, 8f, 8f, white);
-            // Run 2: small path in the bottom-right corner.
-            target.FillPath(208f, 80f, RectPathCommands(208f, 80f, 240f, 112f), white);
+            // Run 1: 640×640 block on the left.
+            target.FillPath(32f, 32f, RectPathCommands(32f, 32f, 672f, 672f), white);
+            // Non-path batch splits the two paths into separate runs. It sits in
+            // the 32px corridor between them, clear of both.
+            target.FillRectangle(688f, 16f, 8f, 8f, white);
+            // Run 2: 544×640 block on the right, offset down so the corners of
+            // the frame stay background.
+            target.FillPath(704f, 96f, RectPathCommands(704f, 96f, 1248f, 736f), white);
         });
 
-        Assert.True(GetBlue(pixels, 32, 32) >= 250, $"run-1 path missing: {GetBlue(pixels, 32, 32)}");
-        Assert.True(GetBlue(pixels, 224, 96) >= 250, $"run-2 path missing: {GetBlue(pixels, 224, 96)}");
-        Assert.True(GetBlue(pixels, 124, 60) >= 250, $"separator rect missing: {GetBlue(pixels, 124, 60)}");
+        Assert.True(GetBlue(pixels, 350, 350) >= 250, $"run-1 path missing: {GetBlue(pixels, 350, 350)}");
+        Assert.True(GetBlue(pixels, 976, 416) >= 250, $"run-2 path missing: {GetBlue(pixels, 976, 416)}");
+        Assert.True(GetBlue(pixels, 692, 20) >= 250, $"separator rect missing: {GetBlue(pixels, 692, 20)}");
 
         // Sentinels far away from both paths and the separator must stay
         // background — a mis-sized damage rect that resolves stale scratch
         // texels would light one of these up.
-        Assert.True(GetBlue(pixels, 200, 20) <= 2, $"sentinel (200,20) polluted: {GetBlue(pixels, 200, 20)}");
-        Assert.True(GetBlue(pixels, 20, 100) <= 2, $"sentinel (20,100) polluted: {GetBlue(pixels, 20, 100)}");
-        Assert.True(GetBlue(pixels, 120, 20) <= 2, $"sentinel (120,20) polluted: {GetBlue(pixels, 120, 20)}");
-        Assert.True(GetBlue(pixels, 60, 90) <= 2, $"sentinel (60,90) polluted: {GetBlue(pixels, 60, 90)}");
+        Assert.True(GetBlue(pixels, 900, 40) <= 2, $"sentinel (900,40) polluted: {GetBlue(pixels, 900, 40)}");
+        Assert.True(GetBlue(pixels, 16, 720) <= 2, $"sentinel (16,720) polluted: {GetBlue(pixels, 16, 720)}");
+        Assert.True(GetBlue(pixels, 1264, 24) <= 2, $"sentinel (1264,24) polluted: {GetBlue(pixels, 1264, 24)}");
+        Assert.True(GetBlue(pixels, 350, 720) <= 2, $"sentinel (350,720) polluted: {GetBlue(pixels, 350, 720)}");
     }
 
     [RequiresWindowsBackendFact(RenderBackend.D3D12)]
@@ -66,16 +77,16 @@ public sealed class StencilPathDamageScopeTests
         {
             using var half = context.CreateSolidBrush(1f, 1f, 1f, 0.5f);
             using var white = context.CreateSolidBrush(1f, 1f, 1f, 1f);
-            target.FillPath(40f, 24f, RectPathCommands(40f, 24f, 120f, 104f), half);
-            // Run separator far from both paths.
-            target.FillRectangle(232f, 4f, 8f, 8f, white);
-            target.FillPath(80f, 24f, RectPathCommands(80f, 24f, 160f, 104f), half);
+            target.FillPath(32f, 64f, RectPathCommands(32f, 64f, 736f, 704f), half);
+            // Run separator, clear of both paths.
+            target.FillRectangle(620f, 8f, 8f, 8f, white);
+            target.FillPath(544f, 64f, RectPathCommands(544f, 64f, 1248f, 704f), half);
         });
 
-        int p1Only = GetBlue(pixels, 60, 64);    // run 1 exclusive
-        int p2Only = GetBlue(pixels, 140, 64);   // run 2 exclusive
-        int overlap = GetBlue(pixels, 100, 64);  // covered by both
-        int gap = GetBlue(pixels, 200, 64);      // covered by neither
+        int p1Only = GetBlue(pixels, 200, 384);   // run 1 exclusive
+        int p2Only = GetBlue(pixels, 1080, 384);  // run 2 exclusive
+        int overlap = GetBlue(pixels, 640, 384);  // covered by both
+        int gap = GetBlue(pixels, 640, 740);      // covered by neither
 
         // Both exclusive regions must be a single 0.5-alpha blend over black and
         // identical to each other (run 2 must not re-blit run 1's region either).
@@ -101,15 +112,15 @@ public sealed class StencilPathDamageScopeTests
         var pixels = Render((target, context) =>
         {
             using var white = context.CreateSolidBrush(1f, 1f, 1f, 1f);
-            target.PushClip(0f, 0f, 64f, 128f);
+            target.PushClip(0f, 0f, 256f, Height);
             // Path much wider than the clip: damage = clip ∩ geometry bounds.
-            target.FillPath(32f, 32f, RectPathCommands(32f, 32f, 224f, 96f), white);
+            target.FillPath(32f, 64f, RectPathCommands(32f, 64f, 1248f, 704f), white);
             target.PopClip();
         });
 
-        Assert.True(GetBlue(pixels, 48, 64) >= 250, $"clipped-in path missing: {GetBlue(pixels, 48, 64)}");
-        Assert.True(GetBlue(pixels, 80, 64) <= 2, $"path escaped clip at (80,64): {GetBlue(pixels, 80, 64)}");
-        Assert.True(GetBlue(pixels, 200, 64) <= 2, $"path escaped clip at (200,64): {GetBlue(pixels, 200, 64)}");
+        Assert.True(GetBlue(pixels, 128, 384) >= 250, $"clipped-in path missing: {GetBlue(pixels, 128, 384)}");
+        Assert.True(GetBlue(pixels, 400, 384) <= 2, $"path escaped clip at (400,384): {GetBlue(pixels, 400, 384)}");
+        Assert.True(GetBlue(pixels, 1000, 384) <= 2, $"path escaped clip at (1000,384): {GetBlue(pixels, 1000, 384)}");
     }
 
     [RequiresWindowsBackendFact(RenderBackend.D3D12)]
@@ -120,11 +131,14 @@ public sealed class StencilPathDamageScopeTests
             using var white = context.CreateSolidBrush(1f, 1f, 1f, 1f);
             // Path straddles the top-left corner; the damage clamp must keep
             // the on-screen part renderable and the rect casts in range.
-            target.FillPath(-32f, -32f, RectPathCommands(-32f, -32f, 32f, 32f), white);
+            target.FillPath(
+                -Width / 2f, -Height / 2f,
+                RectPathCommands(-Width / 2f, -Height / 2f, Width / 2f, Height / 2f),
+                white);
         });
 
         Assert.True(GetBlue(pixels, 8, 8) >= 250, $"on-screen part missing: {GetBlue(pixels, 8, 8)}");
-        Assert.True(GetBlue(pixels, 100, 100) <= 2, $"sentinel polluted: {GetBlue(pixels, 100, 100)}");
+        Assert.True(GetBlue(pixels, 900, 600) <= 2, $"sentinel polluted: {GetBlue(pixels, 900, 600)}");
     }
 
     [RequiresWindowsBackendFact(RenderBackend.D3D12)]
@@ -136,15 +150,15 @@ public sealed class StencilPathDamageScopeTests
         {
             using var white = context.CreateSolidBrush(1f, 1f, 1f, 1f);
             target.FillPath(
-                Width - 32f, Height - 32f,
-                RectPathCommands(Width - 32f, Height - 32f, Width + 32f, Height + 32f),
+                Width / 2f, Height / 2f,
+                RectPathCommands(Width / 2f, Height / 2f, Width * 1.5f, Height * 1.5f),
                 white);
         });
 
         Assert.True(GetBlue(pixels, Width - 8, Height - 8) >= 250,
             $"on-screen part missing: {GetBlue(pixels, Width - 8, Height - 8)}");
-        Assert.True(GetBlue(pixels, Width - 100, Height - 100) <= 2,
-            $"sentinel polluted: {GetBlue(pixels, Width - 100, Height - 100)}");
+        Assert.True(GetBlue(pixels, 100, 100) <= 2, $"sentinel (100,100) polluted: {GetBlue(pixels, 100, 100)}");
+        Assert.True(GetBlue(pixels, 560, 600) <= 2, $"sentinel (560,600) polluted: {GetBlue(pixels, 560, 600)}");
     }
 
     [RequiresWindowsBackendFact(RenderBackend.D3D12)]
@@ -153,24 +167,25 @@ public sealed class StencilPathDamageScopeTests
         var pixels = Render((target, context) =>
         {
             using var white = context.CreateSolidBrush(1f, 1f, 1f, 1f);
-            // 45° rotation around (128,64): the 32×32 rect becomes a diamond.
-            // The damage AABB comes from transforming the local bounds, so a
+            // 45° rotation around (640,384): the 520×520 rect becomes a diamond
+            // whose vertices sit 368px from the centre along both axes. The
+            // damage AABB comes from transforming the local bounds, so a
             // transform bug would clip the resolve and hollow out the diamond.
             const float c = 0.70710678f;
-            float dx = 128f - (128f * c + 64f * -c);
-            float dy = 64f - (128f * c + 64f * c);
+            float dx = 640f - (640f * c + 384f * -c);
+            float dy = 384f - (640f * c + 384f * c);
             target.PushTransform([c, c, -c, c, dx, dy]);
-            target.FillPath(112f, 48f, RectPathCommands(112f, 48f, 144f, 80f), white);
+            target.FillPath(380f, 124f, RectPathCommands(380f, 124f, 900f, 644f), white);
             target.PopTransform();
         });
 
-        Assert.True(GetBlue(pixels, 128, 64) >= 250, $"diamond center missing: {GetBlue(pixels, 128, 64)}");
-        Assert.True(GetBlue(pixels, 40, 40) <= 2, $"sentinel (40,40) polluted: {GetBlue(pixels, 40, 40)}");
-        Assert.True(GetBlue(pixels, 156, 64) <= 2, $"outside diamond polluted: {GetBlue(pixels, 156, 64)}");
+        Assert.True(GetBlue(pixels, 640, 384) >= 250, $"diamond center missing: {GetBlue(pixels, 640, 384)}");
+        Assert.True(GetBlue(pixels, 200, 120) <= 2, $"sentinel (200,120) polluted: {GetBlue(pixels, 200, 120)}");
+        Assert.True(GetBlue(pixels, 1060, 384) <= 2, $"outside diamond polluted: {GetBlue(pixels, 1060, 384)}");
     }
 
     /// <summary>
-    /// Closed rectangle path commands for <see cref="RenderTarget.FillPath"/>:
+    /// Closed rectangle path commands for <see cref="RenderTarget.FillPath(float, float, float[], NativeBrush, int, int)"/>:
     /// the caller passes (x0, y0) as the start point, these walk the remaining
     /// corners. Tags: 0 = LineTo, 5 = ClosePath (jalium_triangulate.h).
     /// </summary>
@@ -217,6 +232,13 @@ public sealed class StencilPathDamageScopeTests
         Assert.Equal(RenderBackend.D3D12, context.Backend);
         Assert.True(target.IsValid);
 
+        // The scratch is viewport-sized per sample; 2× keeps this frame's
+        // allocation modest on CI while running the identical stencil-then-cover
+        // clear / resolve / blit that the damage rect scopes. Every assertion
+        // below samples deep inside or far outside a shape, so the coverage
+        // quantization the sample count controls cannot move them.
+        target.SetPathMsaaSampleCount(2);
+
         Assert.True(target.TryBeginDraw());
         target.Clear(0f, 0f, 0f);
         draw(target, context);
@@ -225,14 +247,16 @@ public sealed class StencilPathDamageScopeTests
 
         // Guard against silent downgrade: if solid FillPath ever stops routing
         // through the stencil-then-cover MSAA pipeline (stencil PSO compile
-        // failure, analytic-only default flip), every damage assertion in this
-        // class would be exercising the wrong code path while staying green.
-        // The MSAA path scratch is allocated on first stencil-path flush, so a
-        // non-zero PathBytes proves the pipeline actually ran.
+        // failure, a tightened PreferAnalyticFill area gate, analytic-only
+        // default flip), every damage assertion in this class would be
+        // exercising the wrong code path while staying green. The MSAA path
+        // scratch is allocated on first stencil-path flush, so a non-zero
+        // PathBytes proves the pipeline actually ran.
         Assert.True(target.TryQueryGpuStats(out var gpuStats));
         Assert.True(gpuStats.PathBytes > 0,
             "FillPath did not route through the stencil-then-cover MSAA pipeline " +
-            "(PathBytes == 0) — these damage tests are not covering computePathRunDamage.");
+            "(PathBytes == 0) — these damage tests are not covering computePathRunDamage. " +
+            "Check the path geometry still exceeds PreferAnalyticFill's area gate.");
 
         var pixels = new byte[Width * Height * 4];
         Assert.Equal(

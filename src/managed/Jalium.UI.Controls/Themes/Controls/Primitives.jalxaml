@@ -9,19 +9,30 @@
     <!-- Targets Control because FocusVisualHost is a   -->
     <!-- Control subclass; CornerRadius is mirrored from-->
     <!-- the adorned element by the manager.            -->
-    <!-- The visual matches WinUI's 2-layer focus ring: -->
-    <!-- outer stroke + inset inner stroke so the       -->
-    <!-- indicator stays visible on both light and dark -->
-    <!-- backgrounds.                                   -->
+    <!-- The stroke brush and thickness are Setters on  -->
+    <!-- the host and the template only TemplateBinds   -->
+    <!-- them, so a derived style                       -->
+    <!--   <Style BasedOn="{StaticResource              -->
+    <!--          DefaultFocusVisualStyle}"             -->
+    <!--          TargetType="Control">                 -->
+    <!--     <Setter Property="BorderBrush" .../>       -->
+    <!--     <Setter Property="BorderThickness" .../>   -->
+    <!--   </Style>                                     -->
+    <!-- recolors / re-weights the ring without         -->
+    <!-- redeclaring the template. Hard-coding them in  -->
+    <!-- the template made such setters silently no-op -->
+    <!-- and left the theme ring in place.              -->
     <!-- ============================================== -->
     <Style x:Key="DefaultFocusVisualStyle" TargetType="Control">
         <Setter Property="IsHitTestVisible" Value="False" />
         <Setter Property="Focusable" Value="False" />
+        <Setter Property="BorderBrush" Value="{ThemeResource FocusStrokeColorOuterBrush}" />
+        <Setter Property="BorderThickness" Value="3" />
         <Setter Property="Template">
             <ControlTemplate TargetType="Control">
                 <Grid>
-                    <Border BorderBrush="{ThemeResource FocusStrokeColorOuterBrush}"
-                            BorderThickness="3"
+                    <Border BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
                             CornerRadius="{TemplateBinding CornerRadius}"
                             Shape="RoundedRectangle"
                             IsHitTestVisible="False" />

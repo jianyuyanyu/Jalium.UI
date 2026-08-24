@@ -3,6 +3,7 @@
 #include "glyph_rasterizer.h"
 #include "jalium_text_api.h"
 
+#include <atomic>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -109,7 +110,16 @@ public:
     /// @param glyphIndex Glyph index from shaping.
     /// @param fontSizePx Font size in pixels.
     /// @param subpixelX Sub-pixel X quantization (0..7).
-    /// @return Atlas entry, or invalid entry if atlas is full.
+    /// @return Atlas entry, or invalid entry if the glyph cannot be packed even
+    ///         into an emptied atlas. When the packer runs out of room the atlas
+    ///         is RESET (Clear + generation bump) and the pack retried once, so
+    ///         a long session that touches many distinct glyphs (CJK, many
+    ///         sizes x 8 sub-pixel buckets) never degrades into "every later
+    ///         glyph re-rasterizes on every call and draws nothing". Consumers
+    ///         that composite quads immediately (the self-hosted Vulkan /
+    ///         software text paths) must re-generate a run when
+    ///         GetGeneration() changed underneath it — see
+    ///         JaliumTextFormat::GenerateGlyphQuads.
     const AtlasGlyphEntry& GetOrInsert(
         GlyphRasterizer& rasterizer,
         FontFace* face,
@@ -118,6 +128,11 @@ public:
         uint16_t fontSizePx,
         uint8_t subpixelX,
         GlyphAntialiasMode antialiasMode);
+
+    /// Monotonic reset counter: bumped by every Clear() (explicit or the
+    /// atlas-full auto reset). Entries obtained under an older generation may
+    /// point at pixels that have since been overwritten.
+    uint64_t GetGeneration() const { return generation_.load(std::memory_order_acquire); }
 
     /// Gets the raw atlas pixel data (RGBA8, 4096x4096).
     const uint8_t* GetPixelData() const { return atlasPixels_.data(); }
@@ -178,11 +193,16 @@ private:
     // Thread safety
     std::mutex mutex_;
 
+    // Reset generation (see GetGeneration).
+    std::atomic<uint64_t> generation_ { 1 };
+
     // Invalid entry sentinel
     static const AtlasGlyphEntry kInvalidEntry;
 
     bool PackGlyph(uint32_t w, uint32_t h, uint32_t& outX, uint32_t& outY);
     void BlitToAtlas(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t* rgba);
+    // Clear() body without taking mutex_ (callers already hold it).
+    void ClearLocked();
 };
 
 } // namespace jalium

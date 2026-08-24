@@ -13,6 +13,7 @@ namespace Jalium.UI.Controls;
 public sealed class FocusVisualAdorner : Adorner
 {
     private readonly FocusVisualHost _host;
+    private readonly Style _focusVisualStyle;
 
     /// <summary>
     /// Initializes a new <see cref="FocusVisualAdorner"/> for the given element, using
@@ -25,6 +26,7 @@ public sealed class FocusVisualAdorner : Adorner
         : base(adornedElement)
     {
         ArgumentNullException.ThrowIfNull(focusVisualStyle);
+        _focusVisualStyle = focusVisualStyle;
 
         // Do not capture input — the adorner is purely visual.
         IsHitTestVisible = false;
@@ -37,11 +39,13 @@ public sealed class FocusVisualAdorner : Adorner
         };
 
         // Forward layout properties that the focus visual template typically needs to mirror
-        // the adorned element (CornerRadius for rounded buttons, Padding for offset indicators).
-        // These are set before Style assignment so TemplateBinding picks them up cleanly.
+        // the adorned element (CornerRadius for rounded buttons). Written as a current value,
+        // not a local one: a local value outranks every style setter, so a focus visual style
+        // that sets its own CornerRadius would silently lose to the mirror. As a current value
+        // it fills in only when the style stays silent, and TemplateBinding still sees it.
         if (adornedElement is Control control)
         {
-            _host.CornerRadius = control.CornerRadius;
+            _host.SetCurrentValue(Control.CornerRadiusProperty, control.CornerRadius);
         }
 
         _host.Style = focusVisualStyle;
@@ -53,6 +57,12 @@ public sealed class FocusVisualAdorner : Adorner
     /// Gets the hosted control that materializes the focus visual's template.
     /// </summary>
     internal FocusVisualHost Host => _host;
+
+    /// <summary>
+    /// Gets the style this indicator was built from, so the manager can tell whether a later
+    /// change of the adorned element's effective focus visual style requires a rebuild.
+    /// </summary>
+    internal Style FocusVisualStyle => _focusVisualStyle;
 
     /// <inheritdoc />
     protected override int VisualChildrenCount => 1;

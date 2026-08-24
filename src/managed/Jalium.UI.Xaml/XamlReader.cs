@@ -495,9 +495,60 @@ public partial class XamlReader
         ArgumentNullException.ThrowIfNull(xaml);
 
         sourceAssembly ??= component.GetType().Assembly;
-        using var xmlReader = JalxamlParser.CreateReader(xaml);
+
+        // Loops are expanded during tokenization, so this is the only chance they get to see any
+        // data at all. Reading through the component — its DataContext first, then the component
+        // itself — matches how every other Razor path resolves a name.
+        using var xmlReader = JalxamlParser.CreateReader(xaml, CreateLoadTimeRazorResolver(component));
         LoadInternal(xmlReader, component, baseUri, sourceAssembly, namedElementsOut: namedElementsOut);
         HotReloadRuntime.RegisterComponent(component);
+    }
+
+    /// <summary>
+    /// Builds the name resolver a document's Razor loops and code blocks read at load time.
+    /// </summary>
+    /// <remarks>
+    /// Same order as <c>RazorValueResolver</c>: the DataContext wins over the component, so a view
+    /// model property shadows a same-named member on the view. Anything unresolved comes back null,
+    /// exactly as before this resolver existed.
+    /// </remarks>
+    [RequiresUnreferencedCode("Resolves Razor names by reflecting over the component and its DataContext.")]
+    private static Func<string, object?> CreateLoadTimeRazorResolver(object component)
+        => name =>
+        {
+            if (string.IsNullOrEmpty(name))
+                return null;
+
+            if (component is FrameworkElement element &&
+                element.GetValue(FrameworkElement.DataContextProperty) is { } dataContext &&
+                TryReadMemberForRazor(dataContext, name, out var fromDataContext))
+            {
+                return fromDataContext;
+            }
+
+            return TryReadMemberForRazor(component, name, out var fromComponent) ? fromComponent : null;
+        };
+
+    [RequiresUnreferencedCode("Reads a property or field by name via reflection.")]
+    private static bool TryReadMemberForRazor(object source, string name, out object? value)
+    {
+        var type = source.GetType();
+
+        if (type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance) is { } property &&
+            property.CanRead)
+        {
+            value = property.GetValue(source);
+            return true;
+        }
+
+        if (type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance) is { } field)
+        {
+            value = field.GetValue(source);
+            return true;
+        }
+
+        value = null;
+        return false;
     }
 
     private static void LoadComponentCore(object component, string resourceName, Dictionary<string, object>? namedElements, Assembly? assembly)
@@ -4790,6 +4841,10 @@ public static class XamlTypeRegistry
     private static void RegisterMarkupTypes(Dictionary<string, Type> types)
     {
         Register<Markup.RazorSectionHost>(types);
+
+        // Emitted by the tokenizer for @virtualize, so it has to resolve by name the same way a
+        // hand-written element would.
+        Register<Controls.RazorItemsHost>(types);
     }
 
     [RequiresUnreferencedCode("Registers control types whose ctors / ProvideValue overrides are themselves annotated with RequiresUnreferencedCode.")]

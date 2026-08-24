@@ -1,4 +1,4 @@
-using Jalium.UI.Media;
+﻿using Jalium.UI.Media;
 using Jalium.UI.Media.Effects;
 using Jalium.UI.Media.Media3D;
 using Jalium.UI.Rendering;
@@ -696,17 +696,53 @@ public abstract class Visual : DependencyObject
     /// animation stays layer-eligible (its cached GPU layer is re-composited at the
     /// new transform/opacity rather than re-recorded). Short-circuits once an
     /// ancestor is already marked, exactly like <see cref="MarkSubtreeDirtyUp"/>.
+    ///
+    /// <para>Every STRICT ancestor additionally gets <see cref="_layerContentDirty"/>:
+    /// a retained layer bakes its whole subtree — including each descendant's
+    /// Opacity / RenderTransform — into ONE texture and composites it applying only
+    /// the LAYER OWNER's own live opacity/transform. A descendant's composition change
+    /// therefore makes that texture stale, and the composite gate reads content flags
+    /// only, so without this the owner keeps compositing the captured pixels and the
+    /// descendant's animation freezes at the value it happened to be captured at.
+    /// The observed failure: a list row (generated item containers are compositor
+    /// boundaries) whose layer was realized on the one frame its fade-in sat at
+    /// Opacity 0 stayed invisible for good — laid out, IsVisible, Opacity back at 1,
+    /// simply never re-realized.</para>
+    ///
+    /// <para>This mark is deliberately NOT short-circuited on
+    /// <see cref="_isSubtreeCompositionDirty"/>: an element inside a composited layer
+    /// is never re-rendered, so its flags are never cleared, and the short-circuit
+    /// would stop the walk at the animating element itself on every frame after the
+    /// first — precisely the case that has to reach the caching ancestor.</para>
     /// </summary>
     private void MarkSubtreeCompositionDirtyUp()
     {
         var current = this;
+        Visual? child = null;
+        var propagateFlag = true;
+
         while (current != null)
         {
-            if (current._isSubtreeCompositionDirty)
+            // current is a strict ancestor of the element whose composition changed
+            // once we have stepped up at least one level.
+            if (child != null)
             {
-                break;
+                current._layerContentDirty = true;
             }
-            current._isSubtreeCompositionDirty = true;
+
+            if (propagateFlag)
+            {
+                if (current._isSubtreeCompositionDirty)
+                {
+                    propagateFlag = false;
+                }
+                else
+                {
+                    current._isSubtreeCompositionDirty = true;
+                }
+            }
+
+            child = current;
             current = current._parent;
         }
     }
@@ -1170,14 +1206,34 @@ public abstract class Visual : DependencyObject
     }
 
     /// <summary>
-    /// Returns true when compositing a retained layer would enlarge its source
-    /// texels. Retained layers are realized at the element's untransformed
-    /// <see cref="UIElement.RenderSize"/>; upscaling that texture turns vector
-    /// paths and text into a blurry bitmap. Such subtrees must be rendered
-    /// through the live transform so vector geometry is rasterized directly at
-    /// the final surface resolution.
+    /// Returns true when compositing a retained layer would resample its source
+    /// texels, i.e. the live transform carries any scale other than 1.
+    ///
+    /// <para><b>Upscaling</b> was always excluded: retained layers are realized at the
+    /// element's untransformed <see cref="UIElement.RenderSize"/>, and enlarging that
+    /// texture turns vector paths and text into a blurry bitmap.</para>
+    ///
+    /// <para><b>Downscaling is now excluded too</b>, because the composite places it wrong.
+    /// <c>CompositeLayer</c> hands native an <b>absolute</b> <c>worldBounds</c> rectangle and
+    /// leaves a non-translate transform on the native matrix stack (only the pure-translate
+    /// case folds its delta into the rectangle — see RetainedLayerTranslateCompositeTests).
+    /// The scale then ends up composed about the wrong fixed point, so the cached texture is
+    /// blitted at an offset of <c>(1-scale) * F</c> from where the element's ink is accounted
+    /// for. Measured in the XAML designer, whose preview surface is a
+    /// <c>ScaleTransform</c> nested inside a pan <c>TranslateTransform</c>: correct at 100%,
+    /// shifted down-right at 50%, shifted up-left at 200% — exactly that signature, while
+    /// layout (ActualWidth/Height and arrange offsets) stayed correct throughout.
+    /// A <c>DropShadowEffect</c> anywhere in the subtree used to hide it by making the
+    /// subtree ineligible for a layer (see SubtreeHasEffect), which is why it surfaced only
+    /// when that effect was removed.</para>
+    ///
+    /// <para>Translate-only (and opacity-only) compositing is unaffected and keeps the fast
+    /// path — that is the case the composite math is actually pinned for. Restoring scaled
+    /// compositing requires fixing the fixed-point composition in
+    /// <c>RenderTargetDrawingContext.CompositeLayer</c> first; until then a scaled subtree
+    /// renders inline, which costs caching but is correct.</para>
     /// </summary>
-    internal static bool TransformWouldUpscaleRetainedLayer(Transform? transform)
+    internal static bool TransformWouldRescaleRetainedLayer(Transform? transform)
     {
         if (transform == null)
             return false;
@@ -1186,7 +1242,7 @@ public abstract class Visual : DependencyObject
         var scaleX = Math.Sqrt(m.M11 * m.M11 + m.M12 * m.M12);
         var scaleY = Math.Sqrt(m.M21 * m.M21 + m.M22 * m.M22);
         const double epsilon = 1e-6;
-        return scaleX > 1.0 + epsilon || scaleY > 1.0 + epsilon;
+        return Math.Abs(scaleX - 1.0) > epsilon || Math.Abs(scaleY - 1.0) > epsilon;
     }
 
     /// <summary>Queues this visual's retained layer (if any) for fence-gated
@@ -1283,13 +1339,13 @@ public abstract class Visual : DependencyObject
         // (Compositor.IsLayerRoot), even a STATIC one, so a content-clean sibling
         // composites its cached texture instead of re-rasterizing every hover frame.
         // Adding (b) is strictly additive — (a) behaves exactly as before. Rotation/
-        // skew, upscaling, and trivial/leaf subtrees remain excluded (the quad path
-        // bakes only scale+translate).
+        // skew, ANY scale != 1, and trivial/leaf subtrees are excluded: the composite only
+        // places a pure translate (or opacity) correctly, see TransformWouldRescaleRetainedLayer.
         bool hasComposite = transform != null || opacity < 1.0;
         bool rotation = transform != null && TransformHasRotationOrSkew(transform);
-        bool upscalesLayer = TransformWouldUpscaleRetainedLayer(transform);
+        bool rescalesLayer = TransformWouldRescaleRetainedLayer(transform);
         var size = child.RenderSize;
-        bool eligible = (child._isCompositorBoundary || hasComposite) && !rotation && !upscalesLayer
+        bool eligible = (child._isCompositorBoundary || hasComposite) && !rotation && !rescalesLayer
             && size.Width >= 1.0 && size.Height >= 1.0
             && child.VisualChildrenCount > 0;
 
@@ -1306,7 +1362,7 @@ public abstract class Visual : DependencyObject
         // guard 拒绝（offscreen capture 不能嵌套 retained capture，EndOffscreenCapture 会把
         // RT 恢复成 swap-chain 而非 layer），导致 glow/阴影/backdrop 等 effect 静默消失。
         // resize 把带动画的容器翻上 layer 路径正是触发点（独显才有 retained-layer 优化）。
-        if (elementEffectsEnabled && SubtreeHasEffect(child))
+        if ((elementEffectsEnabled && SubtreeHasEffect(child)) || SubtreeHasNonTranslateTransform(child))
         {
             if (child._isCompositorBoundary) Jalium.UI.Diagnostics.HoverTrace.Bump(Jalium.UI.Diagnostics.HoverTrace.CB_EFFECT);
             ReleaseLayerIfAny(child);
@@ -1386,6 +1442,58 @@ public abstract class Visual : DependencyObject
                 return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// Does any DESCENDANT carry a render transform that is not a pure translate
+    /// (scale / rotate / skew)? Such a subtree must not become a retained layer.
+    /// </summary>
+    /// <remarks>
+    /// Same shape of hazard as <see cref="SubtreeHasEffect"/>, different mechanism.
+    /// A non-translate transform is pushed onto the NATIVE matrix stack, and
+    /// <c>RenderTargetDrawingContext.PushTransform</c> conjugates it as
+    /// <c>T(-Offset) * M * T(+Offset)</c> so it applies in local space while draw
+    /// coordinates stay absolute. Inside a retained-layer capture the render target has
+    /// been rebased to the layer's origin, so those absolute coordinates arrive shifted by
+    /// <c>-layerOrigin</c> while the conjugated matrix still pins its fixed point at the
+    /// absolute <c>Offset</c>. The scale is therefore composed about the wrong point and the
+    /// captured content lands at <c>(1-scale) * layerOrigin</c> from where layout put it.
+    ///
+    /// <para>Measured in the XAML designer, whose preview is a <c>ScaleTransform</c> (zoom)
+    /// nested inside a pan <c>TranslateTransform</c> that is itself layer-eligible: preview
+    /// content correct at 100%, shifted down-right at 50%, shifted up-left at 200%, while
+    /// layout stayed correct throughout. <c>JALIUM_DISABLE_RETAINED_LAYERS=1</c> made it
+    /// correct at every zoom. A <c>DropShadowEffect</c> in the subtree also hid it, via the
+    /// <see cref="SubtreeHasEffect"/> exclusion above — which is why removing an unrelated
+    /// shadow appeared to "break" the designer.</para>
+    ///
+    /// <para>The child's OWN transform is already screened by
+    /// <see cref="TransformWouldRescaleRetainedLayer"/> / <see cref="TransformHasRotationOrSkew"/>;
+    /// this walk covers the descendants that render INSIDE the capture. Pure translates are
+    /// fine: they fold into the managed <c>Offset</c> and never touch the native matrix.</para>
+    /// </remarks>
+    private static bool SubtreeHasNonTranslateTransform(Visual visual)
+    {
+        int n = visual.VisualChildrenCount;
+        for (int i = 0; i < n; i++)
+        {
+            var c = visual.GetVisualChild(i);
+            if (c == null) continue;
+            if (c is UIElement ce && ce.RenderTransform is { } t && !IsPureTranslate(t))
+                return true;
+            if (SubtreeHasNonTranslateTransform(c))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>A transform whose linear part is the identity — i.e. translation only.</summary>
+    internal static bool IsPureTranslate(Transform transform)
+    {
+        var m = transform.Value;
+        const double epsilon = 1e-6;
+        return Math.Abs(m.M11 - 1.0) <= epsilon && Math.Abs(m.M12) <= epsilon
+            && Math.Abs(m.M21) <= epsilon && Math.Abs(m.M22 - 1.0) <= epsilon;
     }
 
     /// <summary>
