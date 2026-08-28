@@ -34,6 +34,12 @@
     <ProjectReference Include="..\..\src\managed\Jalium.UI.Interop\Jalium.UI.Interop.csproj" />
     <ProjectReference Include="..\..\src\managed\Jalium.UI.Media\Jalium.UI.Media.csproj" />
     <ProjectReference Include="..\..\src\managed\Jalium.UI.Xaml\Jalium.UI.Xaml.csproj" />
+    <!-- Referenced as a normal library, not an analyzer: RazorVirtualizeLoweringTests drives the
+         parser and code generator directly. Mirrors Jalium.UI.Tests so the portable slice keeps
+         compiling the shared source inventory. -->
+    <ProjectReference Include="..\..\src\managed\Jalium.UI.Xaml.SourceGenerator\Jalium.UI.Xaml.SourceGenerator.csproj"
+                      Aliases="sg"
+                      UndefineProperties="PublishAot;PublishTrimmed;PublishSingleFile;SelfContained;RuntimeIdentifier;IsTrimmable;IsAotCompatible" />
   </ItemGroup>
 
   <!--
@@ -44,6 +50,10 @@
   <ItemGroup>
     <_WindowsOnlyTestSource Include="..\Jalium.UI.Tests\DeviceLost\**\*.cs" />
     <_WindowsOnlyTestSource Include="..\Jalium.UI.Tests\EffectCaptureCullOverrideTests.cs" />
+    <!-- Drive the capture path through a real HWND (HiddenNativeWindow), so they need a
+         Windows desktop even where the backend under test is the software one. -->
+    <_WindowsOnlyTestSource Include="..\Jalium.UI.Tests\EffectCaptureTransformCompensationTests.cs" />
+    <_WindowsOnlyTestSource Include="..\Jalium.UI.Tests\SoftwareEffectCaptureTests.cs" />
     <_WindowsOnlyTestSource Include="..\Jalium.UI.Tests\FileDialogComActivationTests.cs" />
     <_WindowsOnlyTestSource Include="..\Jalium.UI.Tests\SpellCheckerComActivationTests.cs" />
     <_WindowsOnlyTestSource Include="..\Jalium.UI.Tests\UiaComWrappersTests.cs" />
